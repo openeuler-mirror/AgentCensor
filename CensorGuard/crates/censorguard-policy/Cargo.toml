@@ -1,0 +1,19 @@
+[package]
+name = "censorguard-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+censorguard-common = { path = "../censorguard-common" }
+serde.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[lints]
+workspace = true
+

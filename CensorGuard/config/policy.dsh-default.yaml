@@ -1,0 +1,30 @@
+# DSH 默认策略组 censorguard-dsh-default（整树包裹模式）
+#
+# 下发 (root):
+#   sudo censorguardctl policy apply --name censorguard-dsh-default --file config/policy.dsh-default.yaml
+# 绑定 (DSH 普通用户): 经 dsh.sock attach_self, policy_group=censorguard-dsh-default
+#
+# 设计原则（对照 ohmyguard policies/policy.dsh-default.yaml）:
+#   - 黑名单式起步: 不做 0.0.0.0/0 白名单网络兜底。DSH 主进程自身也在树内被强制,
+#     启动期需要 DNS/网络, 白名单兜底极易让 DSH 起不来。
+#   - 拒写 Censorguard 自身状态目录与 socket 目录 (防 DSH 子进程篡改策略)。
+#   - 拒毁灭性命令。
+#   - enable_*/audit_* 不在策略文件中配置, 由运行时开关管理
+#     (censorguardctl set / ui.sock set_switches)。
+rules:
+  - file deny+audit /var/lib/censorguard [write,delete,rename]
+  - file deny+audit /run/censorguard [write,delete,rename]
+  - exec deny+audit /usr/bin/rm -rf /
+  - exec deny+audit /usr/bin/rm -rf /*
+  - exec deny+audit /usr/bin/dd of=/dev/sda
+  - exec deny+audit /usr/bin/mkfs
+  - exec deny+audit /usr/bin/shutdown
+  - exec deny+audit /usr/bin/reboot
+  - exec deny+audit /usr/bin/init 0
+
+    # ---- /tmp/dsh-guard-test 文件矩阵 ----
+  - file deny+audit /tmp/dsh-guard-test/base-locked.txt
+  - file deny+audit /tmp/dsh-guard-test/ro-secret.txt [read]
+  - file deny+audit /tmp/dsh-guard-test/ww-nodelete.txt [delete,rename]
+  - file deny+audit /tmp/dsh-guard-test/fa-treasure.txt [delete]
+  - file allow+audit /tmp/dsh-guard-test/public.txt [delete]

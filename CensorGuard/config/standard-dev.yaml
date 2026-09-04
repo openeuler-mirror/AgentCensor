@@ -1,0 +1,7 @@
+# standard-dev.yaml —— 标准开发: 白名单网络 + 工作区只读
+rules:
+  - net deny 0.0.0.0/0
+  - net allow api.github.com:443
+  - net allow 140.82.112.0/20:443
+  - file deny /opt/agent/workspace ro
+  - exec deny /usr/bin/git push

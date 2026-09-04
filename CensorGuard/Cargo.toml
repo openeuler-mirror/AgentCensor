@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/censorguard-common",
+    "crates/censorguard-policy",
+    "crates/censorguard-kernel",
+    "crates/censorguard-daemon",
+    "crates/censorguardctl",
+    "crates/censorguard-audit",
+    "crates/censorguard-exec",
+    "crates/censorguard-grpc",
+]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2024"
+# MSRV 由语言特性决定: edition 2024 (1.85+) 与 let-chains (1.88+);
+# 依赖最高 MSRV 为 indexmap 2.13 的 1.82, 均低于 1.88
+rust-version = "1.88"
+license = "GPL-2.0-only"
+repository = "file:///root/Censorguard"
+
+[workspace.dependencies]
+libc = "0.2.183"
+rustix = { version = "1.1.4", features = ["process"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+thiserror = "2.0.18"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"

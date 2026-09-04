@@ -1,0 +1,18 @@
+[package]
+name = "censorguardctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "censorguardctl"
+path = "src/main.rs"
+
+[dependencies]
+censorguard-common = { path = "../censorguard-common" }
+rustix.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

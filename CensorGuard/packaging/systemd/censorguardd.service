@@ -1,0 +1,51 @@
+[Unit]
+Description=Censorguard eBPF security enforcement daemon
+Documentation=file:/usr/share/doc/censorguard/README.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/sys/kernel/btf/vmlinux
+
+[Service]
+Type=exec
+User=root
+Group=censorguard
+RuntimeDirectory=censorguard
+RuntimeDirectoryMode=0750
+StateDirectory=censorguard
+StateDirectoryMode=0750
+UMask=0027
+
+ExecStart=/usr/sbin/censorguardd launch --bpf-object /usr/lib/censorguard/enforce.bpf.o --ctl-sock /run/censorguard/ctl.sock --event-sock /run/censorguard/events.sock --launch-sock /run/censorguard/launch.sock --state-dir /var/lib/censorguard --socket-group censorguard --spawn-grpc --grpc-bin /usr/bin/censorguard-grpc
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=15s
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+OOMScoreAdjust=-500
+
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateMounts=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/run/censorguard /var/lib/censorguard
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
