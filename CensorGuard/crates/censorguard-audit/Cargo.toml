@@ -1,0 +1,16 @@
+[package]
+name = "censorguard-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "censorguard-audit"
+path = "src/main.rs"
+
+[dependencies]
+censorguard-common = { path = "../censorguard-common" }
+
+[lints]
+workspace = true

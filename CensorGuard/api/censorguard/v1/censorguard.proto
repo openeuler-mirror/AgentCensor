@@ -1,0 +1,225 @@
+// Censorguard gRPC 契约 —— 面向 DSH 插件的委托控制面 + 事件面
+//
+// 结构逐条对照 ohmyguard-link/api/ohmyguard/v1/ohmyguard.proto 复刻。
+// gRPC 适配器进程 (crates/censorguard-grpc, 非特权服务用户) 对外讲本协议,
+// 对内是 daemon ui.sock / events.sock 的客户端 (JSON-lines 透传)。
+// daemon 自身永不直接监听网络。
+//
+// DSH 第一期:
+//   - ui.sock 委托控制面: gRPC 限定 DSH 策略组读写, 不能改 __base__ /
+//     config / bind / track 任意 pid; 写操作受 daemon ui.sock 角色 ACL 兜底
+//   - RequestContext: 来源分类 (DSH_WEB_UI / AGENT_TOOL / DSH_INTERNAL),
+//     仅用于审计与路径区分, 不作为最终授权依据
+//   - Event 带 domain_id/domain/sequence/daemon_boot_id/dropped_before,
+//     UI 显示断线/gap 而非制造"日志完整"错觉
+syntax = "proto3";
+
+package censorguard.v1;
+
+// Censorguard 控制面 + 事件面
+service Censorguard {
+  // 控制面 (一一对应 daemon socket 的 op):
+  rpc Status(StatusReq)            returns (StatusReply);
+  // gRPC 角色限定 ui.sock, 只读 + DSH 组策略写。
+  // Track/Untrack/SetConfig/SetDomainBinding/RemovePolicy 是 admin op,
+  // gRPC 角色无权限, 调用直接被拒 (PermissionDenied)。保留 RPC 定义是为了
+  // 不破坏既有客户端, 新客户端不应再调用。
+  rpc Track(TrackReq)              returns (TrackReply);
+  rpc Untrack(UntrackReq)          returns (UntrackReply);
+  rpc SetConfig(SetConfigReq)      returns (SetConfigReply);
+  rpc SetDomainBinding(BindReq)    returns (BindReply);
+
+  // 策略组读写 (gRPC 角色允许的 op):
+  rpc GetPolicy(GetPolicyReq)      returns (GetPolicyReply);      // 单组只读
+  rpc ValidatePolicy(ValidatePolicyReq) returns (ValidatePolicyReply); // 只编译校验
+  rpc ApplyPolicy(ApplyPolicyReq)  returns (ApplyPolicyReply);    // 整组替换 (限定白名单组)
+  rpc RemovePolicy(RemovePolicyReq) returns (RemovePolicyReply);  // 删组 (gRPC 角色无权限, ACL 拒)
+  rpc GetConfig(GetConfigReq)      returns (GetConfigReply);
+  // 运行时开关读写 (enable_*/audit_* 六开关; ui.sock 委托面允许):
+  rpc SetSwitches(SetSwitchesReq)  returns (SetSwitchesReply);
+
+  // 事件面:
+  rpc SubscribeEvents(EventsReq)   returns (stream Event); // 服务端推流 (按 Domain/kind/allowed 过滤)
+}
+
+// RequestOrigin 来源分类: 用于审计与路径区分, 不作为最终授权依据。
+// 所有策略写操作仍受 ui.sock 的固定 ACL 约束 (白名单组、拒 __base__/config/bind)。
+enum RequestOrigin {
+  REQUEST_ORIGIN_UNSPECIFIED = 0;
+  DSH_WEB_UI = 1;        // DSH WebUI (用户在设置页改 dsh-default)
+  AGENT_TOOL = 2;        // Agent 工具调用
+  DSH_INTERNAL = 3;      // DSH 内部 (Bootstrap 自附着等)
+}
+
+// RequestContext gRPC 请求上下文: 由 gRPC 客户端填充, 仅审计用。
+message RequestContext {
+  RequestOrigin origin = 1;
+  string dsh_instance_id = 2;   // DSH 实例区分 (域名的 -hint)
+  uint64 domain_id = 3;         // 关联 Domain (0 = 不指定)
+  string session_id = 4;        // DSH 会话 ID (UI 路径)
+  string tool_call_id = 5;      // Agent 工具调用 ID
+}
+
+message StatusReq {
+  RequestContext context = 1;
+}
+
+message StatusReply {
+  repeated uint32 roots = 1;          // 追踪根注册表
+  int32 tracked = 2;                  // tracked_pids 当前条目数
+  repeated DomainInfo domains = 3;    // 全部域状态
+  uint64 reload_gen = 4;              // 策略变更代数 (单调; dry_run 不增)
+  string last_reload_time = 5;        // RFC3339, 空 = 从未变更
+  string last_reload_error = 6;       // 上次失败原因, 空 = 上次成功
+  map<string, bool> config = 7;       // 全局开关 (enable_* × file/exec/net)
+  // daemon boot ID 与 hook 健康度: UI 用于显示 daemon 是否存活/重启过,
+  // 以及策略 enforcement 是否就绪。
+  string daemon_boot_id = 10;
+  bool hooks_healthy = 11;
+}
+
+message DomainInfo {
+  string name = 1;
+  uint64 id = 2;
+  uint32 slot = 3;
+  string group = 4;                   // 绑定的策略组名 ("" = 仅基线)
+  int32 roots = 5;                    // 追踪根数量
+  uint32 version = 6;                 // 当前生效策略版本
+  bool draining = 7;                  // 无根但树未排干 (策略仍生效)
+}
+
+message TrackReq {
+  uint32 pid = 1;
+  string domain = 2;
+  bool seed = 3;
+  RequestContext context = 4;
+}
+message TrackReply {
+  DomainInfo domain = 1;
+  int32 seeded = 2;
+}
+
+message UntrackReq {
+  uint32 pid = 1;
+  RequestContext context = 2;
+}
+message UntrackReply {}
+
+// GetPolicy 单组只读: 返回组当前生效的规则原文。
+// gRPC 角色允许任意组名读取 (含 __base__), 写才受限。
+message GetPolicyReq {
+  string name = 1;                    // 策略组名 (__base__ = 全局基线)
+  RequestContext context = 2;
+}
+message GetPolicyReply {
+  string name = 1;                    // 组名回显
+  uint32 version = 2;                 // 当前生效版本
+  string policy_yaml = 3;             // 组 YAML 片段原文 (编辑器直接展示/编辑)
+  repeated string rules = 4;          // 规则原文行 (一行式, 便于 diff)
+  repeated string domains = 5;        // 引用该组的活跃域
+}
+
+// ValidatePolicy 只编译校验, 不动数据面、不增 reload_gen。报告编译错误
+// 供 WebUI 编辑器即时反馈。
+message ValidatePolicyReq {
+  string name = 1;                    // 校验目标组名 (必填; 限白名单组)
+  string policy_yaml = 2;             // 待校验的单组规则片段
+  RequestContext context = 3;
+}
+message ValidatePolicyReply {
+  bool ok = 1;                        // 编译是否通过
+  repeated string errors = 2;         // 编译错误 (按行)
+  repeated string affected = 3;       // 编译成功时引用该组的活跃域 (预演影响面)
+}
+
+message ApplyPolicyReq {
+  string name = 1;                    // 策略组名 (限 DSH 自助白名单组)
+  string policy_yaml = 2;             // 单组规则片段 (GroupPolicy YAML)
+  bool dry_run = 3;                   // 只编译校验 + 报告影响面, 不动数据面
+  RequestContext context = 4;
+}
+message ApplyPolicyReply {
+  uint64 reload_gen = 1;              // 策略变更代数
+  string name = 2;                    // 组名回显
+  uint32 version = 3;                 // 该组新版本
+  repeated string affected = 4;       // 引用该组的活跃域
+}
+
+message RemovePolicyReq {
+  string name = 1;
+  bool force = 2;
+  RequestContext context = 3;
+}
+message RemovePolicyReply {}
+
+message SetConfigReq {
+  map<string, bool> config = 1;
+  RequestContext context = 2;
+}
+message SetConfigReply {
+  map<string, bool> config = 1;
+}
+
+message GetConfigReq {
+  RequestContext context = 1;
+}
+message GetConfigReply {
+  map<string, bool> config = 1;
+}
+
+// SetSwitches 运行时开关: 只传要改的字段 (proto3 optional), 未传字段保持不变。
+// 开关不持久化, daemon 重启恢复默认 (enable 全开, audit 全关)。
+message SetSwitchesReq {
+  optional bool enable_file = 1;
+  optional bool enable_exec = 2;
+  optional bool enable_net = 3;
+  optional bool audit_file = 4;
+  optional bool audit_exec = 5;
+  optional bool audit_net = 6;
+  RequestContext context = 7;
+}
+message SetSwitchesReply {
+  bool enable_file = 1;                // 回显切换后的全量开关状态
+  bool enable_exec = 2;
+  bool enable_net = 3;
+  bool audit_file = 4;
+  bool audit_exec = 5;
+  bool audit_net = 6;
+}
+
+message BindReq {
+  string domain = 1;
+  string group = 2;
+  RequestContext context = 3;
+}
+message BindReply { DomainInfo domain = 1; }
+
+// EventsReq 事件订阅过滤: 过滤在 gRPC 侧完成 (订阅时按 domain_ids/kinds/allowed
+// 过滤后转发)。domain_ids 为空 = 不过滤 (返回全部)。
+message EventsReq {
+  repeated uint64 domain_ids = 1;     // 只订阅这些 Domain (空 = 全部)
+  repeated uint32 kinds = 2;          // 只订阅这些 kind (1=FILE 2=EXEC 3=NET 4=GUARD; 空 = 全部)
+  optional bool allowed = 3;          // 只订阅 allow=true / allow=false 的事件 (不填 = 全部)
+  RequestContext context = 4;
+}
+
+// Event 事件面消息 (ringbuf enforceEvent 的纯数据形态)。
+// kind: 1=FILE 2=EXEC 3=NET 4=GUARD; op: kind=1 时 FILE_OP_*, kind=4 时 GUARD_OP_*。
+message Event {
+  string ts = 1;                      // RFC3339 (daemon 收到事件的时刻)
+  uint32 kind = 2;
+  uint32 op = 3;
+  uint32 pid = 4;
+  uint32 tgid = 5;
+  bool allowed = 6;
+  uint32 policy_version = 7;          // 判定依据的策略版本
+  uint32 rule_version = 8;            // 命中规则自身的版本 (未命中 = 0)
+  string comm = 9;
+  string detail = 10;
+  repeated string args = 11;          // EXEC 参数级事件的 token (kind=2 时有值)
+  uint64 domain_id = 12;              // BPF 上报的 domain_id (0 = 未归属)
+  string domain = 13;                 // daemon 解析的域名
+  uint64 sequence = 14;               // daemon 内单调序列 (从 1 起; 0 是哨兵)
+  string daemon_boot_id = 15;         // daemon boot ID (区分 daemon 重启)
+  uint64 dropped_before = 16;         // 本订阅者上次广播到现在的累计丢失数
+}

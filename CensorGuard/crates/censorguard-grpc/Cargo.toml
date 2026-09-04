@@ -1,0 +1,28 @@
+[package]
+name = "censorguard-grpc"
+description = "Censorguard gRPC adapter: loopback gRPC front-end for the daemon ui/events sockets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "censorguard-grpc"
+path = "src/main.rs"
+
+[dependencies]
+censorguard-common = { path = "../censorguard-common" }
+censorguard-policy = { path = "../censorguard-policy" }
+prost = "0.13"
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic = "0.12"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+# base.yaml —— 全局基线, 所有域叠加生效
+rules:
+  - file deny+audit /etc/shadow
+  - file deny+audit /root/.ssh
+  - exec deny /usr/bin/nc

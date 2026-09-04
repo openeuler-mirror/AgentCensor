@@ -1,0 +1,23 @@
+[package]
+name = "censorguard-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+default-run = "censorguardd"
+
+[[bin]]
+name = "censorguardd"
+path = "src/main.rs"
+
+[dependencies]
+censorguard-common = { path = "../censorguard-common" }
+censorguard-kernel = { path = "../censorguard-kernel" }
+censorguard-policy = { path = "../censorguard-policy" }
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "socket", "user"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

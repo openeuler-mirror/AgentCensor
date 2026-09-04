@@ -1,0 +1,3 @@
+# high-priv.yaml —— 高权限: 仅加少量禁忌
+rules:
+  - file deny /data/model.bin rw
