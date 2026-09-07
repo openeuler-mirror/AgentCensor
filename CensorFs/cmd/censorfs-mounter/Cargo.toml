@@ -1,0 +1,12 @@
+[package]
+name = "censorfs-mounter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+fs2.workspace = true
+libc = "=0.2.161"
+censorfs-core = { path = "../../crates/censorfs-core" }

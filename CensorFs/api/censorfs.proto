@@ -1,0 +1,64 @@
+syntax = "proto3";
+package censorfs.v1;
+
+message RequestContext {
+  uint32 protocol_version = 1;
+  bytes request_id = 2;
+  string actor_id = 3;
+  uint64 mount_epoch = 4;
+  uint64 deadline_unix_ms = 5;
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  GET_FS_INFO = 1;
+  GET_REQUEST_RESULT = 2;
+  INSPECT_RECOVERY = 3;
+  BEGIN_TX = 10;
+  CLOSE_TX = 11;
+  ABORT_TX = 12;
+  OPEN_VIEW = 20;
+  CLOSE_VIEW = 21;
+  CREATE_BRANCH = 30;
+  GET_BRANCH_HEAD = 31;
+  LIST_BRANCHES = 32;
+  CREATE_BRANCH_FROM = 33;
+  BEGIN_TICKET = 40;
+  PREPARE_TICKET = 41;
+  ABORT_TICKET = 42;
+  EXPLORE = 43;
+  ABORT_EXPLORATION = 44;
+  PUBLISH = 50;
+  BUILD_ROLLBACK_CANDIDATE = 51;
+  COMMIT_EXPLORATION = 52;
+  GET_GENERATION_INFO = 60;
+  RESOLVE_FORK_POINT = 61;
+  DIFF_GENERATIONS = 62;
+  MERGE_BRANCHES = 63;
+  DIFF_TEXT = 64;
+  TEST_LIST = 70;
+  TEST_CAT = 71;
+  TEST_WRITE = 72;
+  TEST_MKDIR = 73;
+  TEST_REMOVE = 74;
+  TEST_MOVE = 75;
+  VARIANT_OPEN = 80;
+  VARIANT_PREPARE = 81;
+  VARIANT_PUBLISH = 82;
+  VARIANT_ABORT = 83;
+  // Privileged daemon/mounter handoff; not exposed by censorfsctl.
+  ATTACH_FUSE = 90;
+}
+
+message ControlRequest {
+  RequestContext context = 1;
+  Operation operation = 2;
+  bytes payload = 3;
+}
+
+message ControlResponse {
+  bytes request_id = 1;
+  uint32 status = 2;
+  string message = 3;
+  bytes payload = 4;
+}

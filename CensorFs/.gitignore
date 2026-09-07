@@ -1,0 +1,5 @@
+/target/
+/.tools/
+/.censorfs-test/
+*.log
+

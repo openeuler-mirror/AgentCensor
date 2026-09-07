@@ -1,0 +1,21 @@
+[Unit]
+Description=CensorFS core daemon
+After=local-fs.target
+RequiresMountsFor=/var/lib/censorfs
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/censorfs/censorfsd --storage-root /var/lib/censorfs/.censorfs --socket /run/censorfs/control.sock
+RuntimeDirectory=censorfs
+RuntimeDirectoryMode=0750
+User=root
+Group=censorfs
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/censorfs /run/censorfs
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

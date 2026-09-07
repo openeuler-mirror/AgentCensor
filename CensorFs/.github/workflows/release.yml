@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  packages:
+    name: Publish npm packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Verify package versions match tag
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$(node -p "require('./integrations/deepseek-harness/package.json').version")" = "$tag_version"
+          test "$(node -p "require('./integrations/deepseek-harness/event-exporter/package.json').version")" = "$tag_version"
+      - name: Verify package contents
+        working-directory: integrations/deepseek-harness
+        run: |
+          npm pack --dry-run
+          npm --prefix event-exporter pack --dry-run
+      - name: Publish main plugin
+        working-directory: integrations/deepseek-harness
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish event exporter
+        working-directory: integrations/deepseek-harness/event-exporter
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  binaries:
+    name: Build binary release archive
+    runs-on: [self-hosted, linux, aarch64, openeuler]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.82.0
+          target: aarch64-unknown-linux-gnu
+      - name: Build locked AArch64 release
+        run: cargo build --release --locked --workspace --target aarch64-unknown-linux-gnu
+      - name: Stage binaries
+        shell: bash
+        run: |
+          mkdir -p release/bin
+          for binary in censorfs censorfsd censorfs-mounter; do
+            install -m 0755 "target/aarch64-unknown-linux-gnu/release/$binary" "release/bin/$binary"
+          done
+          tar -czf "censorfs-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz" -C release bin
+      - name: Upload release archive
+        uses: softprops/action-gh-release@v2
+        with:
+          files: censorfs-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
