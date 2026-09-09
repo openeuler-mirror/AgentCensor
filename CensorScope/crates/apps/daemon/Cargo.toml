@@ -1,0 +1,30 @@
+[package]
+name = "daemon"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+collector_binding = { path = "../../contracts/collector/binding" }
+collector_capability = { path = "../../contracts/collector/capability" }
+collector_event = { path = "../../contracts/collector/event" }
+collector_instance = { path = "../../contracts/collector/instance" }
+collector_stats = { path = "../../contracts/collector/stats" }
+control_contract = { path = "../../contracts/control_plane" }
+config_core = { path = "../../core/config" }
+ebpf_collector = { path = "../../adapters/collectors/ebpf" }
+ingest_runtime = { path = "../../core/ingest_runtime" }
+libc = "0.2"
+model_core = { path = "../../core/model" }
+process_identity = { path = "../../core/process_identity" }
+process_tree_snapshot_contract = { path = "../../contracts/process/tree_snapshot" }
+storage_core = { path = "../../storage/core" }
+storage_factory = { path = "../../storage/factory" }
+semantic_action_runtime = { path = "../../core/semantic_action_runtime" }
+semantic_action_contract = { path = "../../contracts/semantic_action" }
+serde_json = "1.0"
+trace_runtime = { path = "../../core/trace_runtime" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+uds_control_server = { path = "../../adapters/control/uds/server" }

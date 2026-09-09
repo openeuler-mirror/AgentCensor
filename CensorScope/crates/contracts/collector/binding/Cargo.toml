@@ -1,0 +1,10 @@
+[package]
+name = "collector_binding"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+collector_capability = { path = "../capability" }
+config_core = { path = "../../../core/config" }
+model_core = { path = "../../../core/model" }

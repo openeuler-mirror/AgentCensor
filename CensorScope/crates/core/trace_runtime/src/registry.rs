@@ -1,0 +1,526 @@
+//! Active-trace registry ownership and indexing boundaries.
+
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+
+use collector_capability::CollectorDescriptor;
+use model_core::ids::{TraceId, TraceName};
+use model_core::process::{ExitStatus, MembershipState, ProcessIdentity, ProcessMembership};
+use model_core::trace::{TraceLifecycleState, TraceRecord};
+
+use crate::commands::{RootRemovalRequest, TrackTraceRequest};
+use crate::membership::MembershipIndex;
+use crate::sensor_plan::{NegotiationFailure, SensorPlan};
+use crate::state_machine;
+
+/// Control peer identity authorized to inspect or remove a trace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceOwnerPrincipal {
+    pub uid: u32,
+    pub pid_namespace: String,
+    pub mount_namespace: String,
+    pub host_pid_namespace: bool,
+    pub host_mount_namespace: bool,
+}
+
+/// Runtime-owned trace state, negotiated sensors, and process memberships.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceEntry {
+    pub trace: TraceRecord,
+    pub profile_snapshot: config_core::trace_snapshot::CaptureProfileSnapshot,
+    pub sensor_plan: SensorPlan,
+    pub memberships: MembershipIndex,
+    pub owner: Option<TraceOwnerPrincipal>,
+}
+
+/// Errors produced while mutating active trace state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryError {
+    TraceNotFound(TraceId),
+    NegotiationFailed(Vec<NegotiationFailure>),
+    RootMembershipMissing(TraceId),
+    OwnerAlreadyBound(TraceId),
+    ParentMembershipMissing(ProcessIdentity),
+    PropagationDisabled(ProcessIdentity),
+    InvalidStateTransition(state_machine::StateTransitionError),
+}
+
+/// In-memory registry for traces owned by the current daemon process.
+///
+/// Entries are not restored from persistent storage after daemon restart.
+pub struct TraceRuntime {
+    next_trace_id: u64,
+    collectors: Vec<CollectorDescriptor>,
+    traces: BTreeMap<TraceId, TraceEntry>,
+}
+
+impl TraceRuntime {
+    /// Create an empty registry with collector descriptors and a persistent ID seed.
+    pub fn new(collectors: Vec<CollectorDescriptor>, initial_trace_id: u64) -> Self {
+        Self {
+            next_trace_id: initial_trace_id,
+            collectors,
+            traces: BTreeMap::new(),
+        }
+    }
+
+    /// Reserve the next trace ID without creating a trace entry.
+    pub fn reserve_trace_id(&mut self) -> TraceId {
+        let trace_id = TraceId::new(self.next_trace_id);
+        self.next_trace_id += 1;
+        trace_id
+    }
+
+    /// Match the trace profile to available collectors.
+    pub fn negotiate(
+        &self,
+        snapshot: &config_core::trace_snapshot::CaptureProfileSnapshot,
+    ) -> Result<SensorPlan, RegistryError> {
+        SensorPlan::negotiate(snapshot, &self.collectors).map_err(RegistryError::NegotiationFailed)
+    }
+
+    /// Insert the root trace and its initial membership in `Starting` state.
+    pub fn create_starting_trace(
+        &mut self,
+        trace_id: TraceId,
+        request: TrackTraceRequest,
+        sensor_plan: SensorPlan,
+    ) -> Result<(), RegistryError> {
+        let mut trace = TraceRecord::new(
+            trace_id,
+            request.root_identity.clone(),
+            request.display_name,
+            request.profile_snapshot.profile_name.clone(),
+            request.created_at,
+        );
+        trace.root_pid_namespace = request.root_pid_namespace;
+        trace.root_container_id = request.root_container_id;
+        trace.root_working_directory = request.root_working_directory;
+        for tag in request.tags {
+            trace.add_tag(tag);
+        }
+
+        let root_membership =
+            ProcessMembership::root(trace_id, request.root_identity, request.created_at);
+        let memberships = MembershipIndex::new(root_membership);
+        self.traces.insert(
+            trace_id,
+            TraceEntry {
+                trace,
+                profile_snapshot: request.profile_snapshot,
+                sensor_plan,
+                memberships,
+                owner: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Bind the authenticated control principal that owns the trace.
+    pub fn bind_trace_owner(
+        &mut self,
+        trace_id: TraceId,
+        owner: TraceOwnerPrincipal,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        if entry.owner.is_some() {
+            return Err(RegistryError::OwnerAlreadyBound(trace_id));
+        }
+        entry.owner = Some(owner);
+        Ok(())
+    }
+
+    /// Activate the trace and every membership discovered by the initial snapshot.
+    pub fn activate_trace(
+        &mut self,
+        trace_id: TraceId,
+        started_at: SystemTime,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        entry.memberships.activate_all();
+        state_machine::start_trace(&mut entry.trace, started_at)
+            .map_err(RegistryError::InvalidStateTransition)
+    }
+
+    /// Adds one process membership discovered during attach bootstrap.
+    pub fn insert_membership(
+        &mut self,
+        trace_id: TraceId,
+        membership: ProcessMembership,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        entry.memberships.insert(membership);
+        Ok(())
+    }
+
+    /// Adds an inherited child when the parent permits propagation.
+    pub fn inherit_process(
+        &mut self,
+        trace_id: TraceId,
+        parent_identity: &ProcessIdentity,
+        child_identity: ProcessIdentity,
+        observed_at: SystemTime,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        let parent = entry
+            .memberships
+            .get(parent_identity)
+            .cloned()
+            .ok_or_else(|| RegistryError::ParentMembershipMissing(parent_identity.clone()))?;
+        if !parent.can_inherit() {
+            return Err(RegistryError::PropagationDisabled(parent.identity));
+        }
+
+        let membership = ProcessMembership::inherited(
+            trace_id,
+            child_identity,
+            parent.identity.clone(),
+            observed_at,
+        );
+        entry.memberships.insert(membership);
+        Ok(())
+    }
+
+    /// Adds a collector-observed child after validating the parent membership state.
+    pub fn insert_observed_child(
+        &mut self,
+        trace_id: TraceId,
+        parent_identity: &ProcessIdentity,
+        child_identity: ProcessIdentity,
+        observed_at: SystemTime,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        let parent = entry
+            .memberships
+            .get(parent_identity)
+            .cloned()
+            .ok_or_else(|| RegistryError::ParentMembershipMissing(parent_identity.clone()))?;
+        if !parent.capture_enabled
+            || !parent.propagation_enabled
+            || matches!(parent.state, MembershipState::IdentityStale)
+        {
+            return Err(RegistryError::PropagationDisabled(parent.identity));
+        }
+
+        let membership = ProcessMembership::inherited(
+            trace_id,
+            child_identity,
+            parent.identity.clone(),
+            observed_at,
+        );
+        entry.memberships.insert(membership);
+        Ok(())
+    }
+
+    /// Disables capture and propagation at the root, then drains live descendants.
+    pub fn track_remove_root(&mut self, request: RootRemovalRequest) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&request.trace_id)
+            .ok_or(RegistryError::TraceNotFound(request.trace_id))?;
+        let root_identity = entry.trace.root_process_identity.clone();
+        let root = entry
+            .memberships
+            .get_mut(&root_identity)
+            .ok_or(RegistryError::RootMembershipMissing(request.trace_id))?;
+        root.disable_capture();
+        root.disable_propagation();
+        self.reconcile_lifecycle(request.trace_id, request.removed_at)
+    }
+
+    /// Records a process exit and advances the trace lifecycle when possible.
+    pub fn mark_process_exited(
+        &mut self,
+        trace_id: TraceId,
+        identity: &ProcessIdentity,
+        status: ExitStatus,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        let membership = entry
+            .memberships
+            .get_mut(identity)
+            .ok_or_else(|| RegistryError::ParentMembershipMissing(identity.clone()))?;
+        let observed_at = status.observed_at;
+        membership.mark_exited(status);
+        self.reconcile_lifecycle(trace_id, observed_at)
+    }
+
+    /// Marks a trace as collecting with reduced guarantees.
+    pub fn mark_degraded(&mut self, trace_id: TraceId) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        state_machine::degrade_trace(&mut entry.trace);
+        Ok(())
+    }
+
+    /// Transitions a trace to its terminal failed state.
+    pub fn fail_trace(
+        &mut self,
+        trace_id: TraceId,
+        failed_at: SystemTime,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        state_machine::fail_trace(&mut entry.trace, failed_at)
+            .map_err(RegistryError::InvalidStateTransition)
+    }
+
+    pub fn get_trace(&self, trace_id: TraceId) -> Option<&TraceEntry> {
+        self.traces.get(&trace_id)
+    }
+
+    /// Removes terminal runtime state after its collector binding is released.
+    pub fn forget_trace(&mut self, trace_id: TraceId) -> Option<TraceEntry> {
+        self.traces.remove(&trace_id)
+    }
+
+    pub fn find_membership(
+        &self,
+        identity: &ProcessIdentity,
+    ) -> Option<(TraceId, ProcessMembership)> {
+        self.traces.iter().find_map(|(trace_id, entry)| {
+            entry
+                .memberships
+                .get(identity)
+                .cloned()
+                .map(|membership| (*trace_id, membership))
+        })
+    }
+
+    pub fn find_membership_in_trace(
+        &self,
+        trace_id: TraceId,
+        identity: &ProcessIdentity,
+    ) -> Option<ProcessMembership> {
+        self.traces
+            .get(&trace_id)?
+            .memberships
+            .get(identity)
+            .cloned()
+    }
+
+    /// Returns active trace records owned by the current daemon instance.
+    pub fn list_trace_records(&self) -> Vec<&TraceRecord> {
+        self.traces.values().map(|entry| &entry.trace).collect()
+    }
+
+    pub fn find_trace_by_name(&self, name: &TraceName) -> Option<&TraceEntry> {
+        self.traces
+            .values()
+            .find(|entry| entry.trace.display_name == *name)
+    }
+
+    fn reconcile_lifecycle(
+        &mut self,
+        trace_id: TraceId,
+        observed_at: SystemTime,
+    ) -> Result<(), RegistryError> {
+        let entry = self
+            .traces
+            .get_mut(&trace_id)
+            .ok_or(RegistryError::TraceNotFound(trace_id))?;
+        if entry.trace.lifecycle_state.is_terminal() {
+            return Ok(());
+        }
+
+        let root_identity = entry.trace.root_process_identity.clone();
+        let root = entry
+            .memberships
+            .get(&root_identity)
+            .ok_or(RegistryError::RootMembershipMissing(trace_id))?;
+        let active_descendants = entry.memberships.active_descendants_of(&root_identity);
+
+        if !root.capture_enabled
+            || matches!(root.state, model_core::process::MembershipState::Exited)
+        {
+            if active_descendants > 0 {
+                if entry.trace.lifecycle_state == TraceLifecycleState::Active {
+                    state_machine::begin_draining(&mut entry.trace, observed_at)
+                        .map_err(RegistryError::InvalidStateTransition)?;
+                }
+            } else if entry.memberships.capturable_members() == 0 {
+                if matches!(root.state, MembershipState::Exited) {
+                    state_machine::exit_trace(&mut entry.trace, observed_at)
+                        .map_err(RegistryError::InvalidStateTransition)?;
+                } else {
+                    state_machine::complete_trace(&mut entry.trace, observed_at)
+                        .map_err(RegistryError::InvalidStateTransition)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::time::SystemTime;
+
+    use collector_capability::CollectorDescriptor;
+    use config_core::capture_profile::CaptureProfile;
+    use config_core::trace_snapshot::CaptureProfileSnapshot;
+    use model_core::capability::{Capability, CapabilityRequest};
+    use model_core::ids::{CollectorName, ProfileName, TraceName};
+    use model_core::process::{ExitStatus, NamespaceIdentity, ProcessIdentity};
+    use model_core::trace::TraceLifecycleState;
+
+    use crate::TraceRuntime;
+    use crate::commands::{RootRemovalRequest, TrackTraceRequest};
+    use crate::sensor_plan::SensorPlan;
+
+    fn runtime() -> TraceRuntime {
+        TraceRuntime::new(
+            vec![CollectorDescriptor {
+                name: CollectorName::new("ebpf"),
+                capabilities: vec![model_core::capability::CapabilityDescriptor::new(
+                    Capability::ProcLifecycle,
+                )],
+            }],
+            1,
+        )
+    }
+
+    fn profile_snapshot() -> CaptureProfileSnapshot {
+        let profile = CaptureProfile::new(
+            ProfileName::new("default"),
+            vec![CapabilityRequest::required(Capability::ProcLifecycle)],
+        );
+        CaptureProfileSnapshot::from_profile(&profile, SystemTime::UNIX_EPOCH)
+    }
+
+    #[test]
+    fn trace_keeps_root_pid_namespace_for_query() {
+        let mut runtime = runtime();
+        let trace_id = runtime.reserve_trace_id();
+        let pid_namespace = NamespaceIdentity::new("pid:[4026532248]");
+        let request = TrackTraceRequest {
+            root_identity: ProcessIdentity::new(1),
+            root_pid_namespace: Some(pid_namespace.clone()),
+            root_container_id: None,
+            root_working_directory: None,
+            display_name: TraceName::new("agent"),
+            profile_snapshot: profile_snapshot(),
+            tags: BTreeSet::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+        };
+        let plan = SensorPlan::negotiate(&request.profile_snapshot, &runtime.collectors).unwrap();
+
+        runtime
+            .create_starting_trace(trace_id, request, plan)
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .get_trace(trace_id)
+                .unwrap()
+                .trace
+                .root_pid_namespace,
+            Some(pid_namespace)
+        );
+    }
+
+    #[test]
+    fn track_remove_keeps_trace_draining_when_descendant_exists() {
+        let mut runtime = runtime();
+        let trace_id = runtime.reserve_trace_id();
+        let root = ProcessIdentity::new(1);
+        let request = TrackTraceRequest {
+            root_identity: root.clone(),
+            root_pid_namespace: None,
+            root_container_id: None,
+            root_working_directory: None,
+            display_name: TraceName::new("agent"),
+            profile_snapshot: profile_snapshot(),
+            tags: BTreeSet::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+        };
+        let plan = SensorPlan::negotiate(&request.profile_snapshot, &runtime.collectors).unwrap();
+
+        runtime
+            .create_starting_trace(trace_id, request, plan)
+            .unwrap();
+        runtime
+            .activate_trace(trace_id, SystemTime::UNIX_EPOCH)
+            .unwrap();
+        runtime
+            .inherit_process(
+                trace_id,
+                &root,
+                ProcessIdentity::new(2),
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        runtime
+            .track_remove_root(RootRemovalRequest {
+                trace_id,
+                removed_at: SystemTime::UNIX_EPOCH,
+            })
+            .unwrap();
+
+        let entry = runtime.get_trace(trace_id).unwrap();
+        assert_eq!(entry.trace.lifecycle_state, TraceLifecycleState::Draining);
+    }
+
+    #[test]
+    fn root_exit_marks_trace_exited_without_descendants() {
+        let mut runtime = runtime();
+        let trace_id = runtime.reserve_trace_id();
+        let root = ProcessIdentity::new(1);
+        let request = TrackTraceRequest {
+            root_identity: root.clone(),
+            root_pid_namespace: None,
+            root_container_id: None,
+            root_working_directory: None,
+            display_name: TraceName::new("agent"),
+            profile_snapshot: profile_snapshot(),
+            tags: BTreeSet::new(),
+            created_at: SystemTime::UNIX_EPOCH,
+        };
+        let plan = SensorPlan::negotiate(&request.profile_snapshot, &runtime.collectors).unwrap();
+
+        runtime
+            .create_starting_trace(trace_id, request, plan)
+            .unwrap();
+        runtime
+            .activate_trace(trace_id, SystemTime::UNIX_EPOCH)
+            .unwrap();
+        runtime
+            .mark_process_exited(
+                trace_id,
+                &root,
+                ExitStatus {
+                    code: Some(0),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                    source: Some(model_core::process::ExitObservationSource::Event),
+                },
+            )
+            .unwrap();
+
+        let entry = runtime.get_trace(trace_id).unwrap();
+        assert_eq!(entry.trace.lifecycle_state, TraceLifecycleState::Exited);
+    }
+}

@@ -1,0 +1,13 @@
+[package]
+name = "uds_control_server"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+control_contract = { path = "../../../../contracts/control_plane" }
+libc = "0.2"
+uds_control_transport = { path = "../transport" }
+
+[dev-dependencies]
+model_core = { path = "../../../../core/model" }

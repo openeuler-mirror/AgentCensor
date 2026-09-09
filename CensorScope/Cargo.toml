@@ -1,0 +1,41 @@
+[workspace]
+members = [
+
+    "crates/apps/daemon",
+    "crates/apps/ctl",
+
+    "crates/core/model",
+    "crates/core/config",
+    "crates/core/trace_runtime",
+    "crates/core/ingest_runtime",
+    "crates/core/semantic_action_runtime",
+    "crates/core/process_identity",
+
+    "crates/contracts/collector/binding",
+    "crates/contracts/collector/capability",
+    "crates/contracts/collector/event",
+    "crates/contracts/collector/instance",
+    "crates/contracts/collector/stats",
+    "crates/contracts/semantic_action",
+
+    "crates/contracts/control_plane",
+    "crates/contracts/process/tree_snapshot",
+
+    "crates/storage/core",
+    "crates/storage/factory",
+    "crates/storage/adapters/sqlite",
+
+    "crates/adapters/collectors/ebpf",
+
+    "crates/adapters/control/uds/client",
+    "crates/adapters/control/uds/server",
+    "crates/adapters/control/uds/transport",
+
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MulanPSL-2.0"

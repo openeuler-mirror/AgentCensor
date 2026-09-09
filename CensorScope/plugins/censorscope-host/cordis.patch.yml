@@ -1,0 +1,7 @@
+# censorscope-host bundle patch: register the CensorScope host/worker plugin row.
+# Loaded in the web profile (main role: single-trace track-add + query cache
+# service) and in the headless worker profile (worker role: per-call env
+# DSH_CENSORSCOPE_CALL_ID injection + call-start/end spans). No dsh source changes.
+- insert:
+    - id: censorscope-host
+      name: 'censorscope-host'
