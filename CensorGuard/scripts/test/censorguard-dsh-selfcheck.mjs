@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // censorguard-dsh-selfcheck: dsh.sock 自助面测试辅助 (attach_self/status_self/tree_self/raw)
-// 走 packages/runtime 的真实 AttachSelfClient (v2 NDJSON 信封),
+// 走插件 src/runtime 的真实 AttachSelfClient (v2 NDJSON 信封),
 // 与 ohmyguard packages/runtime/dist/selfcheck.js 对齐。
 //
 // 用法:
@@ -10,7 +10,7 @@
 
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
-import { AttachSelfClient, AttachError } from '../../plugins/dsh-censorguard/packages/runtime/dist/index.js';
+import { AttachSelfClient, AttachError } from '../../plugins/dsh-censorguard/dist/runtime/index.js';
 
 const [, , command, sock, ...rest] = process.argv;
 

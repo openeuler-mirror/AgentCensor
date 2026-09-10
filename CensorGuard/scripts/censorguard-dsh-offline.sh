@@ -100,8 +100,8 @@ else
 fi
 
 echo "=== O5: bundle 静态一致性 ==="
-PATCH=plugins/dsh-censorguard/bundle/cordis.patch.yml
-DUMP=plugins/dsh-censorguard/bundle/bin/dump-config.mjs
+PATCH=plugins/dsh-censorguard/cordis.patch.yml
+DUMP=plugins/dsh-censorguard/bin/dump-config.mjs
 O5_OK=1
 for line in censorguard-bootstrap censorguard-host censorguard-ui; do
     grep -q "$line" "$PATCH" || { fail "patch 缺插件行 $line"; O5_OK=0; }

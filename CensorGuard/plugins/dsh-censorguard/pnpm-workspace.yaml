@@ -1,3 +1,8 @@
-packages:
-  - 'packages/*'
-  - 'bundle'
+# 单包不再是 workspace, 此文件仅为 pnpm ≥10 的构建脚本白名单:
+# pnpm 11 用 allowBuilds (map, 需显式 true), pnpm 10 用 onlyBuiltDependencies (list)。
+allowBuilds:
+  esbuild: true
+  protobufjs: true
+onlyBuiltDependencies:
+  - esbuild
+  - protobufjs

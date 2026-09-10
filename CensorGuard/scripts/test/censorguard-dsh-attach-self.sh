@@ -31,7 +31,7 @@ SELFCHECK=$ROOT/scripts/test/censorguard-dsh-selfcheck.mjs
 for b in "$DAEMON" "$CTL"; do
     [ -x "$b" ] || { echo "找不到 $b, 先 cargo build"; exit 1; }
 done
-[ -f "$ROOT/plugins/dsh-censorguard/packages/runtime/dist/index.js" ] \
+[ -f "$ROOT/plugins/dsh-censorguard/dist/runtime/index.js" ] \
     || { echo "runtime 未构建: cd plugins/dsh-censorguard && pnpm build"; exit 1; }
 command -v setpriv >/dev/null 2>&1 || { echo "缺少 setpriv"; exit 1; }
 
@@ -49,7 +49,7 @@ NODE_TMP=$TDIR/node
 cp "$NODE_BIN" "$NODE_TMP" && chmod 0755 "$NODE_TMP"
 RT_TMP=$TDIR/runtime-dist
 mkdir -p "$RT_TMP"
-cp -r "$ROOT/plugins/dsh-censorguard/packages/runtime/dist/." "$RT_TMP/"
+cp -r "$ROOT/plugins/dsh-censorguard/dist/runtime/." "$RT_TMP/"
 cp "$SELFCHECK" "$TDIR/selfcheck.mjs"
 chmod -R 0755 "$RT_TMP"
 
@@ -65,7 +65,7 @@ cleanup() {
 trap cleanup EXIT
 
 # selfcheck.mjs 里 import 路径是相对 scripts/test/ 的, 临时副本改为相对 ./runtime-dist
-sed -i "s|'../../plugins/dsh-censorguard/packages/runtime/dist/index.js'|'./runtime-dist/index.js'|" \
+sed -i "s|'../../plugins/dsh-censorguard/dist/runtime/index.js'|'./runtime-dist/index.js'|" \
     "$TDIR/selfcheck.mjs"
 
 "$DAEMON" --ctl-sock "$CTL_SOCK" --event-sock "$EV_SOCK" --state-dir "$TDIR/state" \
