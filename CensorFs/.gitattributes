@@ -1,0 +1,6 @@
+*.md text eol=lf
+*.proto text eol=lf
+*.rs text eol=lf
+*.service text eol=lf
+*.sh text eol=lf
+*.toml text eol=lf

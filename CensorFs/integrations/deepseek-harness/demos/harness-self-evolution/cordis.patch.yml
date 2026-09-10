@@ -1,0 +1,6 @@
+- insert:
+    - id: demo-policy
+      name: '@deepseek-ai/dsh-system-prompt'
+      config:
+        persona: >-
+          You are a careful coding agent. Cite validation evidence before recommending publication.

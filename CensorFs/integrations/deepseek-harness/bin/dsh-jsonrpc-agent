@@ -1,0 +1,136 @@
+#!/bin/sh
+# dsh-jsonrpc-agent — Phase 1 one-shot child agent adapter for CensorFS FUSE mode.
+#
+# This is NOT the full JSON-RPC session protocol binary that the original design
+# assumed DeepSeek Harness would ship — DeepSeek never shipped that binary.
+# It is a thin POSIX sh adapter that does three concrete things:
+#
+#   1. Reconstruct the environment that sudo's env_reset wipes.
+#      censorfs-mounter runs via `sudo -n`, whose env_reset + secure_path +
+#      always_set_home drop PATH/HOME/DSH_HOME and every variable the parent
+#      FuseProvider built. Without reconstruction the child cannot even find
+#      `dsh` or `node`. argv survives sudo; env does not — so model/provider/
+#      event-socket are passed as argv below.
+#   2. Pass through model + provider: parse --model/--provider from argv and
+#      generate a --patch YAML that overrides the headless profile's
+#      agent-default-model (the child otherwise inherits the global default,
+#      not the plugin's config.model).
+#   3. Bridge the event socket: --event-socket becomes DSH_EVENT_SOCKET so the
+#      event-exporter plugin (loaded in the headless profile) can stream
+#      session/event back to the parent and receive reverse control messages
+#      (cancel / update-policy). The actual bidirectional control lives in
+#      event-exporter, not here.
+#
+# Scope: one task in (stdin), one result out (stdout). No session.run / event /
+# cancel protocol of its own — phase 2 bidirectional control goes through the
+# event-exporter socket's reverse channel.
+#
+# Model credentials are NOT passed through argv: the child reconstructs
+# DSH_HOME below, and dsh reads the same $DSH_HOME/.credentials.yaml the parent
+# uses — the harness's official credential layer, which survives sudo env_reset
+# (it is a file, not an env var). The model name + provider route alone travel
+# as argv so the child's --patch can override agent-default-model to the right
+# route.
+#
+# Runs inside the mount namespace, cwd = /workspace (the CensorFS View).
+#
+# HOME is auto-detected (via getent passwd on the current uid) rather than
+# hardcoded, so the script works out-of-the-box for any user whose dsh lives
+# under their own home. DSH_HOME / DSH_BIN remain overridable via env for
+# non-default installs; if your dsh binary lives somewhere unusual, set DSH_BIN.
+
+set -u
+
+# --- env reconstruction (sudo env_reset workaround) ----------------------
+# sudo 的 always_set_home 会把 HOME 设成 /root（非空），env_reset 也可能直接
+# 抹掉 HOME。这里不能用 `:=`（只覆盖空值，非空的 /root 会被保留），也不能硬
+# 编码 /home/dsh（别的用户家目录不同）。用 getent passwd 探测当前 uid 的真实
+# 家目录，探测失败才兜底 /home/dsh。DSH_HOME / DSH_BIN 仍可 env 显式覆盖。
+if [ -z "${HOME:-}" ] || [ "$HOME" = "/root" ] || [ "$HOME" = "/var/root" ]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  [ -z "$HOME" ] && HOME=/home/dsh
+fi
+export HOME
+: "${DSH_HOME:=$HOME/.dsh}"
+export DSH_HOME
+
+# Resolve the dsh binary: explicit override, else PATH lookup, else common install locations.
+DSH_BIN="${DSH_BIN:-}"
+if [ -z "$DSH_BIN" ]; then
+  DSH_BIN="$(command -v dsh 2>/dev/null || true)"
+fi
+if [ -z "$DSH_BIN" ] && [ -x "$HOME/.npm-global/bin/dsh" ]; then
+  DSH_BIN="$HOME/.npm-global/bin/dsh"
+fi
+if [ -z "$DSH_BIN" ] && [ -x "/usr/local/nodejs/bin/dsh" ]; then
+  DSH_BIN="/usr/local/nodejs/bin/dsh"
+fi
+if [ -z "$DSH_BIN" ]; then
+  echo "dsh-jsonrpc-agent: cannot locate the dsh binary (set DSH_BIN)" >&2
+  exit 127
+fi
+
+export PATH="$HOME/.npm-global/bin:/usr/local/nodejs/bin:/opt/censorfs/bin:/usr/local/bin:/usr/bin:/bin"
+
+# --- parse argv (survives sudo env_reset; env does not) -------------------
+MODEL=""
+PROVIDER=""
+EVENT_SOCKET=""
+TASK_FILE=""
+RESULT_FILE=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)         MODEL="$2"; shift 2 ;;
+    --provider)      PROVIDER="$2"; shift 2 ;;
+    --event-socket)  EVENT_SOCKET="$2"; shift 2 ;;
+    --task-file)     TASK_FILE="$2"; shift 2 ;;
+    --result-file)   RESULT_FILE="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# event-exporter reads DSH_EVENT_SOCKET and connects back to the parent.
+if [ -n "$EVENT_SOCKET" ]; then
+  export DSH_EVENT_SOCKET="$EVENT_SOCKET"
+fi
+
+# 凭据不经 argv：重建 DSH_HOME 后，dsh 读同一个 $DSH_HOME/.credentials.yaml
+# （官方凭据层，文件穿得过 sudo env_reset）。这里不重建任何 API key env。
+
+# --- task / result 走文件而非 stdio -------------------------------------
+# 宿主 Harness 会对 plugin spawn 的子进程 stdio 做协议化接管（socketpair 中继，
+# 不转发裸 stdin/stdout 字节），因此任务经 argv 指向的共享文件传入、结果经
+# 另一共享文件回传；事件流走 DSH_EVENT_SOCKET。stdio 通道仅作回退。
+TASK=""
+if [ -n "$TASK_FILE" ] && [ -r "$TASK_FILE" ]; then
+  TASK="$(cat "$TASK_FILE")"
+  rm -f "$TASK_FILE"
+fi
+if [ -z "$TASK" ]; then
+  TASK="$(cat 2>/dev/null || true)"
+fi
+if [ -z "$TASK" ]; then
+  echo "dsh-jsonrpc-agent: empty task (no readable --task-file and empty stdin)" >&2
+  exit 2
+fi
+
+if [ -n "$MODEL" ] || [ -n "$PROVIDER" ]; then
+  PATCH="/tmp/dsh-child-model.$$.yml"
+  {
+    echo '- id: agent-default-model'
+    echo '  config:'
+    echo "    provider: ${PROVIDER:-deepseek-official}"
+    echo "    model: ${MODEL:-deepseek-v4-flash}"
+  } > "$PATCH"
+  if [ -n "$RESULT_FILE" ]; then
+    exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK" >"$RESULT_FILE" 2>&1
+  else
+    exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK"
+  fi
+else
+  if [ -n "$RESULT_FILE" ]; then
+    exec "$DSH_BIN" --profile headless "$TASK" >"$RESULT_FILE" 2>&1
+  else
+    exec "$DSH_BIN" --profile headless "$TASK"
+  fi
+fi

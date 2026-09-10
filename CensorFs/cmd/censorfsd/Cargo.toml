@@ -1,0 +1,10 @@
+[package]
+name = "censorfsd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+censorfs-core = { path = "../../crates/censorfs-core" }

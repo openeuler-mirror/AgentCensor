@@ -1,0 +1,26 @@
+[package]
+name = "censorfs-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bincode.workspace = true
+blake3.workspace = true
+crc32c.workspace = true
+fs2.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+prost.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.15.1", default-features = false, features = ["abi-7-31"] }
+libc = "=0.2.161"
+
+[dev-dependencies]
+tempfile = "=3.13.0"

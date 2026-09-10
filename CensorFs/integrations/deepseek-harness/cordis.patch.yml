@@ -1,0 +1,74 @@
+# CensorFS × DeepSeek Harness — Parallel Worlds（FUSE 隔离耦合版）
+- insert:
+    - id: censorfs-parallel-worlds
+      name: '@censorfs/deepseek-harness'
+      config:
+        childCommand: !!js 'process.env.DSH_CENSORFS_CHILD_COMMAND ?? "dsh-jsonrpc-agent"'
+        childArgs: !!js 'process.env.DSH_CENSORFS_CHILD_CONFIG ? [process.env.DSH_CENSORFS_CHILD_CONFIG] : []'
+        controlPlaneCwd: !!js 'process.env.DSH_HOME ?? process.cwd()'
+        provider: !!js 'process.env.DSH_CENSORFS_PROVIDER ?? "deepseek-official"'
+        model: !!js 'process.env.DSH_CENSORFS_MODEL ?? "deepseek-v4-flash"'
+        maxTokens: 49152
+        childEnv: !!js '({ ...(process.env.DSH_HOME ? { DSH_HOME: process.env.DSH_HOME } : {}) })'
+        branch: main
+        censorfsCommand: !!js 'process.env.CENSORFS_COMMAND ?? "censorfs"'
+        socket: !!js 'process.env.CENSORFS_SOCKET ?? "/run/censorfs/control.sock"'
+        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "censorfs-mounter"'
+        # root 运行时直接执行的 mounter 二进制（自带 CAP_SYS_ADMIN）；非 root 走上面
+        # 的 mounterCommand（通常 sudo 包装）。缺省回落到 mounterCommand。
+        mounterBin: !!js 'process.env.CENSORFS_MOUNTER_BIN ?? undefined'
+
+        # === 配置键归属（两条探索路线不共享可调项）===
+        # FUSE 轨（branch_explore）专属：childCommand / childArgs / provider / model / maxTokens / childEnv / previewProfiles
+        # Runner 轨（branch_explore_inprocess）专属：runnerReadyTimeoutMs / inProcessMaxDepth / inProcessOnly / fuseOnly / runnerAuditDir / runnerIsolation / tmpRoot
+        # 共享数据面：branch / censorfsCommand / socket / mounterCommand / mounterBin / controlPlaneCwd / validationProfiles / defaultValidationProfile
+        # 单轨开关：CENSORFS_INPROCESS_ONLY=1 只启用 Runner 轨；CENSORFS_FUSE_ONLY=1 只启用 FUSE 轨；二者互斥
+
+        # === Namespace Runner（branch_explore_inprocess）===
+        runnerReadyTimeoutMs: 10000
+        inProcessMaxDepth: 1
+        inProcessOnly: !!js 'process.env.CENSORFS_INPROCESS_ONLY === "1"'
+        fuseOnly: !!js 'process.env.CENSORFS_FUSE_ONLY === "1"'
+        runnerAuditDir: !!js 'process.env.CENSORFS_RUNNER_AUDIT_DIR'
+        runnerIsolation: !!js '(() => { const v = {}; if (process.env.CENSORFS_RUNNER_ISOLATION) v.mode = process.env.CENSORFS_RUNNER_ISOLATION; if (process.env.CENSORFS_RUNNER_MINIMUM_LEVEL) v.minimumLevel = process.env.CENSORFS_RUNNER_MINIMUM_LEVEL; if (process.env.CENSORFS_RUNNER_CGROUP_ROOT) v.root = process.env.CENSORFS_RUNNER_CGROUP_ROOT; if (process.env.CENSORFS_RUNNER_CGROUP_STATE_DIR) v.stateDir = process.env.CENSORFS_RUNNER_CGROUP_STATE_DIR; return v })()'
+        tmpRoot: !!js 'process.env.CENSORFS_TMP_ROOT ?? "/tmp/dsh-branch-explore"'
+
+        # === 验证 profile（在 Candidate 只读 View 里跑；每项独立 View）===
+        # 未显式传 validationProfile 时使用的默认 profile；不设则跳过验证。
+        # defaultValidationProfile: !!js 'process.env.CENSORFS_DEFAULT_VALIDATION ?? undefined'
+        validationProfiles:
+          code:
+            - name: tests
+              command: cargo
+              args: ['test', '--workspace', '--all-targets', '--locked']
+              timeoutMs: 120000
+              required: true
+          node:
+            - name: syntax-check
+              command: node
+              args: ['--check', 'index.js']
+              timeoutMs: 15000
+              required: false
+          static-site:
+            - name: html-smoke
+              command: python3
+              args: ['-c', 'from html.parser import HTMLParser; HTMLParser().feed(open("index.html", encoding="utf-8").read())']
+              timeoutMs: 10000
+              required: true
+          python-code:
+            - name: unittest
+              command: python3
+              args: ['-m', 'unittest', 'discover', '-v']
+              timeoutMs: 30000
+              required: true
+          harness-config:
+            - name: patch-present
+              command: test
+              args: ['-s', 'cordis.patch.yml']
+              timeoutMs: 5000
+              required: true
+        previewProfiles:
+          static-site:
+            command: python3
+            args: ['-m', 'http.server', '{port}', '--bind', '127.0.0.1', '--directory', '/workspace']
+            ttlMs: 600000

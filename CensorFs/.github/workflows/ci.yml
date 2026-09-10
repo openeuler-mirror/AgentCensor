@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  harness:
+    name: Harness tests and syntax
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integrations/deepseek-harness
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check JavaScript syntax
+        shell: bash
+        run: |
+          mapfile -t files < <(find src client test -type f -name '*.js' -print)
+          node --check "${files[@]}"
+      - name: Run Harness unit tests
+        run: npm test
+
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.82.0
+          target: aarch64-unknown-linux-gnu
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run locked workspace tests
+        run: cargo test --workspace --all-targets --locked
+
+  target-smoke:
+    name: openEuler smoke (optional self-hosted)
+    if: ${{ vars.CENSORFS_TARGET_SMOKE == '1' }}
+    runs-on: [self-hosted, linux, aarch64, openeuler]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run namespace Runner smoke
+        run: bash scripts/openeuler-namespace-runner-smoke.sh
+      - name: Run cgroup fault smoke
+        run: bash scripts/openeuler-namespace-runner-cgroup-fault-smoke.sh
+      - name: Run in-process protocol E2E
+        run: bash scripts/openeuler-dsh-inprocess-e2e.sh
