@@ -1,0 +1,19 @@
+# agentcensor-session-proxy bundle patch。
+#
+# - 禁用内置 agent-loop:每个 web 会话的执行交给会话代理(WebDriverAgent)→ 每 session
+#   一个常驻 dsh worker 进程(原生 agent-loop),首条消息才懒启动、turn 结束不销毁;
+# - goal/schedule/subagent 行保持启用(桥接而非禁用),浏览器 UI 与原生 web 一致;
+# - 配置与原生 dsh 完全一致:worker 以 DSH_HOME=宿主 home 启动(settings.yaml、
+#   .credentials.yaml、机器级 cordis.patch.yml、env 分层照常读取,无任何 key/模型
+#   env 注入);worker overlay 只把可写数据根(session 持久化/storage/attachment)
+#   重定向到私有临时目录,共享会话日志的唯一写者仍是宿主(透明回放 worker 事件);
+# - worker 每次创建注入 CENSORSCOPE_SESSION_ID=<sessionId>(会话身份元数据)。
+- id: agent-loop
+  disabled: true
+
+- id: session-title-llm
+  disabled: true
+
+- insert:
+    - id: agentcensor-session-proxy
+      name: 'agentcensor-session-proxy'

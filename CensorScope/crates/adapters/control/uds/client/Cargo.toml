@@ -1,0 +1,9 @@
+[package]
+name = "uds_control_client"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+control_contract = { path = "../../../../contracts/control_plane" }
+uds_control_transport = { path = "../transport" }

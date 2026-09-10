@@ -1,0 +1,9 @@
+# censorscope-ui bundle patch: replace the native trajectory view with the
+# CensorScope-aware trajectory-like view (client plugin). Applied after web-app so
+# the disabled override wins.
+- id: ui-trajectory
+  disabled: true
+
+- insert:
+    - id: censorscope-ui
+      name: 'censorscope-ui'

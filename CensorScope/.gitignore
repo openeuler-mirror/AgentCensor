@@ -1,0 +1,52 @@
+target/ 
+*.log 
+# Local config
+config.toml 
+
+logs/* 
+.DS_Store 
+*.db 
+.DS_Store
+AGENTS.md
+.venv/
+
+__pycache__/
+*.pyc
+.clawtrace
+.env
+
+# **/tests/
+
+**/__pycache__/
+
+
+.claude/
+.vscode/
+.idea/
+.opencode/
+CLAUDE.md
+.sisyphus/
+
+tmp/
+findings.md
+progress.md
+task_plan.md
+node_modules/
+crates/apps/web/frontend/dist/
+crates/apps/web/src/render/dist/
+crates/apps/ctl/java-agent/dist/
+
+
+# Added by cargo
+
+/target
+.codex/
+.codex
+.agents/
+local/
+skills-lock.json
+
+**/adr/**
+
+# Local caches / scratch (never commit)
+.cache/

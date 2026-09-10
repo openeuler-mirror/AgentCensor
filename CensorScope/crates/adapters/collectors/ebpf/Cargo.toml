@@ -1,0 +1,21 @@
+[package]
+name = "ebpf_collector"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+collector_binding = { path = "../../../contracts/collector/binding" }
+collector_capability = { path = "../../../contracts/collector/capability" }
+collector_event = { path = "../../../contracts/collector/event" }
+collector_instance = { path = "../../../contracts/collector/instance" }
+collector_stats = { path = "../../../contracts/collector/stats" }
+config_core = { path = "../../../core/config" }
+libc = "0.2"
+libbpf-rs = "0.25.0"
+model_core = { path = "../../../core/model" }
+process_identity = { path = "../../../core/process_identity" }
+process_tree_snapshot_contract = { path = "../../../contracts/process/tree_snapshot" }
+
+[build-dependencies]
+libbpf-cargo = "0.25.0"

@@ -1,0 +1,18 @@
+{
+  "name": "agentcensor-session-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./index.mjs": "./lib/index.mjs",
+    "./worker.mjs": "./lib/worker.mjs",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

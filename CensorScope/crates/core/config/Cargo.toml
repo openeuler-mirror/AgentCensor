@@ -1,0 +1,11 @@
+[package]
+name = "config_core"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+model_core = { path = "../model" }
+serde = { version = "1", features = ["derive"] }
+storage_factory = { path = "../../storage/factory" }
+toml = "0.8"
