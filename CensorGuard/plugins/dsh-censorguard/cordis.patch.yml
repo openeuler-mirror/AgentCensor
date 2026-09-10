@@ -1,0 +1,67 @@
+# Censorguard bundle patch: 叠加在 dsh-base / dsh-web-app 层之后。
+# 机制见 deepseek-harness vendor/include applyEntryPatches:
+#   - insert 行追加新 entry; 非 insert 行按 id 覆盖顶层字段 (config 整体替换,
+#     inject 给了就整体替换, 没给保留原值), 所以下面每个 inject 都重述了原值。
+#
+# 整树包裹模式: 不再 disable 官方 subprocess entry (旧设计的 Provider 替换
+# 已删除); 官方 subprocess 保留, 仅加 censorguardReady 依赖闸门。
+# 失败策略默认不阻塞 (blockOnFailure: false): daemon 不可达/组未安装时
+# Bootstrap 切 degraded 态, censorguardReady 照常提供, DSH 正常启动,
+# WebUI 显示"保护未启用", 后台指数退避重试 —— daemon 就绪后自动转
+# protected, 无需重启 DSH。需要"没有保护就不启动"的强语义时改回 true。
+
+- insert:
+    # 最先激活: 无 inject, 启动即 attach_self (dsh.sock, SO_PEERCRED 取真实 pid)
+    - id: censorguard-bootstrap
+      name: '@censorguard/dsh/bootstrap'
+      config:
+        policyGroup: censorguard-dsh-default
+        dshSockPath: /run/censorguard/dsh.sock
+        # 不阻塞启动: attach 失败进 degraded + 后台重试; 改 true 恢复 fail-closed
+        blockOnFailure: false
+
+    # Host gRPC 桥: /censorguard-read (trusted-host) + /censorguard-admin (loopback)
+    # + 审计事件流有界缓存。protoPath 不写死绝对路径 —— Host 默认解析
+    # 随包分发的 proto/censorguard/v1/censorguard.proto, 可用
+    # CENSORGUARD_PROTO_PATH 环境变量或此处 config 覆盖。
+    - id: censorguard-host
+      name: '@censorguard/dsh/host'
+      config:
+        grpcAddr: 127.0.0.1:50051
+        boundGroup: censorguard-dsh-default
+
+    # 浏览器半: dsh.client 行, node 半扫描进 window.__DSH_BOOT__ roster。
+    # UI entry 必须用裸包名: client-modules 对 entry name 做
+    # require.resolve('<name>/package.json'), 子路径 entry 会被判为非 client 行。
+    - id: censorguard-ui
+      name: '@censorguard/dsh'
+
+# ── 依赖闸门: inject 是行级字段, 覆盖时必须重述原值 ─────────────────────────
+
+# webserver 原 inject: [webStartup] (dsh-web-app 层)
+- id: webserver
+  inject: [webStartup, censorguardReady]
+
+# web-runtime 原 inject: [webStartup] (dsh-web-app 层)
+- id: web-runtime
+  inject: [webStartup, censorguardReady]
+
+# 以下各行原无 inject (dsh-base / dsh-web-app 层)
+- id: api-gateway
+  inject: [censorguardReady]
+
+- id: cordis-host-runner
+  inject: [censorguardReady]
+
+- id: code-runtime
+  inject: [censorguardReady]
+
+# 官方 subprocess 保留, 仅加闸门
+- id: subprocess
+  inject: [censorguardReady]
+
+- id: tools
+  inject: [censorguardReady]
+
+- id: agent-loop
+  inject: [censorguardReady]

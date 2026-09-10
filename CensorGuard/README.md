@@ -105,8 +105,10 @@ DSH（DeepSeek Harness）集成已从旧的“逐子进程保护”（替换 `ct
 launcher argv 前插）升级为**整树包裹**：DSH 主进程启动时由最先激活的 Bootstrap
 插件经 `dsh.sock` 调 `attach_self`（pid 取 SO_PEERCRED，不可伪造），daemon 将该
 进程注册为追踪根，此后整棵进程树（fork 自动继承 + pending 降级层）都在 eBPF LSM
-强制之下，不经任何插件通道的子进程也逃不掉。attach 未成功时 `censorguardReady`
-依赖闸门让 DSH 关键入口不进 Ready（fail-closed）。
+强制之下，不经任何插件通道的子进程也逃不掉。attach 未成功时插件切 degraded
+态，DSH 照常启动并在 WebUI 提示保护未启用，后台重试待 daemon 就绪后自动恢复
+（默认不阻塞；`cordis.patch.yml` 里 `blockOnFailure: true` 可恢复 fail-closed，
+此时 `censorguardReady` 依赖闸门让 DSH 关键入口不进 Ready）。
 
 三条通路：
 
@@ -120,11 +122,12 @@ launcher argv 前插）升级为**整树包裹**：DSH 主进程启动时由最�
 - 事件面：`events.sock` → gRPC 流 → Host 有界缓存 → Client 长轮询，事件带
   单调 `sequence`（从 1 起）、`daemon_boot_id` 与 `dropped_before`。
 
-插件位于 `plugins/dsh-censorguard/`（pnpm workspace：runtime / bootstrap /
-host / client 四包 + bundle 安装器），安装方式：
+插件位于 `plugins/dsh-censorguard/`（单包 `@censorguard/dsh`：runtime /
+bootstrap / host / ui / client 五个内部模块 + cordis.patch.yml 补丁层），
+安装方式：
 
 ```bash
-node plugins/dsh-censorguard/bundle/bin/install.mjs   # 备份并安装到 DSH profile
+dsh plugin --profile web add plugins/dsh-censorguard   # 装入 DSH profile
 ```
 
 DSH 默认策略组 `config/policy.dsh-default.yaml`（黑名单式，防 DSH 起不来）由

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // censorguard-grpc-call: grpcurl 的最小替代 (环境无 grpcurl 时用)
-// 用 packages/host 已有的 @grpc/grpc-js + @grpc/proto-loader 加载
+// 用 plugins/dsh-censorguard 已有的 @grpc/grpc-js + @grpc/proto-loader 加载
 // api/censorguard/v1/censorguard.proto 发起一元调用。
 //
 // 用法: node censorguard-grpc-call.mjs <addr> <Method> [json]
@@ -10,9 +10,9 @@
 
 import { createRequire } from 'node:module';
 
-// 从 packages/host 的依赖里解析 grpc 库 (不新增任何依赖)
+// 从插件包的依赖里解析 grpc 库 (不新增任何依赖)
 const require = createRequire(
-  new URL('../plugins/dsh-censorguard/packages/host/package.json', import.meta.url),
+  new URL('../plugins/dsh-censorguard/package.json', import.meta.url),
 );
 const grpc = require('@grpc/grpc-js');
 const protoLoader = require('@grpc/proto-loader');

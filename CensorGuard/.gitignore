@@ -1,2 +1,32 @@
+# Rust (crates/ workspace 与 bpf 构建)
 /target/
+**/*.rs.bk
+*.rlib
+
+# eBPF / C 构建产物
+*.o
+*.ll
+*.skel.h
+
+# Node / TypeScript
+node_modules/
+dist/
+lib/
+*.tsbuildinfo
+*.tgz
+
+# Python (api/ 与脚本)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 项目原有
 .zcf

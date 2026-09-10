@@ -1,8 +1,0 @@
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "noEmit": true,
-    "jsx": "react-jsx"
-  },
-  "include": ["src/client/**/*", "src/auditTab.ts", "src/auditView.ts", "src/policyEditor.ts", "src/securitySection.ts"]
-}
