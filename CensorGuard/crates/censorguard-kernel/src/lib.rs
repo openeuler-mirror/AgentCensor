@@ -11,7 +11,7 @@ use censorguard_common::abi::{
 use censorguard_policy::{CompiledPolicy, CompiledRules, RuleValue};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::fmt;
 use std::mem::size_of;
 use std::os::fd::RawFd;
@@ -198,7 +198,7 @@ impl NativeKernel {
             .collect();
         let names = names.map_err(|_| KernelError::EmbeddedNul("program name".into()))?;
         let pointers: Vec<_> = names.iter().map(|name| name.as_ptr()).collect();
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: every pointer is NUL-terminated and remains alive for the call. The C function
         // either returns an owned opaque handle or null and writes at most `error.len()` bytes.
         let handle = unsafe {
@@ -335,7 +335,7 @@ impl NativeKernel {
     }
 
     fn clone_rule_slot(&self, source: u32, destination: u32) -> Result<(), KernelError> {
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: both slots belong to the same loaded outer maps. The C shim resolves each source
         // map ID to a live fd before assigning it to the destination outer slot.
         let result = unsafe {
@@ -447,7 +447,7 @@ impl NativeKernel {
         let name =
             CString::new(map_name).map_err(|_| KernelError::EmbeddedNul(map_name.to_owned()))?;
         let mut pids = vec![0_u32; capacity];
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: `pids` provides writable storage for `capacity` u32 values and the kernel
         // handle remains live for the duration of the bounded map iteration.
         let count = unsafe {
@@ -484,7 +484,7 @@ impl NativeKernel {
     }
 
     pub fn event_reader(self: &Arc<Self>) -> Result<EventReader, KernelError> {
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: the kernel handle is valid and retained by the Arc stored in EventReader.
         let handle = unsafe {
             ffi::as_event_reader_new(self.handle.as_ptr(), error.as_mut_ptr(), error.len())
@@ -581,7 +581,7 @@ impl NativeKernel {
     ) -> Result<(), KernelError> {
         let name =
             CString::new(map_name).map_err(|_| KernelError::EmbeddedNul(map_name.to_owned()))?;
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: K/V implement the private KernelPod marker and contain initialized, pointer-free
         // bytes matching their C ABI. The C shim validates key/value sizes before the syscall.
         let result = unsafe {
@@ -607,7 +607,7 @@ impl NativeKernel {
         let name =
             CString::new(map_name).map_err(|_| KernelError::EmbeddedNul(map_name.to_owned()))?;
         let mut value = V::default();
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: K/V are initialized pointer-free ABI values and the C shim validates sizes.
         let result = unsafe {
             ffi::as_kernel_lookup_map(
@@ -628,7 +628,7 @@ impl NativeKernel {
     fn delete_map<K: KernelPod>(&self, map_name: &str, key: &K) -> Result<(), KernelError> {
         let name =
             CString::new(map_name).map_err(|_| KernelError::EmbeddedNul(map_name.to_owned()))?;
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: K is a private KernelPod and the C shim validates the key size.
         let result = unsafe {
             ffi::as_kernel_delete_map(
@@ -646,7 +646,7 @@ impl NativeKernel {
     fn map_count(&self, map_name: &str) -> Result<usize, KernelError> {
         let name =
             CString::new(map_name).map_err(|_| KernelError::EmbeddedNul(map_name.to_owned()))?;
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: the kernel and map name pointers are valid for the duration of the call.
         let count = unsafe {
             ffi::as_kernel_map_count(
@@ -673,7 +673,7 @@ impl NativeKernel {
         debug_assert_eq!(keys.len(), values.len());
         let name = CString::new(outer_name)
             .map_err(|_| KernelError::EmbeddedNul(outer_name.to_owned()))?;
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: the slices are equally sized contiguous arrays of private KernelPod values and
         // remain alive for the call. The C shim validates ABI sizes and count before reading them.
         let result = unsafe {
@@ -698,7 +698,7 @@ impl EventReader {
     pub fn next(&mut self, timeout: Duration) -> Result<Option<RawEvent>, KernelError> {
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let mut event = RawEvent::default();
-        let mut error = [0_i8; 4096];
+        let mut error = [0 as c_char; 4096];
         // SAFETY: the event reader is exclusively borrowed, RawEvent is writable and its size is
         // checked by the C shim against the ringbuf sample before success is returned.
         let result = unsafe {
@@ -748,7 +748,7 @@ impl Drop for EventReader {
     }
 }
 
-fn native_result(result: i32, error: &[i8]) -> Result<(), KernelError> {
+fn native_result(result: i32, error: &[c_char]) -> Result<(), KernelError> {
     if result == 0 {
         return Ok(());
     }
@@ -756,7 +756,7 @@ fn native_result(result: i32, error: &[i8]) -> Result<(), KernelError> {
     Err(native_error(error))
 }
 
-fn native_error(error: &[i8]) -> KernelError {
+fn native_error(error: &[c_char]) -> KernelError {
     // SAFETY: all error arrays are zero-initialized and the C shim writes with `vsnprintf`.
     let message = unsafe { CStr::from_ptr(error.as_ptr()) }
         .to_string_lossy()

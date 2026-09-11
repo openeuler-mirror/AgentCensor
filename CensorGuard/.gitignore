@@ -7,6 +7,7 @@
 *.o
 *.ll
 *.skel.h
+bpf/vmlinux.h
 
 # Node / TypeScript
 node_modules/
