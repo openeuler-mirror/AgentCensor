@@ -12,11 +12,13 @@ DESTDIR ?=
 DISTDIR ?= target/dist
 VERSION ?= $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
 ARCH ?= $(shell uname -m)
+BPF_ARCH ?= $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
+VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 INSTALL ?= install
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all check test bpf build install install-files uninstall package startup-test clean
+.PHONY: all check test bpf vmlinux build install install-files uninstall package startup-test clean
 
 all: check bpf build
 
@@ -31,11 +33,15 @@ check:
 test:
 	cargo test --workspace --offline
 
-bpf:
-	clang -target bpf -D__TARGET_ARCH_x86 -O2 -g -Wall -Werror \
+bpf: vmlinux
+	clang -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -O2 -g -Wall -Werror \
 		-I./bpf -I/usr/include -c bpf/enforce.bpf.c -o bpf/enforce.bpf.o.tmp
 	llvm-strip -g bpf/enforce.bpf.o.tmp
 	mv -f bpf/enforce.bpf.o.tmp bpf/enforce.bpf.o
+
+vmlinux:
+	bpftool btf dump file $(VMLINUX_BTF) format c > bpf/vmlinux.h.tmp
+	mv -f bpf/vmlinux.h.tmp bpf/vmlinux.h
 
 build:
 	cargo build --workspace --release --offline
@@ -223,4 +229,4 @@ integration: integration-basic integration-install integration-file-deny integra
 
 clean:
 	cargo clean
-	$(RM) bpf/enforce.bpf.o
+	$(RM) bpf/enforce.bpf.o bpf/vmlinux.h
