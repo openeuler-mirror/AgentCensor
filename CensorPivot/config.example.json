@@ -1,0 +1,35 @@
+{
+  "socket_path": "/run/censorpivot/control.sock",
+  "state_dir": "/var/lib/censorpivot/transactions",
+  "socket_mode": 432,
+  "max_frame_bytes": 1048576,
+  "max_calls_per_batch": 64,
+  "max_output_bytes": 262144,
+  "component_timeout_ms": 60000,
+  "runner_timeout_ms": 15000,
+  "censorfs": {
+    "command": "/usr/local/bin/censorfs",
+    "socket": "/run/censorfs/control.sock",
+    "mounter_command": [
+      "/usr/bin/sudo",
+      "-n",
+      "/usr/libexec/censorfs/censorfs-mounter"
+    ],
+    "prepare_timeout_ms": 30000,
+    "max_diff_file_bytes": 262144,
+    "cgroup_root": "/sys/fs/cgroup/censorpivot",
+    "cgroup_state_dir": "/run/censorpivot-cgroups"
+  },
+  "censorguard": {
+    "launch_socket": "/run/censorguard/launch.sock",
+    "exec_command": "/usr/bin/censorguard-exec",
+    "allowed_groups": ["censorguard-dsh-default"]
+  },
+  "censorscope": {
+    "command": "/usr/bin/censorscopectl",
+    "socket": "/run/censorscope/censorscoped.sock",
+    "operator_config": "/etc/censorscope/censorscoped.conf",
+    "required": false
+  },
+  "runner_environment": {}
+}
