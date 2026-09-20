@@ -1,10 +1,11 @@
 //! Stable process identity types shared by collectors, runtime, and storage.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 
 /// Opaque identifier for a Linux PID namespace.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct NamespaceIdentity(String);
 
 impl NamespaceIdentity {
@@ -21,7 +22,7 @@ impl NamespaceIdentity {
 /// `DSH_SESSION_ID` in a model shell call). A session groups the processes of
 /// one logical agent conversation; processes without the variable do not
 /// belong to any session and are recorded as non-session operations.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct SessionIdentity(String);
 
 impl SessionIdentity {
@@ -43,7 +44,7 @@ impl fmt::Display for SessionIdentity {
 /// Daemon-assigned identity for one process lifetime.
 ///
 /// Unlike a PID, this value is not reused while its allocation domain remains valid.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ProcessIdentity(u64);
 
 impl ProcessIdentity {
@@ -63,7 +64,7 @@ impl fmt::Display for ProcessIdentity {
 }
 
 /// Coordinates that distinguish a process lifetime in the host PID namespace.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct HostProcessCoordinates {
     pub pid: u32,
     pub task_id: Option<u32>,
@@ -93,7 +94,7 @@ impl HostProcessCoordinates {
 }
 
 /// Coordinates that distinguish a process lifetime inside a PID namespace.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct NamespaceProcessCoordinates {
     pub pid_namespace: NamespaceIdentity,
     pub pid: u32,
@@ -114,7 +115,7 @@ impl NamespaceProcessCoordinates {
 ///
 /// An observation may initially contain only namespace coordinates and be enriched
 /// with host coordinates after procfs resolution.
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ProcessObservation {
     pub host: Option<HostProcessCoordinates>,
     pub namespace: Option<NamespaceProcessCoordinates>,

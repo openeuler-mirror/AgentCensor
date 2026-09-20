@@ -2,7 +2,7 @@
 
 use control_contract::command::{
     CallEndCommand, CallStartCommand, ControlCommand, DoctorCommand, ListTracesCommand,
-    TrackAddCommand, TrackRemoveCommand,
+    OperationStatusCommand, TrackAddCommand, TrackRemoveCommand,
 };
 use control_contract::reply::{ControlError, ControlReply};
 use model_core::ids::RequestId;
@@ -35,6 +35,12 @@ pub fn dispatch(
             request_id,
             selector,
         }),
+        CtlCommand::OperationStatus { operation_id } => {
+            ControlCommand::OperationStatus(OperationStatusCommand {
+                request_id,
+                operation_id,
+            })
+        }
         CtlCommand::ListTraces { selector } => ControlCommand::ListTraces(ListTracesCommand {
             request_id,
             selector,

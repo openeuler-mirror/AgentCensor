@@ -1,5 +1,6 @@
 //! Logical process identity, OS coordinates, and trace membership semantics.
 
+use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 pub use process_identity::{
@@ -8,7 +9,7 @@ pub use process_identity::{
 };
 
 /// Raw argv captured at an execve/execveat entry point.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArgvCapture {
     pub args: Vec<Vec<u8>>,
     /// partial=1, truncated=2, read-failure=4, loss=8.

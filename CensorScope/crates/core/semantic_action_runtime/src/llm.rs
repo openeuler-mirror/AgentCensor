@@ -44,7 +44,10 @@ pub fn project_llm_payload(
         _ => return Vec::new(),
     };
     let mut attributes = BTreeMap::new();
-    attributes.insert("censorscope.action.kind".to_string(), kind.as_str().to_string());
+    attributes.insert(
+        "censorscope.action.kind".to_string(),
+        kind.as_str().to_string(),
+    );
     attributes.insert(
         "llm.content_state".to_string(),
         if matches!(segment.content_state, PayloadContentState::Complete) {

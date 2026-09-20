@@ -16,6 +16,7 @@ libbpf-rs = "0.25.0"
 model_core = { path = "../../../core/model" }
 process_identity = { path = "../../../core/process_identity" }
 process_tree_snapshot_contract = { path = "../../../contracts/process/tree_snapshot" }
+tracing = "0.1"
 
 [build-dependencies]
 libbpf-cargo = "0.25.0"

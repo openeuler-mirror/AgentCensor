@@ -221,7 +221,9 @@ impl<'a> DaemonStartSupervisor<'a> {
                 .try_wait()
                 .map_err(|error| format!("check censorscoped child status: {error}"))?
             {
-                return Err(format!("censorscoped exited before ready with status {status}"));
+                return Err(format!(
+                    "censorscoped exited before ready with status {status}"
+                ));
             }
             if self.config.socket_path.exists() && self.config.pid_file.exists() {
                 println!(

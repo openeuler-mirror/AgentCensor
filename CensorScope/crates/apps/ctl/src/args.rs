@@ -41,6 +41,9 @@ pub enum CtlCommand {
     TrackRemove {
         selector: TraceSelector,
     },
+    OperationStatus {
+        operation_id: RequestId,
+    },
     ListTraces {
         selector: Option<TraceSelector>,
     },
@@ -81,7 +84,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CtlInvocatio
 }
 
 #[derive(Clone, Debug, Parser)]
-#[command(name = "censorscopectl", about = "Control a running CensorScope daemon")]
+#[command(
+    name = "censorscopectl",
+    about = "Control a running CensorScope daemon"
+)]
 struct CtlCli {
     #[arg(long = "config", global = true, value_name = "PATH")]
     config_path: Option<PathBuf>,
@@ -149,6 +155,8 @@ enum CtlCommandArgs {
     TrackAdd(TrackAddArgs),
     #[command(about = "Remove a trace by selector")]
     TrackRemove(SelectorArgs),
+    #[command(name = "operation-status", about = "Read a track-add operation")]
+    OperationStatus(OperationStatusArgs),
     #[command(name = "trace-list", about = "List traces")]
     ListTraces(SelectorArgs),
     #[command(about = "Check daemon control-plane readiness")]
@@ -186,6 +194,9 @@ impl CtlCommandArgs {
             }
             Self::TrackRemove(args) => Ok(CtlCommand::TrackRemove {
                 selector: required_selector(args)?,
+            }),
+            Self::OperationStatus(args) => Ok(CtlCommand::OperationStatus {
+                operation_id: args.operation_id,
             }),
             Self::ListTraces(args) => Ok(CtlCommand::ListTraces {
                 selector: optional_selector(args)?,
@@ -264,16 +275,22 @@ struct ExportArgs {
     trace_id: TraceId,
     #[arg(long = "session-id", value_parser = parse_session_id)]
     session_id: String,
-    #[arg(long = "call-id", alias = "call", value_name = "CALL_ID",
-          help = "Restrict events/payload segments to one tool-call id")]
+    #[arg(
+        long = "call-id",
+        alias = "call",
+        value_name = "CALL_ID",
+        help = "Restrict events/payload segments to one tool-call id"
+    )]
     call_id: Option<String>,
     #[arg(long = "out-path", value_name = "PATH")]
     out_path: PathBuf,
     #[arg(long = "full")]
     full: bool,
-    #[arg(long = "no-internal",
-          help = "Drop plugin self-noise and diagnostics: censorscopectl housekeeping \
-                  processes and tls.coverage application rows")]
+    #[arg(
+        long = "no-internal",
+        help = "Drop plugin self-noise and diagnostics: censorscopectl housekeeping \
+                  processes and tls.coverage application rows"
+    )]
     no_internal: bool,
     #[arg(long = "page-size", value_parser = parse_page_size)]
     page_size: Option<usize>,
@@ -314,6 +331,12 @@ struct TrackAddArgs {
     #[arg(long = "trace-id", value_parser = parse_trace_id, value_name = "ID",
           help = "Continue an existing trace id instead of allocating a new one")]
     trace_id: Option<TraceId>,
+}
+
+#[derive(Clone, Debug, Args)]
+struct OperationStatusArgs {
+    #[arg(long = "operation-id", value_parser = parse_request_id, value_name = "ID")]
+    operation_id: RequestId,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -415,6 +438,12 @@ fn parse_trace_id(raw: &str) -> Result<TraceId, String> {
     raw.parse::<u64>()
         .map(TraceId::new)
         .map_err(|error| format!("invalid trace id: {error}"))
+}
+
+fn parse_request_id(raw: &str) -> Result<RequestId, String> {
+    raw.parse::<u64>()
+        .map(RequestId::new)
+        .map_err(|error| format!("invalid operation id: {error}"))
 }
 
 fn parse_page_size(raw: &str) -> Result<usize, String> {

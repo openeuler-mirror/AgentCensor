@@ -58,14 +58,16 @@ struct censorscope_tls_capture_args {
     __u32 extra_flags;
 };
 
-static __always_inline int emit_tls_chunk(struct pt_regs *ctx,
-                                          const struct censorscope_tls_capture_args *args,
+static __always_inline int emit_tls_chunk(const struct censorscope_tls_capture_args *args,
                                           __u64 chunk_offset,
                                           __u32 chunk_index,
                                           __u32 extra_flags) {
     struct censorscope_tls_event *event;
-    __u64 remaining = args->requested_size > chunk_offset
-                          ? args->requested_size - chunk_offset
+    __u64 capture_limit = args->requested_size < args->captured_size
+                              ? args->requested_size
+                              : args->captured_size;
+    __u64 remaining = capture_limit > chunk_offset
+                          ? capture_limit - chunk_offset
                           : 0;
     __u32 size = remaining > TLS_PAYLOAD_ABI_MAX_BYTES
                      ? TLS_PAYLOAD_ABI_MAX_BYTES
@@ -76,9 +78,12 @@ static __always_inline int emit_tls_chunk(struct pt_regs *ctx,
     if (available < size) {
         size = (__u32)available;
     }
+    if (size == 0 && args->extra_flags == 0) {
+        return BPF_STATUS_OK;
+    }
     event = censorscope_event_reserve(sizeof(*event));
     if (!event) {
-        record_loss(1);
+        record_loss(LOSS_COUNTER_TLS);
         return BPF_STATUS_ERROR;
     }
     init_tls_event(&event->event, current_trace_tgid(args->trace_id),
@@ -93,7 +98,7 @@ static __always_inline int emit_tls_chunk(struct pt_regs *ctx,
     event->chunk_offset = chunk_offset;
     event->chunk_index = chunk_index;
     event->chunk_flags = (chunk_offset == 0 ? TLS_CHUNK_FLAG_START : 0) |
-                         (chunk_offset + size >= args->captured_size
+                         (chunk_offset + size >= capture_limit
                               ? TLS_CHUNK_FLAG_END
                               : 0);
     if (size > 0 &&
@@ -104,33 +109,72 @@ static __always_inline int emit_tls_chunk(struct pt_regs *ctx,
         event->payload_size = 0;
         event->payload_flags |= TLS_FLAG_READ_FAILURE;
     }
-    censorscope_event_submit(ctx, event);
+    censorscope_event_submit(0, event);
     return BPF_STATUS_OK;
 }
 
-static __always_inline int emit_tls_bytes(struct pt_regs *ctx,
-                                          const struct censorscope_tls_capture_args *args) {
-    __u32 status = BPF_STATUS_OK;
-    /* A ring-buffer record is capped at 4 KiB, so larger user buffers are
-     * split into ordered chunk records; the final chunk is flagged truncated
-     * when the buffer exceeds the cap.  Keep the loop runtime-bounded
-     * instead of unrolling all 64 iterations: each one performs a 4 KiB user
-     * read, and full unrolling makes the verifier explore thousands of
-     * equivalent states, failing with `The sequence of 8193 jumps is too
-     * complex`. */
-    #pragma clang loop unroll(disable)
-    for (int index = 0; index < TLS_MAX_CHUNKS; index++) {
-        __u64 offset = (__u64)index * TLS_PAYLOAD_ABI_MAX_BYTES;
-        if (index == 0 || offset < args->captured_size) {
-            __u32 flags = 0;
-            if (index == TLS_MAX_CHUNKS - 1 &&
-                args->requested_size > offset + TLS_PAYLOAD_ABI_MAX_BYTES) {
-                flags |= TLS_FLAG_TRUNCATED;
-            }
-            status |= emit_tls_chunk(ctx, args, offset, (__u32)index, flags);
-        }
+/* State shared between the caller and the bpf_loop() callback.  The callback
+ * receives a pointer to this struct as its second argument.  Running the loop
+ * counter inside the kernel keeps the body out of the caller's control flow
+ * graph, so the verifier walks it once instead of re-deriving every per-chunk
+ * state for all TLS_MAX_CHUNKS iterations. */
+struct censorscope_tls_loop_ctx {
+    struct censorscope_tls_capture_args args;
+    __u64 capture_limit;
+    __u32 status;
+    __u32 reserved;
+};
+
+/* One chunk per iteration.  Returns 1 to stop early: chunk offsets grow
+ * monotonically, so once the offset leaves the capture window every remaining
+ * iteration would be a no-op. */
+static __noinline long emit_tls_chunk_iteration(__u32 index, void *loop_ctx) {
+    struct censorscope_tls_loop_ctx *loop = loop_ctx;
+    struct censorscope_tls_capture_args args;
+    __u32 flags = 0;
+    __u64 offset;
+
+    if (index >= TLS_MAX_CHUNKS) {
+        return 1;
     }
-    return status;
+    offset = (__u64)index * TLS_PAYLOAD_ABI_MAX_BYTES;
+    if (offset >= loop->capture_limit) {
+        return 1;
+    }
+    /* Copy into this frame so everything below works on callback-local stack
+     * rather than on a pointer back into the caller's frame. */
+    args = loop->args;
+    if (index == TLS_MAX_CHUNKS - 1 &&
+        args.requested_size > offset + TLS_PAYLOAD_ABI_MAX_BYTES) {
+        flags |= TLS_FLAG_TRUNCATED;
+    }
+    loop->status |= emit_tls_chunk(&args, offset, index, flags);
+    return 0;
+}
+
+static __always_inline int
+emit_tls_bytes(const struct censorscope_tls_capture_args *args) {
+    struct censorscope_tls_loop_ctx loop = {};
+    __u64 capture_limit = args->requested_size < args->captured_size
+                              ? args->requested_size
+                              : args->captured_size;
+
+    loop.args = *args;
+    loop.capture_limit = capture_limit;
+    loop.status = BPF_STATUS_OK;
+
+    if (capture_limit > 0) {
+        long iterations =
+            bpf_loop(TLS_MAX_CHUNKS, emit_tls_chunk_iteration, &loop, 0);
+        if (iterations < 0) {
+            loop.status |= BPF_STATUS_ERROR;
+        }
+    } else if (args->extra_flags != 0) {
+        /* Nothing is in range, but the outcome (a read failure, say) still
+         * has to reach the reader as one flag-only chunk. */
+        loop.status |= emit_tls_chunk(args, 0, 0, 0);
+    }
+    return (int)loop.status;
 }
 
 static __always_inline int tls_write_enter(struct pt_regs *ctx, __u32 symbol) {
@@ -151,7 +195,7 @@ static __always_inline int tls_write_enter(struct pt_regs *ctx, __u32 symbol) {
         .symbol = symbol,
         .extra_flags = 0,
     };
-    return emit_tls_bytes(ctx, &args);
+    return emit_tls_bytes(&args);
 }
 
 static __always_inline int tls_write_ex_enter(struct pt_regs *ctx, __u32 symbol) {
@@ -163,7 +207,7 @@ static __always_inline int tls_write_ex_enter(struct pt_regs *ctx, __u32 symbol)
         return BPF_STATUS_OK;
     }
     if (bpf_map_lookup_elem(&pending_tls_ops, &pid_tgid)) {
-        record_loss(1);
+        record_loss(LOSS_COUNTER_TLS);
         return BPF_STATUS_ERROR;
     }
     op.trace_id = *trace_id;
@@ -175,7 +219,7 @@ static __always_inline int tls_write_ex_enter(struct pt_regs *ctx, __u32 symbol)
     op.direction = TLS_DIRECTION_OUTBOUND;
     op.symbol = symbol;
     if (bpf_map_update_elem(&pending_tls_ops, &pid_tgid, &op, BPF_ANY) != 0) {
-        record_loss(1);
+        record_loss(LOSS_COUNTER_TLS);
     }
     return BPF_STATUS_OK;
 }
@@ -192,7 +236,7 @@ static __always_inline int tls_read_enter(struct pt_regs *ctx, __u32 symbol) {
         /* The map is keyed by thread. A nested TLS call cannot be represented
          * safely without overwriting the outer call, so account for the loss
          * and leave the original pending operation intact. */
-        record_loss(1);
+        record_loss(LOSS_COUNTER_TLS);
         return BPF_STATUS_ERROR;
     }
     op.trace_id = *trace_id;
@@ -204,7 +248,7 @@ static __always_inline int tls_read_enter(struct pt_regs *ctx, __u32 symbol) {
     op.direction = TLS_DIRECTION_INBOUND;
     op.symbol = symbol;
     if (bpf_map_update_elem(&pending_tls_ops, &pid_tgid, &op, BPF_ANY) != 0) {
-        record_loss(1);
+        record_loss(LOSS_COUNTER_TLS);
     }
     return BPF_STATUS_OK;
 }
@@ -250,7 +294,7 @@ static __always_inline int tls_read_exit(struct pt_regs *ctx) {
                                   ? TLS_FLAG_TRUNCATED
                                   : 0),
     };
-    status = emit_tls_bytes(ctx, &args);
+    status = emit_tls_bytes(&args);
     bpf_map_delete_elem(&pending_tls_ops, &pid_tgid);
     return status;
 }
@@ -492,7 +536,7 @@ static __always_inline int capture_argv(__u64 argv_ptr) {
     if (bpf_map_update_elem(&pending_argv, &pid_tgid, capture, BPF_ANY) != 0) {
         /* key 1 is the collector-wide counter projected as a trace-scoped
          * loss event by the daemon; argv map loss must not be silent. */
-        record_loss(1);
+        record_loss(LOSS_COUNTER_EXEC_CONTEXT);
     }
     return BPF_STATUS_OK;
 }

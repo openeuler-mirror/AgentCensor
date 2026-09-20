@@ -18,6 +18,9 @@
  *
  * The plugin never blocks boot: censorscoped may be absent (track-add is retried
  * in the background) — installing this plugin has no dependency on censorscoped.
+ * track-add itself is one synchronous call: the daemon answers with the final
+ * operation state (or an error carrying its reason), so nothing here polls
+ * `operation-status`.
  */
 export const name = 'censorscope-host'
 
@@ -74,6 +77,13 @@ function runCensorscopectl(args, opts = {}) {
       { timeout: timeoutMs, windowsHide: true },
       (error, stdout, stderr) => {
         const text = String(stdout || '').trim()
+        // In --json mode a rejected command still writes its structured body to
+        // stdout and exits non-zero, so the body is parsed on both paths: the
+        // daemon's error code and message travel in it.
+        let parsed = null
+        try {
+          parsed = JSON.parse(text)
+        } catch {}
         if (error !== null) {
           // Distinguish an execFile deadline kill (empty output, no stderr —
           // the censorscoped control plane stalled) from a real rejection so later
@@ -83,18 +93,36 @@ function runCensorscopectl(args, opts = {}) {
             : error.code !== undefined && error.code !== null
               ? `exit code ${error.code}${error.signal ? ` (signal ${error.signal})` : ''}`
               : String(error.message || 'exit != 0')
-          const detail = String(stderr || '').trim() || text
-          resolvePromise({ ok: false, code: error.code, message: detail ? `${why}: ${detail}` : why })
+          const detail =
+            typeof parsed?.message === 'string' && parsed.message !== ''
+              ? parsed.message
+              : String(stderr || '').trim() || text
+          resolvePromise({
+            ok: false,
+            code: error.code,
+            json: parsed,
+            message: detail ? `${why}: ${detail}` : why,
+          })
           return
         }
-        let parsed = null
-        try {
-          parsed = JSON.parse(text)
-        } catch {}
         resolvePromise({ ok: true, text, json: parsed })
       },
     )
   })
+}
+
+/**
+ * Why a censorscopectl call failed, with the daemon's own reason first: the
+ * error body of a rejected command carries `{code, message}`, while a transport
+ * failure carries only the execFile diagnosis. Never empty.
+ */
+function describeFailure(res) {
+  const code = typeof res?.json?.code === 'string' && res.json.code !== '' ? res.json.code : null
+  const message =
+    typeof res?.json?.message === 'string' && res.json.message !== '' ? res.json.message : res?.message
+  const detail = String(message ?? '').trim()
+  if (code !== null) return detail === '' ? code : `${code}: ${detail}`
+  return detail === '' ? `exit code ${res?.code ?? 'unknown'}` : detail
 }
 
 /** Read trace-id record (main writes; worker reads). Never throws. */
@@ -108,6 +136,57 @@ export async function readTraceRecord(dshHome) {
 }
 
 /**
+ * Persist the shared trace record (main writes; worker reads). Never throws.
+ */
+async function writeTraceRecord(dshHome, record) {
+  try {
+    await mkdir(join(dshHome, '.censorscope'), { recursive: true })
+    await writeFile(traceIdFile(dshHome), JSON.stringify(record, null, 2), 'utf8')
+    return true
+  } catch (error) {
+    log(`trace record write failed: ${error?.message ?? String(error)}`)
+    return false
+  }
+}
+
+/**
+ * Ask the daemon for the shared dsh-main trace and rewrite the local record.
+ *
+ * The daemon is authoritative about `active`, so this covers both a missing
+ * local file (a worker that booted before main wrote it) and a host trace that
+ * is already tracked (a main process whose previous track-add reply was lost).
+ * `rootPid` narrows the lookup to traces rooted at this process; without it the
+ * newest active dsh-main trace wins, with any dsh-main trace as last resort.
+ * Never throws.
+ */
+async function lookupHostTrace(dshHome, rootPid) {
+  const matchesRoot = (trace) =>
+    rootPid === undefined || rootPid === null || trace.root_pid === rootPid
+  try {
+    const res = await runCensorscopectl(['trace-list'], { timeoutMs: 5000 })
+    if (!res.ok) return null
+    const traces = Array.isArray(res.json?.traces) ? res.json.traces : []
+    const active = traces
+      .filter((t) => t.display_name === 'dsh-main' && t.lifecycle_state === 'active')
+      .filter(matchesRoot)
+      .sort((a, b) => b.trace_id - a.trace_id)
+    const pick =
+      active[0] ??
+      (rootPid === undefined ? traces.find((t) => t.display_name === 'dsh-main') : undefined)
+    if (!pick || typeof pick.trace_id !== 'number') return null
+    const record = {
+      traceId: String(pick.trace_id),
+      rootPid: typeof pick.root_pid === 'number' ? pick.root_pid : null,
+      updatedAt: Date.now(),
+    }
+    await writeTraceRecord(dshHome, record)
+    return record
+  } catch {
+    return null
+  }
+}
+
+/**
  * Resolve the shared dsh-main trace: local record first, then the daemon's
  * trace list. The local file can lag (main writes it asynchronously right after
  * boot) or be missing after a manual DSH_HOME wipe while the daemon still owns
@@ -117,75 +196,88 @@ export async function readTraceRecord(dshHome) {
 export async function resolveTraceRecord(dshHome) {
   const local = await readTraceRecord(dshHome)
   if (local !== null) return local
-  try {
-    const res = await runCensorscopectl(['trace-list'], { timeoutMs: 5000 })
-    const traces = res.ok && Array.isArray(res.json?.traces) ? res.json.traces : []
-    const active = traces
-      .filter((t) => t.display_name === 'dsh-main' && t.lifecycle_state === 'active')
-      .sort((a, b) => b.trace_id - a.trace_id)
-    const pick = active[0] ?? traces.find((t) => t.display_name === 'dsh-main')
-    if (!pick || typeof pick.trace_id !== 'number') return null
-    const record = {
-      traceId: String(pick.trace_id),
-      rootPid: typeof pick.root_pid === 'number' ? pick.root_pid : null,
-      updatedAt: Date.now(),
-    }
-    try {
-      await mkdir(join(dshHome, '.censorscope'), { recursive: true })
-      await writeFile(traceIdFile(dshHome), JSON.stringify(record, null, 2), 'utf8')
-    } catch {}
-    return record
-  } catch {
-    return null
-  }
+  return lookupHostTrace(dshHome)
 }
 
 /**
  * main role: one persistent trace over this process, retried in the background
  * so boot never waits on censorscoped.
+ *
+ * `track-add` is synchronous end to end: censorscopectl only answers after
+ * censorscoped has finished the operation, so an ok reply already reports the
+ * terminal state, and a failure is a non-zero exit whose JSON body carries the
+ * daemon's error code and message. The plugin never polls `operation-status`;
+ * it logs the reason of every failed attempt and retries the call itself.
  */
 async function ensureHostTrace(ctx) {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   const myPid = process.pid
-  // ~ every 2.5s for ~15s, then give up quietly (retry on next boot)
+  // Up to six attempts, ~2.5s apart; one attempt can itself block on the daemon
+  // for the whole track-add budget below.
   const attempts = 6
+  // True once an attempt died without an answer (execFile deadline), because
+  // that attempt may have completed inside the daemon after its reply was lost.
+  let outcomeUnknown = false
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const doctor = await runCensorscopectl(['doctor'])
     if (!doctor.ok) {
-      if (attempt === 1) log(`censorscoped not reachable yet (${doctor.message || doctor.code}); will retry, boot unaffected`)
+      log(
+        `censorscoped unreachable (attempt ${attempt}/${attempts}): ${describeFailure(doctor)}; boot unaffected`,
+      )
       await new Promise((r) => setTimeout(r, 2500))
       continue
     }
     const record = await readTraceRecord(dshHome)
     const traceArg = record?.traceId ? ['--trace-id', record.traceId] : []
-    // track-add snapshots and persists the whole dsh-main process tree; when
-    // the daemon is busy draining a boot backlog the reply can take well over
-    // the default 5s, so use the same 20s budget as export/span calls.
-    const added = await runCensorscopectl(['track-add', '--root-pid', String(myPid), '--name', 'dsh-main', ...traceArg], 20000)
+    // The daemon runs the whole track-add (procfs snapshot of the dsh-main
+    // process tree, identity resolution, persistence) before it replies, so the
+    // budget has to cover the operation, not just a round trip. Keep it above
+    // the writer's 30s control barrier so a slow start reports a real reason
+    // instead of being killed by this deadline.
+    const added = await runCensorscopectl(
+      ['track-add', '--root-pid', String(myPid), '--name', 'dsh-main', ...traceArg],
+      40000,
+    )
     if (!added.ok) {
-      if (attempt === 1 || attempt === attempts) log(`track-add attempt ${attempt}/${attempts} failed: ${added.message}`)
+      log(`track-add attempt ${attempt}/${attempts} failed: ${describeFailure(added)}`)
+      const alreadyActive =
+        added.json?.code === 'trace_id' && String(added.json?.message ?? '').includes('already active')
+      if (alreadyActive && outcomeUnknown) {
+        // Our own earlier attempt completed after its reply was lost: the host
+        // is already tracked, so adopt that trace instead of retrying a command
+        // the daemon will keep rejecting.
+        const adopted = await lookupHostTrace(dshHome, myPid)
+        if (adopted !== null) {
+          log(`track-add already active; adopted host trace traceId=trace-${adopted.traceId}`)
+          return
+        }
+      }
+      outcomeUnknown =
+        outcomeUnknown || (added.json === null && String(added?.message ?? '').includes('timed out'))
+      await new Promise((r) => setTimeout(r, 2500))
+      continue
+    }
+    if (added.json?.operation_state !== 'active') {
+      log(
+        `track-add answered without active: state=${added.json?.operation_state ?? 'missing'} reply=${added.text}`,
+      )
       await new Promise((r) => setTimeout(r, 2500))
       continue
     }
     const numericId = added.json?.trace_id
-    if (typeof numericId === 'number') {
-      const traceId = String(numericId)
-      try {
-        await mkdir(join(dshHome, '.censorscope'), { recursive: true })
-        await writeFile(
-          traceIdFile(dshHome),
-          JSON.stringify({ traceId, rootPid: myPid, updatedAt: Date.now() }, null, 2),
-          'utf8',
-        )
-        log(`trace ready traceId=trace-${traceId} rootPid=${myPid} file=${traceIdFile(dshHome)}`)
-      } catch (error) {
-        log(`trace record write failed: ${error?.message ?? String(error)}`)
-      }
-    } else {
-      log(`track-add ok but reply had no trace_id: ${added.text}`)
+    if (typeof numericId !== 'number') {
+      // An active operation always carries its trace id, so this is a protocol
+      // violation rather than a retryable state.
+      log(`track-add active but reply had no trace_id: ${added.text}`)
+      return
+    }
+    const traceId = String(numericId)
+    if (await writeTraceRecord(dshHome, { traceId, rootPid: myPid, updatedAt: Date.now() })) {
+      log(`trace ready traceId=trace-${traceId} rootPid=${myPid} file=${traceIdFile(dshHome)}`)
     }
     return
   }
+  log(`track-add gave up after ${attempts} attempts; see the reasons above (retried on next boot)`)
 }
 
 /**

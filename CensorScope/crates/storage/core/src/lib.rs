@@ -1,11 +1,9 @@
 //! Unified storage backend facade.
 
-mod backfill;
 mod backend;
+mod backfill;
 mod error;
 
-pub use backfill::{
-    BackfillJob, BackfillJobKind, BackfillJobState, CallSpanRecord,
-};
-pub use backend::StorageBackend;
+pub use backend::{AncillaryRow, StorageBackend};
+pub use backfill::{BackfillJob, BackfillJobKind, BackfillJobState, CallSpanRecord};
 pub use error::StorageError;

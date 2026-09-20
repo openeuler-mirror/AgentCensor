@@ -7,9 +7,7 @@ use model_core::payload::PayloadSegment;
 use model_core::process::{ProcessMembership, ProcessRecord};
 use model_core::trace::{TraceLifecycleState, TraceRecord};
 use semantic_action_contract::{SemanticAction, SemanticActionLink, SemanticContent};
-use storage_core::{
-    BackfillJob, BackfillJobState, CallSpanRecord, StorageBackend, StorageError,
-};
+use storage_core::{BackfillJob, BackfillJobState, CallSpanRecord, StorageBackend, StorageError};
 
 use crate::SqliteStorage;
 
@@ -87,6 +85,17 @@ impl StorageBackend for SqliteStorage {
             .map_err(|error| storage_error("append_payloads_batch", error))
     }
 
+    fn apply_ingest_batch(
+        &mut self,
+        sequence: u64,
+        ancillary: Vec<storage_core::AncillaryRow>,
+        events: Vec<DomainEvent>,
+        payloads: Vec<PayloadSegment>,
+    ) -> Result<(), StorageError> {
+        SqliteStorage::apply_ingest_batch(self, sequence, ancillary, events, payloads)
+            .map_err(|error| storage_error("apply_ingest_batch", error))
+    }
+
     fn upsert_session(
         &mut self,
         session_id: &model_core::process::SessionIdentity,
@@ -145,14 +154,16 @@ impl StorageBackend for SqliteStorage {
         limit: u64,
     ) -> Result<Vec<(i64, Option<u32>, i64)>, StorageError> {
         SqliteStorage::unassigned_events_in_window(
-            self, trace_id, session_id, started_at_ns, ended_at_ns, limit,
+            self,
+            trace_id,
+            session_id,
+            started_at_ns,
+            ended_at_ns,
+            limit,
         )
         .map_err(|e| storage_error("unassigned_events_in_window", e))
     }
-    fn assign_event_call_ids(
-        &mut self,
-        assignments: &[(i64, String)],
-    ) -> Result<(), StorageError> {
+    fn assign_event_call_ids(&mut self, assignments: &[(i64, String)]) -> Result<(), StorageError> {
         SqliteStorage::assign_event_call_ids(self, assignments)
             .map_err(|e| storage_error("assign_event_call_ids", e))
     }
@@ -218,5 +229,23 @@ impl StorageBackend for SqliteStorage {
     fn checkpoint_truncate(&mut self) -> Result<(), StorageError> {
         SqliteStorage::checkpoint_truncate(self)
             .map_err(|error| storage_error("sqlite_checkpoint_truncate", error))
+    }
+
+    /// Applies the batch in one transaction instead of one per row, which is
+    /// what makes an event's ancillary rows cost a single commit.
+    fn apply_ancillary_batch(
+        &mut self,
+        rows: Vec<storage_core::AncillaryRow>,
+    ) -> Result<Vec<String>, StorageError> {
+        SqliteStorage::apply_ancillary_batch(self, rows)
+            .map_err(|error| storage_error("apply_ancillary_batch", error))
+    }
+
+    fn apply_control_batch(
+        &mut self,
+        rows: Vec<storage_core::AncillaryRow>,
+    ) -> Result<(), StorageError> {
+        SqliteStorage::apply_control_batch(self, rows)
+            .map_err(|error| storage_error("apply_control_batch", error))
     }
 }
