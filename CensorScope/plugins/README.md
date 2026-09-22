@@ -4,8 +4,8 @@
 
 | 包 | 版本 | 作用 | 装入 profile |
 |---|---|---|---|
-| `censorscope-host` | 0.1.0 | main 角色：单 trace track-add(trace-id 复用) + per-call cache writer + `/censorscope/call` 路由；worker 角色：注入 `DSH_CENSORSCOPE_CALL_ID` + call-start/end span（真实起止时刻） | web + headless |
-| `agentcensor-session-proxy` | 0.1.0 | web 每会话 headless worker（agentcensor 拓扑）+ `CENSORSCOPE_SESSION_ID` | web |
+| `censorscope-host` | 0.1.1 | main 角色：单 trace track-add(trace-id 复用；单次调用同步拿到终态或错误) + per-call cache writer + `/censorscope/call` 路由；worker 角色：注入 `DSH_CENSORSCOPE_CALL_ID` + call-start/end span（真实起止时刻） | web + headless |
+| `agentcensor-session-proxy` | 0.1.1 | web 每会话 headless worker（agentcensor 拓扑）+ `CENSORSCOPE_SESSION_ID`；停止按钮 = 协议级取消（worker 内原生 `agent.cancel`）；审批 / `ask_user_question` 交互桥（worker→host→浏览器→回注，控制面不写会话数据） | web |
 | `censorscope-ui` | 0.1.0 | 浏览器会话「CensorScope」Tab（替换原生轨迹视图） | web |
 
 ## 一键安装（推荐）

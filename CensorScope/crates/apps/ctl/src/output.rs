@@ -18,9 +18,32 @@ pub fn format_init_json(status: &str, path: &std::path::Path) -> String {
 pub fn format_reply(reply: &ControlReply) -> String {
     match reply {
         ControlReply::TrackAdded(reply) => {
-            format!("trace {} entered {}", reply.trace_id, reply.lifecycle_state)
+            format!(
+                "trace {} entered {} (operation {} {})",
+                reply
+                    .trace_id
+                    .map(|trace_id| trace_id.to_string())
+                    .unwrap_or_else(|| "pending".to_string()),
+                reply.lifecycle_state,
+                reply.operation_id,
+                reply.operation_state.as_str()
+            )
         }
         ControlReply::TrackRemoved => "root capture removed".to_string(),
+        ControlReply::OperationStatus(reply) => format!(
+            "operation {} {} trace={}{}",
+            reply.operation_id,
+            reply.operation_state.as_str(),
+            reply
+                .trace_id
+                .map(|trace_id| trace_id.to_string())
+                .unwrap_or_else(|| "pending".to_string()),
+            reply
+                .error
+                .as_deref()
+                .map(|error| format!(" error={error}"))
+                .unwrap_or_default()
+        ),
         ControlReply::CallStarted => "call span started".to_string(),
         ControlReply::CallEnded => "call span ended".to_string(),
         ControlReply::TraceList(items) => items
@@ -56,10 +79,20 @@ pub fn format_reply_json(reply: &ControlReply) -> String {
     let value = match reply {
         ControlReply::TrackAdded(reply) => json!({
             "ok": true,
-            "trace_id": reply.trace_id.get(),
+            "trace_id": reply.trace_id.map(|trace_id| trace_id.get()),
             "lifecycle_state": reply.lifecycle_state.as_display_str(),
+            "operation_id": reply.operation_id.get().to_string(),
+            "operation_state": reply.operation_state.as_str(),
         }),
         ControlReply::TrackRemoved => json!({ "ok": true }),
+        ControlReply::OperationStatus(reply) => json!({
+            "ok": true,
+            "operation_id": reply.operation_id.get().to_string(),
+            "trace_id": reply.trace_id.map(|trace_id| trace_id.get()),
+            "lifecycle_state": reply.lifecycle_state.map(|state| state.as_display_str()),
+            "operation_state": reply.operation_state.as_str(),
+            "error": reply.error,
+        }),
         ControlReply::CallStarted => json!({"ok": true, "status": "started"}),
         ControlReply::CallEnded => json!({"ok": true, "status": "ended"}),
         ControlReply::TraceList(items) => json!({
@@ -103,8 +136,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::SystemTime;
 
+    use control_contract::reply::OperationState;
     use control_contract::reply::{ControlReply, TraceListItem, TrackAddReply};
-    use model_core::ids::{TraceId, TraceName};
+    use model_core::ids::{RequestId, TraceId, TraceName};
     use model_core::process::NamespaceIdentity;
     use model_core::trace::{TraceHealth, TraceLifecycleState};
 
@@ -158,12 +192,31 @@ mod tests {
     #[test]
     fn track_add_json_is_parseable_and_carries_trace_id() {
         let raw = format_reply_json(&ControlReply::TrackAdded(TrackAddReply {
-            trace_id: TraceId::new(9),
+            trace_id: Some(TraceId::new(9)),
             lifecycle_state: TraceLifecycleState::Active,
+            operation_id: RequestId::new(10),
+            operation_state: OperationState::Active,
+            error: None,
         }));
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["ok"], true);
         assert_eq!(value["trace_id"], 9);
         assert_eq!(value["lifecycle_state"], "Active");
+        assert_eq!(value["operation_id"], "10");
+        assert_eq!(value["operation_state"], "active");
+    }
+
+    #[test]
+    fn operation_id_json_preserves_u64_precision() {
+        let operation_id = u64::MAX - 7;
+        let raw = format_reply_json(&ControlReply::TrackAdded(TrackAddReply {
+            trace_id: None,
+            lifecycle_state: TraceLifecycleState::Starting,
+            operation_id: RequestId::new(operation_id),
+            operation_state: OperationState::Preparing,
+            error: None,
+        }));
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["operation_id"], operation_id.to_string());
     }
 }

@@ -4,11 +4,12 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_contract::command::{
-    CallEndCommand, CallStartCommand, ControlCommand, DoctorCommand, ListTracesCommand, ProcessRef,
-    TrackAddCommand, TrackRemoveCommand,
+    CallEndCommand, CallStartCommand, ControlCommand, DoctorCommand, ListTracesCommand,
+    OperationStatusCommand, ProcessRef, TrackAddCommand, TrackRemoveCommand,
 };
 use control_contract::reply::{
-    ControlError, ControlReply, DoctorReply, TraceListItem, TrackAddReply,
+    ControlError, ControlReply, DoctorReply, OperationState, OperationStatusReply, TraceListItem,
+    TrackAddReply,
 };
 use control_contract::selector::TraceSelector;
 use model_core::ids::{ProfileName, RequestId, TraceId, TraceName};
@@ -52,6 +53,11 @@ pub fn encode_command(command: &ControlCommand) -> Vec<u8> {
             fields.extend(["track-remove".into(), c.request_id.get().to_string()]);
             encode_selector(&mut fields, &c.selector);
         }
+        ControlCommand::OperationStatus(c) => fields.extend([
+            "operation-status".into(),
+            c.request_id.get().to_string(),
+            c.operation_id.get().to_string(),
+        ]),
         ControlCommand::ListTraces(c) => {
             fields.extend(["trace-list".into(), c.request_id.get().to_string()]);
             match &c.selector {
@@ -108,15 +114,13 @@ pub fn decode_command(bytes: &[u8]) -> Result<ControlCommand, ControlCodecError>
             }
             // Sentinel field: "0" marks "no trace to continue"; otherwise the
             // raw numeric trace id.
-            let trace_id = fields
-                .get(7 + count)
-                .and_then(|value| {
-                    if value == "0" {
-                        None
-                    } else {
-                        value.parse::<u64>().ok().map(TraceId::new)
-                    }
-                });
+            let trace_id = fields.get(7 + count).and_then(|value| {
+                if value == "0" {
+                    None
+                } else {
+                    value.parse::<u64>().ok().map(TraceId::new)
+                }
+            });
             Ok(ControlCommand::TrackAdd(TrackAddCommand {
                 request_id,
                 root,
@@ -129,6 +133,10 @@ pub fn decode_command(bytes: &[u8]) -> Result<ControlCommand, ControlCodecError>
         "track-remove" => Ok(ControlCommand::TrackRemove(TrackRemoveCommand {
             request_id,
             selector: decode_selector(&fields, 2)?,
+        })),
+        "operation-status" => Ok(ControlCommand::OperationStatus(OperationStatusCommand {
+            request_id,
+            operation_id: RequestId::new(parse_u64(field(&fields, 2)?, "operation_id")?),
         })),
         "trace-list" => {
             let has_selector = field(&fields, 2)? == "1";
@@ -172,8 +180,24 @@ pub fn encode_reply(reply: &Result<ControlReply, ControlError>) -> Vec<u8> {
         Err(error) => fields.extend(["error".into(), error.code.clone(), error.message.clone()]),
         Ok(ControlReply::TrackAdded(r)) => fields.extend([
             "track-added".into(),
-            r.trace_id.get().to_string(),
+            r.trace_id
+                .map_or_else(|| "0".to_string(), |id| id.get().to_string()),
             r.lifecycle_state.as_display_str().into(),
+            r.operation_id.get().to_string(),
+            r.operation_state.as_str().into(),
+            r.error.clone().unwrap_or_default(),
+        ]),
+        Ok(ControlReply::OperationStatus(r)) => fields.extend([
+            "operation-status".into(),
+            r.operation_id.get().to_string(),
+            r.trace_id
+                .map_or_else(|| "0".to_string(), |id| id.get().to_string()),
+            r.lifecycle_state.map_or_else(
+                || "".to_string(),
+                |state| state.as_display_str().to_string(),
+            ),
+            r.operation_state.as_str().into(),
+            r.error.clone().unwrap_or_default(),
         ]),
         Ok(ControlReply::TrackRemoved) => fields.push("track-removed".into()),
         Ok(ControlReply::TraceList(items)) => {
@@ -219,8 +243,27 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Result<ControlReply, ControlError>, 
             field(&fields, 2)?,
         ))),
         "track-added" => Ok(Ok(ControlReply::TrackAdded(TrackAddReply {
-            trace_id: TraceId::new(parse_u64(field(&fields, 1)?, "trace_id")?),
+            trace_id: match parse_u64(field(&fields, 1)?, "trace_id")? {
+                0 => None,
+                value => Some(TraceId::new(value)),
+            },
             lifecycle_state: parse_lifecycle(field(&fields, 2)?)?,
+            operation_id: RequestId::new(parse_u64(field(&fields, 3)?, "operation_id")?),
+            operation_state: OperationState::from_str(field(&fields, 4)?)
+                .ok_or_else(|| ControlCodecError::new("decode", "invalid operation state"))?,
+            error: nonempty(field(&fields, 5)?),
+        }))),
+        "operation-status" => Ok(Ok(ControlReply::OperationStatus(OperationStatusReply {
+            operation_id: RequestId::new(parse_u64(field(&fields, 1)?, "operation_id")?),
+            trace_id: match parse_u64(field(&fields, 2)?, "trace_id")? {
+                0 => None,
+                value => Some(TraceId::new(value)),
+            },
+            lifecycle_state: nonempty(field(&fields, 3)?)
+                .and_then(|value| parse_lifecycle(&value).ok()),
+            operation_state: OperationState::from_str(field(&fields, 4)?)
+                .ok_or_else(|| ControlCodecError::new("decode", "invalid operation state"))?,
+            error: nonempty(field(&fields, 5)?),
         }))),
         "track-removed" => Ok(Ok(ControlReply::TrackRemoved)),
         "call-started" => Ok(Ok(ControlReply::CallStarted)),

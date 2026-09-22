@@ -5,6 +5,7 @@ use collector_capability::CollectorDescriptor;
 use collector_event::{RawCollectorEvent, RawPayloadSegment};
 use collector_stats::CollectorStats;
 use model_core::ids::TraceId;
+use serde::{Deserialize, Serialize};
 
 /// Error returned by a collector during setup, polling, or teardown.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +40,17 @@ pub trait CollectorInstance {
     }
     /// Polls observations together with any batch-level collector state.
     fn poll_batch(&mut self) -> Result<CollectorPollBatch, CollectorError>;
+    /// Drains raw transport records without decoding them.
+    fn poll_raw_batch(&mut self) -> Result<Option<CollectorRawBatch>, CollectorError> {
+        Ok(None)
+    }
+    /// Kernel descriptor that becomes readable when the transport holds data.
+    ///
+    /// Lets the daemon wake on captured records instead of polling on a timer.
+    /// `None` while the collector has no transport to watch.
+    fn transport_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
     /// Drain the kernel transport buffer into userspace without decoding.
     ///
     /// Best-effort: call after expensive processing to shrink the ring-buffer
@@ -50,8 +62,15 @@ pub trait CollectorInstance {
     fn stats(&self) -> CollectorStats;
 }
 
-/// Batch of observations drained from a collector transport.
+/// Raw records copied from a collector transport before userspace decoding.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CollectorRawBatch {
+    pub events: Vec<Vec<u8>>,
+    pub diagnostics: Vec<RawCollectorEvent>,
+}
+
+/// Batch of observations drained from a collector transport.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectorPollBatch {
     pub observations: Vec<RawCollectorEvent>,
     pub payload_segments: Vec<RawPayloadSegment>,

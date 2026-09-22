@@ -98,7 +98,10 @@ fn project_event_inner(event: &DomainEvent) -> ProjectionBatch {
         }
         _ => return ProjectionBatch::default(),
     };
-    attributes.insert("censorscope.action.kind".to_string(), kind.as_str().to_string());
+    attributes.insert(
+        "censorscope.action.kind".to_string(),
+        kind.as_str().to_string(),
+    );
     let completeness = if event.envelope.flags == EventFlags::empty() {
         SemanticActionCompleteness::Complete
     } else {
@@ -155,7 +158,10 @@ fn project_exec(
     let exec_id = action_id(event, SemanticActionKind::ProcessExec);
     let command_id = action_id(event, SemanticActionKind::CommandInvocation);
     let mut exec_attributes = payload.metadata.clone();
-    exec_attributes.insert("censorscope.action.kind".to_string(), "process.exec".to_string());
+    exec_attributes.insert(
+        "censorscope.action.kind".to_string(),
+        "process.exec".to_string(),
+    );
     let mut command_attributes = BTreeMap::new();
     command_attributes.insert(
         "censorscope.action.kind".to_string(),

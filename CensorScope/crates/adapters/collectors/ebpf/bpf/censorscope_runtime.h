@@ -108,8 +108,18 @@ enum censorscope_bpf_flag {
     BPF_FLAG_NONE = 0,
 };
 
+/* One counter per class of observation: a loss episode has to say which kind of
+ * data was dropped, because losing a process tree edge and losing captured
+ * plaintext are different failures. The keys fit the map's 8 entries and index
+ * 0 stays unused, so a zeroed entry is never read as a real class. */
 enum censorscope_loss_counter_key {
-    LOSS_COUNTER_DEFAULT = 1,
+    LOSS_COUNTER_PROCESS = 1,
+    LOSS_COUNTER_FILE = 2,
+    LOSS_COUNTER_NET = 3,
+    LOSS_COUNTER_IPC = 4,
+    LOSS_COUNTER_FD_IO = 5,
+    LOSS_COUNTER_TLS = 6,
+    LOSS_COUNTER_EXEC_CONTEXT = 7,
 };
 
 enum censorscope_capture_flag {
@@ -131,6 +141,16 @@ enum censorscope_tls_symbol {
     TLS_SYMBOL_SSL_READ_EX = 12,
 };
 
+/* Event records are deliberately NOT `packed`.  Every event struct below is
+ * already naturally aligned and padded-free by construction (verified: the
+ * size and every field offset are identical with and without the attribute),
+ * and the userspace decoder reads fixed byte offsets.  Packing them buys
+ * nothing but forces clang to emit single-byte loads and stores for every
+ * field access, memset and memcpy, which is what made the verifier exceed its
+ * 1,000,000 processed-instruction budget: a 328-byte `__builtin_memset` costs
+ * 328 instructions instead of 41, and the TLS chunk emitter ballooned to 726
+ * instructions.  Dropping it cut total object instructions from 12008 to 8308
+ * and byte stores from 2904 to 511. */
 struct censorscope_event {
     __u32 kind;
     __u32 pid;
@@ -149,7 +169,7 @@ struct censorscope_event {
      * children remain attributable after their /proc entry disappears. */
     char session[SESSION_LEN];
     char call_id[CALL_ID_LEN];
-} __attribute__((packed));
+};
 
 struct censorscope_exec_event {
     struct censorscope_event event;
@@ -165,7 +185,7 @@ struct censorscope_exec_event {
         __u32 length;
     } argv_entries[EXEC_ARG_MAX];
     __u8 argv_bytes[EXEC_ARG_BYTES_ABI_MAX];
-} __attribute__((packed));
+};
 
 struct censorscope_pending_argv {
     __u64 trace_id;
@@ -203,7 +223,7 @@ struct censorscope_tls_event {
     __u32 chunk_index;
     __u32 chunk_flags;
     __u8 payload[TLS_PAYLOAD_ABI_MAX_BYTES];
-} __attribute__((packed));
+};
 
 /* One entry per tracked host PID.  A fork-created binding keeps the parent
  * host pid in `parent_pid` until exec promotes the child in place (cleared);
@@ -243,7 +263,7 @@ struct censorscope_net_event {
     __u32 sockaddr_size;
     __u32 sockaddr_flags;
     __u8 sockaddr[128];
-} __attribute__((packed));
+};
 
 struct censorscope_pending_file_op {
     __u64 trace_id;
@@ -262,7 +282,7 @@ struct censorscope_file_event {
     __u32 path2_flags;
     char path[FILE_PATH_ABI_MAX_BYTES];
     char path2[FILE_PATH_ABI_MAX_BYTES];
-} __attribute__((packed));
+};
 
 struct censorscope_pending_ipc_op {
     __u64 trace_id;
@@ -290,7 +310,7 @@ struct censorscope_fd_io_event {
     __u32 payload_size;
     __u32 payload_flags;
     __u8 payload[256];
-} __attribute__((packed));
+};
 
 struct task_struct {
     int pid;
@@ -760,18 +780,16 @@ static __always_inline void censorscope_event_submit(void *ctx, void *event) {
 
 static __always_inline void record_loss(__u32 key) {
     __u64 *count = bpf_map_lookup_elem(&loss_counters, &key);
-    __u64 next = count ? *count + 1 : LOSS_COUNTER_DEFAULT;
+    __u64 next = count ? *count + 1 : 1;
     bpf_map_update_elem(&loss_counters, &key, &next, BPF_ANY);
 }
 
-static __always_inline int emit_event(void *ctx, struct censorscope_event *event) {
+static __always_inline int emit_event(void *ctx, struct censorscope_event *event,
+                                      __u32 loss_class) {
     long result = bpf_ringbuf_output(&events, event, sizeof(*event),
                                      BPF_FLAG_NONE);
     if (result != 0) {
-        __u32 key = LOSS_COUNTER_DEFAULT;
-        __u64 *count = bpf_map_lookup_elem(&loss_counters, &key);
-        __u64 next = count ? *count + 1 : LOSS_COUNTER_DEFAULT;
-        bpf_map_update_elem(&loss_counters, &key, &next, BPF_ANY);
+        record_loss(loss_class);
     }
     return result;
 }
@@ -797,7 +815,13 @@ store_pending_net_op(struct trace_event_raw_sys_enter *ctx,
     op.sockaddr_ptr = 0;
     op.sockaddr_len = 0;
     op.sockaddr_len_ptr = 0;
-    return bpf_map_update_elem(&pending_net_ops, &pid_tgid, &op, BPF_ANY);
+    if (bpf_map_update_elem(&pending_net_ops, &pid_tgid, &op, BPF_ANY) != 0) {
+        /* A full pending map means this operation can never be completed at
+         * exit: the observation is lost here. */
+        record_loss(LOSS_COUNTER_NET);
+        return BPF_STATUS_ERROR;
+    }
+    return BPF_STATUS_OK;
 }
 
 static __always_inline int
@@ -864,7 +888,7 @@ emit_pending_net_op(struct trace_event_raw_sys_exit *ctx) {
     }
     event = censorscope_event_reserve(sizeof(*event));
     if (!event) {
-        record_loss(LOSS_COUNTER_DEFAULT);
+        record_loss(LOSS_COUNTER_NET);
         bpf_map_delete_elem(&pending_net_ops, &pid_tgid);
         return BPF_STATUS_ERROR;
     }
@@ -920,7 +944,13 @@ store_pending_file_op(struct trace_event_raw_sys_enter *ctx,
     op.requested_size = requested_size;
     op.path_ptr = 0;
     op.path2_ptr = 0;
-    return bpf_map_update_elem(&pending_file_ops, &pid_tgid, &op, BPF_ANY);
+    if (bpf_map_update_elem(&pending_file_ops, &pid_tgid, &op, BPF_ANY) != 0) {
+        /* A full pending map means this operation can never be completed at
+         * exit: the observation is lost here. */
+        record_loss(LOSS_COUNTER_FILE);
+        return BPF_STATUS_ERROR;
+    }
+    return BPF_STATUS_OK;
 }
 
 static __always_inline int
@@ -981,7 +1011,7 @@ emit_pending_file_op(struct trace_event_raw_sys_exit *ctx) {
     }
     event = censorscope_event_reserve(sizeof(*event));
     if (!event) {
-        record_loss(LOSS_COUNTER_DEFAULT);
+        record_loss(LOSS_COUNTER_FILE);
         bpf_map_delete_elem(&pending_file_ops, &pid_tgid);
         return BPF_STATUS_ERROR;
     }
@@ -1052,7 +1082,13 @@ store_pending_ipc_op(struct trace_event_raw_sys_enter *ctx,
     op.operation = operation;
     op.pair_ptr = pair_ptr;
     op.domain = domain;
-    return bpf_map_update_elem(&pending_ipc_ops, &pid_tgid, &op, BPF_ANY);
+    if (bpf_map_update_elem(&pending_ipc_ops, &pid_tgid, &op, BPF_ANY) != 0) {
+        /* A full pending map means this operation can never be completed at
+         * exit: the observation is lost here. */
+        record_loss(LOSS_COUNTER_IPC);
+        return BPF_STATUS_ERROR;
+    }
+    return BPF_STATUS_OK;
 }
 
 static __always_inline int
@@ -1081,7 +1117,7 @@ emit_pending_ipc_op(struct trace_event_raw_sys_exit *ctx) {
     event.reserved = (__u32)pair[1];
     event.requested_size = op->domain;
     event.result = (__s32)ctx->ret;
-    emit_event(ctx, &event);
+    emit_event(ctx, &event, LOSS_COUNTER_IPC);
     bpf_map_delete_elem(&pending_ipc_ops, &pid_tgid);
     return BPF_STATUS_OK;
 }
@@ -1123,7 +1159,13 @@ store_pending_fd_io_op(struct trace_event_raw_sys_enter *ctx,
             op.staged_flags = CAPTURE_FLAG_READ_FAILURE;
         }
     }
-    return bpf_map_update_elem(&pending_fd_io_ops, &pid_tgid, &op, BPF_ANY);
+    if (bpf_map_update_elem(&pending_fd_io_ops, &pid_tgid, &op, BPF_ANY) != 0) {
+        /* A full pending map means this operation can never be completed at
+         * exit: the observation is lost here. */
+        record_loss(LOSS_COUNTER_FD_IO);
+        return BPF_STATUS_ERROR;
+    }
+    return BPF_STATUS_OK;
 }
 
 static __always_inline int
@@ -1141,7 +1183,7 @@ emit_pending_fd_io_op(struct trace_event_raw_sys_exit *ctx) {
     }
     event = censorscope_event_reserve(sizeof(*event));
     if (!event) {
-        record_loss(LOSS_COUNTER_DEFAULT);
+        record_loss(LOSS_COUNTER_FD_IO);
         bpf_map_delete_elem(&pending_fd_io_ops, &pid_tgid);
         return BPF_STATUS_ERROR;
     }

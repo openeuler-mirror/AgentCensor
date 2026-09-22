@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 
-use model_core::ids::{TraceId, TraceName};
+use model_core::ids::{RequestId, TraceId, TraceName};
 use model_core::process::NamespaceIdentity;
 use model_core::trace::{TraceHealth, TraceLifecycleState};
 
@@ -30,8 +30,49 @@ pub struct TraceListItem {
 /// Result returned after a trace is attached and activated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackAddReply {
-    pub trace_id: TraceId,
+    pub trace_id: Option<TraceId>,
     pub lifecycle_state: TraceLifecycleState,
+    pub operation_id: RequestId,
+    pub operation_state: OperationState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationStatusReply {
+    pub operation_id: RequestId,
+    pub trace_id: Option<TraceId>,
+    pub lifecycle_state: Option<TraceLifecycleState>,
+    pub operation_state: OperationState,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationState {
+    Preparing,
+    Starting,
+    Active,
+    Failed,
+}
+
+impl OperationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Starting => "starting",
+            Self::Active => "active",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "preparing" => Some(Self::Preparing),
+            "starting" => Some(Self::Starting),
+            "active" => Some(Self::Active),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 /// Daemon readiness information returned by `doctor`.
@@ -45,6 +86,7 @@ pub struct DoctorReply {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlReply {
     TrackAdded(TrackAddReply),
+    OperationStatus(OperationStatusReply),
     TrackRemoved,
     TraceList(Vec<TraceListItem>),
     Doctor(DoctorReply),

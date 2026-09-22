@@ -1,10 +1,13 @@
 //! Stable identifiers used across runtime, storage, and export flows.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 macro_rules! define_u64_id {
     ($name:ident, $label:literal) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        #[derive(
+            Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+        )]
         pub struct $name(u64);
 
         impl $name {
@@ -30,7 +33,7 @@ define_u64_id!(EventId, "event");
 define_u64_id!(RequestId, "request");
 
 /// Name of the configured capture profile.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ProfileName(String);
 
 impl ProfileName {
@@ -50,7 +53,7 @@ impl fmt::Display for ProfileName {
 }
 
 /// Stable name of the collector that produced an event.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct CollectorName(String);
 
 impl CollectorName {
@@ -70,7 +73,7 @@ impl fmt::Display for CollectorName {
 }
 
 /// User-facing display name assigned to a trace.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct TraceName(String);
 
 impl TraceName {

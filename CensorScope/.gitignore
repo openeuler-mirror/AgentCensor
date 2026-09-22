@@ -45,6 +45,7 @@ crates/apps/ctl/java-agent/dist/
 .agents/
 local/
 skills-lock.json
+.workbuddy
 
 **/adr/**
 
