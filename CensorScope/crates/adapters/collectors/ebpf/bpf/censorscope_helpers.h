@@ -23,6 +23,11 @@
 #define CENSORSCOPE_BPF_FUNC_RINGBUF_SUBMIT 132
 #define CENSORSCOPE_BPF_FUNC_RINGBUF_DISCARD 133
 #define CENSORSCOPE_BPF_MAP_TYPE_RINGBUF 27
+/* bpf_loop (kernel >= 5.17): the loop counter runs in the kernel, so the
+ * callback subprogram is verified once instead of once per iteration.  This is
+ * what keeps long per-call capture loops inside the verifier's processed
+ * instruction budget without shortening them. */
+#define CENSORSCOPE_BPF_FUNC_LOOP 181
 
 
 struct task_struct;
@@ -50,6 +55,10 @@ static void *(*bpf_ringbuf_reserve)(void *ringbuf, __u64 size, __u64 flags) =
     (void *)CENSORSCOPE_BPF_FUNC_RINGBUF_RESERVE;
 static void (*bpf_ringbuf_submit)(void *data, __u64 flags) = (void *)
     CENSORSCOPE_BPF_FUNC_RINGBUF_SUBMIT;
+static long (*bpf_loop)(__u32 nr_loops,
+                        void *callback_fn,
+                        void *callback_ctx,
+                        __u64 flags) = (void *)CENSORSCOPE_BPF_FUNC_LOOP;
 static long (*bpf_probe_read_kernel)(void *dst,
                                      __u32 size,
                                      const void *unsafe_ptr) = (void *)

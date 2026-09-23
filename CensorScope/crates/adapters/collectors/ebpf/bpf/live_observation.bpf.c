@@ -187,7 +187,7 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx) {
     event.aux_host_pid = child_host_pid;
     event.pid_generation = parent_start_ns;
     event.aux_generation = child_start_boottime_ns;
-    return emit_event(ctx, &event);
+    return emit_event(ctx, &event, LOSS_COUNTER_PROCESS);
 }
 
 SEC("tracepoint/sched/sched_process_exec")
@@ -295,7 +295,7 @@ int handle_sched_process_exit(struct sched_process_exit_ctx *ctx) {
     }
     init_event(&event, PROC_EXIT, pid, *trace_id);
     attach_exit_code(&event, pid_tgid);
-    emit_event(ctx, &event);
+    emit_event(ctx, &event, LOSS_COUNTER_PROCESS);
     bpf_map_delete_elem(&trace_bindings, &pid);
     if (host_pid && host_pid != pid) {
         bpf_map_delete_elem(&trace_bindings, &host_pid);
@@ -331,7 +331,7 @@ int handle_signal_generate(struct signal_generate_ctx *ctx) {
     event.fd = (__u32)ctx->sig;
     event.reserved = (__u32)ctx->group;
     event.requested_size = (__u64)ctx->pid;
-    return emit_event(ctx, &event);
+    return emit_event(ctx, &event, LOSS_COUNTER_PROCESS);
 }
 
 SEC("tracepoint/syscalls/sys_enter_connect")

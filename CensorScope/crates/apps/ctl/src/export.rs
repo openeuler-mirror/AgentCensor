@@ -13,6 +13,23 @@ fn optional_ns(value: Option<i64>) -> Value {
     value.map_or(Value::Null, ns)
 }
 
+fn call_action_predicate(alias: &str) -> String {
+    format!(
+        "(?3 IS NULL OR EXISTS ( \
+            SELECT 1 FROM semantic_action_evidence_read sae \
+            WHERE sae.trace_id = {alias}.trace_id AND sae.action_id = {alias}.action_id \
+              AND ((sae.evidence_kind = 1 AND EXISTS ( \
+                    SELECT 1 FROM events ev \
+                    WHERE ev.trace_id = sae.trace_id AND ev.event_id = sae.evidence_id \
+                      AND ev.session_id = ?2 AND ev.call_id = ?3)) \
+                OR (sae.evidence_kind = 3 AND EXISTS ( \
+                    SELECT 1 FROM payload_segments ps \
+                    WHERE ps.trace_id = sae.trace_id AND ps.sequence = sae.evidence_id \
+                      AND ps.session_id = ?2 AND ps.call_id = ?3)))))",
+        alias = alias
+    )
+}
+
 /// Fill `path` on fd-relative I/O (read/write/readv/writev/…) from the owning
 /// process's last bind of that fd: eBPF only reports a path at open time, so
 /// without this pass those rows would show `fd N` and no file name.
@@ -37,7 +54,12 @@ fn enrich_fd_paths(events: &mut [Value]) {
         match operation {
             "open" | "openat" | "openat2" | "creat" => {
                 if let (Some(fd), Some(path)) = (fd, path) {
-                    by_fd.insert((trace, process, fd), Bound { path: path.to_string() });
+                    by_fd.insert(
+                        (trace, process, fd),
+                        Bound {
+                            path: path.to_string(),
+                        },
+                    );
                 }
             }
             "close" => {
@@ -50,14 +72,17 @@ fn enrich_fd_paths(events: &mut [Value]) {
                     if let Some(bound) = by_fd.get(&(trace, process, fd)) {
                         by_fd.insert(
                             (trace, process, target),
-                            Bound { path: bound.path.clone() },
+                            Bound {
+                                path: bound.path.clone(),
+                            },
                         );
                     }
                 }
             }
-            "read" | "write" | "readv" | "writev" | "pread" | "pread64" | "pwrite"
-            | "pwrite64" | "mmap" | "ftruncate" | "fsync" | "fdatasync" | "lseek"
-            | "fallocate" if is_file => {
+            "read" | "write" | "readv" | "writev" | "pread" | "pread64" | "pwrite" | "pwrite64"
+            | "mmap" | "ftruncate" | "fsync" | "fdatasync" | "lseek" | "fallocate"
+                if is_file =>
+            {
                 // Absent means SQL NULL; an explicit JSON null is the same.
                 let has_path = event
                     .get("path")
@@ -121,7 +146,6 @@ pub fn export_to_path(
     write_atomic_json(output, &result).map_err(|error| format!("export write failed: {error}"))
 }
 
-
 /// Rows the dsh plugin integration treats as self-noise and hides from call
 /// views: `tls.coverage` diagnostics and the censorscope-host plugin's
 /// housekeeping (`censorscopectl` runs as a subprocess under the tracked root).
@@ -166,7 +190,9 @@ fn export(
     full: bool,
     max_bytes: usize,
 ) -> Result<Value, rusqlite::Error> {
-    export_with_paging(connection, trace_id, None, None, full, false, max_bytes, None, None)
+    export_with_paging(
+        connection, trace_id, None, None, full, false, max_bytes, None, None,
+    )
 }
 
 fn export_with_paging(
@@ -287,19 +313,32 @@ fn export_with_paging_inner(
                 }))
             },
         )?;
-    let mut events = query_json(
-        connection,
+    let event_after = after_event
+        .map(|cursor| format!(" AND event_id > {cursor}"))
+        .unwrap_or_default();
+    let event_limit = page_size
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_else(|| " LIMIT -1".to_string());
+    let event_sql = format!(
         "SELECT event_id, trace_id, observed_at, process_id, kind, flags, operation,
                 path, fd, size_bytes, endpoint, direction, result, stream, protocol,
-                loss_reason, dropped, dropped_bytes, session_id
+                loss_reason, dropped, dropped_bytes, session_id, call_id, metadata,
+                collector, parent_process_id, executable, argv, argv_flags, channel, resource
          FROM events_read WHERE (?1 IS NULL OR trace_id = ?1)
            AND (?2 IS NULL OR session_id = ?2)
-         ORDER BY trace_id, observed_at, event_id",
+           AND (?3 IS NULL OR call_id = ?3){event_after}
+         ORDER BY trace_id, observed_at, event_id{event_limit}"
+    );
+    let mut events = query_json_with_call(
+        connection,
+        &event_sql,
         trace_id,
         session_id,
+        call_id,
         |row| {
             let kind: i64 = row.get(4)?;
             let operation: String = row.get(6)?;
+            let metadata = row.get::<_, String>(20)?;
             let category = observation_category(kind, &operation);
             Ok(json!({
                 "event_id": row.get::<_, u64>(0)?, "trace_id": row.get::<_, u64>(1)?,
@@ -315,21 +354,19 @@ fn export_with_paging_inner(
                 "protocol": row.get::<_, Option<String>>(14)?, "loss_reason": row.get::<_, Option<String>>(15)?,
                 "dropped": row.get::<_, Option<u64>>(16)?, "dropped_bytes": row.get::<_, Option<u64>>(17)?,
                 "session_id": row.get::<_, Option<String>>(18)?,
-                "metadata": {},
+                "call_id": row.get::<_, Option<String>>(19)?,
+                "metadata": serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({})),
+                "collector": row.get::<_, String>(21)?,
+                "parent_process_id": row.get::<_, Option<u64>>(22)?,
+                "executable": row.get::<_, Option<String>>(23)?,
+                "argv": row.get::<_, Option<String>>(24)?,
+                "argv_flags": row.get::<_, u32>(25)?,
+                "channel": row.get::<_, Option<String>>(26)?,
+                "resource": row.get::<_, Option<String>>(27)?,
             }))
         },
     )?;
-    // Index events once so the merge passes below are O(N) instead of per-row linear scans.
-    let event_by_id: std::collections::HashMap<u64, usize> = events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| {
-            event
-                .get("event_id")
-                .and_then(Value::as_u64)
-                .map(|id| (id, index))
-        })
-        .collect();
+    // Map process ids once so host-pid enrichment is linear in the page size.
     let event_by_process: std::collections::HashMap<u64, usize> = events
         .iter()
         .enumerate()
@@ -340,124 +377,47 @@ fn export_with_paging_inner(
                 .map(|id| (id, index))
         })
         .collect();
-    let call_ids = query_json(
-            connection,
-            "SELECT event_id, call_id FROM events WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2)",
-            trace_id,
-            session_id,
-            |row| {
-                Ok(
-                    json!({"event_id": row.get::<_, u64>(0)?, "call_id": row.get::<_, Option<String>>(1)?}),
-                )
-            },
-        )?;
-        for item in call_ids {
-            if let (Some(id), Some(call)) = (
-                item.get("event_id").and_then(Value::as_u64),
-                item.get("call_id"),
-            ) {
-                if let Some(index) = event_by_id.get(&id) {
-                    events[*index]["call_id"] = call.clone();
-                }
-            }
-        }
-    let metadata_rows = query_json(
-            connection,
-            "SELECT event_id, metadata FROM events WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2)",
-            trace_id,
-            session_id,
-            |row| {
-                Ok(json!({
-                    "event_id": row.get::<_, u64>(0)?,
-                    "metadata": row.get::<_, String>(1)?,
-                }))
-            },
-        )?;
-        for item in metadata_rows {
-            let Some(id) = item.get("event_id").and_then(Value::as_u64) else {
-                continue;
-            };
-            let Some(index) = event_by_id.get(&id) else {
-                continue;
-            };
-            if let Some(raw) = item.get("metadata").and_then(Value::as_str) {
-                if let Ok(value) = serde_json::from_str::<Value>(raw) {
-                    events[*index]["metadata"] = value;
-                }
-            }
-        }
-    let rows = query_json(
-            connection,
-            "SELECT event_id, collector, parent_process_id, executable, argv, argv_flags, channel, resource
-             FROM events WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2)",
-            trace_id,
-            session_id,
-            |row| {
-                Ok(json!({
-                    "event_id": row.get::<_, u64>(0)?,
-                    "collector": row.get::<_, String>(1)?,
-                    "parent_process_id": row.get::<_, Option<u64>>(2)?,
-                    "executable": row.get::<_, Option<String>>(3)?,
-                    "argv": row.get::<_, Option<String>>(4)?,
-                    "argv_flags": row.get::<_, u32>(5)?,
-                    "channel": row.get::<_, Option<String>>(6)?,
-                    "resource": row.get::<_, Option<String>>(7)?,
-                }))
-            },
-        )?;
-        for item in rows {
-            let Some(id) = item.get("event_id").and_then(Value::as_u64) else {
-                continue;
-            };
-            let Some(index) = event_by_id.get(&id) else {
-                continue;
-            };
-            for key in [
-                "collector",
-                "parent_process_id",
-                "executable",
-                "argv",
-                "argv_flags",
-                "channel",
-                "resource",
-            ] {
-                if let Some(value) = item.get(key) {
-                    events[*index][key] = value.clone();
-                }
-            }
-        }
     let process_pids = query_json(
-            connection,
-            "SELECT process_id, host_pid FROM processes",
-            None,
-            None,
-            |row| {
-                Ok(
-                    json!({"process_id": row.get::<_, u64>(0)?, "host_pid": row.get::<_, Option<u32>>(1)?}),
-                )
-            },
-        )?;
-        for item in process_pids {
-            if let (Some(id), Some(pid)) = (
-                item.get("process_id").and_then(Value::as_u64),
-                item.get("host_pid").and_then(Value::as_u64),
-            ) {
-                if let Some(index) = event_by_process.get(&id) {
-                    events[*index]["host_pid"] = json!(pid);
-                }
+        connection,
+        "SELECT process_id, host_pid FROM processes",
+        None,
+        None,
+        |row| {
+            Ok(
+                json!({"process_id": row.get::<_, u64>(0)?, "host_pid": row.get::<_, Option<u32>>(1)?}),
+            )
+        },
+    )?;
+    for item in process_pids {
+        if let (Some(id), Some(pid)) = (
+            item.get("process_id").and_then(Value::as_u64),
+            item.get("host_pid").and_then(Value::as_u64),
+        ) {
+            if let Some(index) = event_by_process.get(&id) {
+                events[*index]["host_pid"] = json!(pid);
             }
         }
+    }
     enrich_fd_paths(&mut events);
-    let mut payloads = query_json(
-        connection,
+    let payload_limit = page_size
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_else(|| " LIMIT -1".to_string());
+    let payload_bytes = if full { "bytes" } else { "NULL" };
+    let payload_sql = format!(
         "SELECT segment_id, trace_id, process_id, session_id, observed_at, source, content_state,
                 direction, stream_key, sequence, original_size, captured_size,
-                library, symbol, protocol_hint, loss_reason, bytes
+                library, symbol, protocol_hint, loss_reason, {payload_bytes}, call_id
          FROM payload_segments WHERE (?1 IS NULL OR trace_id = ?1)
            AND (?2 IS NULL OR session_id = ?2)
-         ORDER BY trace_id, sequence, segment_id",
+           AND (?3 IS NULL OR call_id = ?3)
+         ORDER BY trace_id, sequence, segment_id{payload_limit}"
+    );
+    let mut payloads = query_json_with_call(
+        connection,
+        &payload_sql,
         trace_id,
         session_id,
+        call_id,
         |row| {
             let bytes = row.get::<_, Option<Vec<u8>>>(16)?;
             Ok(json!({
@@ -471,33 +431,10 @@ fn export_with_paging_inner(
                 "protocol_hint": row.get::<_, Option<String>>(14)?,
                 "loss_reason": row.get::<_, Option<String>>(15)?,
                 "bytes_hex": full.then(|| bytes.as_deref().map(hex)).flatten(),
+                "call_id": row.get::<_, Option<String>>(17)?,
             }))
         },
     )?;
-    let ids = query_json(
-            connection,
-            "SELECT segment_id, call_id FROM payload_segments WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2)",
-            trace_id,
-            session_id,
-            |row| {
-                Ok(
-                    json!({"segment_id": row.get::<_, u64>(0)?, "call_id": row.get::<_, Option<String>>(1)?}),
-                )
-            },
-        )?;
-        for item in ids {
-            if let (Some(id), Some(call)) = (
-                item.get("segment_id").and_then(Value::as_u64),
-                item.get("call_id"),
-            ) {
-                if let Some(seg) = payloads
-                    .iter_mut()
-                    .find(|e| e.get("segment_id").and_then(Value::as_u64) == Some(id))
-                {
-                    seg["call_id"] = call.clone();
-                }
-            }
-        }
     let mut diagnostics = query_json(
         connection,
         "SELECT diagnostic_id, trace_id, observed_at, collector, kind, severity,
@@ -520,16 +457,41 @@ fn export_with_paging_inner(
             }))
         },
     )?;
-    let mut actions = Vec::new();
-    let mut statement = connection.prepare(
-        "SELECT trace_id, action_id, kind_name, title, start_time, end_time,
-                process_id, status, completeness, confidence_millis, session_id, schema_version
-         FROM semantic_actions_read
+    let mut attributes_by_action: std::collections::HashMap<(u64, String), Map<String, Value>> =
+        std::collections::HashMap::new();
+    let mut attrs_stmt = connection.prepare(
+        "SELECT trace_id, action_id, attr_key, attr_value
+         FROM semantic_action_attributes
          WHERE (?1 IS NULL OR trace_id = ?1)
-           AND (?2 IS NULL OR session_id = ?2)
-         ORDER BY trace_id, start_time, action_id",
+         ORDER BY trace_id, action_id, attr_key",
     )?;
-    let rows = statement.query_map(params![trace_id, session_id], |row| {
+    for row in attrs_stmt.query_map([trace_id], |row| {
+        Ok((
+            row.get::<_, u64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let (trace, action, key, value) = row?;
+        attributes_by_action
+            .entry((trace, action))
+            .or_default()
+            .insert(key, json!(value));
+    }
+    let mut actions = Vec::new();
+    let action_sql = format!(
+        "SELECT a.trace_id, a.action_id, a.kind_name, a.title, a.start_time, a.end_time,
+                a.process_id, a.status, a.completeness, a.confidence_millis, a.session_id, a.schema_version
+         FROM semantic_actions_read a
+         WHERE (?1 IS NULL OR a.trace_id = ?1)
+           AND (?2 IS NULL OR a.session_id = ?2)
+           AND {}
+         ORDER BY a.trace_id, a.start_time, a.action_id",
+        call_action_predicate("a")
+    );
+    let mut statement = connection.prepare(&action_sql)?;
+    let rows = statement.query_map(params![trace_id, session_id, call_id], |row| {
         let trace: u64 = row.get(0)?;
         let action_id: String = row.get(1)?;
         let mut action = Map::new();
@@ -554,17 +516,10 @@ fn export_with_paging_inner(
             json!(row.get::<_, Option<String>>(10)?),
         );
         action.insert("schema_version".into(), json!(row.get::<_, i64>(11)?));
-        let mut attrs = Map::new();
-        let mut attrs_stmt = connection.prepare(
-            "SELECT attr_key, attr_value FROM semantic_action_attributes
-                      WHERE trace_id = ?1 AND action_id = ?2 ORDER BY attr_key",
-        )?;
-        for attr in attrs_stmt.query_map(params![trace, action_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (key, value) = attr?;
-            attrs.insert(key, json!(value));
-        }
+        let attrs = attributes_by_action
+            .get(&(trace, action_id.clone()))
+            .cloned()
+            .unwrap_or_default();
         if full {
             action.insert("attributes".into(), Value::Object(attrs));
         } else {
@@ -577,16 +532,23 @@ fn export_with_paging_inner(
     }
 
     let mut links = Vec::new();
-    let mut links_stmt = connection.prepare(
-        "SELECT trace_id, source_action_id, target_action_id, role_name,
-                confidence, valid, schema_version
-         FROM semantic_action_links_read
-         WHERE (?1 IS NULL OR trace_id = ?1)
-           AND (?2 IS NULL OR source_action_id IN (SELECT action_id FROM semantic_actions_read WHERE session_id = ?2)
-                OR target_action_id IN (SELECT action_id FROM semantic_actions_read WHERE session_id = ?2))
-         ORDER BY trace_id, source_action_id, target_action_id, role",
-    )?;
-    for row in links_stmt.query_map(params![trace_id, session_id], |row| {
+    let link_sql = format!(
+        "SELECT l.trace_id, l.source_action_id, l.target_action_id, l.role_name,
+                l.confidence, l.valid, l.schema_version
+         FROM semantic_action_links_read l
+         WHERE (?1 IS NULL OR l.trace_id = ?1)
+           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = l.trace_id AND a.session_id = ?2
+                                        AND (a.action_id = l.source_action_id OR a.action_id = l.target_action_id)))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = l.trace_id
+                                        AND (a.action_id = l.source_action_id OR a.action_id = l.target_action_id)
+                                        AND {}))
+         ORDER BY l.trace_id, l.source_action_id, l.target_action_id, l.role",
+        call_action_predicate("a")
+    );
+    let mut links_stmt = connection.prepare(&link_sql)?;
+    for row in links_stmt.query_map(params![trace_id, session_id, call_id], |row| {
         Ok(json!({
             "trace_id": row.get::<_, u64>(0)?,
             "source_action_id": row.get::<_, String>(1)?,
@@ -601,14 +563,21 @@ fn export_with_paging_inner(
     }
 
     let mut evidence = Vec::new();
-    let mut evidence_stmt = connection.prepare(
-        "SELECT trace_id, action_id, evidence_kind, evidence_id, evidence_role
-         FROM semantic_action_evidence_read
-         WHERE (?1 IS NULL OR trace_id = ?1)
-           AND (?2 IS NULL OR action_id IN (SELECT action_id FROM semantic_actions_read WHERE session_id = ?2))
-         ORDER BY trace_id, action_id, evidence_kind, evidence_id, evidence_role",
-    )?;
-    for row in evidence_stmt.query_map(params![trace_id, session_id], |row| {
+    let evidence_sql = format!(
+        "SELECT e.trace_id, e.action_id, e.evidence_kind, e.evidence_id, e.evidence_role
+         FROM semantic_action_evidence_read e
+         WHERE (?1 IS NULL OR e.trace_id = ?1)
+           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = e.trace_id AND a.action_id = e.action_id
+                                        AND a.session_id = ?2))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = e.trace_id AND a.action_id = e.action_id
+                                        AND {}))
+         ORDER BY e.trace_id, e.action_id, e.evidence_kind, e.evidence_id, e.evidence_role",
+        call_action_predicate("a")
+    );
+    let mut evidence_stmt = connection.prepare(&evidence_sql)?;
+    for row in evidence_stmt.query_map(params![trace_id, session_id, call_id], |row| {
         Ok(json!({
             "trace_id": row.get::<_, u64>(0)?,
             "action_id": row.get::<_, String>(1)?,
@@ -664,19 +633,26 @@ fn export_with_paging_inner(
         .iter()
         .filter_map(|event| event.get("event_id").and_then(Value::as_u64))
         .max();
-    let contents = query_json(
+    let contents_sql = format!(
+        "SELECT c.trace_id, c.action_id, c.content_id, c.kind_name, c.state_name,
+                c.payload_reference, c.canonical_json, c.schema_version
+         FROM semantic_contents_read c
+         WHERE (?1 IS NULL OR c.trace_id = ?1)
+           AND (?2 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = c.trace_id AND a.action_id = c.action_id
+                                        AND a.session_id = ?2))
+           AND (?3 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
+                                      WHERE a.trace_id = c.trace_id AND a.action_id = c.action_id
+                                        AND {}))
+         ORDER BY c.trace_id, c.action_id, c.content_id",
+        call_action_predicate("a")
+    );
+    let contents = query_json_with_call(
         connection,
-        "SELECT trace_id, action_id, content_id, kind_name, state_name,
-                payload_reference, canonical_json, schema_version
-         FROM semantic_contents_read
-         WHERE (?1 IS NULL OR trace_id = ?1)
-           AND (?2 IS NULL OR trace_id IN (
-                SELECT trace_id FROM events_read WHERE session_id = ?2
-                UNION SELECT trace_id FROM semantic_actions_read WHERE session_id = ?2
-           ))
-         ORDER BY trace_id, action_id, content_id",
+        &contents_sql,
         trace_id,
         session_id,
+        call_id,
         |row| {
             let canonical_json = row.get::<_, Option<String>>(6)?;
             Ok(json!({
@@ -709,18 +685,18 @@ fn export_with_paging_inner(
         },
     )?;
     let call_spans = query_json(
-            connection,
-            "SELECT trace_id, session_id, call_id, host_pid, started_at, ended_at, status FROM call_spans WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2) ORDER BY trace_id, started_at, call_id",
-            trace_id,
-            session_id,
-            |row| {
-                Ok(json!({
-                    "trace_id": row.get::<_, u64>(0)?, "session_id": row.get::<_, Option<String>>(1)?,
-                    "call_id": row.get::<_, String>(2)?, "host_pid": row.get::<_, u32>(3)?,
-                    "started_at": ns(row.get::<_, i64>(4)?), "ended_at": optional_ns(row.get::<_, Option<i64>>(5)?), "status": row.get::<_, Option<String>>(6)?
-                }))
-            },
-        )?;
+        connection,
+        "SELECT trace_id, session_id, call_id, host_pid, started_at, ended_at, status FROM call_spans WHERE (?1 IS NULL OR trace_id = ?1) AND (?2 IS NULL OR session_id = ?2) ORDER BY trace_id, started_at, call_id",
+        trace_id,
+        session_id,
+        |row| {
+            Ok(json!({
+                "trace_id": row.get::<_, u64>(0)?, "session_id": row.get::<_, Option<String>>(1)?,
+                "call_id": row.get::<_, String>(2)?, "host_pid": row.get::<_, u32>(3)?,
+                "started_at": ns(row.get::<_, i64>(4)?), "ended_at": optional_ns(row.get::<_, Option<i64>>(5)?), "status": row.get::<_, Option<String>>(6)?
+            }))
+        },
+    )?;
 
     let mut output = json!({
         "schema_version": 1,
@@ -769,7 +745,6 @@ fn export_with_paging_inner(
     Ok(output)
 }
 
-
 fn query_json<F>(
     connection: &Connection,
     sql: &str,
@@ -794,6 +769,33 @@ where
             .query_map(params![trace_id, session_id], |row| map(row))?
             .collect(),
         count => Err(rusqlite::Error::InvalidParameterCount(2, count)),
+    }
+}
+
+fn query_json_with_call<F>(
+    connection: &Connection,
+    sql: &str,
+    trace_id: Option<u64>,
+    session_id: Option<&str>,
+    call_id: Option<&str>,
+    mut map: F,
+) -> Result<Vec<Value>, rusqlite::Error>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> Result<Value, rusqlite::Error>,
+{
+    let mut statement = connection.prepare(sql)?;
+    match statement.parameter_count() {
+        0 => statement.query_map([], |row| map(row))?.collect(),
+        1 => statement
+            .query_map(params![trace_id], |row| map(row))?
+            .collect(),
+        2 => statement
+            .query_map(params![trace_id, session_id], |row| map(row))?
+            .collect(),
+        3 => statement
+            .query_map(params![trace_id, session_id, call_id], |row| map(row))?
+            .collect(),
+        count => Err(rusqlite::Error::InvalidParameterCount(3, count)),
     }
 }
 

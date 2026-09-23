@@ -1,6 +1,6 @@
 # CensorScope
 
-CensorScope 是被动式主机可观测性系统（version 0.1.0）：在不修改、不要求被观测程序配合的前提下，通过 procfs、eBPF tracepoint 与运行时动态 uprobe 采集进程、文件、网络、IPC、stdio 与应用负载观测，并把观测投影为可查询事件、负载分段与语义动作，落库 SQLite 供只读消费。
+CensorScope 是被动式主机可观测性系统（version 0.1.1）：在不修改、不要求被观测程序配合的前提下，通过 procfs、eBPF tracepoint 与运行时动态 uprobe 采集进程、文件、网络、IPC、stdio 与应用负载观测，并把观测投影为可查询事件、负载分段与语义动作，落库 SQLite 供只读消费。
 
 CensorScope 不执行文件、网络或命令策略；没有 agent SDK、preload、插件运行时或主动上报协议。daemon 独占数据库，其它程序通过文档化的只读视图或导出命令读取数据。
 
@@ -49,6 +49,9 @@ sudo ./target/release/censorscoped init
 # 启动 daemon（前台调试用 run；后台用 start）
 sudo ./target/release/censorscoped start                 # 默认等级 L1
 sudo ./target/release/censorscoped start --level L3      # 指定等级（run/start/restart 可用）
+
+# 开始观测
+./target/release/censorscopectl track-add --root-pid xxxx
 
 # 状态与控制
 ./target/release/censorscopectl doctor

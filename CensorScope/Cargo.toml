@@ -22,6 +22,7 @@ members = [
     "crates/contracts/process/tree_snapshot",
 
     "crates/storage/core",
+    "crates/storage/spool",
     "crates/storage/factory",
     "crates/storage/adapters/sqlite",
 

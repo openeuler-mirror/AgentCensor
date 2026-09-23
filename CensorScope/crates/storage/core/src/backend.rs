@@ -12,6 +12,32 @@ use semantic_action_contract::{SemanticAction, SemanticActionLink, SemanticConte
 
 use crate::{BackfillJob, CallSpanRecord, StorageError};
 
+/// One ancillary row produced while ingesting an event or a payload segment.
+///
+/// Rows are queued in the order they must be applied: an action precedes the
+/// links that reference it, and a trace exists before its lifecycle moves.
+/// They are collected per item rather than written one at a time because every
+/// row carries its own commit cost once it reaches storage.
+#[derive(Clone, Debug)]
+pub enum AncillaryRow {
+    ProcessRecord(ProcessRecord),
+    Session {
+        session_id: SessionIdentity,
+        trace_id: TraceId,
+        observed_at: SystemTime,
+    },
+    TraceRecord(TraceRecord),
+    TraceLifecycle {
+        trace_id: TraceId,
+        state: TraceLifecycleState,
+    },
+    Membership(ProcessMembership),
+    SemanticAction(SemanticAction),
+    SemanticLink(SemanticActionLink),
+    SemanticContent(SemanticContent),
+    Diagnostic(CaptureDiagnostic),
+}
+
 /// Persistence boundary used by the daemon for process and trace state.
 pub trait StorageBackend {
     /// Returns an unused trace ID seed based on persisted traces.
@@ -53,6 +79,15 @@ pub trait StorageBackend {
         }
         Ok(())
     }
+    /// Commits one decoded spool batch atomically. The consumer may advance
+    /// its spool checkpoint only after this method succeeds.
+    fn apply_ingest_batch(
+        &mut self,
+        sequence: u64,
+        ancillary: Vec<AncillaryRow>,
+        events: Vec<DomainEvent>,
+        payloads: Vec<PayloadSegment>,
+    ) -> Result<(), StorageError>;
     /// Records session directory metadata observed during event ingest.
     fn upsert_session(
         &mut self,
@@ -109,10 +144,7 @@ pub trait StorageBackend {
     ) -> Result<Vec<(i64, Option<u32>, i64)>, StorageError>;
     /// Backfills `call_id` onto previously stored events, skipping rows that
     /// were attributed in the meantime (UPDATE ... WHERE call_id IS NULL).
-    fn assign_event_call_ids(
-        &mut self,
-        assignments: &[(i64, String)],
-    ) -> Result<(), StorageError>;
+    fn assign_event_call_ids(&mut self, assignments: &[(i64, String)]) -> Result<(), StorageError>;
     /// Loads the currently committed call spans of one trace in start order.
     /// The writer thread uses this as the span set when it re-runs unique-window
     /// attribution for a backfill job, so jobs need no in-memory registry
@@ -156,6 +188,45 @@ pub trait StorageBackend {
     fn upsert_semantic_content(&mut self, content: SemanticContent) -> Result<(), StorageError>;
     /// Flushes backend state needed for orderly daemon shutdown.
     fn checkpoint(&mut self) -> Result<(), StorageError>;
+    /// Applies one ordered batch of ancillary rows in a single transaction.
+    ///
+    /// A backend that can wrap the whole batch reports per-row failures and
+    /// keeps the rows that succeeded: losing one malformed row must not discard
+    /// the rest of the batch. The default applies rows one at a time.
+    fn apply_ancillary_batch(
+        &mut self,
+        rows: Vec<AncillaryRow>,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut failures = Vec::new();
+        for row in rows {
+            if let Err(error) = self.apply_ancillary_row(row) {
+                failures.push(error.to_string());
+            }
+        }
+        Ok(failures)
+    }
+    /// Applies a control-plane batch atomically.
+    fn apply_control_batch(&mut self, rows: Vec<AncillaryRow>) -> Result<(), StorageError>;
+    /// Applies one ancillary row.
+    fn apply_ancillary_row(&mut self, row: AncillaryRow) -> Result<(), StorageError> {
+        match row {
+            AncillaryRow::ProcessRecord(record) => self.upsert_process_record(record),
+            AncillaryRow::Session {
+                session_id,
+                trace_id,
+                observed_at,
+            } => self.upsert_session(&session_id, trace_id, observed_at),
+            AncillaryRow::TraceRecord(trace) => self.create_trace(trace),
+            AncillaryRow::TraceLifecycle { trace_id, state } => {
+                self.update_trace_lifecycle(trace_id, state)
+            }
+            AncillaryRow::Membership(membership) => self.upsert_membership(membership),
+            AncillaryRow::SemanticAction(action) => self.upsert_semantic_action(action),
+            AncillaryRow::SemanticLink(link) => self.upsert_semantic_link(link),
+            AncillaryRow::SemanticContent(content) => self.upsert_semantic_content(content),
+            AncillaryRow::Diagnostic(diagnostic) => self.append_diagnostic(diagnostic),
+        }
+    }
     /// Checkpoint and truncate the WAL file (needs a reader-free moment).
     fn checkpoint_truncate(&mut self) -> Result<(), StorageError>;
 }

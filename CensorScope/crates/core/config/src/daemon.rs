@@ -14,14 +14,27 @@ pub const DEFAULT_OPERATOR_CONFIG_PATH: &str = "/etc/censorscope/censorscoped.co
 pub const DEFAULT_CONTROL_PENDING_CONNECTION_MAX: u32 = 256;
 pub const DEFAULT_ACTIVE_TRACE_MAX: u32 = 128;
 /// Default commit size of the writer thread's event accumulator (rows).
-pub const DEFAULT_WRITER_BATCH_ITEMS: u32 = 512;
+///
+/// Larger batches amortize the per-commit cost over more rows, which is what
+/// keeps the writer ahead of a fast capture; the accumulator holds at most this
+/// many rows, so the value also bounds the memory a commit can hold.
+pub const DEFAULT_WRITER_BATCH_ITEMS: u32 = 2048;
 /// Default idle window (ms) before a partial writer accumulator is committed.
 pub const DEFAULT_WRITER_IDLE_TIMEOUT_MS: u64 = 8;
 /// Default cadence (seconds) of the writer thread's PASSIVE checkpoint.
 pub const DEFAULT_WRITER_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 /// Default bounded bulk-queue capacity; kept bounded so a slow writer cannot
 /// balloon daemon RAM into an OOM on no-swap hosts.
-pub const DEFAULT_WRITER_QUEUE_CAP_ITEMS: u32 = 16_384;
+pub const DEFAULT_WRITER_QUEUE_CAP_ITEMS: u32 = 65_536;
+/// Default memory budget for rows waiting on the writer, in bytes.
+///
+/// Reaching it makes the event loop wait for the writer rather than discard
+/// rows, so overload is absorbed by the kernel transport -- sized by
+/// `ebpf.event_ring_buffer_max_bytes` -- and reported as per-class transport
+/// loss instead of as whole queued batches disappearing here.
+pub const DEFAULT_WRITER_QUEUE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// Default maximum on-disk size of the collector spool.
+pub const DEFAULT_WRITER_SPOOL_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Default permissions for the daemon control socket.
 ///
 /// The daemon may run with elevated privileges while `censorscopectl` runs as
@@ -169,8 +182,6 @@ pub struct OperatorConfig {
     pub storage: StorageConfig,
     pub capture_profile: CaptureProfile,
     pub ebpf_config: EbpfCollectorConfig,
-    pub payload_max_trace_bytes: u64,
-    pub payload_max_segment_bytes: u64,
     pub startup_wait_ms: u64,
     pub shutdown_wait_ms: u64,
     pub supervision_poll_interval_ms: u64,
@@ -178,6 +189,11 @@ pub struct OperatorConfig {
     /// process; processes without the variable are non-session operations.
     pub session_env_name: String,
     pub writer: WriterConfig,
+    /// Config-file keys that are still accepted but no longer honored
+    /// (for example the removed `payload.max_trace_bytes`). Surfaced so the
+    /// daemon can warn at startup instead of silently ignoring an operator's
+    /// intent.
+    pub deprecated_keys: Vec<String>,
 }
 
 /// Persistence writer-thread tuning (censorscoped.conf `[writer]` section).
@@ -191,9 +207,19 @@ pub struct WriterConfig {
     /// Periodic PASSIVE checkpoint cadence (seconds); zero disables the
     /// periodic checkpoint (a final checkpoint still runs at shutdown).
     pub checkpoint_interval_secs: u64,
-    /// Bounded bulk-queue capacity in items; when the writer falls behind the
-    /// event loop blocks (back pressure) instead of letting the queue grow.
+    /// Bulk-queue capacity in items. A full queue makes the writer endpoint wait
+    /// for room and, if none appears, drop the incoming item and count it, so
+    /// the loss is reported through the `data.queue_overflow` stage of the loss
+    /// ledger. Zero keeps the queue unbounded.
     pub queue_cap_items: u32,
+    /// Memory budget for queued rows, in bytes; zero disables the budget.
+    ///
+    /// Under sustained overload this is what the producer waits on, so the
+    /// memory ceiling is a stated number rather than a product of the item cap
+    /// and the largest item.
+    pub queue_budget_bytes: u64,
+    /// Maximum collector spool size in bytes; zero disables the limit.
+    pub spool_max_bytes: u64,
 }
 
 impl Default for WriterConfig {
@@ -203,6 +229,8 @@ impl Default for WriterConfig {
             idle_timeout_ms: DEFAULT_WRITER_IDLE_TIMEOUT_MS,
             checkpoint_interval_secs: DEFAULT_WRITER_CHECKPOINT_INTERVAL_SECS,
             queue_cap_items: DEFAULT_WRITER_QUEUE_CAP_ITEMS,
+            queue_budget_bytes: DEFAULT_WRITER_QUEUE_BUDGET_BYTES,
+            spool_max_bytes: DEFAULT_WRITER_SPOOL_MAX_BYTES,
         }
     }
 }
@@ -214,7 +242,9 @@ struct OperatorDocument {
     storage: StorageDocument,
     profile: ProfileDocument,
     ebpf: EbpfDocument,
-    #[serde(default)]
+    /// Omitted from generated files; retained so deployed files that still
+    /// carry the deprecated `[payload]` keys keep parsing.
+    #[serde(default, skip_serializing_if = "PayloadDocument::is_empty")]
     payload: PayloadDocument,
     #[serde(default)]
     session: SessionDocument,
@@ -238,6 +268,14 @@ fn default_writer_queue_cap_items() -> u32 {
     DEFAULT_WRITER_QUEUE_CAP_ITEMS
 }
 
+fn default_writer_queue_budget_bytes() -> u64 {
+    DEFAULT_WRITER_QUEUE_BUDGET_BYTES
+}
+
+fn default_writer_spool_max_bytes() -> u64 {
+    DEFAULT_WRITER_SPOOL_MAX_BYTES
+}
+
 impl Default for WriterDocument {
     fn default() -> Self {
         Self {
@@ -245,6 +283,8 @@ impl Default for WriterDocument {
             idle_timeout_ms: default_writer_idle_timeout_ms(),
             checkpoint_interval_secs: default_writer_checkpoint_interval_secs(),
             queue_cap_items: default_writer_queue_cap_items(),
+            queue_budget_bytes: default_writer_queue_budget_bytes(),
+            spool_max_bytes: default_writer_spool_max_bytes(),
         }
     }
 }
@@ -260,32 +300,49 @@ struct WriterDocument {
     checkpoint_interval_secs: u64,
     #[serde(default = "default_writer_queue_cap_items")]
     queue_cap_items: u32,
+    #[serde(default = "default_writer_queue_budget_bytes")]
+    queue_budget_bytes: u64,
+    #[serde(default = "default_writer_spool_max_bytes")]
+    spool_max_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The `[payload]` section.
+///
+/// Both historical keys are **deprecated and no longer honored**: captured
+/// plaintext is retained in full and no per-trace or per-segment budget is
+/// enforced any more. The keys are still *accepted* so existing operator files
+/// keep loading (the section is `deny_unknown_fields`, so dropping the fields
+/// outright would make every deployed config fail validation), and they are
+/// deliberately `skip_serializing` so a freshly generated config never
+/// contains them again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PayloadDocument {
-    /// Maximum retained bytes per trace. Zero means unlimited.
-    #[serde(default = "default_payload_max_trace_bytes")]
-    max_trace_bytes: u64,
-    #[serde(default = "default_payload_max_segment_bytes")]
-    max_segment_bytes: u64,
+    /// Deprecated: ignored. Formerly the per-trace retained-payload budget.
+    #[serde(default, rename = "max_trace_bytes", skip_serializing)]
+    _deprecated_max_trace_bytes: Option<u64>,
+    /// Deprecated: ignored. Formerly the per-segment payload cap.
+    #[serde(default, rename = "max_segment_bytes", skip_serializing)]
+    _deprecated_max_segment_bytes: Option<u64>,
 }
 
-fn default_payload_max_trace_bytes() -> u64 {
-    64 * 1024 * 1024
-}
+impl PayloadDocument {
+    /// Whether the document holds no serializable content, so `dump()` can omit
+    /// the whole section for newly generated files.
+    fn is_empty(&self) -> bool {
+        self._deprecated_max_trace_bytes.is_none() && self._deprecated_max_segment_bytes.is_none()
+    }
 
-fn default_payload_max_segment_bytes() -> u64 {
-    1024 * 1024
-}
-
-impl Default for PayloadDocument {
-    fn default() -> Self {
-        Self {
-            max_trace_bytes: default_payload_max_trace_bytes(),
-            max_segment_bytes: default_payload_max_segment_bytes(),
+    /// Keys an operator supplied that are accepted but no longer honored.
+    fn deprecated_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self._deprecated_max_trace_bytes.is_some() {
+            keys.push("payload.max_trace_bytes".to_string());
         }
+        if self._deprecated_max_segment_bytes.is_some() {
+            keys.push("payload.max_segment_bytes".to_string());
+        }
+        keys
     }
 }
 
@@ -384,7 +441,10 @@ impl Default for OperatorDocument {
                 // main process plus every worker/tool process tree.
                 tracked_process_max_entries: 262_144,
                 pending_operation_max_entries: 262_144,
-                event_ring_buffer_max_bytes: 64 * 1024 * 1024,
+                // Sized for plaintext capture: one TLS record is ~4 KiB, so the
+                // buffer holds only about 15k of them at 64 MiB, which a fast
+                // target can produce within a second.
+                event_ring_buffer_max_bytes: 256 * 1024 * 1024,
                 tls_dynamic_loading: false,
                 tls_scan_debounce: default_tls_scan_debounce(),
                 tls_scan_interval_ms: default_tls_scan_interval_ms(),
@@ -471,9 +531,6 @@ impl OperatorConfig {
         if document.ebpf.tls_scan_interval_ms == 0 {
             return Err("ebpf.tls_scan_interval_ms must be greater than zero".to_string());
         }
-        if document.payload.max_segment_bytes == 0 {
-            return Err("payload.max_segment_bytes must be greater than zero".to_string());
-        }
         if document.writer.batch_items == 0 {
             return Err("writer.batch_items must be greater than zero".to_string());
         }
@@ -514,8 +571,6 @@ impl OperatorConfig {
                 tls_scan_debounce,
                 tls_scan_interval_ms: document.ebpf.tls_scan_interval_ms,
             },
-            payload_max_trace_bytes: document.payload.max_trace_bytes,
-            payload_max_segment_bytes: document.payload.max_segment_bytes,
             startup_wait_ms: document.daemon.startup_wait_ms,
             shutdown_wait_ms: document.daemon.shutdown_wait_ms,
             supervision_poll_interval_ms: document.daemon.supervision_poll_interval_ms,
@@ -525,7 +580,10 @@ impl OperatorConfig {
                 idle_timeout_ms: document.writer.idle_timeout_ms,
                 checkpoint_interval_secs: document.writer.checkpoint_interval_secs,
                 queue_cap_items: document.writer.queue_cap_items,
+                queue_budget_bytes: document.writer.queue_budget_bytes,
+                spool_max_bytes: document.writer.spool_max_bytes,
             },
+            deprecated_keys: document.payload.deprecated_keys(),
         })
     }
 
@@ -563,15 +621,16 @@ impl OperatorConfig {
             session: SessionDocument {
                 env_name: self.session_env_name.clone(),
             },
-            payload: PayloadDocument {
-                max_trace_bytes: self.payload_max_trace_bytes,
-                max_segment_bytes: self.payload_max_segment_bytes,
-            },
+            // Generated files never carry the removed payload keys; the field
+            // stays only so deployed files that still contain them keep parsing.
+            payload: PayloadDocument::default(),
             writer: WriterDocument {
                 batch_items: self.writer.batch_items,
                 idle_timeout_ms: self.writer.idle_timeout_ms,
                 checkpoint_interval_secs: self.writer.checkpoint_interval_secs,
                 queue_cap_items: self.writer.queue_cap_items,
+                queue_budget_bytes: self.writer.queue_budget_bytes,
+                spool_max_bytes: self.writer.spool_max_bytes,
             },
         }
     }
@@ -617,25 +676,45 @@ mod tests {
     }
 
     #[test]
-    fn payload_limits_round_trip_and_patch() {
+    fn generated_config_omits_the_removed_payload_limits() {
         let config = OperatorConfig::init().unwrap();
-        assert_eq!(config.payload_max_trace_bytes, 64 * 1024 * 1024);
-        let patched = config
-            .patch("[payload]\nmax_trace_bytes = 12345\nmax_segment_bytes = 678\n")
-            .unwrap();
-        assert_eq!(patched.payload_max_trace_bytes, 12345);
-        assert_eq!(patched.payload_max_segment_bytes, 678);
-        let dumped = patched.dump().unwrap();
-        assert!(dumped.contains("max_trace_bytes = 12345"));
+        assert!(config.deprecated_keys.is_empty());
+        let dumped = config.dump().unwrap();
+        assert!(!dumped.contains("max_trace_bytes"), "dump: {dumped}");
+        assert!(!dumped.contains("max_segment_bytes"), "dump: {dumped}");
+        assert!(!dumped.contains("[payload]"), "dump: {dumped}");
     }
 
     #[test]
-    fn zero_trace_limit_is_explicit_unlimited_mode() {
+    fn deprecated_payload_limits_still_load_but_are_not_honored() {
+        // A deployed file that predates the removal must keep loading: the keys
+        // are accepted, reported as deprecated, and never written back.
+        let config = OperatorConfig::init()
+            .unwrap()
+            .patch("[payload]\nmax_trace_bytes = 12345\nmax_segment_bytes = 678\n")
+            .unwrap();
+        assert_eq!(
+            config.deprecated_keys,
+            vec![
+                "payload.max_trace_bytes".to_string(),
+                "payload.max_segment_bytes".to_string()
+            ]
+        );
+        let dumped = config.dump().unwrap();
+        assert!(!dumped.contains("max_trace_bytes"), "dump: {dumped}");
+        assert!(!dumped.contains("max_segment_bytes"), "dump: {dumped}");
+    }
+
+    #[test]
+    fn zero_trace_limit_is_accepted_as_a_deprecated_key() {
         let config = OperatorConfig::init()
             .unwrap()
             .patch("[payload]\nmax_trace_bytes = 0\n")
             .unwrap();
-        assert_eq!(config.payload_max_trace_bytes, 0);
+        assert_eq!(
+            config.deprecated_keys,
+            vec!["payload.max_trace_bytes".to_string()]
+        );
     }
 
     #[test]
@@ -662,10 +741,7 @@ mod tests {
     #[test]
     fn writer_tuning_round_trips_and_validates() {
         let config = OperatorConfig::init().unwrap();
-        assert_eq!(
-            config.writer.batch_items,
-            super::DEFAULT_WRITER_BATCH_ITEMS
-        );
+        assert_eq!(config.writer.batch_items, super::DEFAULT_WRITER_BATCH_ITEMS);
         assert_eq!(
             config.writer.idle_timeout_ms,
             super::DEFAULT_WRITER_IDLE_TIMEOUT_MS

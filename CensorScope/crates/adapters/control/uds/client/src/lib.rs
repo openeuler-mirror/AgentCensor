@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use control_contract::command::ControlCommand;
 use control_contract::reply::{ControlError, ControlReply};
@@ -19,6 +20,8 @@ pub trait RoundTripTransport {
 pub struct UdsSocketTransport {
     socket_path: PathBuf,
 }
+
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl UdsSocketTransport {
     /// Creates a transport that opens a fresh connection for each request.
@@ -37,6 +40,10 @@ impl RoundTripTransport for UdsSocketTransport {
     fn send(&mut self, request: Vec<u8>) -> Result<Vec<u8>, String> {
         let mut stream =
             UnixStream::connect(&self.socket_path).map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+            .and_then(|_| stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT)))
+            .map_err(|error| error.to_string())?;
         stream
             .write_all(&request)
             .and_then(|_| stream.shutdown(Shutdown::Write))

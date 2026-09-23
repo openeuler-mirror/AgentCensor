@@ -207,12 +207,7 @@ impl FdLineage {
 
     /// Channel id of a pipe/Unix-socket endpoint; the daemon recognizes
     /// orchestration channels (created by the trace root) across fork/dup.
-    pub fn channel_of(
-        &self,
-        trace_id: TraceId,
-        process: ProcessIdentity,
-        fd: i32,
-    ) -> Option<u64> {
+    pub fn channel_of(&self, trace_id: TraceId, process: ProcessIdentity, fd: i32) -> Option<u64> {
         self.get(FdKey {
             trace_id,
             process,
@@ -222,12 +217,7 @@ impl FdLineage {
     }
 
     /// Whether one fd is tracked as a pipe or Unix-socket endpoint.
-    pub fn is_channel_fd(
-        &self,
-        trace_id: TraceId,
-        process: ProcessIdentity,
-        fd: i32,
-    ) -> bool {
+    pub fn is_channel_fd(&self, trace_id: TraceId, process: ProcessIdentity, fd: i32) -> bool {
         matches!(
             self.get(FdKey {
                 trace_id,
