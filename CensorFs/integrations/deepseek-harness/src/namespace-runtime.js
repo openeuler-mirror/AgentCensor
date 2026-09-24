@@ -491,7 +491,8 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
     // 重启残留 reconcile（幂等）：上一进程启动的 run，其 worker 已随进程死亡，
     // 但 terminal 事件没落盘 —— 卡片/树图会永远定格 running。这里在读取时补写。
     const reconciledNodes = reconcileInterruptedSubagents(agent.session)
-    let state = foldExploration(agent.session.events, runId)
+    // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+    let state = foldExploration(agent.session.snapshotEvents(), runId)
     if (state === undefined) throw new Error(`exploration ${runId} does not belong to this session`)
     let reconciledVariants = 0
     if ((state.startedAt ?? 0) < PROCESS_STARTED_AT) {
@@ -506,7 +507,7 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
         })
       }
       reconciledVariants = staleVariants.length
-      if (reconciledVariants > 0) state = foldExploration(agent.session.events, runId)
+      if (reconciledVariants > 0) state = foldExploration(agent.session.snapshotEvents(), runId)
     }
     // 补写的事件要落盘（fire-and-forget），否则下次重启后磁盘上仍是旧状态。
     if (reconciledNodes + reconciledVariants > 0) this.ctx.sessions.flush(agent.session).catch(() => {})

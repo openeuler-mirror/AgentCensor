@@ -20,11 +20,15 @@ export const name = 'censorfs-parallel-worlds'
 export const inject = ['tools', 'commands', 'subagents', 'sessions']
 
 // 插件写入会话日志的自定义事件类型（见 src/events.js）。
-// harness 的持久化读取器拒绝包含未知事件类型的日志（SessionFormatUnsupportedError），
-// 官方为插件事件预留的注册接口尚未提供（known-event-types.js: "a registration
-// surface for them is deferred"）。本插件经 profile node_modules 链接到 harness
-// 全局安装内的同一份 dsh-session 模块（Node 按真实路径解析，模块实例共享），
-// 因此在 apply() 时向 KNOWN_SESSION_EVENT_TYPES 注册即可让读取器放行。
+// dsh 0.1.5-rc.2：持久化读取器的放行条件是
+// `KNOWN_SESSION_EVENT_TYPES.has(type) || event.ignorable === true`
+// （session-persistence/src/storage-contract.ts），而官方的 ignorable 信封
+// 只能由 Session.append 内部产生、没有公开的插件写入口，事件名注册机制也
+// 已被官方否决（known-event-types.ts 头注）。运行时 Set 未冻结，本插件经
+// profile node_modules 链接到 harness 安装内的同一份 dsh-session 模块
+// （Node 按真实路径解析，模块实例共享），因此在 apply() 时向
+// KNOWN_SESSION_EVENT_TYPES 注册即可同时通过写入与读取校验。
+// 迁移方向：待官方提供 ignorable 事件写入口后改走信封标记。
 const PLUGIN_EVENT_TYPES = [
   'exploration-started',
   'variant-running',
@@ -204,8 +208,9 @@ function registerCommands(ctx, runtime, config) {
         && report.fuse === true
       return {
         kind: healthy ? 'success' : 'error',
+        // dsh 0.1.5-rc.2 的 CommandResult 只有 {kind, text}；机器可读的
+        // exitCode 保留在 --json 的文本负载里。
         text: json ? JSON.stringify({ ...report, healthy, exitCode: healthy ? 0 : 1 }) : formatDoctor(report),
-        exitCode: healthy ? 0 : 1,
       }
     },
   })
@@ -219,7 +224,8 @@ function registerCommands(ctx, runtime, config) {
       const sessionId = invocation.agent.session.id
       const root = runtime.resolveRootSession(sessionId) ?? ctx.sessions.get(sessionId)
       if (root === undefined) return { kind: 'error', text: 'no root session found' }
-      const events = root.events.filter((e) => typeof e.type === 'string' && e.type.startsWith('subagent-'))
+      // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+      const events = root.snapshotEvents().filter((e) => typeof e.type === 'string' && e.type.startsWith('subagent-'))
       if (events.length === 0) return { kind: 'success', text: 'no subagent-* events in root session ' + root.id }
       const lines = ['root session: ' + root.id, 'events: ' + events.length, '---']
       for (const event of events.slice(-120)) {
@@ -257,7 +263,8 @@ function registerCommands(ctx, runtime, config) {
       const sessionId = invocation.agent.session.id
       const root = runtime.resolveRootSession(sessionId) ?? ctx.sessions.get(sessionId)
       if (root === undefined) return { kind: 'error', text: 'no root session found' }
-      const events = root.events.filter((e) => typeof e.type === 'string' && e.type.startsWith('subagent-'))
+      // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+      const events = root.snapshotEvents().filter((e) => typeof e.type === 'string' && e.type.startsWith('subagent-'))
       const nodes = new Map()
       for (const event of events) {
         const d = event.data ?? {}
@@ -460,7 +467,8 @@ function registerCommands(ctx, runtime, config) {
         }
         if (args.length === 0) {
           // 列出所有探索 + 全局子代理
-          const events = invocation.agent.session.events
+          // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+          const events = invocation.agent.session.snapshotEvents()
           const runIds = new Set()
           for (const event of events) {
             if (event?.type === 'exploration-started') runIds.add(event.data.runId)

@@ -35,7 +35,7 @@
 
         # === 验证 profile（在 Candidate 只读 View 里跑；每项独立 View）===
         # 未显式传 validationProfile 时使用的默认 profile；不设则跳过验证。
-        # defaultValidationProfile: !!js 'process.env.CENSORFS_DEFAULT_VALIDATION ?? undefined'
+        defaultValidationProfile: !!js 'process.env.CENSORFS_DEFAULT_VALIDATION ?? undefined'
         validationProfiles:
           code:
             - name: tests
