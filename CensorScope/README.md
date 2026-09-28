@@ -111,7 +111,7 @@ node --check plugins/*/lib/*.mjs plugins/censorscope-ui/lib/client.js   # 插件
 
 ## 致谢
 
-本项目 fork 自 [openEuler/AcTrail](https://gitee.com/openeuler/AcTrail)。感谢 AcTrail 团队和原始贡献者所做的出色工作。
+本项目 fork 自 [openEuler/AcTrail](https://gitcode.com/openeuler/AcTrail)。感谢 AcTrail 团队和原始贡献者所做的出色工作。
 
 
 ## 许可
