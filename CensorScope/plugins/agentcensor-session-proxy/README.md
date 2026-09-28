@@ -13,7 +13,7 @@ worker 是完整的 dsh 进程、跑正常的原生 agent 流程,宿主只做 UI
 
 ## 要求
 
-- dsh **0.1.5-rc.1**(`dsh --version`),Node 22。
+- dsh **0.1.5-rc.2**(`dsh --version`),Node 22。
 
 ## 安装与启动
 
