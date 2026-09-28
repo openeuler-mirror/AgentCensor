@@ -2,10 +2,10 @@
 
 AgentCensor 是面向 Agent 工作负载的主机级隔离、强制与观测系统。它把一次包含多个工具调用的 Agent 任务交给 **CensorPivot** 编排，在同一批次内同时提供：
 
-- **隔离且可回滚的文件工作区**：由 [CensorFS](CensorFs/README.md) 提供私有 View、版本化提交和崩溃恢复；
-- **内核级安全边界**：由 [CensorGuard](CensorGuard/README.md) 通过 eBPF LSM 对整棵进程树执行 file、exec、network 策略；
-- **被动式运行观测**：由 [CensorScope](CensorScope/README.md) 采集进程、文件、网络、IPC 和工具调用归因数据；
-- **统一入口与事务决策**：由 [CensorPivot](CensorPivot/README.md) 负责批次协议、生命周期、幂等、Commit/Abort 决策和故障恢复。
+- **隔离且可回滚的文件工作区**：由 [CensorFS](../../../CensorFs/README.md) 提供私有 View、版本化提交和崩溃恢复；
+- **内核级安全边界**：由 [CensorGuard](../../../CensorGuard/README.md) 通过 eBPF LSM 对整棵进程树执行 file、exec、network 策略；
+- **被动式运行观测**：由 [CensorScope](../../../CensorScope/README.md) 采集进程、文件、网络、IPC 和工具调用归因数据；
+- **统一入口与事务决策**：由 [CensorPivot](../../../CensorPivot/README.md) 负责批次协议、生命周期、幂等、Commit/Abort 决策和故障恢复。
 
 > **让 Agent 在隔离工作区中探索，让安全策略在内核中生效，让每次变更和调用都可以追溯。**
 
@@ -28,12 +28,12 @@ Agent Runtime
 
 | 组件 | 主要职责 | 文档 |
 | --- | --- | --- |
-| **CensorPivot** | 统一接入层和批次事务编排；把多个工具调用收束为一个可恢复的提交或放弃决定 | [组件 README](CensorPivot/README.md) · [安装与使用](CensorPivot/docs/INSTALL.zh-CN.md) · [完整运行流程](CensorPivot/docs/flow.md) · [设计与状态机](CensorPivot/docs/DESIGN.zh-CN.md) |
-| **CensorFS** | 分支式、可回滚、可恢复的文件系统；为每个批次提供隔离的 `/workspace` | [组件 README](CensorFs/README.md) · [架构](CensorFs/docs/ARCHITECTURE.md) · [CLI 指南](CensorFs/docs/CensorFS_CLI_GUIDE.md) |
-| **CensorGuard** | eBPF LSM 进程级安全强制；策略覆盖文件、执行和网络，并沿进程树继承 | [组件 README](CensorGuard/README.md) · [使用手册](CensorGuard/docs/使用手册.md) · [构建指南](CensorGuard/docs/构建指南.md) · [DSH 插件指南](CensorGuard/docs/DSH插件指南.md) |
-| **CensorScope** | 无需被观测程序链接 SDK 的被动式主机观测和只读导出 | [组件 README](CensorScope/README.md) · [插件说明](CensorScope/plugins/README.md) |
+| **CensorPivot** | 统一接入层和批次事务编排；把多个工具调用收束为一个可恢复的提交或放弃决定 | [组件 README](../../../CensorPivot/README.md) · [安装与使用](../../../CensorPivot/docs/INSTALL.zh-CN.md) · [完整运行流程](../../../CensorPivot/docs/flow.md) · [设计与状态机](../../../CensorPivot/docs/DESIGN.zh-CN.md) |
+| **CensorFS** | 分支式、可回滚、可恢复的文件系统；为每个批次提供隔离的 `/workspace` | [组件 README](../../../CensorFs/README.md) · [架构](../../../CensorFs/docs/ARCHITECTURE.md) · [CLI 指南](../../../CensorFs/docs/CensorFS_CLI_GUIDE.md) |
+| **CensorGuard** | eBPF LSM 进程级安全强制；策略覆盖文件、执行和网络，并沿进程树继承 | [组件 README](../../../CensorGuard/README.md) · [使用手册](../../../CensorGuard/docs/使用手册.md) · [构建指南](../../../CensorGuard/docs/构建指南.md) · [DSH 插件指南](../../../CensorGuard/docs/DSH插件指南.md) |
+| **CensorScope** | 无需被观测程序链接 SDK 的被动式主机观测和只读导出 | [组件 README](../../../CensorScope/README.md) · [插件说明](../../../CensorScope/plugins/README.md) |
 
-组件接口和 Pivot 责任边界的逐项核对见 [组件功能与接口说明](CensorPivot/docs/COMPONENTS.zh-CN.md)。
+组件接口和 Pivot 责任边界的逐项核对见 [组件功能与接口说明](../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
 
 ## CensorPivot 如何编排一次批次
 
@@ -64,7 +64,7 @@ BatchRequest
 
 ### 环境要求
 
-完整部署需要 Linux、systemd、cgroup v2、FUSE、BTF，以及启用 BPF LSM 的内核。构建 CensorGuard 和 CensorScope 还需要 Rust、clang、libbpf 头文件等工具。CensorFS 的持久化目录应位于本地 ext4 或 XFS；完整检查项见 [CensorPivot 安装文档](CensorPivot/docs/INSTALL.zh-CN.md)。
+完整部署需要 Linux、systemd、cgroup v2、FUSE、BTF，以及启用 BPF LSM 的内核。构建 CensorGuard 和 CensorScope 还需要 Rust、clang、libbpf 头文件等工具。CensorFS 的持久化目录应位于本地 ext4 或 XFS；完整检查项见 [CensorPivot 安装文档](../../../CensorPivot/docs/INSTALL.zh-CN.md)。
 
 ### 一键安装原生组件
 
@@ -110,7 +110,7 @@ cd ../CensorScope && cargo build --release -p daemon -p ctl
 cd ../CensorPivot && cargo build --release && cargo test
 ```
 
-单独构建只生成当前组件的产物，不会创建系统用户、安装 daemon 或准备内核环境。生产部署应使用上面的统一安装器和 [安装文档](CensorPivot/docs/INSTALL.zh-CN.md)。
+单独构建只生成当前组件的产物，不会创建系统用户、安装 daemon 或准备内核环境。生产部署应使用上面的统一安装器和 [安装文档](../../../CensorPivot/docs/INSTALL.zh-CN.md)。
 
 ## 运行 CensorPivot
 
@@ -138,7 +138,7 @@ cd /path/to/deepseek-harness
 pnpm web
 ```
 
-组合插件会将 CensorFS、CensorGuard、CensorScope 接入 DSH 的 `web` 和 `headless` profile。完整环境变量、源码目录识别、打包和排障说明见 [CensorPivot 安装文档](CensorPivot/docs/INSTALL.zh-CN.md) 和 [DSH 集成说明](CensorFs/integrations/deepseek-harness/README.md)。
+组合插件会将 CensorFS、CensorGuard、CensorScope 接入 DSH 的 `web` 和 `headless` profile。完整环境变量、源码目录识别、打包和排障说明见 [CensorPivot 安装文档](../../../CensorPivot/docs/INSTALL.zh-CN.md) 和 [DSH 集成说明](../../../CensorFs/integrations/deepseek-harness/README.md)。
 
 ### 原生 CLI 与 Demo
 
@@ -153,9 +153,9 @@ censorpivot doctor
 
 提交协议中的工具必须使用绝对路径，工作目录只能是 `/workspace` 下的相对路径。示例批次见：
 
-- [原子代码变更示例](CensorPivot/examples/atomic-code-change.json)
-- [批次请求示例](CensorPivot/examples/batch.json)
-- [运行 Demo](CensorPivot/scripts/run-atomic-code-change-demo.sh)
+- [原子代码变更示例](../../../CensorPivot/examples/atomic-code-change.json)
+- [批次请求示例](../../../CensorPivot/examples/batch.json)
+- [运行 Demo](../../../CensorPivot/scripts/run-atomic-code-change-demo.sh)
 
 在三个组件和 Pivot daemon 均已启动、`censorpivot doctor` 返回 ready 后，可以运行完整 Demo：
 
@@ -172,9 +172,9 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 - CensorGuard 默认 fail-closed；CensorScope 是观测组件，不能替代 Guard 的安全结论。
 - CensorPivot 的原子性覆盖 CensorFS 文件修改和自身 Commit/Abort 决策，不覆盖网络请求、外部数据库、消息发送等带外副作用。
 - CensorFS 当前明确不支持 symlink、hardlink、xattr、ACL、设备节点、FIFO、socket、chown、共享可写 mmap、在线 GC 和跨分支原子提交。
-- 组件 daemon 和控制面依赖 Unix socket、合适的 UID/GID、`/dev/fuse`、cgroup v2、BTF 与 BPF LSM；缺少这些条件时应先看 `doctor` 输出和 [部署文档](CensorPivot/docs/INSTALL.zh-CN.md)。
+- 组件 daemon 和控制面依赖 Unix socket、合适的 UID/GID、`/dev/fuse`、cgroup v2、BTF 与 BPF LSM；缺少这些条件时应先看 `doctor` 输出和 [部署文档](../../../CensorPivot/docs/INSTALL.zh-CN.md)。
 
-更完整的崩溃矩阵、信任边界和接口约束见 [CensorPivot 设计文档](CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](CensorPivot/docs/flow.md) 和 [代码审查记录](CensorPivot/docs/REVIEW.zh-CN.md)。
+更完整的崩溃矩阵、信任边界和接口约束见 [CensorPivot 设计文档](../../../CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](../../../CensorPivot/docs/flow.md) 和 [代码审查记录](../../../CensorPivot/docs/REVIEW.zh-CN.md)。
 
 ## 开发与测试
 
@@ -193,15 +193,15 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 
 各组件保留自己的许可证声明：
 
-- [CensorFS Cargo.toml](CensorFs/Cargo.toml)：Apache-2.0；
-- [CensorGuard LICENSE](CensorGuard/LICENSE)：GPL-2.0-only；
-- [CensorScope LICENSE](CensorScope/LICENSE)：MulanPSL-2.0；
-- [CensorPivot Cargo.toml](CensorPivot/Cargo.toml)：Apache-2.0。
+- [CensorFS Cargo.toml](../../../CensorFs/Cargo.toml)：Apache-2.0；
+- [CensorGuard LICENSE](../../../CensorGuard/LICENSE)：GPL-2.0-only；
+- [CensorScope LICENSE](../../../CensorScope/LICENSE)：MulanPSL-2.0；
+- [CensorPivot Cargo.toml](../../../CensorPivot/Cargo.toml)：Apache-2.0。
 
 使用、分发或组合部署时，请同时遵守对应组件及其依赖的许可证要求。
 
 ## 致谢
 
-感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](CensorPivot/docs/flow.md) 与 [组件接口说明](CensorPivot/docs/COMPONENTS.zh-CN.md)。
+感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](../../../CensorPivot/docs/flow.md) 与 [组件接口说明](../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
 
 同时感谢 Rust、Linux、eBPF、FUSE、systemd、SQLite 以及 DeepSeek Harness 社区提供的基础设施和工具。
