@@ -67,7 +67,8 @@
  * (session-persistence/storage/attachments) into the per-worker private dir.
  *
  * Host-side env:
- *   AGENTCENSOR_DSH_BIN   dsh executable (default 'dsh')
+ *   AGENTCENSOR_DSH_BIN   dsh executable (default: auto-detect source tree, then 'dsh')
+ *   DSH_ROOT              optional DeepSeek Harness source root for worker launch
  *   AGENTCENSOR_KEEP      '1' keeps per-worker private dirs for inspection
  */
 import { spawn } from 'node:child_process'
@@ -78,7 +79,7 @@ import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
-import { turnBoundaryProjectionDefinition } from '@deepseek-ai/dsh-agent-loop'
+import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
@@ -165,6 +166,29 @@ function shutdownAllWorkers(exitCode) {
 
 function bundleDir() {
   return dirname(fileURLToPath(import.meta.url))
+}
+
+/** Resolve a worker launcher for installed dsh or a Harness source checkout. */
+async function resolveDshWorkerLauncher() {
+  if (process.env.AGENTCENSOR_DSH_BIN) {
+    return { command: process.env.AGENTCENSOR_DSH_BIN, prefixArgs: [], label: process.env.AGENTCENSOR_DSH_BIN }
+  }
+  const candidates = [...new Set([process.env.DSH_ROOT, process.cwd()].filter(Boolean))]
+  for (const candidate of candidates) {
+    try {
+      const pkg = JSON.parse(await fsp.readFile(join(candidate, 'package.json'), 'utf8'))
+      if (pkg.scripts?.dsh) {
+        return {
+          command: 'pnpm',
+          prefixArgs: ['--dir', candidate, 'dsh'],
+          label: `pnpm --dir ${candidate} dsh`,
+        }
+      }
+    } catch {
+      // Continue to the installed command fallback.
+    }
+  }
+  return { command: 'dsh', prefixArgs: [], label: 'dsh' }
 }
 
 /**
@@ -445,7 +469,11 @@ class WebDriverAgent {
     process.stdout.write(
       `[agentcensor] worker spawn mode=${resume ? 'resume' : 'create'} session=${this.id} pid=PENDING\n`,
     )
-    const child = spawn(dshBin, ['--profile', 'headless', '--patch', overlayPath], {
+    process.stdout.write(`[agentcensor] worker launcher=${dshLauncher.label}\n`)
+    const child = spawn(dshLauncher.command, [
+      ...dshLauncher.prefixArgs,
+      '--profile', 'headless', '--patch', overlayPath,
+    ], {
       cwd,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -857,12 +885,18 @@ export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
   interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
-  // control stream (row is disabled by overlay).
-  try {
-    ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
-    process.stdout.write('[agentcensor] turnBoundary projection registered\n')
-  } catch (error) {
-    process.stdout.write(`[agentcensor] projection register: ${String(error)}\n`)
+  // control stream (row is disabled by overlay). dsh 0.1.1 does not export
+  // this optional definition, so keep the worker bridge usable without it.
+  const turnBoundaryProjectionDefinition = agentLoopModule.turnBoundaryProjectionDefinition
+  if (turnBoundaryProjectionDefinition === undefined) {
+    process.stdout.write('[agentcensor] turnBoundary projection unavailable; compatibility mode\n')
+  } else {
+    try {
+      ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
+      process.stdout.write('[agentcensor] turnBoundary projection registered\n')
+    } catch (error) {
+      process.stdout.write(`[agentcensor] projection register: ${String(error)}\n`)
+    }
   }
 
   // Host-exit cleanup so no resident worker is orphaned. Node does not emit
