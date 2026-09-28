@@ -31,6 +31,7 @@ pub struct CaptureDiagnostic {
     pub kind: DiagnosticKind,
     pub severity: DiagnosticSeverity,
     pub message: String,
+    pub dedupe_key: Option<String>,
     pub dropped: u64,
     pub dropped_bytes: u64,
 }
@@ -51,6 +52,7 @@ impl CaptureDiagnostic {
             kind: DiagnosticKind::BufferLoss,
             severity: DiagnosticSeverity::Warning,
             message: message.into(),
+            dedupe_key: None,
             dropped,
             dropped_bytes,
         }

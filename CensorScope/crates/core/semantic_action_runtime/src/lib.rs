@@ -1,8 +1,10 @@
 //! Built-in, observation-only SemanticAction projection.
 
+mod exchange;
 mod http;
 mod llm;
 mod mcp;
+mod provider;
 mod sse;
 
 use std::collections::BTreeMap;
@@ -20,9 +22,23 @@ pub struct ProjectionBatch {
     pub links: Vec<SemanticActionLink>,
 }
 
-pub use http::project_http1_payload;
+pub use exchange::{
+    LlmExchangeOutput, LlmExchangeRuntime, project_llm_http_message,
+    project_llm_http_message_with_decoder_diagnostics, project_llm_http_message_with_diagnostics,
+    project_llm_http2_messages_with_diagnostics,
+};
+pub use http::{
+    HpackDecoder, Http1Message, Http2AssemblerOutput, Http2ConnectionAssembler, Http2Message,
+    WebSocketMessage, extract_http1_message, extract_http2_message, extract_http2_messages,
+    extract_http2_messages_with_decoder, extract_websocket_message, project_http1_payload,
+    project_http2_message,
+};
 pub use llm::project_llm_payload;
 pub use mcp::project_mcp_payload;
+pub use provider::{
+    ProviderCandidate, ProviderCodec, ProviderProjection, ProviderRegistry,
+    builtin_provider_registry, project_provider_message_with_registry,
+};
 pub use sse::project_sse_payload;
 
 /// Project one normalized event into stable semantic actions and links.
