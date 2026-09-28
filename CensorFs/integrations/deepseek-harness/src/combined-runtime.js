@@ -45,7 +45,8 @@ export class CombinedBranchExploreRuntime {
 
   /** The recorded exploration mode of `runId`, or `undefined` when unknown. */
   #runMode(agent, runId) {
-    const started = agent.session.events.find((event) => event.type === 'exploration-started' && event.data?.runId === runId)
+    // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+    const started = agent.session.snapshotEvents().find((event) => event.type === 'exploration-started' && event.data?.runId === runId)
     return started?.data?.mode
   }
 
