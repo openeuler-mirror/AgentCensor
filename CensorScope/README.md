@@ -109,6 +109,11 @@ cargo test --workspace --lib --bins
 node --check plugins/*/lib/*.mjs plugins/censorscope-ui/lib/client.js   # 插件语法
 ```
 
+## 致谢
+
+本项目 fork 自 [openEuler/AcTrail](https://gitee.com/openeuler/AcTrail)。感谢 AcTrail 团队和原始贡献者所做的出色工作。
+
+
 ## 许可
 
 Mulan Permissive Software License，Version 2（MulanPSL-2.0），见 [LICENSE](LICENSE)。
