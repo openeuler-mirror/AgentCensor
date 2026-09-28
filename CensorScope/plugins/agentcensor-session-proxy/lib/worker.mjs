@@ -141,14 +141,8 @@ async function run(ctx) {
   // stays registered for the whole process life (multi-turn).
   ctx.on('session/event', (session, event) => {
     if (session.id !== sessionId) return
-    const { type, seq, data, surfaceOp, sourceEventSeqs } = event
-    const line = JSON.stringify({
-      type,
-      seq,
-      data,
-      ...(surfaceOp === undefined ? {} : { surfaceOp }),
-      ...(sourceEventSeqs === undefined ? {} : { sourceEventSeqs }),
-    })
+    // Preserve the complete Session V3 event envelope across the wire.
+    const line = JSON.stringify(event)
     process.stdout.write(`ACEVT\t${line}\n`)
   }, { global: true })
 

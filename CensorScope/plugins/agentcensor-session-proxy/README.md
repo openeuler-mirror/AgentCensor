@@ -13,13 +13,13 @@ worker 是完整的 dsh 进程、跑正常的原生 agent 流程,宿主只做 UI
 
 ## 要求
 
-- dsh **0.1.2-rc.1**(`dsh --version`),Node 22。
+- dsh **0.1.5-rc.1**(`dsh --version`),Node 22。
 
 ## 安装与启动
 
 ```sh
 # 安装
-dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.1.tgz
+dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.2.tgz
 # 启动
 dsh web
 ```
@@ -75,7 +75,7 @@ agentcensor-session-proxy/              插件源码(可读/可改;安装请用�
 ├── lib/worker.mjs                        worker 侧:常驻 runner(原生 agent-loop + 双向帧协议)
 ├── lib/interaction-bridge.mjs            宿主侧:审批/提问的交互桥(控制面,只派发 waterfall,不写会话数据)
 ├── package.json / cordis.patch.yml       插件包元数据与 bundle patch
-agentcensor-session-proxy-0.1.1.tgz    可安装包(安装即用)
+agentcensor-session-proxy-0.1.2.tgz    可安装包(安装即用)
 README.md                              本文件
 ```
 
