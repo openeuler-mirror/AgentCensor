@@ -745,14 +745,27 @@ class WebDriverAgent {
       }
     }
     try {
-      const hasSurface = event.surfaceOp !== undefined || event.sourceEventSeqs !== undefined
+      // The host assigns seq/time on append; retain every other envelope
+      // field and fail loudly if a future dsh event cannot be represented.
+      const { type, seq: _seq, time: _time, data, ...intent } = event
+      const unsupportedIntent = Object.keys(intent).filter(
+        (key) => key !== 'surfaceOp' && key !== 'sourceEventSeqs',
+      )
+      if (unsupportedIntent.length > 0) {
+        stats.failed += 1
+        process.stdout.write(
+          `[agentcensor] mirror refused unsupported event envelope fields: ${unsupportedIntent.join(', ')} (type=${type})\n`,
+        )
+        return
+      }
+      const hasSurface = intent.surfaceOp !== undefined || intent.sourceEventSeqs !== undefined
       if (hasSurface) {
-        this.session.append(event.type, event.data, {
-          ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
-          ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
+        this.session.append(type, data, {
+          ...(intent.surfaceOp === undefined ? {} : { surfaceOp: intent.surfaceOp }),
+          ...(intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs }),
         })
       } else {
-        this.session.append(event.type, event.data)
+        this.session.append(type, data)
       }
       stats.mirrored += 1
     } catch (error) {
@@ -809,10 +822,15 @@ async function seedLogCopy(realFile, privRoot) {
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source) {
+async function publish(rootCtx, ownerCtx, session, options, source, parentAgent) {
   const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
-  const detachAgent = rootCtx.agents.enter(agent, ownerCtx?.agent)
+  // dsh 0.1.5 removes the implicit ctx.agent accessor.
+  let initiator
+  try {
+    initiator = rootCtx.agents.currentInitiator?.()
+  } catch {}
+  const detachAgent = rootCtx.agents.enter(agent, parentAgent ?? initiator)
   try {
     agent.ctx.sessions.announce(session)
     rootCtx.agents.announce(agent)
@@ -880,18 +898,27 @@ export async function apply(ctx) {
       } catch (error) {
         process.stdout.write(`[agentcensor] persistence.create: ${error?.message ?? String(error)}\n`)
       }
-      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup')
+      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent)
     },
     async resume(ownerCtx, options) {
       const id = String(options.resumeSessionId)
       process.stdout.write(`[agentcensor] resume id=${id}\n`)
       if (persistence === undefined) throw new Error('agentcensor: no sessionPersistence')
-      const preparation = await persistence.prepare(id)
+      // dsh 0.1.5 exposes persistence through per-session handles. The
+      // previous prepare(id) convenience API is no longer part of the
+      // service, so reconstruct the live session from a read-only snapshot.
+      const handle = await persistence.open(id, 'read')
       try {
-        const session = preparation.session
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume')
+        const snapshot = await handle.read(0)
+        const session = ctx.sessions.prepare(id, {
+          seed: snapshot.events,
+          meta: structuredClone(handle.header),
+          inheritedEventCount: handle.inheritedEventCount,
+          eventState: snapshot.eventState,
+        })
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent)
       } finally {
-        await preparation[Symbol.dispose]?.()
+        await handle.close()
       }
     },
   }
