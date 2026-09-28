@@ -1,0 +1,28 @@
+[Unit]
+Description=AgentCensor unified data-plane supervisor
+Documentation=file:/usr/share/doc/censorpivot/INSTALL.zh-CN.md
+After=local-fs.target network-online.target
+Wants=network-online.target
+ConditionPathExists=/sys/kernel/btf/vmlinux
+ConditionPathExists=/sys/fs/cgroup/cgroup.controllers
+
+[Service]
+Type=simple
+User=root
+Group=censorpivot
+UMask=0007
+RuntimeDirectory=censorfs censorguard censorscope censorpivot-cgroups
+RuntimeDirectoryMode=0750
+ExecStartPre=/usr/bin/mkdir -p /sys/fs/cgroup/censorpivot
+ExecStartPre=/usr/local/bin/censord init --config /etc/agentcensor/censord.json
+ExecStart=/usr/local/bin/censord run --config /etc/agentcensor/censord.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=90s
+TimeoutStopSec=20s
+KillMode=control-group
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

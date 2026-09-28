@@ -1,0 +1,44 @@
+{
+  "state_dir": "/var/lib/agentcensor/censord",
+  "startup_timeout_ms": 30000,
+  "shutdown_timeout_ms": 10000,
+  "poll_interval_ms": 50,
+  "command_output_bytes": 262144,
+  "censorfs": {
+    "daemon": "/usr/libexec/censorfs/censorfsd",
+    "control": "/usr/libexec/censorfs/censorfsctl",
+    "storage_root": "/var/lib/censorfs/.censorfs",
+    "import_root": "/var/lib/agentcensor/workspace",
+    "socket": "/run/censorfs/control.sock",
+    "branch": "main"
+  },
+  "censorguard": {
+    "daemon": "/usr/sbin/censorguardd",
+    "control": "/usr/bin/censorguardctl",
+    "policy": "/etc/censorguard/agentcensor.yaml",
+    "bpf_object": "/usr/lib/censorguard/enforce.bpf.o",
+    "state_dir": "/var/lib/censorguard",
+    "control_socket": "/run/censorguard/ctl.sock",
+    "event_socket": "/run/censorguard/events.sock",
+    "launch_socket": "/run/censorguard/launch.sock",
+    "dsh_socket": "/run/censorguard/dsh.sock",
+    "ui_socket": "/run/censorguard/ui.sock",
+    "extra_args": [
+      "--socket-group",
+      "censorpivot",
+      "--gateway-user",
+      "censorpivot",
+      "--spawn-grpc",
+      "--grpc-bin",
+      "/usr/bin/censorguard-grpc"
+    ]
+  },
+  "censorscope": {
+    "daemon": "/usr/sbin/censorscoped",
+    "control": "/usr/bin/censorscopectl",
+    "config": "/etc/censorscope/censorscoped.conf",
+    "socket": "/run/censorscope/censorscoped.sock",
+    "level": "L3",
+    "extra_args": []
+  }
+}

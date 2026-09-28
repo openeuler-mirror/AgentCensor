@@ -1,0 +1,32 @@
+{
+  "request_id": "atomic-code-change-demo",
+  "session_id": "atomic-code-change-demo",
+  "trace_id": null,
+  "branch": "main",
+  "expected_generation": "REPLACED_BY_DEMO_SCRIPT",
+  "expected_head_seq": 0,
+  "guard_scope": "atomic-code-change-demo",
+  "guard_group": "censorguard-dsh-default",
+  "calls": [
+    {
+      "id": "generate-artifact",
+      "program": "/bin/sh",
+      "args": [
+        "-c",
+        "mkdir -p demo && printf 'pivot demo transaction\\n' > demo/pivot-result.txt"
+      ],
+      "cwd": ".",
+      "timeout_ms": 5000
+    },
+    {
+      "id": "verify-artifact",
+      "program": "/bin/sh",
+      "args": [
+        "-c",
+        "test \"$(cat demo/pivot-result.txt)\" = 'pivot demo transaction'"
+      ],
+      "cwd": ".",
+      "timeout_ms": 5000
+    }
+  ]
+}
