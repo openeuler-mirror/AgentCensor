@@ -28,7 +28,9 @@ pub fn run_from_env() -> Result<(), String> {
             let config = load_config_for_level(&config_path, level)?;
             start_daemon(&config_path, &config, level)
         }
-        CensorscopedCommand::Stop { config_path } => stop_daemon(&OperatorConfig::load(&config_path)?),
+        CensorscopedCommand::Stop { config_path } => {
+            stop_daemon(&OperatorConfig::load(&config_path)?)
+        }
         CensorscopedCommand::Restart { config_path, level } => {
             let config = load_config_for_level(&config_path, level)?;
             stop_daemon(&config)?;
@@ -54,7 +56,10 @@ pub fn run_from_env() -> Result<(), String> {
 /// The level is per-run state: the operator file is never rewritten and never
 /// records a level, so a later `start` without `--level` always falls back to
 /// the default level L1.
-fn load_config_for_level(config_path: &Path, level: CaptureLevel) -> Result<OperatorConfig, String> {
+fn load_config_for_level(
+    config_path: &Path,
+    level: CaptureLevel,
+) -> Result<OperatorConfig, String> {
     let mut config = OperatorConfig::load(config_path)?;
     config.capture_profile = CaptureProfile::for_level(level);
     Ok(config)
@@ -92,6 +97,12 @@ fn initialize(path: &Path, force: bool, patch: Option<&Path>) -> Result<(), Stri
 fn run_foreground(config: &OperatorConfig) -> Result<(), String> {
     signals::install_shutdown_handlers()?;
     write_pid_file(&config.pid_file, std::process::id())?;
+    for key in &config.deprecated_keys {
+        tracing::warn!(
+            key = %key,
+            "operator config key is deprecated and ignored; captured payloads are retained in full"
+        );
+    }
     let resolution = resolve_ebpf_collector_config(config.ebpf_config.clone());
     if let Some(detail) = &resolution.degrade_detail {
         tracing::warn!(detail = %detail, "eBPF collector unavailable; using snapshot-only tracking");
@@ -101,8 +112,6 @@ fn run_foreground(config: &OperatorConfig) -> Result<(), String> {
         config.capture_profile.clone(),
         resolution.config,
         config.writer,
-        config.payload_max_trace_bytes,
-        config.payload_max_segment_bytes,
         config.active_trace_max,
         config.session_env_name.clone(),
     )
@@ -117,6 +126,17 @@ fn run_foreground(config: &OperatorConfig) -> Result<(), String> {
                 "daemon listening socket={} storage={}",
                 config.socket_path.display(),
                 config.storage.path().display()
+            );
+            // The capacities interact: the queue budget makes the kernel
+            // transport absorb overload, so how much loss a capture can survive
+            // depends on the transport size set here.
+            tracing::info!(
+                ring_buffer_mb = config.ebpf_config.event_ring_buffer_max_bytes / (1024 * 1024),
+                queue_cap_items = config.writer.queue_cap_items,
+                queue_budget_mb = config.writer.queue_budget_bytes / (1024 * 1024),
+                batch_items = config.writer.batch_items,
+                checkpoint_secs = config.writer.checkpoint_interval_secs,
+                "effective capture and persistence capacities"
             );
             Ok(())
         },

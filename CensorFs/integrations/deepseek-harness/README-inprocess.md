@@ -190,7 +190,7 @@ Error [ERR_MODULE_NOT_FOUND]: Cannot find package '@deepseek-ai/dsh-llm'
   imported from .../integrations/deepseek-harness/src/index.js
 ```
 
-修复（实测 openEuler 24.03 / dsh 0.1.0-rc.8 / pnpm 11.22.0）：
+修复（实测 openEuler 24.03 / dsh 0.1.5-rc.2 / pnpm 11.22.0）：
 
 ```bash
 P=~/.dsh/profiles/headless   # 换成你的 profile
@@ -199,8 +199,8 @@ cd "$P"
 pnpm remove @censorfs/deepseek-harness
 pnpm add "file:/绝对路径/integrations/deepseek-harness"
 # 2) 补齐缺失的 peer（缺哪个装哪个；国内可加 --registry=https://registry.npmmirror.com）
-pnpm add @deepseek-ai/dsh-sdk-client@0.1.0-rc.8
-pnpm add @deepseek-ai/dsh-sdk-protocol@0.1.0-rc.8
+pnpm add @deepseek-ai/dsh-sdk-client@0.1.5-rc.2
+pnpm add @deepseek-ai/dsh-sdk-protocol@0.1.5-rc.2
 ```
 
 装完用入口导入探针确认（期望 `ENTRY_IMPORT_OK`）：

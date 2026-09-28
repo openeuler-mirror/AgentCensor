@@ -1,11 +1,12 @@
 //! Raw payload retention contracts shared by collectors and storage.
 
+use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 use crate::ids::TraceId;
 use crate::process::{ProcessIdentity, SessionIdentity};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PayloadContentState {
     Unknown = 0,
     Complete = 1,
@@ -14,7 +15,7 @@ pub enum PayloadContentState {
     Loss = 4,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PayloadDirection {
     Unknown = 0,
     Inbound = 1,
@@ -22,7 +23,7 @@ pub enum PayloadDirection {
     Bidirectional = 3,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PayloadSourceBoundary {
     Unknown = 0,
     Uprobe = 2,
@@ -30,7 +31,7 @@ pub enum PayloadSourceBoundary {
 }
 
 /// A normalized payload segment. Bytes are optional for metadata-only data.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PayloadSegment {
     pub trace_id: TraceId,
     pub process: ProcessIdentity,

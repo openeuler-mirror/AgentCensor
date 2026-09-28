@@ -21,9 +21,11 @@ process_identity = { path = "../../core/process_identity" }
 process_tree_snapshot_contract = { path = "../../contracts/process/tree_snapshot" }
 storage_core = { path = "../../storage/core" }
 storage_factory = { path = "../../storage/factory" }
+storage_spool = { path = "../../storage/spool" }
 semantic_action_runtime = { path = "../../core/semantic_action_runtime" }
 semantic_action_contract = { path = "../../contracts/semantic_action" }
 serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
 trace_runtime = { path = "../../core/trace_runtime" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

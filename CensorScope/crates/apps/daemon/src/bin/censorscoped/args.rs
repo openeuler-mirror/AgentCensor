@@ -41,8 +41,9 @@ pub enum CensorscopedCommand {
 /// they are never persisted to the operator file and never switch mid-run.
 /// `init`/`stop`/`status` do not accept `--level`.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CensorscopedCommand, String> {
-    let cli = CensorscopedCli::try_parse_from(std::iter::once("censorscoped".to_string()).chain(args))
-        .unwrap_or_else(|error| error.exit());
+    let cli =
+        CensorscopedCli::try_parse_from(std::iter::once("censorscoped".to_string()).chain(args))
+            .unwrap_or_else(|error| error.exit());
     let explicit = cli.config_path.is_some();
     let config = cli
         .config_path
@@ -54,7 +55,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Censorscoped
             CensorscopedCommand::Init {
                 config_path: match (args.output, explicit) {
                     (Some(_), true) => {
-                        return Err("init accepts either --output or --config, not both".to_string());
+                        return Err(
+                            "init accepts either --output or --config, not both".to_string()
+                        );
                     }
                     (Some(path), false) => path,
                     (None, _) => config,
@@ -65,23 +68,36 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Censorscoped
         }
         Command::Run => {
             let level = parse_level(cli.level.as_deref(), default_level())?;
-            CensorscopedCommand::Run { config_path: config, level }
+            CensorscopedCommand::Run {
+                config_path: config,
+                level,
+            }
         }
         Command::Start => {
             let level = parse_level(cli.level.as_deref(), default_level())?;
-            CensorscopedCommand::Start { config_path: config, level }
+            CensorscopedCommand::Start {
+                config_path: config,
+                level,
+            }
         }
         Command::Stop => {
             reject_level_for_non_run(&cli.level)?;
-            CensorscopedCommand::Stop { config_path: config }
+            CensorscopedCommand::Stop {
+                config_path: config,
+            }
         }
         Command::Restart => {
             let level = parse_level(cli.level.as_deref(), default_level())?;
-            CensorscopedCommand::Restart { config_path: config, level }
+            CensorscopedCommand::Restart {
+                config_path: config,
+                level,
+            }
         }
         Command::Status => {
             reject_level_for_non_run(&cli.level)?;
-            CensorscopedCommand::Status { config_path: config }
+            CensorscopedCommand::Status {
+                config_path: config,
+            }
         }
     })
 }
@@ -105,7 +121,10 @@ fn reject_level_for_non_run(level: &Option<String>) -> Result<(), String> {
 }
 
 #[derive(Parser)]
-#[command(name = "censorscoped", about = "Run and supervise the CensorScope daemon")]
+#[command(
+    name = "censorscoped",
+    about = "Run and supervise the CensorScope daemon"
+)]
 struct CensorscopedCli {
     #[arg(long = "config", global = true, value_name = "PATH")]
     config_path: Option<PathBuf>,
@@ -154,8 +173,8 @@ mod tests {
     #[test]
     fn explicit_level_is_preserved_for_run_start_restart() {
         for sub in ["run", "start", "restart"] {
-            let command = parse_args([sub.to_string(), "--level".to_string(), "L3".to_string()])
-                .unwrap();
+            let command =
+                parse_args([sub.to_string(), "--level".to_string(), "L3".to_string()]).unwrap();
             let level = match command {
                 CensorscopedCommand::Run { level, .. }
                 | CensorscopedCommand::Start { level, .. }

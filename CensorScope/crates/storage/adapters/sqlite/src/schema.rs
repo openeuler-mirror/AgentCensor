@@ -22,6 +22,12 @@ CREATE TABLE event_id_sequence (
 );
 INSERT INTO event_id_sequence (singleton, next_event_id) VALUES (1, 1);
 
+CREATE TABLE spool_checkpoint (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    last_sequence INTEGER NOT NULL
+);
+INSERT INTO spool_checkpoint (singleton, last_sequence) VALUES (1, -1);
+
 CREATE TABLE processes (
     process_id INTEGER PRIMARY KEY,
     host_pid INTEGER,
@@ -112,6 +118,9 @@ CREATE INDEX idx_memberships_trace_parent
 CREATE INDEX idx_events_trace_time ON events (trace_id, observed_at, event_id);
 CREATE INDEX idx_events_session ON events (session_id, observed_at, event_id);
 CREATE INDEX idx_events_call ON events (trace_id, call_id, observed_at);
+CREATE INDEX idx_events_unassigned_trace_time
+    ON events (trace_id, observed_at, event_id)
+    WHERE call_id IS NULL;
 
 CREATE TABLE call_spans (
     trace_id INTEGER NOT NULL,
@@ -124,6 +133,8 @@ CREATE TABLE call_spans (
     PRIMARY KEY (trace_id, call_id)
 );
 CREATE INDEX idx_call_spans_pid_time ON call_spans(trace_id, host_pid, started_at, ended_at);
+CREATE INDEX idx_call_spans_trace_start
+    ON call_spans(trace_id, started_at, call_id);
 
 -- Durable attribution backfill queue. The daemon writes one row per call-end
 -- window/sweep job inside the same writer transaction that closes the span, so
@@ -351,6 +362,14 @@ fn validate_current_schema(connection: &Connection) -> Result<(), rusqlite::Erro
             return Err(rusqlite::Error::InvalidQuery);
         }
     }
+    // Keep performance indexes present when opening databases created before
+    // these indexes were introduced; schema version 1 remains wire-compatible.
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_events_unassigned_trace_time
+             ON events (trace_id, observed_at, event_id) WHERE call_id IS NULL;
+         CREATE INDEX IF NOT EXISTS idx_call_spans_trace_start
+             ON call_spans(trace_id, started_at, call_id);",
+    )?;
     Ok(())
 }
 

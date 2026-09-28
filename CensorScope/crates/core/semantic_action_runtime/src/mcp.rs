@@ -37,7 +37,10 @@ pub fn project_mcp_payload(
     };
     let complete = matches!(segment.content_state, PayloadContentState::Complete);
     let mut attributes = BTreeMap::new();
-    attributes.insert("censorscope.action.kind".to_string(), kind.as_str().to_string());
+    attributes.insert(
+        "censorscope.action.kind".to_string(),
+        kind.as_str().to_string(),
+    );
     attributes.insert("mcp.jsonrpc".to_string(), "2.0".to_string());
     attributes.insert(
         "mcp.direction".to_string(),

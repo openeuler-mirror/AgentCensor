@@ -616,12 +616,14 @@ export const PROCESS_STARTED_AT = Date.now()
 // 幂等：补写后 ended 集合含该 sessionId，重复调用无操作。
 // @returns 补写数量
 export function reconcileInterruptedSubagents(session, processStartedAt = PROCESS_STARTED_AT) {
+  // rc.2 的 Session 用 snapshotEvents() 取事件快照（不再有 events 数组属性）。
+  const log = session.snapshotEvents()
   const ended = new Set()
-  for (const event of session.events) {
+  for (const event of log) {
     if (event.type === 'subagent-ended') ended.add(event.data?.sessionId)
   }
   const stale = []
-  for (const event of session.events) {
+  for (const event of log) {
     if (event.type !== 'subagent-started') continue
     const sessionId = event.data?.sessionId
     const startedAt = event.data?.startedAt ?? event.time ?? 0

@@ -91,7 +91,10 @@ pub fn project_http1_payload(
         "http.content_state".to_string(),
         if body_complete { "complete" } else { "partial" }.to_string(),
     );
-    attributes.insert("censorscope.action.kind".to_string(), kind.as_str().to_string());
+    attributes.insert(
+        "censorscope.action.kind".to_string(),
+        kind.as_str().to_string(),
+    );
     let direction = match segment.direction {
         PayloadDirection::Outbound => "outbound",
         PayloadDirection::Inbound => "inbound",
@@ -219,7 +222,10 @@ fn project_http2_payload(
         SemanticActionCompleteness::Partial
     };
     let mut attributes = BTreeMap::new();
-    attributes.insert("censorscope.action.kind".to_string(), "http.message".to_string());
+    attributes.insert(
+        "censorscope.action.kind".to_string(),
+        "http.message".to_string(),
+    );
     attributes.insert("http.protocol".to_string(), "h2".to_string());
     attributes.insert("http.frame_count".to_string(), frames.to_string());
     attributes.insert("http.headers_frames".to_string(), headers.to_string());

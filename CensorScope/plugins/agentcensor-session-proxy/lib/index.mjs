@@ -26,10 +26,35 @@
  *   ACREADY\t<json>  worker booted & ready for messages
  *   ACIDLE\t<json>   one turn finished (agent idle)
  *   ACERR\t<json>    runner-level turn failure (worker stays alive)
+ *   ACCANCEL\t<json> cancel handed to the worker's native agent: {cause,keepInbox,seq,applied}
+ *   ACASK\t<json>    approval/question ask forwarded by the worker: {id,kind,…payload}
+ *   ACWITHDRAW\t<json> withdrawal of one forwarded ask: {id}
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
  *   {"type":"message","message":{content,source,id?,role?}}  original user message
+ *   {"type":"cancel","cause":{kind},"keepInbox":bool}         native turn cancellation
+ *   {"type":"answer","kind":…,"id":…,"ok":bool,…}             answer to a forwarded ask
  *   {"type":"shutdown"}                                      graceful exit
+ *
+ * ── Human interaction (approval + ask_user_question) ──
+ * The browser is the only interactive answerer in dsh and it listens on THIS
+ * host's remote waterfall, so a tool call running in the worker could never reach
+ * a human: its ask fell through to the fail-closed outcome. The worker therefore
+ * forwards such an ask (`ACASK`) and this host dispatches the same waterfall the
+ * native web surface uses (see interaction-bridge.mjs) — control plane only, no
+ * session data is written here; the audit pair and the tool result stay authored
+ * by the worker and reach the UI through the ordinary 1:1 mirror.
+ *
+ * ── Cancellation (the stop button) ──
+ * The web app's stop calls `agent.cancel({kind:'user'},{keepInbox:true})`; stock
+ * dsh aborts the live turn inside the agent that owns it, so the transcript gets
+ * an ordinary `turn/end {reason:{kind:'aborted',reason}}` plus the synthetic
+ * tool/step closers, and the agent stays usable. This driver therefore FORWARDS
+ * the cancel to the worker (which owns the native agent-loop) instead of killing
+ * it: the worker aborts its live turn natively, those events stream back through
+ * the ordinary 1:1 mirror, and the durable tail stays properly closed — which is
+ * also keeps the host cursor aligned: the worker emits the normal closing events
+ * before the next message is accepted, so the mirrored sequence remains contiguous.
  *
  * ── Worker env (host side injects at spawn: task-channel plumbing only) ──
  *   AGENTCENSOR_SESSION_ID    durable session identity (create or resume)
@@ -57,6 +82,7 @@ import { agentEvents } from '@deepseek-ai/dsh-agent'
 import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { createInteractionBridge } from './interaction-bridge.mjs'
 
 export const name = 'agentcensor-session-proxy'
 export const inject = ['agents', 'sessions', 'sessionPersistence', 'sessionProjections']
@@ -65,6 +91,9 @@ const EVT_PREFIX = 'ACEVT\t'
 const READY_PREFIX = 'ACREADY\t'
 const IDLE_PREFIX = 'ACIDLE\t'
 const ERR_PREFIX = 'ACERR\t'
+const CANCEL_PREFIX = 'ACCANCEL\t'
+const ASK_PREFIX = 'ACASK\t'
+const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
 const STOP_GRACE_MS = 3000
 /** All live worker child processes, for host-exit cleanup. */
@@ -78,6 +107,12 @@ const HOST_SIGNAL_EXIT_CODES = [
 ]
 let hostExitHooksInstalled = false
 let shuttingDown = false
+/**
+ * Host-side interaction bridge (approval + ask_user_question), created once with
+ * the plugin's host context. See interaction-bridge.mjs: it is control plane
+ * only and never writes session data.
+ */
+let interactionBridge
 
 /**
  * Graceful stop of a set of workers: send the shutdown frame, then escalate to
@@ -214,6 +249,12 @@ function workerOverlay(privHome, compression = 'none') {
   )
   lines.push('    - id: agentcensor-worker')
   lines.push(`      name: ${JSON.stringify(pathToFileURLish(runner))}`)
+  // The worker composes the BASE agent plane (the `standard` agent preset, which
+  // owns `tool-ask-user` / `ask_user_question`, is only mounted by the web
+  // surface), so the model would have no way to ask the human anything. Insert
+  // the tool row here; the interaction bridge carries the ask to the browser.
+  lines.push('    - id: tool-ask-user')
+  lines.push("      name: '@deepseek-ai/dsh-tool-ask-user'")
   return `${lines.join('\n')}\n`
 }
 
@@ -237,7 +278,6 @@ class WebDriverAgent {
     this.session = session
     this.options = options ?? {}
     this.status = 'idle'
-    this.cancelled = false
     this.inbox = { nextTurn: [], nextStep: [] }
     this.dispatch = agentEvents(rootCtx, this)
     this.scope = createScope(rootCtx, this)
@@ -251,17 +291,22 @@ class WebDriverAgent {
     this.spawning = undefined
     // Messages forwarded to the worker, not yet answered by an IDLE.
     this.outstanding = 0
+    // Messages accepted by the driver but not yet written to the worker's stdin;
+    // a cancel racing one of these is held instead of dropped.
+    this.unwritten = 0
     this.idleWaiters = []
     this.endSeedInserted = false
     this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
     this.sendChain = Promise.resolve()
     this.closedByHost = false
+    // Cancels received while the worker could not accept them yet (spawn in
+    // flight). Applied right after the next forwarded message so a stop that
+    // races its own message still aborts that message's turn.
+    this.pendingCancels = []
   }
 
   /** Handle one user message: route it to this session's worker process. */
   followup(message) {
-    // A new message clears an earlier cancel (native semantics).
-    this.cancelled = false
     this.enqueueMessage(message)
     return undefined
   }
@@ -270,16 +315,42 @@ class WebDriverAgent {
   send(message, _target, _wakeup) { this.followup(message) }
   inject() {}
 
-  cancel(cause) {
-    // Stop the resident worker (native protocol cancel is not implemented); its
-    // state drops on close and the next message lazily respawns it from the
-    // durable log, which already contains everything mirrored so far.
-    this.cancelled = true
-    const state = this.workerState
-    if (state !== undefined && state.alive) {
-      process.stdout.write(`[agentcensor] cancel session=${this.id}: stopping worker pid=${String(state.child.pid ?? '?')}\n`)
-      state.stop('SIGTERM', cause)
+  /**
+   * Native-protocol cancellation (the stop button). Stock dsh aborts the live
+   * turn inside the agent that owns it and keeps the agent usable, so the cancel
+   * is FORWARDED to the resident worker — never a process kill. The worker's
+   * native agent-loop then appends the ordinary cancellation events
+   * (`tool/result` for started calls, `step/end`, `turn/end {kind:'aborted'}`),
+   * which stream back through the same 1:1 mirror as any other turn output.
+   * @param cause - caller intent ({kind:'user'} from the web stop button).
+   * @param options - `keepInbox` preserves queued/steering messages (the web stop
+   *   passes it, matching stock dsh).
+   */
+  cancel(cause, options) {
+    const cancel = {
+      cause: normalizeCancelCause(cause),
+      keepInbox: options?.keepInbox === true,
     }
+    interactionBridge?.disposeAgent(this, 'cancelled')
+    const state = this.workerState
+    if (state !== undefined && state.alive && !state.stopping) {
+      process.stdout.write(
+        `[agentcensor] cancel session=${this.id}: protocol cancel → worker pid=${String(state.child.pid ?? '?')} cause=${cancel.cause.kind} keepInbox=${cancel.keepInbox}\n`,
+      )
+      state.write({ type: 'cancel', cause: cancel.cause, keepInbox: cancel.keepInbox })
+      return
+    }
+    if (this.outstanding === 0 && this.unwritten === 0) {
+      // Nothing is running and nothing is queued: cancellation is a no-op and
+      // must not arm the next turn (native semantics).
+      process.stdout.write(`[agentcensor] cancel session=${this.id}: nothing to cancel (no live worker, no pending turn)\n`)
+      return
+    }
+    // A message is queued behind a spawn that has not reached READY yet: hold the
+    // cancel and flush it right after that message frame, so the worker starts
+    // the turn and aborts it natively instead of losing the message.
+    this.pendingCancels.push(cancel)
+    process.stdout.write(`[agentcensor] cancel session=${this.id}: queued until the pending message reaches the worker\n`)
   }
 
   /** Resolves when every forwarded message has been answered (worker IDLE). */
@@ -302,18 +373,31 @@ class WebDriverAgent {
     const text = messageText(message)
     this.markBusy()
     this.emitStatus('running')
+    this.unwritten += 1
     this.sendChain = this.sendChain
       .then(async () => {
         const state = await this.ensureWorker()
         if (state === undefined || !state.alive) throw new Error('worker unavailable')
         this.writeFrame(state, { type: 'message', message: forwardableMessage(message) })
+        this.unwritten = Math.max(0, this.unwritten - 1)
         process.stdout.write(
           `[agentcensor] message → worker session=${this.id} text=${JSON.stringify(text.slice(0, 80))}\n`,
         )
+        // A stop pressed while this message was still queued behind the spawn:
+        // deliver it now so the worker opens the turn and aborts it natively.
+        for (const cancel of this.pendingCancels.splice(0)) {
+          process.stdout.write(
+            `[agentcensor] cancel session=${this.id}: flushing queued protocol cancel cause=${cancel.cause.kind} keepInbox=${cancel.keepInbox}\n`,
+          )
+          this.writeFrame(state, { type: 'cancel', cause: cancel.cause, keepInbox: cancel.keepInbox })
+        }
       })
       .catch((error) => {
         // Spawn/boot failure before the first mirrored event: record it as a
-        // failure note so the UI and durable log stay sane.
+        // failure note so the UI and durable log stay sane. A cancel held for
+        // this message dies with it (its turn never started).
+        this.unwritten = Math.max(0, this.unwritten - 1)
+        this.pendingCancels = []
         this.markDone()
         if (this.outstanding === 0) this.noteRunError(error, text)
       })
@@ -346,12 +430,12 @@ class WebDriverAgent {
     if (sessions === undefined || persistence === undefined) {
       throw new Error('agentcensor: sessions/sessionPersistence unavailable')
     }
-    if (this.cancelled) throw new Error('agentcensor: cancelled before worker spawn')
-    const dshLauncher = await resolveDshWorkerLauncher()
+    const dshBin = process.env.AGENTCENSOR_DSH_BIN ?? 'dsh'
 
     await sessions.flush(this.session)
     this.endSeedInserted = false
     this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
+    this.pendingCancels = []
     const header = this.session.header
     const located = persistence.locate?.(header)
     const realFile = located?.path
@@ -486,6 +570,28 @@ class WebDriverAgent {
           )
         } else if (line.startsWith(IDLE_PREFIX)) {
           this.onTurnIdle()
+        } else if (line.startsWith(ASK_PREFIX)) {
+          let payload = {}
+          /* keep {} */
+          try { payload = JSON.parse(line.slice(ASK_PREFIX.length)) } catch {}
+          const agent = this
+          void Promise.resolve()
+            .then(() => interactionBridge?.ask(agent, payload, (frame) => state.write(frame)))
+            .catch((error) => {
+              process.stdout.write(`[agentcensor] interaction ask failed: ${String(error)}\n`)
+            })
+        } else if (line.startsWith(WITHDRAW_PREFIX)) {
+          let payload = {}
+          /* keep {} */
+          try { payload = JSON.parse(line.slice(WITHDRAW_PREFIX.length)) } catch {}
+          interactionBridge?.withdraw(this, payload.id, 'worker withdrew')
+        } else if (line.startsWith(CANCEL_PREFIX)) {
+          let payload = {}
+          /* keep {} */
+          try { payload = JSON.parse(line.slice(CANCEL_PREFIX.length)) } catch {}
+          process.stdout.write(
+            `[agentcensor] worker cancel session=${this.id} applied=${payload.applied ?? '?'} cause=${payload.cause?.kind ?? '?'} keepInbox=${String(payload.keepInbox ?? '?')} seq=${String(payload.seq ?? '?')}\n`,
+          )
         } else if (line.startsWith(ERR_PREFIX)) {
           let payload = {}
           /* keep {} */
@@ -518,6 +624,9 @@ class WebDriverAgent {
       } else {
         settleReady(true, undefined)
       }
+      // A worker that is gone can no longer answer prompts: withdraw anything
+      // still pending so the browser panel is dismissed and no wait survives.
+      interactionBridge?.disposeAgent(this, 'worker closed')
       // Only mirrored events are durable: a dead worker answers nothing.
       if (this.outstanding > 0) this.markDone()
       if (this.workerState === state) {
@@ -664,14 +773,27 @@ class WebDriverAgent {
       }
     }
     try {
-      const hasSurface = event.surfaceOp !== undefined || event.sourceEventSeqs !== undefined
+      // The host assigns seq/time on append; retain every other envelope
+      // field and fail loudly if a future dsh event cannot be represented.
+      const { type, seq: _seq, time: _time, data, ...intent } = event
+      const unsupportedIntent = Object.keys(intent).filter(
+        (key) => key !== 'surfaceOp' && key !== 'sourceEventSeqs',
+      )
+      if (unsupportedIntent.length > 0) {
+        stats.failed += 1
+        process.stdout.write(
+          `[agentcensor] mirror refused unsupported event envelope fields: ${unsupportedIntent.join(', ')} (type=${type})\n`,
+        )
+        return
+      }
+      const hasSurface = intent.surfaceOp !== undefined || intent.sourceEventSeqs !== undefined
       if (hasSurface) {
-        this.session.append(event.type, event.data, {
-          ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
-          ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
+        this.session.append(type, data, {
+          ...(intent.surfaceOp === undefined ? {} : { surfaceOp: intent.surfaceOp }),
+          ...(intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs }),
         })
       } else {
-        this.session.append(event.type, event.data)
+        this.session.append(type, data)
       }
       stats.mirrored += 1
     } catch (error) {
@@ -689,6 +811,21 @@ function forwardableMessage(message) {
   if (message.id !== undefined) snapshot.id = message.id
   if (message.role !== undefined) snapshot.role = message.role
   return snapshot
+}
+
+/**
+ * Normalize a cancellation cause to the closed set the native agent accepts
+ * (`AgentCancelCause`). The stop button sends `{kind:'user'}`; hook causes keep
+ * their reason text; anything unrecognized degrades to `{kind:'user'}` so a
+ * cancel is never dropped.
+ */
+function normalizeCancelCause(cause) {
+  if (cause !== null && typeof cause === 'object') {
+    const kind = cause.kind
+    if (kind === 'user' || kind === 'parent') return { kind }
+    if (kind === 'hook' && typeof cause.reason === 'string') return { kind: 'hook', reason: cause.reason }
+  }
+  return { kind: 'user' }
 }
 
 /** Whether the durable artifact exists and contains at least one event. */
@@ -713,10 +850,15 @@ async function seedLogCopy(realFile, privRoot) {
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source) {
+async function publish(rootCtx, ownerCtx, session, options, source, parentAgent) {
   const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
-  const detachAgent = rootCtx.agents.enter(agent, ownerCtx?.agent)
+  // dsh 0.1.5 removes the implicit ctx.agent accessor.
+  let initiator
+  try {
+    initiator = rootCtx.agents.currentInitiator?.()
+  } catch {}
+  const detachAgent = rootCtx.agents.enter(agent, parentAgent ?? initiator)
   try {
     agent.ctx.sessions.announce(session)
     rootCtx.agents.announce(agent)
@@ -741,6 +883,7 @@ async function publish(rootCtx, ownerCtx, session, options, source) {
 
 export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
+  interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
   // control stream (row is disabled by overlay). dsh 0.1.1 does not export
   // this optional definition, so keep the worker bridge usable without it.
@@ -789,18 +932,27 @@ export async function apply(ctx) {
       } catch (error) {
         process.stdout.write(`[agentcensor] persistence.create: ${error?.message ?? String(error)}\n`)
       }
-      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup')
+      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent)
     },
     async resume(ownerCtx, options) {
       const id = String(options.resumeSessionId)
       process.stdout.write(`[agentcensor] resume id=${id}\n`)
       if (persistence === undefined) throw new Error('agentcensor: no sessionPersistence')
-      const preparation = await persistence.prepare(id)
+      // dsh 0.1.5 exposes persistence through per-session handles. The
+      // previous prepare(id) convenience API is no longer part of the
+      // service, so reconstruct the live session from a read-only snapshot.
+      const handle = await persistence.open(id, 'read')
       try {
-        const session = preparation.session
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume')
+        const snapshot = await handle.read(0)
+        const session = ctx.sessions.prepare(id, {
+          seed: snapshot.events,
+          meta: structuredClone(handle.header),
+          inheritedEventCount: handle.inheritedEventCount,
+          eventState: snapshot.eventState,
+        })
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent)
       } finally {
-        await preparation[Symbol.dispose]?.()
+        await handle.close()
       }
     },
   }

@@ -43,6 +43,12 @@ pub struct TrackRemoveCommand {
     pub selector: TraceSelector,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationStatusCommand {
+    pub request_id: RequestId,
+    pub operation_id: RequestId,
+}
+
 /// Request to list only traces currently owned by this daemon instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListTracesCommand {
@@ -82,6 +88,7 @@ pub struct CallEndCommand {
 pub enum ControlCommand {
     TrackAdd(TrackAddCommand),
     TrackRemove(TrackRemoveCommand),
+    OperationStatus(OperationStatusCommand),
     ListTraces(ListTracesCommand),
     Doctor(DoctorCommand),
     CallStart(CallStartCommand),

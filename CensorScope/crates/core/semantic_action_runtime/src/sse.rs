@@ -42,7 +42,10 @@ pub fn project_sse_payload(
         PayloadContentState::Truncated | PayloadContentState::Loss
     );
     let mut stream_attributes = BTreeMap::new();
-    stream_attributes.insert("censorscope.action.kind".to_string(), "sse.stream".to_string());
+    stream_attributes.insert(
+        "censorscope.action.kind".to_string(),
+        "sse.stream".to_string(),
+    );
     stream_attributes.insert("sse.event_count".to_string(), "0".to_string());
     stream_attributes.insert(
         "sse.content_state".to_string(),
@@ -96,7 +99,10 @@ pub fn project_sse_payload(
             attributes.insert("sse.event_type".to_string(), name);
         }
         attributes.insert("sse.data_bytes".to_string(), data_bytes.to_string());
-        attributes.insert("censorscope.action.kind".to_string(), "sse.event".to_string());
+        attributes.insert(
+            "censorscope.action.kind".to_string(),
+            "sse.event".to_string(),
+        );
         let action_id = format!("{stream_id}:event:{index}");
         actions.push(SemanticAction {
             action_id,

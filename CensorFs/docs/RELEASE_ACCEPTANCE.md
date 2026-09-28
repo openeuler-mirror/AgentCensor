@@ -16,7 +16,7 @@ This checklist is a release gate for `@censorfs/deepseek-harness` and `@censorfs
 - Target: `openEuler 24.03 AArch64`
 - Kernel: `<fill in>`
 - CensorFS release: `<fill in>`
-- Harness peer release: `0.1.0-rc.8`
+- Harness peer release: `0.1.5-rc.2`
 - Model/provider: `<fill in>`
 - Date/commit: `<fill in>`
 - Evidence directory: `<fill in>`

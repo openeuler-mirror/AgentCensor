@@ -86,20 +86,25 @@ export class InProcessCensorFsProvider {
 
     const handle = await parent.ctx.agents.create({
       sessionId: childId,
-      meta: childSessionMeta(parent, childDepth, 0),
+      // rc.2 的第三参是 isSeeded: boolean（fork 前缀继承标记）；worker 是全新
+      // session，无继承前缀，必须传 false——旧版调用传的 0 会被 header 校验拒绝。
+      meta: childSessionMeta(parent, childDepth, false),
       agentOptions: resolveChildAgentOptions(parent, request.agentOptions, childDepth),
       signal: request.signal,
-      setup(childCtx) {
-        appendDelegatedPolicyOverrides(childCtx.agent.session, inherited)
+      // rc.2 的 AgentSetup 签名是 (agentCtx, agent)：unpublished setup 阶段
+      // agent 尚未注入 context，必须用第二参访问——旧版 childCtx.agent 会抛
+      // 'cannot get property "agent" without inject'。
+      setup(childCtx, childAgent) {
+        appendDelegatedPolicyOverrides(childAgent.session, inherited)
         applyChildComposition(childCtx, parent, {
           persona: request.persona,
           toolFilter: request.toolFilter,
         })
-        manager.bind(childCtx.agent, binding.runner)
-        boundAgent = childCtx.agent
-        childCtx.effect(() => () => manager.disposeAgent(childCtx.agent), 'censorfs-runner.agent-dispose')
+        manager.bind(childAgent, binding.runner)
+        boundAgent = childAgent
+        childCtx.effect(() => () => manager.disposeAgent(childAgent), 'censorfs-runner.agent-dispose')
         attachDescriptor(childCtx, request.descriptor)
-        return { commit: () => manager.commitBinding(childCtx.agent, binding.runner) }
+        return { commit: () => manager.commitBinding(childAgent, binding.runner) }
       },
     })
 
@@ -123,10 +128,12 @@ export class InProcessCensorFsProvider {
           child.followup(createUserMessage({ content: request.prompt, source: { kind: 'user' } }))
           await child.whenIdle()
         }
-        const end = foldConsumedWork(child.session.events).end
+        // rc.2 的 Session 不再暴露 events 数组属性，改为 snapshotEvents() 快照方法。
+        const sessionEvents = child.session.snapshotEvents()
+        const end = foldConsumedWork(sessionEvents).end
         const recorded = stopReason(end?.data.reason)
         return {
-          output: finalAssistantOutput(child.session.events) ?? [],
+          output: finalAssistantOutput(sessionEvents) ?? [],
           stopReason: cancelled && recorded !== 'completed' ? 'aborted' : recorded,
         }
       } finally {

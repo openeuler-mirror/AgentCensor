@@ -25,40 +25,45 @@ pub fn unique_call_window_match(
     observed_at: SystemTime,
 ) -> Option<String> {
     let session_matches = |span: &CallSpanRecord| {
-        session_id.as_ref().is_none_or(|session| {
-            span.session_id.as_deref() == Some(session.as_str())
-        })
+        session_id
+            .as_ref()
+            .is_none_or(|session| span.session_id.as_deref() == Some(session.as_str()))
     };
     let in_window = |span: &CallSpanRecord| {
-        observed_at >= span.started_at
-            && span.ended_at.is_none_or(|end| observed_at <= end)
+        observed_at >= span.started_at && span.ended_at.is_none_or(|end| observed_at <= end)
     };
-    let mut candidates = spans
+    let mut candidate = None;
+    let mut candidate_count = 0_u8;
+    for span in spans
         .iter()
-        .filter(|span| {
-            span.trace_id == trace_id && session_matches(span) && in_window(span)
-        })
-        .map(|span| span.call_id.as_str())
-        .collect::<Vec<_>>();
-    if candidates.len() != 1 {
+        .filter(|span| span.trace_id == trace_id && session_matches(span) && in_window(span))
+    {
+        candidate_count = candidate_count.saturating_add(1);
+        candidate = Some(span.call_id.as_str());
+    }
+    if candidate_count != 1 {
         // The host pid is only a tie-breaker: prefer it when it leaves one
         // unambiguous candidate, keeping the session/time-only path for
         // descendant processes.
-        let pid_candidates = spans
-            .iter()
-            .filter(|span| {
-                span.trace_id == trace_id
-                    && Some(span.host_pid) == host_pid
-                    && session_matches(span)
-                    && in_window(span)
-            })
-            .map(|span| span.call_id.as_str())
-            .collect::<Vec<_>>();
-        if pid_candidates.len() == 1 {
-            candidates = pid_candidates;
+        let mut pid_candidate = None;
+        let mut pid_count = 0_u8;
+        for span in spans.iter().filter(|span| {
+            span.trace_id == trace_id
+                && Some(span.host_pid) == host_pid
+                && session_matches(span)
+                && in_window(span)
+        }) {
+            pid_count = pid_count.saturating_add(1);
+            pid_candidate = Some(span.call_id.as_str());
+        }
+        if pid_count == 1 {
+            candidate = pid_candidate;
+            candidate_count = 1;
+        } else {
+            candidate_count = pid_count;
         }
     }
-    (candidates.len() == 1).then(|| candidates[0].to_string())
+    (candidate_count == 1).then(|| candidate.expect("candidate count is one").to_string())
 }
 
 #[cfg(test)]

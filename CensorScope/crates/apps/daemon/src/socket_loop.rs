@@ -1,4 +1,4 @@
-//! Nonblocking Unix-socket event loop for control requests and collector polling.
+//! Nonblocking Unix-socket event loop for control requests and spool draining.
 
 use std::fs::{self, Permissions};
 use std::io;
@@ -11,6 +11,10 @@ use config_core::daemon::SocketPermissions;
 use uds_control_server::UdsControlConnection;
 
 use crate::bootstrap::LocalDaemonServer;
+
+/// Idle poll timeout in milliseconds: the longest a durable record waits for
+/// the next independent drain step when no control socket is active.
+const IDLE_POLL_MS: libc::c_int = 10;
 
 /// Failure raised while binding or serving the daemon control socket.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,10 +64,13 @@ impl LocalDaemonServer {
                     revents: 0,
                 }
             }));
+            // The timeout bounds how long a durable record waits for the next
+            // spool drain while control connections remain independently paced.
             // SAFETY: `pollfds` remains exclusively borrowed for the syscall,
             // its length matches the initialized array, and descriptors come
             // from live listener/connection objects.
-            let result = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, 250) };
+            let result =
+                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as _, IDLE_POLL_MS) };
             if result < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 return Err(DaemonRunError::new(
                     "poll",
@@ -91,6 +98,9 @@ impl LocalDaemonServer {
             connections.retain_mut(|connection| {
                 let ready = pollfds.get(index).is_some_and(|poll| poll.revents != 0);
                 index += 1;
+                if connection.is_idle_expired() {
+                    return false;
+                }
                 if !ready {
                     return true;
                 }
@@ -102,9 +112,6 @@ impl LocalDaemonServer {
                     }
                 }
             });
-            if let Err(error) = self.drain_live_events() {
-                tracing::warn!(code = %error.code, message = %error.message, "live event drain failed");
-            }
         }
         Ok(())
     }
@@ -139,8 +146,10 @@ mod tests {
 
     #[test]
     fn control_socket_uses_operator_accessible_default_mode() {
-        let path =
-            std::env::temp_dir().join(format!("censorscope-socket-permissions-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!(
+            "censorscope-socket-permissions-{}",
+            std::process::id()
+        ));
         let _ = fs::remove_file(&path);
         let listener = bind_listener(
             &path,

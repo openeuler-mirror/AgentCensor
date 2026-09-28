@@ -1,5 +1,6 @@
 //! Raw observation-event contracts emitted by collectors.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
@@ -8,7 +9,7 @@ use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBo
 use model_core::process::{ArgvCapture, ProcessObservation, SessionIdentity};
 
 /// Collector-side identity and timestamp before ingest normalization.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RawEventEnvelope {
     pub trace_id: Option<TraceId>,
     pub observed_at: SystemTime,
@@ -21,7 +22,7 @@ pub struct RawEventEnvelope {
 }
 
 /// Raw observation payload variants carried by collector events.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RawObservationPayload {
     Process {
         operation: String,
@@ -69,14 +70,14 @@ pub enum RawObservationPayload {
 }
 
 /// Event emitted by eBPF and consumed by the ingest runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RawCollectorEvent {
     pub envelope: RawEventEnvelope,
     pub payload: RawObservationPayload,
 }
 
 /// Collector-side payload segment before trace/process identity resolution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RawPayloadSegment {
     pub envelope: RawEventEnvelope,
     pub source: PayloadSourceBoundary,

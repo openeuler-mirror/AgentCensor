@@ -223,6 +223,7 @@ name = "collector_event"
 version = "0.1.0"
 dependencies = [
  "model_core",
+ "serde",
 ]
 
 [[package]]
@@ -234,6 +235,7 @@ dependencies = [
  "collector_event",
  "collector_stats",
  "model_core",
+ "serde",
 ]
 
 [[package]]
@@ -306,9 +308,11 @@ dependencies = [
  "process_tree_snapshot_contract",
  "semantic_action_contract",
  "semantic_action_runtime",
+ "serde",
  "serde_json",
  "storage_core",
  "storage_factory",
+ "storage_spool",
  "trace_runtime",
  "tracing",
  "tracing-subscriber",
@@ -331,6 +335,7 @@ dependencies = [
  "model_core",
  "process_identity",
  "process_tree_snapshot_contract",
+ "tracing",
 ]
 
 [[package]]
@@ -612,6 +617,7 @@ name = "model_core"
 version = "0.1.0"
 dependencies = [
  "process_identity",
+ "serde",
 ]
 
 [[package]]
@@ -680,6 +686,9 @@ dependencies = [
 [[package]]
 name = "process_identity"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "process_tree_snapshot_contract"
@@ -872,6 +881,10 @@ dependencies = [
  "sqlite_storage",
  "storage_core",
 ]
+
+[[package]]
+name = "storage_spool"
+version = "0.1.0"
 
 [[package]]
 name = "strsim"

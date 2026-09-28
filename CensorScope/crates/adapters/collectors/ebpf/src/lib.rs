@@ -10,23 +10,25 @@ pub mod procfs;
 pub mod tls_coverage;
 pub mod tls_resolver;
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use collector_binding::{TraceBindingHandle, TraceBindingRequest};
 use collector_event::{
     RawCollectorEvent, RawEventEnvelope, RawObservationPayload, RawPayloadSegment,
 };
-use collector_instance::{CollectorError, CollectorInstance, CollectorPollBatch};
+use collector_instance::{
+    CollectorError, CollectorInstance, CollectorPollBatch, CollectorRawBatch,
+};
 use collector_stats::CollectorStats;
 use config_core::daemon::{EbpfCollectorConfig, MemlockRlimit, TlsScanDebounce};
 use libbpf_rs::{
-    Link, MapCore, MapFlags, MapHandle, Object, ObjectBuilder, RingBuffer, RingBufferBuilder,
+    Link, MapCore, MapFlags, MapHandle, Object, ObjectBuilder, PrintLevel, RingBuffer,
+    RingBufferBuilder, set_print,
 };
 use model_core::capability::Capability;
 use model_core::ids::{CollectorName, TraceId};
@@ -61,6 +63,18 @@ const NET_ENDPOINT_MAX: usize = 128;
 const NET_EVENT_SIZE: usize = PROCESS_EVENT_SIZE + 8 + NET_ENDPOINT_MAX;
 const TLS_PAYLOAD_MAX: usize = 4096;
 const TLS_EVENT_SIZE: usize = PROCESS_EVENT_SIZE + 48 + TLS_PAYLOAD_MAX;
+/// Bound one userspace drain so decoding and spooling cannot monopolize the
+/// collector thread while the kernel ring buffer is receiving new events.
+const MAX_EVENTS_PER_POLL: usize = 1024;
+
+fn libbpf_log(level: PrintLevel, message: String) {
+    let message = message.trim_end();
+    match level {
+        PrintLevel::Warn => tracing::warn!(target: "ebpf", "libbpf: {message}"),
+        PrintLevel::Info => tracing::info!(target: "ebpf", "libbpf: {message}"),
+        PrintLevel::Debug => tracing::debug!(target: "ebpf", "libbpf: {message}"),
+    }
+}
 
 /// Failure while loading, attaching, or interacting with eBPF programs.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,9 +103,9 @@ struct EbpfRuntime {
     session_ids: MapHandle,
     call_ids: MapHandle,
     loss_counters: MapHandle,
-    events: Rc<RefCell<Vec<Vec<u8>>>>,
+    events: Arc<Mutex<Vec<Vec<u8>>>>,
     event_buffer: RingBuffer<'static>,
-    decode_failures: Rc<RefCell<u64>>,
+    decode_failures: Arc<Mutex<u64>>,
 }
 
 impl EbpfRuntime {
@@ -99,6 +113,7 @@ impl EbpfRuntime {
         config: &EbpfCollectorConfig,
         requested: &BTreeSet<Capability>,
     ) -> Result<Self, LoaderError> {
+        set_print(Some((PrintLevel::Warn, libbpf_log)));
         apply_memlock_rlimit(config.memlock_rlimit)?;
         let mut open = ObjectBuilder::default()
             .open_memory(include_bytes!(env!("EBPF_OBJECT")))
@@ -172,21 +187,51 @@ impl EbpfRuntime {
                 program.set_autoload(false);
             }
         }
-        let object = open
-            .load()
-            .map_err(|error| LoaderError::new("load_bpf", error.to_string()))?;
+        let mut instruction_total = 0usize;
+        let mut instruction_counts = Vec::new();
+        for program in open.progs_mut() {
+            let name = program.name().to_string_lossy().into_owned();
+            if autoloaded.contains(&name) {
+                let count = program.insn_cnt();
+                instruction_total = instruction_total.saturating_add(count);
+                instruction_counts.push(format!("{name}={count}"));
+            }
+        }
+        tracing::info!(
+            target: "ebpf",
+            tracked_process_max_entries = config.tracked_process_max_entries,
+            pending_operation_max_entries = config.pending_operation_max_entries,
+            event_ring_buffer_max_bytes = config.event_ring_buffer_max_bytes,
+            instruction_total,
+            autoloaded_programs = ?instruction_counts,
+            "loading eBPF object"
+        );
+        let object = open.load().map_err(|error| {
+            LoaderError::new(
+                "load_bpf",
+                format!(
+                    "{error}; maps: tracked_process_max_entries={}, pending_operation_max_entries={}, event_ring_buffer_max_bytes={}; requested_capabilities={requested:?}; autoloaded_programs={autoloaded:?}",
+                    config.tracked_process_max_entries,
+                    config.pending_operation_max_entries,
+                    config.event_ring_buffer_max_bytes,
+                ),
+            )
+        })?;
         let trace_bindings = map_handle(&object, "trace_bindings")?;
         let session_ids = map_handle(&object, "session_ids")?;
         let call_ids = map_handle(&object, "call_ids")?;
         let loss_counters = map_handle(&object, "loss_counters")?;
         let events_map = map_handle(&object, "events")?;
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let decode_failures = Rc::new(RefCell::new(0));
-        let callback_events = Rc::clone(&events);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let decode_failures = Arc::new(Mutex::new(0));
+        let callback_events = Arc::clone(&events);
         let mut builder = RingBufferBuilder::new();
         builder
             .add(&events_map, move |raw| {
-                callback_events.borrow_mut().push(raw.to_vec());
+                callback_events
+                    .lock()
+                    .expect("ring buffer events mutex")
+                    .push(raw.to_vec());
                 0
             })
             .map_err(|error| LoaderError::new("ring_buffer", error.to_string()))?;
@@ -416,28 +461,70 @@ impl EbpfRuntime {
     }
 
     fn poll(&mut self) -> Result<Vec<KernelProcessEvent>, LoaderError> {
-        self.event_buffer
-            .consume()
-            .map_err(|error| LoaderError::new("poll_bpf", error.to_string()))?;
+        let consumed = self.event_buffer.consume_raw_n(MAX_EVENTS_PER_POLL);
+        if consumed < 0 {
+            return Err(LoaderError::new(
+                "poll_bpf",
+                format!("ring buffer consume failed: {consumed}"),
+            ));
+        }
         let mut decoded = Vec::new();
-        for raw in std::mem::take(&mut *self.events.borrow_mut()) {
+        for raw in std::mem::take(&mut *self.events.lock().expect("ring buffer events mutex")) {
             match decode_event(&raw) {
                 Ok(event) => decoded.push(event),
                 Err(_) => {
-                    *self.decode_failures.borrow_mut() += 1;
+                    *self.decode_failures.lock().expect("decode failures mutex") += 1;
                 }
             }
         }
         Ok(decoded)
     }
 
-    fn decode_failures(&self) -> u64 {
-        *self.decode_failures.borrow()
+    fn poll_raw(&mut self) -> Result<Vec<Vec<u8>>, LoaderError> {
+        let consumed = self.event_buffer.consume_raw_n(MAX_EVENTS_PER_POLL);
+        if consumed < 0 {
+            return Err(LoaderError::new(
+                "poll_bpf",
+                format!("ring buffer consume failed: {consumed}"),
+            ));
+        }
+        Ok(std::mem::take(
+            &mut *self.events.lock().expect("ring buffer events mutex"),
+        ))
     }
 
-    fn transport_losses(&self) -> u64 {
+    fn decode_failures(&self) -> u64 {
+        *self.decode_failures.lock().expect("decode failures mutex")
+    }
+
+    /// Loss counts per observation class.
+    ///
+    /// The classes are the kernel's loss-counter keys. They are reported
+    /// separately because the failures are not interchangeable: a lost process
+    /// tree edge changes attribution, while lost plaintext only shortens a
+    /// captured body, and a single total cannot tell the two apart.
+    fn loss_counters(&self) -> Vec<(&'static str, u64)> {
+        const CLASSES: [(u32, &str); 7] = [
+            (1, "loss_process"),
+            (2, "loss_file"),
+            (3, "loss_net"),
+            (4, "loss_ipc"),
+            (5, "loss_fd_io"),
+            (6, "loss_tls_plaintext"),
+            (7, "loss_exec_context"),
+        ];
+        CLASSES
+            .iter()
+            .filter_map(|(key, name)| {
+                let count = self.loss_counter(*key);
+                (count > 0).then_some((*name, count))
+            })
+            .collect()
+    }
+
+    fn loss_counter(&self, key: u32) -> u64 {
         self.loss_counters
-            .lookup(&1_u32.to_ne_bytes(), MapFlags::ANY)
+            .lookup(&key.to_ne_bytes(), MapFlags::ANY)
             .ok()
             .flatten()
             .and_then(|bytes| {
@@ -1066,6 +1153,7 @@ pub struct EbpfCollector {
     stdio_sequences: BTreeMap<(u32, u32), u64>,
     tls_last_refresh: BTreeMap<(TraceId, u32, u64), SystemTime>,
     tls_image_scans: BTreeMap<(TraceId, u32, u64, String), SystemTime>,
+    offline_decoder: bool,
 }
 
 impl EbpfCollector {
@@ -1093,7 +1181,48 @@ impl EbpfCollector {
             stdio_sequences: BTreeMap::new(),
             tls_last_refresh: BTreeMap::new(),
             tls_image_scans: BTreeMap::new(),
+            offline_decoder: false,
         }
+    }
+
+    /// Construct a decoder that never loads or modifies eBPF state.
+    pub fn new_decoder(
+        config: EbpfCollectorConfig,
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) -> Self {
+        let mut collector = Self::new(config);
+        collector.offline_decoder = true;
+        collector.requested_capabilities.extend(capabilities);
+        collector
+    }
+
+    pub fn seed_decode_memberships(
+        &mut self,
+        trace_id: TraceId,
+        records: impl IntoIterator<Item = ProcessRecord>,
+    ) {
+        for record in records {
+            let _ = self.track_observation(trace_id, record.observation());
+        }
+    }
+
+    pub fn decode_raw_events(
+        &mut self,
+        raws: Vec<Vec<u8>>,
+    ) -> Result<CollectorPollBatch, CollectorError> {
+        let mut events = Vec::with_capacity(raws.len());
+        for raw in raws {
+            events.push(decode_event(&raw).map_err(collector_error)?);
+        }
+        let observations = self.decode_batch(events);
+        Ok(CollectorPollBatch {
+            observations,
+            payload_segments: std::mem::take(&mut self.payload_segments),
+        })
+    }
+
+    pub fn unbind_decode_trace(&mut self, trace_id: TraceId) {
+        let _ = self.unbind_trace(trace_id);
     }
 
     pub fn probe_result(&self) -> &EbpfProbeResult {
@@ -1169,18 +1298,23 @@ impl EbpfCollector {
         })?;
         let pid = host.pid;
         let generation = host.start_boottime_ns.unwrap_or(host.start_time_ticks);
-        self.ensure_runtime()?
-            .track(pid, generation, trace_id)
-            .map_err(collector_error)?;
+        if !self.offline_decoder {
+            self.ensure_runtime()?
+                .track(pid, generation, trace_id)
+                .map_err(collector_error)?;
+        }
         /* Seed already-running processes as well as fork-created ones.  New
          * tool-call children are populated in the fork hook; this bootstrap
          * covers a trace attached after the child was created. */
-        if let Some(session) = crate::procfs::read_process_session(pid, "CENSORSCOPE_SESSION_ID")
-            .or_else(|| crate::procfs::read_process_session(pid, "DSH_SESSION_ID"))
-        {
-            self.ensure_runtime()?
-                .cache_session(pid, session.as_str())
-                .map_err(collector_error)?;
+        if !self.offline_decoder {
+            if let Some(session) =
+                crate::procfs::read_process_session(pid, "CENSORSCOPE_SESSION_ID")
+                    .or_else(|| crate::procfs::read_process_session(pid, "DSH_SESSION_ID"))
+            {
+                self.ensure_runtime()?
+                    .cache_session(pid, session.as_str())
+                    .map_err(collector_error)?;
+            }
         }
         self.processes.insert(pid, (trace_id, observation));
         self.trace_pids.entry(trace_id).or_default().insert(pid);
@@ -1207,6 +1341,9 @@ impl EbpfCollector {
         observation: &ProcessObservation,
         trigger: &str,
     ) {
+        if self.offline_decoder {
+            return;
+        }
         if !self
             .requested_capabilities
             .contains(&Capability::TlsPlaintextPayload)
@@ -1383,19 +1520,20 @@ impl EbpfCollector {
         };
         let fd = event.fd;
         let process = self.observation(event.host_pid, event.generation);
-        let envelope =
-            |observed_at: SystemTime, process: &ProcessObservation| RawEventEnvelope {
-                trace_id: Some(event.trace_id),
-                observed_at,
-                process: process.clone(),
-                collector: CollectorName::new("ebpf"),
-                session_id: Some(event.session_id.clone()).flatten(),
-                call_id: event.call_id.clone(),
-            };
+        let envelope = |observed_at: SystemTime, process: &ProcessObservation| RawEventEnvelope {
+            trace_id: Some(event.trace_id),
+            observed_at,
+            process: process.clone(),
+            collector: CollectorName::new("ebpf"),
+            session_id: Some(event.session_id.clone()).flatten(),
+            call_id: event.call_id.clone(),
+        };
 
         if fd <= 2
             && event.result > 0
-            && self.requested_capabilities.contains(&Capability::StdioChunk)
+            && self
+                .requested_capabilities
+                .contains(&Capability::StdioChunk)
         {
             let stream = match fd {
                 0 => "stdin",
@@ -1406,7 +1544,10 @@ impl EbpfCollector {
             let bytes = event.fd_io_payload.clone();
             let captured_size = bytes.as_ref().map_or(0, |value| value.len() as u64);
             let sequence = {
-                let counter = self.stdio_sequences.entry((event.host_pid, fd)).or_insert(0);
+                let counter = self
+                    .stdio_sequences
+                    .entry((event.host_pid, fd))
+                    .or_insert(0);
                 *counter = counter.saturating_add(1);
                 *counter
             };
@@ -1463,13 +1604,13 @@ impl EbpfCollector {
         // fd recycled to a socket, fabricating a network row for a file write.
         let known_file = self.file_fds.contains(&fd_key);
         let probed_socket = fd_probe_kind(event.host_pid, fd);
-        let is_socket = fd_is_socket_class(
-            self.socket_fds.contains(&fd_key),
-            known_file,
-            probed_socket,
-        );
+        let is_socket =
+            fd_is_socket_class(self.socket_fds.contains(&fd_key), known_file, probed_socket);
         if is_socket {
-            if self.requested_capabilities.contains(&Capability::NetTransport) {
+            if self
+                .requested_capabilities
+                .contains(&Capability::NetTransport)
+            {
                 self.socket_fds.insert(fd_key);
                 // Map fd-io opcodes onto the net-event space (8..=11:
                 // write/read/writev/readv) for length semantics.
@@ -1496,7 +1637,10 @@ impl EbpfCollector {
             }
             return output;
         }
-        if self.requested_capabilities.contains(&Capability::FsAccessBasic) {
+        if self
+            .requested_capabilities
+            .contains(&Capability::FsAccessBasic)
+        {
             if !known_file && probed_socket == Some(false) {
                 // Determinable non-socket seen for the first time: learn it so
                 // later fd-io never re-probes a recycled number, and drop any
@@ -2178,6 +2322,42 @@ impl CollectorInstance for EbpfCollector {
         })
     }
 
+    fn poll_raw_batch(&mut self) -> Result<Option<CollectorRawBatch>, CollectorError> {
+        let raws = match &mut self.runtime {
+            Some(runtime) => runtime.poll_raw().map_err(collector_error)?,
+            None => Vec::new(),
+        };
+        let diagnostics = std::mem::take(&mut self.pending_tls_diagnostics);
+        if raws.is_empty() && diagnostics.is_empty() {
+            return Ok(None);
+        }
+        let mut lifecycle = Vec::new();
+        for raw in &raws {
+            let kind = raw
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_ne_bytes);
+            if matches!(kind, Some(EVENT_FORK) | Some(EVENT_EXEC) | Some(EVENT_EXIT)) {
+                if let Ok(event) = decode_event(raw) {
+                    lifecycle.push(event);
+                }
+            }
+        }
+        if !lifecycle.is_empty() {
+            let _ = self.decode_batch(lifecycle);
+        }
+        Ok(Some(CollectorRawBatch {
+            events: raws,
+            diagnostics,
+        }))
+    }
+
+    fn transport_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.event_buffer.epoll_fd())
+    }
+
     fn flush_transport(&mut self) -> Result<(), CollectorError> {
         if let Some(runtime) = &mut self.runtime {
             runtime
@@ -2189,22 +2369,19 @@ impl CollectorInstance for EbpfCollector {
     }
 
     fn stats(&self) -> CollectorStats {
-        let dropped_count = self
-            .runtime
-            .as_ref()
-            .map(|runtime| (runtime.decode_failures(), runtime.transport_losses()));
         let mut dropped = Vec::new();
-        if let Some((decode, transport)) = dropped_count {
+        if let Some(runtime) = self.runtime.as_ref() {
+            let decode = runtime.decode_failures();
             if decode > 0 {
                 dropped.push(collector_stats::DropCounter {
                     reason: "decode_failure".to_string(),
                     count: decode,
                 });
             }
-            if transport > 0 {
+            for (class, count) in runtime.loss_counters() {
                 dropped.push(collector_stats::DropCounter {
-                    reason: "ring_buffer_loss".to_string(),
-                    count: transport,
+                    reason: class.to_string(),
+                    count,
                 });
             }
         }
@@ -2366,23 +2543,23 @@ fn decode_event(raw: &[u8]) -> Result<KernelProcessEvent, LoaderError> {
     } else {
         (None, None, None, 0, 0, 0, 0, 0, 0)
     };
-    let (fd_io_operation, fd_io_payload, fd_io_loss) =
-        if kind == EVENT_FD_IO && raw.len() == FD_IO_EVENT_SIZE {
-            let size = usize::try_from(read_u32(raw, PROCESS_EVENT_SIZE)?)
-                .map_err(|error| LoaderError::new("decode_bpf", error.to_string()))?;
-            if size > FD_IO_PAYLOAD_MAX {
-                return Err(LoaderError::new("decode_bpf", "fd-io payload is too large"));
-            }
-            let flags = read_u32(raw, PROCESS_EVENT_SIZE + 4)?;
-            (
-                Some(read_u32(raw, 8)?),
-                (size > 0)
-                    .then(|| raw[PROCESS_EVENT_SIZE + 8..PROCESS_EVENT_SIZE + 8 + size].to_vec()),
-                flags != 0,
-            )
-        } else {
-            (None, None, false)
-        };
+    let (fd_io_operation, fd_io_payload, fd_io_loss) = if kind == EVENT_FD_IO
+        && raw.len() == FD_IO_EVENT_SIZE
+    {
+        let size = usize::try_from(read_u32(raw, PROCESS_EVENT_SIZE)?)
+            .map_err(|error| LoaderError::new("decode_bpf", error.to_string()))?;
+        if size > FD_IO_PAYLOAD_MAX {
+            return Err(LoaderError::new("decode_bpf", "fd-io payload is too large"));
+        }
+        let flags = read_u32(raw, PROCESS_EVENT_SIZE + 4)?;
+        (
+            Some(read_u32(raw, 8)?),
+            (size > 0).then(|| raw[PROCESS_EVENT_SIZE + 8..PROCESS_EVENT_SIZE + 8 + size].to_vec()),
+            flags != 0,
+        )
+    } else {
+        (None, None, false)
+    };
     Ok(KernelProcessEvent {
         kind,
         host_pid: read_u32(raw, 12)?,
@@ -2570,7 +2747,12 @@ fn resize_map(
         .find(|map| map.name() == OsStr::new(name))
         .ok_or_else(|| LoaderError::new("resize_bpf_map", format!("missing map {name}")))?
         .set_max_entries(max_entries)
-        .map_err(|error| LoaderError::new("resize_bpf_map", error.to_string()))
+        .map_err(|error| {
+            LoaderError::new(
+                "resize_bpf_map",
+                format!("map {name} max_entries={max_entries}: {error}"),
+            )
+        })
 }
 
 fn map_handle(object: &Object, name: &str) -> Result<MapHandle, LoaderError> {

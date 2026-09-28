@@ -9,4 +9,5 @@ collector_binding = { path = "../binding" }
 collector_capability = { path = "../capability" }
 collector_event = { path = "../event" }
 collector_stats = { path = "../stats" }
+serde = { version = "1", features = ["derive"] }
 model_core = { path = "../../../core/model" }

@@ -51,7 +51,7 @@ impl SqliteStorage {
         if call_id.len() > 128 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT OR REPLACE INTO call_spans(trace_id,session_id,call_id,host_pid,started_at,ended_at,status) VALUES (?1,?2,?3,?4,?5,NULL,NULL)",
             params![trace_id.get(), session_id, call_id, host_pid, encode_time(started_at)],
         )?;
@@ -71,7 +71,7 @@ impl SqliteStorage {
         if call_id.len() > 128 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "UPDATE call_spans SET ended_at=?1,status=?2,session_id=COALESCE(session_id,?3) WHERE trace_id=?4 AND call_id=?5 AND host_pid=?6",
             params![encode_time(ended_at), status, session_id, trace_id.get(), call_id, host_pid],
         )?;
@@ -124,8 +124,8 @@ impl SqliteStorage {
         let mut connection = self.connection.borrow_mut();
         let transaction = connection.transaction()?;
         {
-            let mut statement =
-                transaction.prepare("UPDATE events SET call_id=?1 WHERE event_id=?2 AND call_id IS NULL")?;
+            let mut statement = transaction
+                .prepare("UPDATE events SET call_id=?1 WHERE event_id=?2 AND call_id IS NULL")?;
             for (event_id, call_id) in assignments {
                 statement.execute(params![call_id, event_id])?;
             }
@@ -186,9 +186,8 @@ impl SqliteStorage {
                     encode_time(job.updated_at),
                 ],
             )?;
-            let id: i64 = transaction.query_row("SELECT last_insert_rowid()", [], |row| {
-                row.get(0)
-            })?;
+            let id: i64 =
+                transaction.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))?;
             ids.push(id);
         }
         transaction.commit()?;
@@ -224,14 +223,11 @@ impl SqliteStorage {
 
     /// Persist one attribution backfill job as `pending`, returning the
     /// assigned queue id.
-    pub fn enqueue_backfill_job(
-        &mut self,
-        job: &BackfillJob,
-    ) -> Result<i64, rusqlite::Error> {
+    pub fn enqueue_backfill_job(&mut self, job: &BackfillJob) -> Result<i64, rusqlite::Error> {
         if job.state != BackfillJobState::Pending {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT INTO call_backfill_queue (
                 trace_id, session_id, call_id, kind, span_started_ns, span_ended_ns,
                 scope_from_ns, scope_to_ns, state, attempts, last_error,
@@ -309,10 +305,7 @@ impl SqliteStorage {
 
     /// Claim up to `limit` pending jobs oldest-first, flipping each to
     /// `running` inside one transaction so a crash leaves a resumable row.
-    pub fn claim_backfill_jobs(
-        &mut self,
-        limit: u64,
-    ) -> Result<Vec<BackfillJob>, rusqlite::Error> {
+    pub fn claim_backfill_jobs(&mut self, limit: u64) -> Result<Vec<BackfillJob>, rusqlite::Error> {
         let mut connection = self.connection.borrow_mut();
         let transaction = connection.transaction()?;
         let claimed_at = SystemTime::now();
@@ -395,14 +388,12 @@ impl SqliteStorage {
     /// Startup recovery: reset any `running` rows left by a crash to `pending`
     /// so they are claimed and executed again. Returns the number reset.
     pub fn reset_stale_backfill_jobs(&mut self) -> Result<usize, rusqlite::Error> {
-        self.connection
-            .borrow_mut()
-            .execute(
-                "UPDATE call_backfill_queue
+        self.connection.borrow_mut().execute(
+            "UPDATE call_backfill_queue
                     SET state = 'pending', updated_at_ns = ?1
                   WHERE state = 'running'",
-                [encode_time(SystemTime::now())],
-            )
+            [encode_time(SystemTime::now())],
+        )
     }
 
     /// Open or create a CensorScope SQLite database with WAL journaling enabled.
@@ -436,6 +427,10 @@ impl SqliteStorage {
         // made readers time out); shrinking the -wal file on disk is left to
         // the daemon's quiet-period TRUNCATE checkpoint.
         connection.pragma_update(None, "wal_autocheckpoint", 4096)?;
+        // The ingest path repeats a fixed set of statements per row; the default
+        // cache is smaller than that set, which would evict entries and
+        // re-prepare them on every event.
+        connection.set_prepared_statement_cache_capacity(64);
         schema::initialize(&connection)?;
         Ok(Self {
             connection: Rc::new(RefCell::new(connection)),
@@ -501,43 +496,13 @@ impl SqliteStorage {
     /// Insert or enrich a process record and its namespace aliases.
     pub fn upsert_process_record(&mut self, record: &ProcessRecord) -> Result<(), rusqlite::Error> {
         let mut connection = self.connection.borrow_mut();
-        let transaction = connection.transaction()?;
-        let host = record.host.as_ref();
-        transaction.execute(
-            "INSERT INTO processes (
-                process_id, host_pid, host_task_id, host_start_ticks,
-                host_start_boottime_ns, resolution_state, session_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(process_id) DO UPDATE SET
-                host_pid = excluded.host_pid,
-                host_task_id = excluded.host_task_id,
-                host_start_ticks = excluded.host_start_ticks,
-                host_start_boottime_ns = excluded.host_start_boottime_ns,
-                resolution_state = excluded.resolution_state,
-                session_id = excluded.session_id",
-            params![
-                record.identity.get(),
-                host.map(|value| value.pid),
-                host.and_then(|value| value.task_id),
-                host.map(|value| value.start_time_ticks),
-                host.and_then(|value| value.start_boottime_ns),
-                resolution_state_name(record.resolution_state),
-                record.session_id.as_ref().map(|value| value.as_str()),
-            ],
-        )?;
-        for namespace in &record.namespaces {
-            transaction.execute(
-                "INSERT OR IGNORE INTO process_namespace_aliases (
-                    process_id, pid_namespace, namespace_pid, namespace_start_ticks
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    record.identity.get(),
-                    namespace.pid_namespace.as_str(),
-                    namespace.pid,
-                    namespace.start_time_ticks,
-                ],
-            )?;
+        // Inside a batch the surrounding transaction already provides atomicity
+        // for this row, and opening a second one is rejected by SQLite.
+        if !connection.is_autocommit() {
+            return write_process_record(&connection, record);
         }
+        let transaction = connection.transaction()?;
+        write_process_record(&transaction, record)?;
         transaction.commit()
     }
 
@@ -571,7 +536,7 @@ impl SqliteStorage {
 
     /// Persist trace metadata at the moment it becomes active.
     pub fn create_trace(&mut self, trace: &TraceRecord) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT OR REPLACE INTO traces (
                 trace_id, root_process_id, root_pid_namespace, root_container_id,
                 root_working_directory, display_name, profile_name, tags, lifecycle_state,
@@ -610,7 +575,7 @@ impl SqliteStorage {
         trace_id: model_core::ids::TraceId,
         lifecycle: TraceLifecycleState,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "UPDATE traces SET lifecycle_state = ?2 WHERE trace_id = ?1",
             params![trace_id.get(), lifecycle.as_storage_str()],
         )?;
@@ -662,7 +627,7 @@ impl SqliteStorage {
         trace_id: model_core::ids::TraceId,
         observed_at: SystemTime,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT INTO sessions (session_id, display_name, first_seen, last_seen, last_trace_id)
              VALUES (?1, NULL, ?2, ?2, ?3)
              ON CONFLICT(session_id) DO UPDATE SET
@@ -682,7 +647,7 @@ impl SqliteStorage {
         &mut self,
         membership: &ProcessMembership,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT OR REPLACE INTO memberships (
                 trace_id, process_id, inherited_from_process_id, observed_at,
                 capture_enabled, propagation_enabled, membership_state, exit_code,
@@ -789,7 +754,7 @@ impl SqliteStorage {
                 String::new()
             }),
         };
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT OR REPLACE INTO events (
                 event_id, trace_id, observed_at, process_id, collector, kind, flags,
                 operation, parent_process_id, executable, argv, argv_flags, path, fd,
@@ -854,7 +819,7 @@ impl SqliteStorage {
         &mut self,
         segment: &model_core::payload::PayloadSegment,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT INTO payload_segments (
                 trace_id, process_id, session_id, observed_at, source, content_state, direction,
                 stream_key, sequence, operation_id, offset_bytes, completed,
@@ -903,13 +868,22 @@ impl SqliteStorage {
         self.connection.borrow_mut().execute_batch("COMMIT")
     }
 
+    /// Execute one write through the connection's prepared-statement cache.
+    fn execute_cached<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<usize, rusqlite::Error> {
+        execute_cached(&self.connection.borrow(), sql, params)
+    }
+
     /// Persist one explicit capture diagnostic. Diagnostics remain queryable
     /// without decoding event or payload blobs.
     pub fn append_diagnostic(
         &mut self,
         diagnostic: &CaptureDiagnostic,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT INTO diagnostics (
                 trace_id, observed_at, collector, kind, severity, message,
                 dropped, dropped_bytes
@@ -936,67 +910,158 @@ impl SqliteStorage {
         action: &SemanticAction,
     ) -> Result<(), rusqlite::Error> {
         let mut connection = self.connection.borrow_mut();
+        // Inside a batch the surrounding transaction already provides atomicity
+        // for this row, and opening a second one is rejected by SQLite.
+        if !connection.is_autocommit() {
+            return write_semantic_action(&connection, action);
+        }
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO semantic_actions (
-                trace_id, action_id, kind, kind_name, title, start_time, end_time,
-                process_id, status, completeness, confidence_millis, session_id,
-                schema_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
-             ON CONFLICT(trace_id, action_id) DO UPDATE SET
-                kind = excluded.kind, kind_name = excluded.kind_name,
-                title = excluded.title, start_time = excluded.start_time,
-                end_time = excluded.end_time, process_id = excluded.process_id,
-                status = excluded.status, completeness = excluded.completeness,
-                confidence_millis = excluded.confidence_millis,
-                session_id = excluded.session_id,
-                schema_version = 1",
-            params![
-                action.trace_id.get(),
-                action.action_id,
-                action.kind as i64,
-                action.kind.as_str(),
-                action.title,
-                encode_time(action.start_time),
-                action.end_time.map(encode_time),
-                action.process.get(),
-                action.status as i64,
-                action.completeness as i64,
-                action.confidence_millis.map(i64::from),
-                action.session_id.as_ref().map(|value| value.as_str()),
-            ],
-        )?;
-        transaction.execute(
-            "DELETE FROM semantic_action_attributes WHERE trace_id = ?1 AND action_id = ?2",
-            params![action.trace_id.get(), action.action_id],
-        )?;
-        for (key, value) in &action.attributes {
-            transaction.execute(
-                "INSERT INTO semantic_action_attributes
-                    (trace_id, action_id, attr_key, attr_value)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![action.trace_id.get(), action.action_id, key, value],
-            )?;
-        }
-        transaction.execute(
-            "DELETE FROM semantic_action_evidence WHERE trace_id = ?1 AND action_id = ?2",
-            params![action.trace_id.get(), action.action_id],
-        )?;
-        for evidence in &action.evidence {
-            transaction.execute(
-                "INSERT INTO semantic_action_evidence
-                    (trace_id, action_id, evidence_kind, evidence_id, evidence_role)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    action.trace_id.get(),
-                    action.action_id,
-                    evidence.kind as i64,
-                    evidence.id,
-                    evidence.role,
-                ],
-            )?;
-        }
+        write_semantic_action(&transaction, action)?;
         transaction.commit()
+    }
+
+    /// Apply one ordered batch of ancillary rows in a single transaction.
+    ///
+    /// Each row keeps its own atomicity through a savepoint, so a row that fails
+    /// is rolled back alone and the remaining rows still commit: a single
+    /// malformed row must not discard the rest of the batch. The rows are
+    /// reported as failures in queue order.
+    pub fn apply_ancillary_batch(
+        &mut self,
+        rows: Vec<storage_core::AncillaryRow>,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.connection
+            .borrow_mut()
+            .execute_batch("BEGIN IMMEDIATE")?;
+        let mut failures = Vec::new();
+        for row in rows {
+            self.connection
+                .borrow_mut()
+                .execute_batch("SAVEPOINT bulk_row")?;
+            match self.apply_ancillary_row(row) {
+                Ok(()) => {
+                    self.connection
+                        .borrow_mut()
+                        .execute_batch("RELEASE bulk_row")?;
+                }
+                Err(error) => {
+                    failures.push(error.to_string());
+                    self.connection
+                        .borrow_mut()
+                        .execute_batch("ROLLBACK TO bulk_row; RELEASE bulk_row")?;
+                }
+            }
+        }
+        self.connection.borrow_mut().execute_batch("COMMIT")?;
+        Ok(failures)
+    }
+
+    /// Apply a control-plane batch in one transaction so large trace updates
+    /// incur one commit and either all metadata becomes visible or none does.
+    pub fn apply_control_batch(
+        &mut self,
+        rows: Vec<storage_core::AncillaryRow>,
+    ) -> Result<(), rusqlite::Error> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.connection
+            .borrow_mut()
+            .execute_batch("BEGIN IMMEDIATE")?;
+        for row in rows {
+            if let Err(error) = self.apply_ancillary_row(row) {
+                let _ = self.connection.borrow_mut().execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        self.connection.borrow_mut().execute_batch("COMMIT")
+    }
+
+    /// Commit all rows belonging to one spool batch in one transaction.
+    pub fn apply_ingest_batch(
+        &mut self,
+        sequence: u64,
+        ancillary: Vec<storage_core::AncillaryRow>,
+        events: Vec<DomainEvent>,
+        payloads: Vec<model_core::payload::PayloadSegment>,
+    ) -> Result<(), rusqlite::Error> {
+        let sequence = i64::try_from(sequence).map_err(|_| rusqlite::Error::InvalidQuery)?;
+        self.connection
+            .borrow_mut()
+            .execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let committed: Option<i64> = self
+                .connection
+                .borrow()
+                .query_row(
+                    "SELECT last_sequence FROM spool_checkpoint WHERE singleton = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if committed.is_some_and(|value| sequence <= value) {
+                return Ok(());
+            }
+            for row in ancillary {
+                self.apply_ancillary_row(row)?;
+            }
+            for event in events {
+                self.append_event(&event)?;
+            }
+            for payload in payloads {
+                self.append_payload(&payload)?;
+            }
+            self.execute_cached(
+                "INSERT INTO spool_checkpoint (singleton, last_sequence) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET last_sequence = excluded.last_sequence",
+                [sequence],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })();
+        match result {
+            Ok(()) => self.connection.borrow_mut().execute_batch("COMMIT"),
+            Err(error) => {
+                let _ = self.connection.borrow_mut().execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply one ancillary row through the matching single-row writer.
+    fn apply_ancillary_row(
+        &mut self,
+        row: storage_core::AncillaryRow,
+    ) -> Result<(), rusqlite::Error> {
+        match row {
+            storage_core::AncillaryRow::ProcessRecord(record) => {
+                self.upsert_process_record(&record)
+            }
+            storage_core::AncillaryRow::Session {
+                session_id,
+                trace_id,
+                observed_at,
+            } => self.upsert_session(&session_id, trace_id, observed_at),
+            storage_core::AncillaryRow::TraceRecord(trace) => self.create_trace(&trace),
+            storage_core::AncillaryRow::TraceLifecycle { trace_id, state } => {
+                self.update_trace_lifecycle(trace_id, state)
+            }
+            storage_core::AncillaryRow::Membership(membership) => {
+                self.upsert_membership(&membership)
+            }
+            storage_core::AncillaryRow::SemanticAction(action) => {
+                self.upsert_semantic_action(&action)
+            }
+            storage_core::AncillaryRow::SemanticLink(link) => self.upsert_semantic_link(&link),
+            storage_core::AncillaryRow::SemanticContent(content) => {
+                self.upsert_semantic_content(&content)
+            }
+            storage_core::AncillaryRow::Diagnostic(diagnostic) => {
+                self.append_diagnostic(&diagnostic)
+            }
+        }
     }
 
     /// Upsert a lineage link only when both endpoints exist in the same trace.
@@ -1018,7 +1083,8 @@ impl SqliteStorage {
         if exists(&link.source_action_id)? == 0 || exists(&link.target_action_id)? == 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        connection.execute(
+        execute_cached(
+            &connection,
             "INSERT INTO semantic_action_links (
                 trace_id, source_action_id, target_action_id, role, role_name,
                 confidence, valid, schema_version
@@ -1047,7 +1113,7 @@ impl SqliteStorage {
         &mut self,
         content: &SemanticContent,
     ) -> Result<(), rusqlite::Error> {
-        self.connection.borrow_mut().execute(
+        self.execute_cached(
             "INSERT INTO semantic_contents (
                 trace_id, action_id, content_id, kind, kind_name, state,
                 state_name, payload_reference, canonical_json, schema_version
@@ -1139,6 +1205,143 @@ fn process_record_from_row(row: &Row<'_>) -> Result<ProcessRecord, rusqlite::Err
             .get::<_, Option<String>>(6)?
             .map(model_core::process::SessionIdentity::new),
     })
+}
+
+/// Execute one write through the connection's prepared-statement cache.
+///
+/// Ingest repeats the same handful of statements per event; re-preparing them
+/// per row costs more than executing them, and the cache makes the statement
+/// text the only per-row overhead.
+fn execute_cached<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<usize, rusqlite::Error> {
+    connection.prepare_cached(sql)?.execute(params)
+}
+
+/// Write one process record and its namespace aliases.
+///
+/// Takes the connection rather than the storage handle so the same statements
+/// serve both a single-row write and a queued batch, where the surrounding
+/// transaction is opened by the caller.
+fn write_process_record(
+    connection: &Connection,
+    record: &ProcessRecord,
+) -> Result<(), rusqlite::Error> {
+    let host = record.host.as_ref();
+    let mut statement = connection.prepare_cached(
+        "INSERT INTO processes (
+            process_id, host_pid, host_task_id, host_start_ticks,
+            host_start_boottime_ns, resolution_state, session_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(process_id) DO UPDATE SET
+            host_pid = excluded.host_pid,
+            host_task_id = excluded.host_task_id,
+            host_start_ticks = excluded.host_start_ticks,
+            host_start_boottime_ns = excluded.host_start_boottime_ns,
+            resolution_state = excluded.resolution_state,
+            session_id = excluded.session_id",
+    )?;
+    statement.execute(params![
+        record.identity.get(),
+        host.map(|value| value.pid),
+        host.and_then(|value| value.task_id),
+        host.map(|value| value.start_time_ticks),
+        host.and_then(|value| value.start_boottime_ns),
+        resolution_state_name(record.resolution_state),
+        record.session_id.as_ref().map(|value| value.as_str()),
+    ])?;
+    drop(statement);
+    let mut alias = connection.prepare_cached(
+        "INSERT OR IGNORE INTO process_namespace_aliases (
+            process_id, pid_namespace, namespace_pid, namespace_start_ticks
+         ) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for namespace in &record.namespaces {
+        alias.execute(params![
+            record.identity.get(),
+            namespace.pid_namespace.as_str(),
+            namespace.pid,
+            namespace.start_time_ticks,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Write one semantic action with its attributes and evidence.
+///
+/// Takes the connection rather than the storage handle so the same statements
+/// serve both a single-row write and a queued batch, where the surrounding
+/// transaction is opened by the caller.
+fn write_semantic_action(
+    connection: &Connection,
+    action: &SemanticAction,
+) -> Result<(), rusqlite::Error> {
+    connection
+        .prepare_cached(
+            "INSERT INTO semantic_actions (
+                trace_id, action_id, kind, kind_name, title, start_time, end_time,
+                process_id, status, completeness, confidence_millis, session_id,
+                schema_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
+             ON CONFLICT(trace_id, action_id) DO UPDATE SET
+                kind = excluded.kind, kind_name = excluded.kind_name,
+                title = excluded.title, start_time = excluded.start_time,
+                end_time = excluded.end_time, process_id = excluded.process_id,
+                status = excluded.status, completeness = excluded.completeness,
+                confidence_millis = excluded.confidence_millis,
+                session_id = excluded.session_id,
+                schema_version = 1",
+        )?
+        .execute(params![
+            action.trace_id.get(),
+            action.action_id,
+            action.kind as i64,
+            action.kind.as_str(),
+            action.title,
+            encode_time(action.start_time),
+            action.end_time.map(encode_time),
+            action.process.get(),
+            action.status as i64,
+            action.completeness as i64,
+            action.confidence_millis.map(i64::from),
+            action.session_id.as_ref().map(|value| value.as_str()),
+        ])?;
+    connection
+        .prepare_cached(
+            "DELETE FROM semantic_action_attributes WHERE trace_id = ?1 AND action_id = ?2",
+        )?
+        .execute(params![action.trace_id.get(), action.action_id])?;
+    let mut attribute = connection.prepare_cached(
+        "INSERT INTO semantic_action_attributes
+            (trace_id, action_id, attr_key, attr_value)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (key, value) in &action.attributes {
+        attribute.execute(params![action.trace_id.get(), action.action_id, key, value])?;
+    }
+    drop(attribute);
+    connection
+        .prepare_cached(
+            "DELETE FROM semantic_action_evidence WHERE trace_id = ?1 AND action_id = ?2",
+        )?
+        .execute(params![action.trace_id.get(), action.action_id])?;
+    let mut evidence_statement = connection.prepare_cached(
+        "INSERT INTO semantic_action_evidence
+            (trace_id, action_id, evidence_kind, evidence_id, evidence_role)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for evidence in &action.evidence {
+        evidence_statement.execute(params![
+            action.trace_id.get(),
+            action.action_id,
+            evidence.kind as i64,
+            evidence.id,
+            evidence.role,
+        ])?;
+    }
+    Ok(())
 }
 
 fn resolution_state_name(value: ProcessResolutionState) -> &'static str {
@@ -1768,22 +1971,42 @@ mod tests {
         };
         // In-window candidates: same session (id 1) and NULL session (id 2).
         storage
-            .append_event(&DomainEvent::new(env(7, 1, 10, Some("sess-1"), None), file("/a")))
+            .append_event(&DomainEvent::new(
+                env(7, 1, 10, Some("sess-1"), None),
+                file("/a"),
+            ))
             .unwrap();
         storage
             .append_event(&DomainEvent::new(env(7, 2, 11, None, None), file("/b")))
             .unwrap();
         // Already attributed / outside window / other trace must not match.
         storage
-            .append_event(&DomainEvent::new(env(7, 3, 12, Some("sess-1"), Some("call-x")), file("/c")))
+            .append_event(&DomainEvent::new(
+                env(7, 3, 12, Some("sess-1"), Some("call-x")),
+                file("/c"),
+            ))
             .unwrap();
         storage
-            .append_event(&DomainEvent::new(env(7, 4, 13, Some("sess-1"), None), file("/d")))
+            .append_event(&DomainEvent::new(
+                env(7, 4, 13, Some("sess-1"), None),
+                file("/d"),
+            ))
             .unwrap();
         storage
-            .append_event(&DomainEvent::new(env(8, 5, 10, Some("sess-1"), None), file("/e")))
+            .append_event(&DomainEvent::new(
+                env(8, 5, 10, Some("sess-1"), None),
+                file("/e"),
+            ))
             .unwrap();
-        let ns = |secs: u64| i64::try_from((base + std::time::Duration::from_secs(secs)).duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let ns = |secs: u64| {
+            i64::try_from(
+                (base + std::time::Duration::from_secs(secs))
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            )
+            .unwrap()
+        };
         let candidates = storage
             .unassigned_events_in_window(TraceId::new(7), Some("sess-1"), ns(10), ns(12), 100)
             .unwrap();
@@ -1980,5 +2203,426 @@ mod tests {
         let remaining = storage.claim_backfill_job_by_id(first).unwrap().unwrap();
         assert_eq!(remaining.queue_id, first);
         assert_eq!(remaining.state, BackfillJobState::Running);
+    }
+}
+
+/// Batched ancillary writes.
+///
+/// The daemon hands over an item's rows as one batch: rows must commit together
+/// without a single bad row discarding the rest, which is what the per-row
+/// savepoint provides.
+#[cfg(test)]
+mod ancillary_batch_tests {
+    use std::time::SystemTime;
+
+    use model_core::event::{
+        DomainEvent, EventEnvelope, EventFlags, EventKind, EventPayload, FilePayload,
+    };
+    use model_core::ids::TraceId;
+    use model_core::process::{
+        HostProcessCoordinates, ProcessIdentity, ProcessObservation, ProcessRecord, SessionIdentity,
+    };
+    use semantic_action_contract::{
+        SemanticActionLink, SemanticActionLinkConfidence, SemanticActionLinkRole,
+    };
+    use storage_core::AncillaryRow;
+
+    #[test]
+    fn rows_commit_together_and_a_failed_row_does_not_discard_the_rest() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let process = ProcessRecord::new(
+            ProcessIdentity::new(7),
+            ProcessObservation::host(HostProcessCoordinates::new(700, 42)),
+        );
+        // A link whose endpoints were never written: storage rejects it.
+        let orphan_link = SemanticActionLink {
+            trace_id: TraceId::new(1),
+            source_action_id: "missing-source".to_string(),
+            target_action_id: "missing-target".to_string(),
+            role: SemanticActionLinkRole::CommandContainsFileAccess,
+            confidence: SemanticActionLinkConfidence::Derived,
+            valid: true,
+        };
+        let outcomes = storage
+            .apply_ancillary_batch(vec![
+                AncillaryRow::ProcessRecord(process.clone()),
+                AncillaryRow::SemanticLink(orphan_link),
+                AncillaryRow::Session {
+                    session_id: SessionIdentity::new("sess-after-failure"),
+                    trace_id: TraceId::new(1),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                },
+            ])
+            .expect("batch applies");
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "only the orphan link fails: {outcomes:?}"
+        );
+        let records = storage.list_process_records().expect("process records");
+        assert!(
+            records
+                .iter()
+                .any(|record| record.identity == process.identity),
+            "the row before the failure must be committed"
+        );
+        let sessions: i64 = storage
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = 'sess-after-failure'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions, 1,
+            "a row after the failure must still be committed"
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_touches_storage_not_at_all() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let outcomes = storage
+            .apply_ancillary_batch(Vec::new())
+            .expect("empty batch");
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn control_batch_rolls_back_when_one_row_fails() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let process = ProcessRecord::new(
+            ProcessIdentity::new(8),
+            ProcessObservation::host(HostProcessCoordinates::new(800, 43)),
+        );
+        let orphan_link = SemanticActionLink {
+            trace_id: TraceId::new(1),
+            source_action_id: "missing-source".to_string(),
+            target_action_id: "missing-target".to_string(),
+            role: SemanticActionLinkRole::CommandContainsFileAccess,
+            confidence: SemanticActionLinkConfidence::Derived,
+            valid: true,
+        };
+        assert!(
+            storage
+                .apply_control_batch(vec![
+                    AncillaryRow::ProcessRecord(process.clone()),
+                    AncillaryRow::SemanticLink(orphan_link),
+                ])
+                .is_err()
+        );
+        assert!(
+            storage
+                .list_process_records()
+                .unwrap()
+                .iter()
+                .all(|record| record.identity != process.identity)
+        );
+    }
+
+    #[test]
+    fn ingest_batch_rolls_back_ancillary_and_events_on_event_failure() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let process = ProcessRecord::new(
+            ProcessIdentity::new(9),
+            ProcessObservation::host(HostProcessCoordinates::new(900, 44)),
+        );
+        let envelope = |event_id| EventEnvelope {
+            event_id: model_core::ids::EventId::new(event_id),
+            trace_id: TraceId::new(1),
+            observed_at: SystemTime::UNIX_EPOCH,
+            process: process.identity,
+            collector: model_core::ids::CollectorName::new("test"),
+            kind: EventKind::Unknown,
+            session_id: None,
+            call_id: None,
+            flags: EventFlags::empty(),
+        };
+        let valid = DomainEvent::new(
+            envelope(1),
+            EventPayload::File(FilePayload {
+                operation: "read".to_string(),
+                path: Some("/tmp/valid".to_string()),
+                fd: None,
+                size: None,
+                metadata: std::collections::BTreeMap::new(),
+            }),
+        );
+        let mut invalid = valid.clone();
+        invalid.envelope.event_id = model_core::ids::EventId::new(2);
+        invalid.envelope.call_id = Some("x".repeat(129));
+
+        assert!(
+            storage
+                .apply_ingest_batch(
+                    1,
+                    vec![AncillaryRow::ProcessRecord(process.clone())],
+                    vec![valid, invalid],
+                    Vec::new(),
+                )
+                .is_err()
+        );
+        assert!(
+            storage
+                .list_process_records()
+                .unwrap()
+                .iter()
+                .all(|record| record.identity != process.identity)
+        );
+        let event_count: i64 = storage
+            .connection
+            .borrow()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn ingest_batch_sequence_makes_replay_idempotent() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let process = ProcessRecord::new(
+            ProcessIdentity::new(10),
+            ProcessObservation::host(HostProcessCoordinates::new(1_000, 45)),
+        );
+        let event = DomainEvent::new(
+            EventEnvelope {
+                event_id: model_core::ids::EventId::new(10),
+                trace_id: TraceId::new(1),
+                observed_at: SystemTime::UNIX_EPOCH,
+                process: process.identity,
+                collector: model_core::ids::CollectorName::new("test"),
+                kind: EventKind::Unknown,
+                session_id: None,
+                call_id: None,
+                flags: EventFlags::empty(),
+            },
+            EventPayload::File(FilePayload {
+                operation: "read".to_string(),
+                path: Some("/tmp/replay".to_string()),
+                fd: None,
+                size: None,
+                metadata: std::collections::BTreeMap::new(),
+            }),
+        );
+        let mut apply = || {
+            storage.apply_ingest_batch(
+                7,
+                vec![AncillaryRow::ProcessRecord(process.clone())],
+                vec![event.clone()],
+                Vec::new(),
+            )
+        };
+        apply().unwrap();
+        apply().unwrap();
+        let event_count: i64 = storage
+            .connection
+            .borrow()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
+        let checkpoint: i64 = storage
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT last_sequence FROM spool_checkpoint WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint, 7);
+    }
+}
+
+/// Opt-in measurement of the persistence paths the writer drives.
+///
+/// Storage is the stage that limits how long the writer can absorb a fast
+/// capture, so its per-row cost has to be measurable on a host without
+/// privileges. The rows mirror what the daemon queues: one event row per
+/// observation, one 4 KiB plaintext row per captured segment, and the ancillary
+/// rows that accompany each event.
+///
+/// Run with:
+///
+/// ```text
+/// cargo test --release -p sqlite_storage -- storage_ --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod storage_bench {
+    use std::collections::BTreeMap;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use model_core::event::{
+        DomainEvent, EventEnvelope, EventFlags, EventKind, EventPayload, FilePayload,
+    };
+    use model_core::ids::{CollectorName, EventId, TraceId};
+    use model_core::payload::{
+        PayloadContentState, PayloadDirection, PayloadSegment, PayloadSourceBoundary,
+    };
+    use model_core::process::{ProcessIdentity, ProcessRecord, SessionIdentity};
+    use model_core::trace::{TraceLifecycleState, TraceRecord};
+    use storage_core::AncillaryRow;
+
+    const ROWS: u64 = 20_000;
+    const BATCH: usize = 512;
+    const PAYLOAD_BYTES: usize = 4096;
+
+    fn payload_bytes() -> Vec<u8> {
+        vec![b'a'; PAYLOAD_BYTES]
+    }
+
+    #[test]
+    #[ignore = "opt-in storage benchmark; run with --ignored --nocapture"]
+    fn storage_write_throughput() {
+        let path = std::env::temp_dir().join(format!(
+            "censorscope-storage-bench-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut storage =
+            super::SqliteStorage::open_with_busy_timeout(&path, Duration::from_secs(5))
+                .expect("open storage");
+
+        let base = UNIX_EPOCH + Duration::from_secs(10_000);
+        let envelope = |id: u64| EventEnvelope {
+            event_id: EventId::new(id),
+            trace_id: TraceId::new(1),
+            observed_at: base + Duration::from_nanos(id),
+            process: ProcessIdentity::new(50),
+            collector: CollectorName::new("bench"),
+            kind: EventKind::Unknown,
+            session_id: Some(SessionIdentity::new("sess")),
+            call_id: Some("call".to_string()),
+            flags: EventFlags::empty(),
+        };
+        let record = ProcessRecord::new(
+            ProcessIdentity::new(50),
+            model_core::process::ProcessObservation::default(),
+        );
+        storage
+            .create_trace(&TraceRecord::new(
+                TraceId::new(1),
+                ProcessIdentity::new(50),
+                model_core::ids::TraceName::new("bench"),
+                model_core::ids::ProfileName::new("bench"),
+                base,
+            ))
+            .expect("create trace");
+
+        // Event rows.
+        let events: Vec<DomainEvent> = (1..=ROWS)
+            .map(|id| {
+                DomainEvent::new(
+                    envelope(id),
+                    EventPayload::File(FilePayload {
+                        operation: "read".to_string(),
+                        path: Some("/tmp/bench".to_string()),
+                        fd: Some(3),
+                        size: Some(PAYLOAD_BYTES as u64),
+                        metadata: BTreeMap::new(),
+                    }),
+                )
+            })
+            .collect();
+        let started = Instant::now();
+        for chunk in events.chunks(BATCH) {
+            storage.append_events_batch(chunk).expect("events");
+        }
+        let event_elapsed = started.elapsed();
+
+        // Plaintext rows.
+        let segments: Vec<PayloadSegment> = (1..=ROWS)
+            .map(|sequence| PayloadSegment {
+                trace_id: TraceId::new(1),
+                process: ProcessIdentity::new(50),
+                session_id: Some(SessionIdentity::new("sess")),
+                call_id: Some("call".to_string()),
+                observed_at: base + Duration::from_nanos(sequence),
+                source: PayloadSourceBoundary::Uprobe,
+                content_state: PayloadContentState::Complete,
+                direction: PayloadDirection::Outbound,
+                stream_key: Some(format!("stream:{sequence}")),
+                sequence,
+                operation_id: Some(sequence),
+                offset: Some(0),
+                completed: true,
+                original_size: PAYLOAD_BYTES as u64,
+                captured_size: PAYLOAD_BYTES as u64,
+                library: Some("openssl".to_string()),
+                symbol: Some("SSL_write".to_string()),
+                protocol_hint: Some("tls".to_string()),
+                loss_reason: None,
+                bytes: Some(payload_bytes()),
+            })
+            .collect();
+        let started = Instant::now();
+        for chunk in segments.chunks(BATCH) {
+            storage.append_payloads_batch(chunk).expect("payloads");
+        }
+        let payload_elapsed = started.elapsed();
+
+        // Ancillary rows, one transaction per row: the cost of writing each
+        // row on its own.
+        let rows: Vec<AncillaryRow> = (0..ROWS)
+            .map(|_| AncillaryRow::ProcessRecord(record.clone()))
+            .collect();
+        let started = Instant::now();
+        for row in rows.clone() {
+            storage
+                .apply_ancillary_row(row)
+                .expect("single ancillary row");
+        }
+        let per_row_elapsed = started.elapsed();
+
+        // The same rows coalesced the way the writer queues them.
+        let started = Instant::now();
+        for chunk in rows.chunks(BATCH) {
+            let failures = storage
+                .apply_ancillary_batch(chunk.to_vec())
+                .expect("ancillary batch");
+            assert!(
+                failures.is_empty(),
+                "unexpected write failures: {failures:?}"
+            );
+        }
+        let batched_elapsed = started.elapsed();
+
+        // A lifecycle transition is a single statement per trace.
+        let started = Instant::now();
+        for _ in 0..ROWS {
+            storage
+                .update_trace_lifecycle(TraceId::new(1), TraceLifecycleState::Active)
+                .expect("lifecycle");
+        }
+        let lifecycle_elapsed = started.elapsed();
+
+        drop(storage);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+
+        let report = |label: &str, elapsed: Duration| {
+            println!(
+                "{label}: {} rows in {:.3}s -> {:.2} us/row, {:.0} rows/s",
+                ROWS,
+                elapsed.as_secs_f64(),
+                elapsed.as_secs_f64() * 1e6 / ROWS as f64,
+                ROWS as f64 / elapsed.as_secs_f64()
+            );
+        };
+        report("event rows", event_elapsed);
+        report("plaintext rows (4 KiB)", payload_elapsed);
+        report("ancillary rows, one transaction each", per_row_elapsed);
+        report(
+            &format!("ancillary rows, one transaction per {BATCH}"),
+            batched_elapsed,
+        );
+        report("lifecycle updates", lifecycle_elapsed);
     }
 }
