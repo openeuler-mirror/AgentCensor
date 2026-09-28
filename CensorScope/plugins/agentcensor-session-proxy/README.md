@@ -13,8 +13,7 @@ worker 是完整的 dsh 进程、跑正常的原生 agent 流程,宿主只做 UI
 
 ## 要求
 
-- Node 22；dsh **0.1.2-rc.1** 完整支持。dsh **0.1.1-rc.2** 可使用兼容模式，
-  仅跳过该版本尚未导出的 `turnBoundary` UI 投影。
+- dsh **0.1.2-rc.1**(`dsh --version`),Node 22。
 
 ## 安装与启动
 
@@ -24,10 +23,6 @@ dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.1.tgz
 # 启动
 dsh web
 ```
-
-没有全局 `dsh`、直接从源码运行时，在 DeepSeek Harness 根目录执行 `pnpm dsh web`；插件会
-自动用同一源码入口启动 headless worker。也可在启动 Web 时设置 `DSH_ROOT`，或用
-`AGENTCENSOR_DSH_BIN` 指向独立的 `dsh` 可执行文件。
 
 ## 卸载
 ```sh

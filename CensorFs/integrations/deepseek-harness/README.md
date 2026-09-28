@@ -4,7 +4,7 @@
 
 **共同 FUSE 数据面**：每个 variant 一个独立 CensorFS View（copy-on-write 覆盖层），写入私有 Upper/Delta；`prepare`→Candidate→`publish` 才把 delta 合并成新 Generation。无共享文件系统模式、无 git worktree 模式。
 
-当前适配 DeepSeek Harness `0.1.5-rc.2`（npm 包 `@deepseek-ai/*@0.1.5-rc.2`）。Harness 仍是 developer preview；升级前必须重跑这里的 unit test、Session event snapshot 和 openEuler 真机 smoke。
+当前适配 DeepSeek Harness `0.1.0-rc.8`（npm 包 `@deepseek-ai/*@0.1.0-rc.8`）。Harness 仍是 developer preview；升级前必须重跑这里的 unit test、Session event snapshot 和 openEuler 真机 smoke。
 
 ## 架构：三个协同件
 
@@ -138,7 +138,7 @@ grep -c 'task-file\|taskFilePath' "$DSH_HOME/profiles/<profile>/node_modules/@ce
 
 ```bash
 pnpm add file:/path/to/CensorFS/integrations/deepseek-harness
-pnpm add @deepseek-ai/dsh-sdk-client@0.1.5-rc.2 @deepseek-ai/dsh-sdk-protocol@0.1.5-rc.2
+pnpm add @deepseek-ai/dsh-sdk-client@0.1.0-rc.8 @deepseek-ai/dsh-sdk-protocol@0.1.0-rc.8
 ```
 
 装完用入口探针确认可解析：`node -e "import(process.env.HOME + '/.dsh/profiles/<profile>/node_modules/@censorfs/deepseek-harness/src/index.js').then(() => console.log('ENTRY_IMPORT_OK'))"`。

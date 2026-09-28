@@ -1,2 +1,0 @@
-# CensorPivot may invoke only the CensorFS namespace/FUSE helper as root.
-censorpivot ALL=(root) NOPASSWD: /usr/libexec/censorfs/censorfs-mounter *

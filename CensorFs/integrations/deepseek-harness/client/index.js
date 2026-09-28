@@ -3230,19 +3230,19 @@ return h('div', { className: 'branch-explore-summary', style: panel },
     // 客户端 cordis 模块规范：模块必须导出 apply(ctx)，
     // 否则浏览器端加载器会报 invalid plugin, expect function or object with an "apply" method。
 
-    var inject = ['uiConversation', 'slots', 'remote', 'remote.commands', 'sessions']
+    var inject = ['conversationEvents', 'conversationViews', 'slots', 'remote', 'remote.commands', 'sessions']
 
     function apply(ctx) {
       var sessions = ctx.sessions
       // 事件聚合：把 exploration-* / variant-* 事件折叠成一张聊天卡片（摘要）
-      ctx.uiConversation.events.register(branchExploreDefinition)
+      ctx.conversationEvents.register(branchExploreDefinition)
       // 事件聚合：同一批事件再投影一份到 'worlds' 视图（全宽 Dashboard）
-      ctx.uiConversation.events.register(worldsEventDefinition)
+      ctx.conversationEvents.register(worldsEventDefinition)
       // 事件聚合：全局子代理图（subagent-graph-opened + subagent-*），投递到 'subagents' 视图
-      ctx.uiConversation.events.register(subagentGraphDefinition)
+      ctx.conversationEvents.register(subagentGraphDefinition)
       // 视图数据源
-      ctx.uiConversation.views.register(subagentViewDefinition)
-      ctx.uiConversation.views.register(worldsViewDefinition)
+      ctx.conversationViews.register(subagentViewDefinition)
+      ctx.conversationViews.register(worldsViewDefinition)
       // 卡片渲染：注册到 conversation.chat.node 槽位，key 必须与事件聚合的 kind 一致
       ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({
         name: 'conversation.chat.node',
