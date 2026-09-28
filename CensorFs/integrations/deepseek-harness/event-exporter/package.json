@@ -1,6 +1,6 @@
 {
   "name": "@censorfs/event-exporter",
-  "version": "0.1.2",
+  "version": "0.1.1",
   "description": "Child-side DSH plugin: stream session/event over a Unix socket and receive reverse control for CensorFS Parallel Worlds",
   "type": "module",
   "main": "src/index.js",
@@ -23,7 +23,7 @@
     "bundle": { "patch": "./cordis.patch.yml" }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-session": "^0.1.5-rc.2"
+    "@deepseek-ai/cordis": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-session": "0.1.0-rc.8"
   }
 }

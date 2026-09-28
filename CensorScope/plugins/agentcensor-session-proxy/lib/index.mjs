@@ -67,8 +67,7 @@
  * (session-persistence/storage/attachments) into the per-worker private dir.
  *
  * Host-side env:
- *   AGENTCENSOR_DSH_BIN   dsh executable (default: auto-detect source tree, then 'dsh')
- *   DSH_ROOT              optional DeepSeek Harness source root for worker launch
+ *   AGENTCENSOR_DSH_BIN   dsh executable (default 'dsh')
  *   AGENTCENSOR_KEEP      '1' keeps per-worker private dirs for inspection
  */
 import { spawn } from 'node:child_process'
@@ -79,7 +78,7 @@ import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
-import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
+import { turnBoundaryProjectionDefinition } from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
@@ -168,29 +167,6 @@ function bundleDir() {
   return dirname(fileURLToPath(import.meta.url))
 }
 
-/** Resolve a worker launcher for installed dsh or a Harness source checkout. */
-async function resolveDshWorkerLauncher() {
-  if (process.env.AGENTCENSOR_DSH_BIN) {
-    return { command: process.env.AGENTCENSOR_DSH_BIN, prefixArgs: [], label: process.env.AGENTCENSOR_DSH_BIN }
-  }
-  const candidates = [...new Set([process.env.DSH_ROOT, process.cwd()].filter(Boolean))]
-  for (const candidate of candidates) {
-    try {
-      const pkg = JSON.parse(await fsp.readFile(join(candidate, 'package.json'), 'utf8'))
-      if (pkg.scripts?.dsh) {
-        return {
-          command: 'pnpm',
-          prefixArgs: ['--dir', candidate, 'dsh'],
-          label: `pnpm --dir ${candidate} dsh`,
-        }
-      }
-    } catch {
-      // Continue to the installed command fallback.
-    }
-  }
-  return { command: 'dsh', prefixArgs: [], label: 'dsh' }
-}
-
 /**
  * Worker overlay (real LLM only): headless profile minus its one-shot rows,
  * native agent-loop ON. The worker SHARES the host DSH_HOME for configuration
@@ -273,11 +249,10 @@ function messageText(message) {
 
 /** Host driver agent: one session ↔ one resident worker process. */
 class WebDriverAgent {
-  constructor(rootCtx, session, options, persistenceHandle) {
+  constructor(rootCtx, session, options) {
     this.id = session.id
     this.session = session
     this.options = options ?? {}
-    this.persistenceHandle = persistenceHandle
     this.status = 'idle'
     this.inbox = { nextTurn: [], nextStep: [] }
     this.dispatch = agentEvents(rootCtx, this)
@@ -431,8 +406,7 @@ class WebDriverAgent {
     if (sessions === undefined || persistence === undefined) {
       throw new Error('agentcensor: sessions/sessionPersistence unavailable')
     }
-    if (this.cancelled) throw new Error('agentcensor: cancelled before worker spawn')
-    const dshLauncher = await resolveDshWorkerLauncher()
+    const dshBin = process.env.AGENTCENSOR_DSH_BIN ?? 'dsh'
 
     await sessions.flush(this.session)
     this.endSeedInserted = false
@@ -471,11 +445,7 @@ class WebDriverAgent {
     process.stdout.write(
       `[agentcensor] worker spawn mode=${resume ? 'resume' : 'create'} session=${this.id} pid=PENDING\n`,
     )
-    process.stdout.write(`[agentcensor] worker launcher=${dshLauncher.label}\n`)
-    const child = spawn(dshLauncher.command, [
-      ...dshLauncher.prefixArgs,
-      '--profile', 'headless', '--patch', overlayPath,
-    ], {
+    const child = spawn(dshBin, ['--profile', 'headless', '--patch', overlayPath], {
       cwd,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -839,8 +809,8 @@ async function seedLogCopy(realFile, privRoot) {
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source, persistenceHandle) {
-  const agent = new WebDriverAgent(rootCtx, session, options, persistenceHandle)
+async function publish(rootCtx, ownerCtx, session, options, source) {
+  const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
   const detachAgent = rootCtx.agents.enter(agent, ownerCtx?.agent)
   try {
@@ -850,7 +820,6 @@ async function publish(rootCtx, ownerCtx, session, options, source, persistenceH
   } catch (error) {
     detachAgent?.()
     detachSession?.()
-    await persistenceHandle?.close().catch(() => {})
     throw error
   }
   const dispose = (async () => {
@@ -860,9 +829,6 @@ async function publish(rootCtx, ownerCtx, session, options, source, persistenceH
       detachAgent?.()
     } finally {
       detachSession?.()
-      await agent.persistenceHandle?.close().catch((error) => {
-        process.stdout.write(`[agentcensor] persistence handle close failed: ${error?.message ?? String(error)}\n`)
-      })
       await agent.scope.dispose()
     }
   })
@@ -873,18 +839,12 @@ export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
   interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
-  // control stream (row is disabled by overlay). dsh 0.1.1 does not export
-  // this optional definition, so keep the worker bridge usable without it.
-  const turnBoundaryProjectionDefinition = agentLoopModule.turnBoundaryProjectionDefinition
-  if (turnBoundaryProjectionDefinition === undefined) {
-    process.stdout.write('[agentcensor] turnBoundary projection unavailable; compatibility mode\n')
-  } else {
-    try {
-      ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
-      process.stdout.write('[agentcensor] turnBoundary projection registered\n')
-    } catch (error) {
-      process.stdout.write(`[agentcensor] projection register: ${String(error)}\n`)
-    }
+  // control stream (row is disabled by overlay).
+  try {
+    ctx.sessionProjections.register(turnBoundaryProjectionDefinition)
+    process.stdout.write('[agentcensor] turnBoundary projection registered\n')
+  } catch (error) {
+    process.stdout.write(`[agentcensor] projection register: ${String(error)}\n`)
   }
 
   // Host-exit cleanup so no resident worker is orphaned. Node does not emit
@@ -915,36 +875,23 @@ export async function apply(ctx) {
       let handle
       try {
         if (persistence !== undefined) {
-          handle = await persistence.create(session.header, {
-            inheritedEventCount: session.inheritedEventCount,
-          })
-          const seed = session.snapshotEvents()
-          if (seed.length > 0) await handle.append(seed)
+          handle = await persistence.create(session.header, session.inheritedEventCount)
         }
       } catch (error) {
         process.stdout.write(`[agentcensor] persistence.create: ${error?.message ?? String(error)}\n`)
-        await handle?.close().catch(() => {})
-        throw error
       }
-      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup', handle)
+      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup')
     },
     async resume(ownerCtx, options) {
       const id = String(options.resumeSessionId)
       process.stdout.write(`[agentcensor] resume id=${id}\n`)
       if (persistence === undefined) throw new Error('agentcensor: no sessionPersistence')
-      const handle = await persistence.open(id, 'write')
+      const preparation = await persistence.prepare(id)
       try {
-        const loaded = await handle.read()
-        const session = ctx.sessions.prepare(id, {
-          seed: [...loaded.events],
-          meta: structuredClone(handle.header),
-          inheritedEventCount: handle.inheritedEventCount,
-          eventState: loaded.eventState,
-        })
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', handle)
-      } catch (error) {
-        await handle.close().catch(() => {})
-        throw error
+        const session = preparation.session
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume')
+      } finally {
+        await preparation[Symbol.dispose]?.()
       }
     },
   }

@@ -14,5 +14,10 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
-  }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ]
 }

@@ -1,6 +1,0 @@
-# CensorPivot baseline. The default Pivot/DSH group is applied through
-# censorguardctl after the daemon is healthy.
-rules:
-  - file deny+audit /etc/shadow
-  - file deny+audit /root/.ssh
-  - exec deny /usr/bin/nc
