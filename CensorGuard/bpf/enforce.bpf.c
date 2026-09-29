@@ -1,21 +1,10 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Migration baseline: ohmyguard feat/pidtree-domain
- * commit fa1f28546abecd01fe07c0e14bad3aad1d077070.
- *
- * During parity phases this file intentionally keeps the verified hook semantics intact. Safety
- * enhancements are introduced only after the Rust/C integration matrix has a matching regression
- * test, so loader, policy compiler and kernel behavior are not changed simultaneously.
- */
 /*
  * enforce.bpf.c —— 进程树作用域 (pidtree) + 多域策略 (map-in-map) eBPF 拦截
  *
  * [pidtree] P1: 作用域从 cgroup 换成自建进程树 (tracked_pids, 照搬
  * AcTrail 追踪集合维护机制), cgroup 路径已停用、代码以注释保留待回溯。
- * 设计文档: docs/design/多Agent域模型-进程树作用域设计.md
  *
- * [P2] 多域策略: 策略从全局扁平 map 换成 map-in-map 域索引
- * (docs/design/ohmyguard多域策略map-in-map改造实现方案.md):
+ * [P2] 多域策略: 策略从全局扁平 map 换成 map-in-map 域索引:
  *   进程 → tracked_pids 拿 scope_id → scope_policies 拿 policy_slot
  *        → 7 张 outer (ARRAY_OF_MAPS) 按 slot 拿 inner 指针
  *        → inner 查规则。slot 0 固定为全局基线 (__base__), 与域 slot 并查。
@@ -24,7 +13,7 @@
  * 每条规则 value 与 slot_meta 携带策略版本, 事件上报版本供审计对账。
  *
  * 三个策略：文件 / 命令(含参数级) / 网络
- * 29 个 program: lsm.s/file_open (按 f_flags 区分读/写),
+ * 29 个 program: lsm/file_open (按 f_flags 区分读/写),
  *              lsm/file_permission (预打开 fd 实际读写时重新授权),
  *              lsm/path_truncate (写), lsm/path_unlink (删),
  *              lsm/path_rmdir (删目录), lsm/path_rename (改名/移动),
@@ -35,11 +24,16 @@
  * 注意: path_truncate/unlink/rmdir/rename 不在内核 sleepable LSM
  * 钩子名单里 (inode 锁上下文), 只能用非 sleepable lsm/ 挂载;
  * 而 bpf_d_path 在非 sleepable 程序里被禁
- * ("helper call is not allowed in probe"), 所以文件策略的判定
- * 不依赖路径字符串, 改用 (dev,ino) 身份匹配: 受害者自身 inode 查
+ * ("helper call is not allowed in probe"), 所以文件策略的主判定
+ * 用 (dev,ino) 身份匹配: 受害者自身 inode 查
  * file_ino 维, 祖先目录走链查 dir_ino 维。
- * file_open 是 sleepable, 仍用 bpf_d_path 拿全路径做事件展示和
- * 字符串兜底 (加载时不存在的路径只能这样拦 open)。
+ * (dev,ino) miss 时的兜底是 path_walk.h 的手工 d_path 走链
+ * 解析出命名空间绝对路径查 file_str 维 —— 这盖住"策略加载后文件
+ * 被删除重建/新建, inode 变化逃逸"的场景 (编译器对每条文件规则
+ * 恒双写字符串身份)。
+ * file_open 同样用走链兜底 (非 sleepable): bpf_d_path 已弃用,
+ * 其 d_path 右对齐写入 + memmove(len) 的实现会在缓冲尾部残留
+ * 字符串副本, 直接当定长 key 用会恒 miss。
  *
  * 加载方式: Rust kernel crate 经 libbpf C shim 按严格 manifest 加载并 attach，
  * 任一必需 program 失败都不进入 READY。
@@ -52,6 +46,7 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
+#include "path_walk.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -70,14 +65,14 @@ char LICENSE[] SEC("license") = "GPL";
  * key 结构原样保留, 作为各维度 inner map 的 key。
  */
 
-/* 文件路径 key: 完整路径 (最长 64 字节) */
+/* 文件路径 key: 完整路径 (最长 255 字节 + NUL, NAME_MAX) */
 struct path_key {
-    char s[64];
+    char s[256];
 };
 
-/* 命令 key: 完整命令路径 (最长 64 字节) */
+/* 命令 key: 完整命令路径 (最长 255 字节 + NUL, NAME_MAX) */
 struct cmd_key {
-    char s[64];
+    char s[256];
 };
 
 /* 网络规则 key (LPM_TRIE, 无端口规则): prefixlen + addr 位串。
@@ -128,14 +123,19 @@ struct net6_port_lpm_key {
 
 /* (dev, ino) 文件/目录规则 key。
  *
- * 为什么用 (dev,ino) 不用路径字符串 (详见 docs/archive/诊断记录s.md 记录 7-10):
+ * 为什么主键用 (dev,ino) 不用路径字符串:
  * path_truncate/unlink/rmdir/rename 不在内核 sleepable LSM 名单里,
- * 只能非 sleepable 挂载; 而 bpf_d_path 在非 sleepable 程序里被禁,
- * 全路径在这些钩子里**根本拿不到**。但 dentry->d_inode->i_ino /
- * i_sb->s_dev 是普通内存读 (BPF_CORE_READ), 任何钩子都能用。
+ * 只能非 sleepable 挂载; 而 bpf_d_path 在非 sleepable 程序里被禁。
+ * 但 dentry->d_inode->i_ino / i_sb->s_dev 是普通内存读 (BPF_CORE_READ),
+ * 任何钩子都能用。
  *
  * 红利: 保护跟随 inode —— mv 改名后依然被拦; 硬链接共享 inode 天然覆盖;
- * 无路径长度/深度/挂载点限制。
+ * 无路径长度/深度限制。
+ *
+ * 代价与补丁: inode 身份绑定加载时刻的快照, 文件被删除重建后新 inode
+ * 逃逸 —— 由 path_fallback_mask (path_walk.h 手工走链查 file_str 维)
+ * 兜底; dir_ancestor_mask 不跨挂载点 (纯 d_parent 走链停在挂载根),
+ * 挂载点上方的受保护祖先也由路径兜底层补盖。
  *
  * dev 编码: 内核 s_dev 是原始 dev_t ((major<<20)|minor), 用户态 stat 的
  * st_dev 是 new_encode_dev 编码, Rust 策略编译器打包 key 前做逆变换。 */
@@ -632,6 +632,15 @@ struct net6_port_lpm_inner {
     __type(value, struct net_rule_val);
 };
 
+/* 空 inner 实体: file_policy_setup 把空槽指针归一化到这两张表。
+ * 查它们恒 miss (永不写入条目), 与"空槽"语义相同 (默认放行),
+ * 但给 verifier 一个统一的非空 PTR_TO_MAP 类型 —— 六个槽位各自的
+ * "NULL | PTR_TO_MAP" 组合 (2^6=64 种栈类型) 沿下游全程传播且永不
+ * 合并, 是指令数爆炸的头号来源 (enforce_path_rename 实测冲破 100 万
+ * 上限)。归一化后所有组合坍缩成单一状态。 */
+struct ino_hash_inner empty_ino_inner SEC(".maps");
+struct str_hash_inner empty_str_inner SEC(".maps");
+
 /* ---- outer: 每策略维度一张, key = slot ---- */
 #define DECLARE_OUTER(name, inner_type)                          \
     struct {                                                     \
@@ -670,6 +679,8 @@ struct net_rule_val *_unused_net_rule_val __attribute__((unused));
 struct slot_meta {
     __u32 version;       /* 当前槽位生效的策略版本 */
     __u32 policy_group;  /* 绑定的策略组 id */
+    __u32 file_str_count; /* 该槽 file_str 规则条数: 0 = 路径兜底判定整体跳过 */
+    __u32 pad;
     __u64 switch_ts;     /* 换槽时间戳 (控制面写入, UnixNano), 审计用 */
 };
 struct {
@@ -781,6 +792,37 @@ struct {
     __type(value, __u64);
 } event_drops SEC(".maps");
 
+/* 尾调用阶段表 : path_rename 双侧判定拆两段,
+ * 源侧在 lsm/path_rename 本体, 目标侧在 enforce_path_rename_dst。
+ * 尾调用是终端跳转、目标拿到同一个 ctx —— 钩子参数原样重读,
+ * 无需状态暂存; 两段各自独立验证, verifier 状态不跨段累积
+ * (rename 单体冲破 100 万指令上限的根治)。
+ * 阶段程序 fd 由加载器 (native.c) 在 load 后灌入。 */
+#define FILE_STAGE_RENAME_DST 0
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} file_stage_calls SEC(".maps");
+
+/* 尾调用失败计数: 失败 = loader 未灌阶段表 (READY 门禁失守),
+ * 调用方 fail-closed 拒操作。正常应为恒 0。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} tailcall_misses SEC(".maps");
+
+static __always_inline void count_tailcall_miss(void)
+{
+    __u32 key = 0;
+    __u64 *misses = bpf_map_lookup_elem(&tailcall_misses, &key);
+    if (misses)
+        __sync_fetch_and_add(misses, 1);
+}
+
 /* ALLOW 采样只影响低优先级正常事件。per-CPU 计数避免所有 CPU 在高频
  * 文件/网络热路径上争用同一个原子变量；policy_version 变化时每个 CPU
  * 首次使用会自行清零，使热更新后的采样周期有明确边界。 */
@@ -844,6 +886,27 @@ struct {
     __type(key, __u32);
     __type(value, struct arg_key);
 } arg_key_scratch SEC(".maps");
+
+/* path_fallback_mask 的 scratch key 缓冲。同样的 512B 栈理由:
+ * 走链调用链是 钩子 -> path_fallback_mask -> bpf_loop -> walk_step,
+ * 三层帧合并计账, path_key(256B) 内联进兜底子程序会顶爆上限
+ * (实测 combined stack 544 > 512)。非 sleepable 钩子独占 CPU,
+ * per-cpu array 无并发问题。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct path_key);
+} path_key_scratch SEC(".maps");
+
+/* is_cmd_in_blacklist 的 scratch key 缓冲: cmd_key 扩到 256B 后
+ * 不能再放栈上 (exec 钩子的合并栈帧余量不足)。同上, per-cpu 独占。 */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cmd_key);
+} cmd_key_scratch SEC(".maps");
 
 #if 0
 /* ============ 公共: 单条 allow_paths[i] 与 path 前缀比较 ============
@@ -1081,57 +1144,117 @@ static __always_inline __u8 file_ino_mask(struct inode *inode,
     return ino_mask_lookup(base, dom, &k, rule_ver);
 }
 
-/* 祖先走链预算。dentry 指针在 bounded-loop 回边后会被当前 6.6 verifier
- * 降级为 scalar，并造成百万指令状态爆炸；因此保留静态展开，但把预算从 8
- * 提升到 32。极端深度耗尽预算时 fail closed，不再静默逃逸。 */
+/* 祖先走链预算。保持 32 层语义不变, 但实现从 #pragma unroll 静态展开
+ * 改为 bpf_loop 回调 (与 path_walk.h 的 walk_step 同款):
+ *  1. 根治 6.6 verifier 在 bounded-loop 回边把 dentry 指针降级成
+ *     scalar 的老问题 (当时被迫静态展开的原因) —— 回调里指针经 ctx
+ *     内存传递、全部 probe_read 访问, 与 walk_step 同理;
+ *  2. 每层 2 次 hash 查询 + 多个分支的状态隔离在回调子程序内,
+ *     不再与调用方状态相乘 —— enforce_path_rename 双侧判定冲破
+ *     100 万指令上限的修复 (诊断记录 8 同类: 展开循环 × 分支 = 爆炸)。 */
 #define DENTRY_WALK_MAX  32
+
+struct dir_walk_state {
+    struct dentry *cur;
+    __u32 base_slot; /* 物理槽号。inner map 指针不经 ctx 内存传递 (map 引用
+                      * 指针在 bpf_loop ctx 里能否保持类型, 内核版本间行为
+                      * 不一); 只放标量 slot, 回调内用全局 outer 引用现场
+                      * lookup —— ldimm64 重取是 verifier 天然干净的形态 */
+    __u32 dom_slot;
+    __u32 rule_ver;  /* 沿途最后一次命中的版本 (根侧覆盖叶侧, 与原语义一致) */
+    __u8  mask;
+    bool  stop;
+    bool  invalid;
+};
+
+static long dir_walk_step(__u32 index, void *ctx)
+{
+    struct dir_walk_state *st = ctx;
+    struct dentry *parent = NULL;
+    bpf_probe_read_kernel(&parent, sizeof(parent), &st->cur->d_parent);
+    if (!parent) {
+        st->stop = true;
+        st->invalid = true;
+        return 1;
+    }
+    if (parent == st->cur) {   /* fs 根 (d_parent 指向自己) */
+        st->stop = true;
+        return 1;
+    }
+    struct inode *pi = NULL;
+    bpf_probe_read_kernel(&pi, sizeof(pi), &parent->d_inode);
+    if (pi) {
+        struct ino_key k = {};
+        ino_key_from_inode(pi, &k);
+        /* 与原 ino_mask_lookup 同语义: 基线先查域后查, 掩码取并,
+         * rule_ver 取命中者、两侧都命中时域侧覆盖 (更具体)。
+         * 空槽归一化到 empty_ino_inner (恒 miss), 省掉判空分支。 */
+        struct bpf_map *base =
+            bpf_map_lookup_elem(&dom_dir_ino, &st->base_slot);
+        if (!base)
+            base = (struct bpf_map *)&empty_ino_inner;
+        struct ino_rule_val *rv = bpf_map_lookup_elem(base, &k);
+        if (rv) {
+            if (rv->action == 0)
+                st->mask |= rv->mask;
+            st->rule_ver = rv->version;
+            if (rv->audit)
+                st->rule_ver |= 0x80000000u;
+        }
+        struct bpf_map *dom =
+            bpf_map_lookup_elem(&dom_dir_ino, &st->dom_slot);
+        if (!dom)
+            dom = (struct bpf_map *)&empty_ino_inner;
+        rv = bpf_map_lookup_elem(dom, &k);
+        if (rv) {
+            if (rv->action == 0)
+                st->mask |= rv->mask;
+            st->rule_ver = rv->version;
+            if (rv->audit)
+                st->rule_ver |= 0x80000000u;
+        }
+    }
+    st->cur = parent;
+    return 0;
+}
 
 /* 祖先走链查目录集合: 从 victim 的父目录开始, 每级在基线+域 inner 并查
  * 一次, 命中即并入 mask。fs 根 (d_parent 指向自己) 停止。
- * 普通内存读 + map 查询, 无字符串操作, verifier 友好。 */
+ * 预算耗尽/读取异常时 fail closed (无法证明不存在更高层受保护目录)。 */
 static __always_inline __u8 dir_ancestor_mask(struct dentry *dentry,
-                                              struct bpf_map *base,
-                                              struct bpf_map *dom,
+                                              __u32 base_slot,
+                                              __u32 dom_slot,
                                               __u32 *rule_ver)
 {
-    __u8 mask = 0;
-    bool stop = false;
-    bool invalid = false;
-    struct dentry *cur = dentry;
-#pragma unroll
-    for (int i = 0; i < DENTRY_WALK_MAX; i++) {
-        if (!stop && cur) {
-            struct dentry *parent = BPF_CORE_READ(cur, d_parent);
-            if (!parent) {
-                stop = true;
-                invalid = true;
-            } else if (parent == cur) {
-                stop = true;
-            } else {
-                struct inode *pi = BPF_CORE_READ(parent, d_inode);
-                if (pi) {
-                    struct ino_key k = {};
-                    ino_key_from_inode(pi, &k);
-                    mask |= ino_mask_lookup(base, dom, &k, rule_ver);
-                }
-                cur = parent;
-            }
-        }
-    }
-    /* 未停止表示仍未到根；invalid 表示祖先读取异常。两者都无法证明不存在
-     * 更高层受保护目录，因此拒绝全部文件操作。 */
-    return (!stop || invalid) ? (mask | DENY_ALL) : mask;
+    struct dir_walk_state st = {
+        .cur = dentry,
+        .base_slot = base_slot,
+        .dom_slot = dom_slot,
+        .rule_ver = 0,
+        .mask = 0,
+        .stop = false,
+        .invalid = false,
+    };
+    bpf_loop(DENTRY_WALK_MAX, dir_walk_step, &st, 0);
+    if (st.rule_ver)
+        *rule_ver = st.rule_ver;
+    return (!st.stop || st.invalid) ? (st.mask | DENY_ALL) : st.mask;
 }
 
-/* 文件钩子统一前奏: scope 判定 + file_ino/dir_ino 两维 outer 各查
+/* 文件钩子统一前奏: scope 判定 + file_ino/dir_ino/file_str 三维 outer 各查
  * 基线/域一次, inner 指针传出复用; 带回域 slot 与兜底策略版本。
- * 返回 false = 不在 scope / 两维都无表 (空槽), 调用方直接放行。 */
+ * file_str_count 是路径兜底判定的热路径闸: 基线+域槽都没有字符串规则时
+ * path_fallback_mask 直接返回, 一次走链都不发生。
+ * 返回 false = 不在 scope / 三维都无表 (空槽), 调用方直接放行。 */
 struct file_policy {
     struct bpf_map *base_fino;
     struct bpf_map *dom_fino;
     struct bpf_map *base_dino;
     struct bpf_map *dom_dino;
+    __u32 file_str_count;
     __u32 slot;
+    __u32 base_slot;   /* 基线物理槽号: dir_walk_step 回调与
+                        * path_fallback_mask 内现场查 outer 用 */
     __u32 policy_ver;
 };
 
@@ -1147,54 +1270,79 @@ static __always_inline bool file_policy_setup(const struct filter_config *cfg,
     fp->dom_fino  = bpf_map_lookup_elem(&dom_file_ino, &domain);
     fp->base_dino = bpf_map_lookup_elem(&dom_dir_ino, &base);
     fp->dom_dino  = bpf_map_lookup_elem(&dom_dir_ino, &domain);
-    /* 四个 inner 指针逐一判空聚成标量, 绝不合并写 !a && !b && !c && !d:
-     * clang 会 if-convert 成 (a|b|c|d)==0, 即对指针做位或, verifier
-     * 明令禁止 "pointer |= pointer" 直接拒载 (P2 实测教训, 见设计文档附B)。 */
-    __u32 have = 0;
+    /* verifier 状态坍缩 (rename 冲破 100 万指令上限的主因):
+     * 四个 inner 槽在 verifier 眼里各有 "NULL | PTR_TO_MAP" 两种类型,
+     * 组合沿下游全程传播、且因各不相同永不合并。
+     * 对策: 判空只聚成布尔 any (不用位图 —— have=5 与 have=9 也是
+     * 两种状态); 随后把空槽归一化到 empty_*_inner (恒 miss, 与空槽
+     * 同为默认放行, 语义不变), 所有组合坍缩成单一类型状态。
+     * 判空仍逐条独立 if, 绝不合并写 !a && !b: clang if-convert 成
+     * (a|b|...)==0 即对指针做位或, verifier 明令禁止直接拒载
+     * (P2 实测教训, 见设计文档附B)。
+     * file_str 维不经 fp 携带 (path_fallback_mask 内现场查 outer),
+     * 也不参与 any 判定: 槽位一旦 install 过, ino 两维 inner 必同时
+     * 存在 (replace_rule_set 全量替换), any==false 只意味着从未配置。 */
+    bool any = false;
     if (fp->base_fino)
-        have |= 1;
+        any = true;
     if (fp->dom_fino)
-        have |= 2;
+        any = true;
     if (fp->base_dino)
-        have |= 4;
+        any = true;
     if (fp->dom_dino)
-        have |= 8;
-    if (!have)
-        return false;   /* 两维全空槽 = 无文件策略 */
+        any = true;
+    if (!any)
+        return false;   /* 全空槽 = 无文件策略 */
+    if (!fp->base_fino)
+        fp->base_fino = (struct bpf_map *)&empty_ino_inner;
+    if (!fp->dom_fino)
+        fp->dom_fino = (struct bpf_map *)&empty_ino_inner;
+    if (!fp->base_dino)
+        fp->base_dino = (struct bpf_map *)&empty_ino_inner;
+    if (!fp->dom_dino)
+        fp->dom_dino = (struct bpf_map *)&empty_ino_inner;
     fp->slot = domain;
+    fp->base_slot = base;
     struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &fp->slot);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
     fp->policy_ver = sm ? sm->version : 0;
+    fp->file_str_count = (sm ? sm->file_str_count : 0) +
+                         (bm ? bm->file_str_count : 0);
     return true;
 }
 
 /* 统一判定入口: 受害者自身 (file_ino 维) | 祖先目录 (dir_ino 维)。
  * dentry->d_inode 允许为 NULL (rename 目标不存在时), 自身查询跳过,
- * 祖先走链照常 —— 在受保护目录里新建文件也能被目录规则拦住。 */
-static __always_inline __u8 victim_mask(struct dentry *dentry,
-                                        const struct file_policy *fp,
-                                        __u32 *rule_ver)
+ * 祖先走链照常 —— 在受保护目录里新建文件也能被目录规则拦住。
+ *
+ * __noinline 是 verifier 成本控制: dir_ancestor_mask 的 32 层展开循环
+ * 是状态大户, inline 时其分支状态会与后续兜底调用的分支相乘,
+ * 双侧判定的 enforce_path_rename 因此冲破 100 万指令上限
+ * (诊断记录 8 同类)。子程序边界把循环状态留在内部验证, 钩子本体
+ * 只剩 调用→判掩码 的直线结构。子程序不做任何 sleepable 操作,
+ * sleepable 的 file_open 与非 sleepable 的 path_* 钩子都能共享。 */
+static __noinline __u8 victim_mask(struct dentry *dentry,
+                                   const struct file_policy *fp,
+                                   __u32 *rule_ver)
 {
     if (!dentry)
         return 0;
     __u8 m = file_ino_mask(BPF_CORE_READ(dentry, d_inode),
                            fp->base_fino, fp->dom_fino, rule_ver);
-    return m | dir_ancestor_mask(dentry, fp->base_dino, fp->dom_dino, rule_ver);
+    return m | dir_ancestor_mask(dentry, fp->base_slot, fp->slot, rule_ver);
 }
 
-/* 字符串兜底查询 (file_str 维): 完整路径 -> DENY_* 掩码 (未命中返回 0)。
- * 策略路径在加载时不存在 (stat 失败) 的规则只能按路径拦 open。 */
-static __always_inline __u8 file_deny_mask(const char *path,
-                                           struct bpf_map *base,
-                                           struct bpf_map *dom,
-                                           __u32 *rule_ver)
+/* file_str 维精确匹配: 基线/域 inner 并查 (key 已构造好)。
+ * 唯一调用方是 path_fallback_mask (走链 + scratch 构 key)。 */
+static __always_inline __u8 file_str_key_lookup(const struct path_key *key,
+                                                struct bpf_map *base,
+                                                struct bpf_map *dom,
+                                                __u32 *rule_ver)
 {
-    struct path_key key = {};
-    /* 拷贝最多 63 字节 (留 1 字节给 NUL) */
-    bpf_probe_read_kernel_str(key.s, sizeof(key.s), path);
     struct str_rule_val *rv;
     __u8 mask = 0;
     if (base) {
-        rv = bpf_map_lookup_elem(base, &key);
+        rv = bpf_map_lookup_elem(base, key);
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
@@ -1204,7 +1352,7 @@ static __always_inline __u8 file_deny_mask(const char *path,
         }
     }
     if (dom) {
-        rv = bpf_map_lookup_elem(dom, &key);
+        rv = bpf_map_lookup_elem(dom, key);
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
@@ -1216,18 +1364,94 @@ static __always_inline __u8 file_deny_mask(const char *path,
     return mask;
 }
 
-/* 命令字符串兜底并查: 只用于策略加载时 stat 失败的路径。 */
+/* 路径兜底判定: (dev,ino) 两维 miss 后, 用 path_walk.h 的走链解析出
+ * 命名空间绝对路径, 在 file_str 维做精确匹配。
+ *
+ * 这是"策略加载后文件被删除重建/新建"场景的防线: 新 inode 不在 file_ino
+ * 表里, 但编译器双写的字符串规则与 inode 无关, 重建文件按路径仍命中。
+ * 非 sleepable 钩子同样可用 (走链全程普通内存读, 不用 bpf_d_path)。
+ *
+ * 触发闸: fp->file_str_count == 0 时直接返回 0, 无字符串规则的策略
+ * 在热路径上一次走链都不发生。
+ *
+ * 失败方向:
+ *   - 走链预算耗尽/缓冲不可用 (unresolved) -> DENY_ALL, fail-closed,
+ *     与 dir_ancestor_mask 深度耗尽的语义一致;
+ *   - mnt 缺失 (partial) -> 0 不表态, inode 判定仍然有效;
+ *   - 路径 > 255 字节 -> 0 (pack_path 编译期已拒绝这种规则, 必不命中)。
+ *
+ * path_out: 调用方的 64B 栈缓冲, 解析成功时拷入截断到 63 字节的 NUL
+ * 终止路径, 仅供事件展示; 完整匹配走下方 per-cpu scratch, 两者解耦,
+ * 钩子的栈帧不随 key 上限膨胀。未解析时 path_out[0]=='\0' 即无效。
+ *
+ * __noinline 是 verifier 成本控制的关键 (诊断记录 8 的同类坑):
+ * 本函数 inline 进 12 个钩子时, 其内部分支会与 dir_ancestor_mask
+ * 32 次展开循环累积的状态做组合爆炸 (实测 enforce_path_unlink
+ * 冲破 100 万指令上限)。改成 BPF-to-BPF 调用后, 调用边界把调用方
+ * 状态抽象化, 子程序按调用点独立验证, 每个都很小。 */
+static __noinline __u8 path_fallback_mask(struct dentry *dentry,
+                                          struct vfsmount *mnt,
+                                          const struct file_policy *fp,
+                                          __u32 *rule_ver,
+                                          char *path_out)
+{
+    if (fp->file_str_count == 0 || !dentry)
+        return 0;
+    __u32 len = 0;
+    bool partial = false;
+    char *path = path_resolve(dentry, mnt, &len, &partial);
+    if (!path)
+        return partial ? 0 : DENY_ALL;
+    if (len > 255)
+        return 0;
+    /* verifier 教训: 上面的分支只收窄了比较用的 (u32) 截断副本,
+     * 64 位 len 本身的范围不会回传 (实测 6.6: probe_read size 仍按
+     * 上限 4096 算, 栈目标直接拒); 纯 C 的 len &= 255 会被 clang 当作
+     * 无操作删除。asm barrier 强制在寄存器上执行与操作, tnum 值域
+     * 钉死在 [0,255]。 */
+    asm volatile("%[len] &= 0xff;\n" : [len] "+r"(len));
+
+    /* 展示副本: 定长 read_str 进调用方已零初始化的 64B 栈缓冲, 路径在
+     * 堆内已 NUL 终止 (path_resolve 保证), 超长自然截断。定长拷贝无需
+     * 第二道 asm barrier, 也没有变长下标写 —— 合并栈帧是硬约束。 */
+    bpf_probe_read_kernel_str(path_out, 64, path);
+
+    /* len ∈ (0,255] 已由上面的分支收窄 + asm 钉死, 变长 probe_read 过
+     * verifier; path 之后的缓冲可能残留上一次走链的字节, 所以拷贝只取
+     * len 字节, key 的其余部分保持零填充 (与编译器 pack_path 一致)。 */
+    __u32 z = 0;
+    struct path_key *key = bpf_map_lookup_elem(&path_key_scratch, &z);
+    if (!key)
+        return DENY_ALL;   /* scratch 不可用 = 无法证明安全, fail-closed */
+    __builtin_memset(key, 0, sizeof(*key));   /* per-cpu 缓冲有上轮残留 */
+    bpf_probe_read_kernel(key->s, len, path);
+    /* fstr inner 现场查 outer, 不经 file_policy 携带: 每个文件钩子的
+     * 栈帧少带两个 map 指针 (合并栈帧 + setup 状态组合双双缩小);
+     * 空槽查 outer 得 NULL, file_str_key_lookup 内部跳过即可。 */
+    struct bpf_map *base_fstr = bpf_map_lookup_elem(&dom_file_str,
+                                                    &fp->base_slot);
+    struct bpf_map *dom_fstr = bpf_map_lookup_elem(&dom_file_str,
+                                                   &fp->slot);
+    return file_str_key_lookup(key, base_fstr, dom_fstr, rule_ver);
+}
+
+/* 命令字符串兜底并查: 只用于策略加载时 stat 失败的路径。
+ * cmd_key 256B 不能放栈 (exec 钩子合并栈帧余量不足), 走 per-cpu
+ * scratch; 调用点只有 bprm_check (非 sleepable), 无并发问题。 */
 static __always_inline bool is_cmd_in_blacklist(const char *cmd,
                                                 struct bpf_map *base,
                                                 struct bpf_map *dom,
                                                 __u32 *rule_ver)
 {
-    struct cmd_key key;
-    __builtin_memset(&key, 0, sizeof(key));
-    bpf_probe_read_kernel_str(key.s, sizeof(key.s), cmd);
+    __u32 z = 0;
+    struct cmd_key *key = bpf_map_lookup_elem(&cmd_key_scratch, &z);
+    if (!key)
+        return false;
+    __builtin_memset(key, 0, sizeof(*key));   /* per-cpu 缓冲有上轮残留 */
+    bpf_probe_read_kernel_str(key->s, sizeof(key->s), cmd);
     struct str_rule_val *rv;
     if (base) {
-        rv = bpf_map_lookup_elem(base, &key);
+        rv = bpf_map_lookup_elem(base, key);
         if (rv) {
             *rule_ver = rv->version;
             if (rv->audit)
@@ -1236,7 +1460,7 @@ static __always_inline bool is_cmd_in_blacklist(const char *cmd,
         }
     }
     if (dom) {
-        rv = bpf_map_lookup_elem(dom, &key);
+        rv = bpf_map_lookup_elem(dom, key);
         if (rv) {
             *rule_ver = rv->version;
             if (rv->audit)
@@ -1484,13 +1708,29 @@ static __always_inline void report_path_op(__u32 op, __u32 allowed,
     report(1, op, allowed, detail, policy_ver, rule_ver);
 }
 
+/* 带路径的事件上报: path 有效 (走链兜底已解析) 时 detail 直接用全路径,
+ * 比 ino 格式更易审计; 否则退回 report_path_op 的 ino 格式。 */
+static __always_inline void report_file_op(__u32 op, __u32 allowed,
+                                           struct dentry *dentry,
+                                           const char *path,
+                                           __u32 policy_ver, __u32 rule_ver)
+{
+    if (path && path[0]) {
+        report(1, op, allowed, path, policy_ver, rule_ver);
+        return;
+    }
+    report_path_op(op, allowed, dentry, policy_ver, rule_ver);
+}
+
 /* ===================================================================
  * 文件策略: 细粒度操作拦截 (读/写/删/改名), (dev,ino) 主键
  *
- * 判定统一走 victim_mask(dentry, fp): 受害者自身 inode 在 file_ino 维
- * 并查 (基线+域), 祖先目录走链在 dir_ino 维并查, 取并集。
- * file_open 额外查字符串 file_str 维 (加载时 stat 失败的兜底规则),
- * 并用 bpf_d_path 拿全路径做事件 detail (sleepable, 允许)。
+ * 判定分两层: 先 victim_mask(dentry, fp) —— 受害者自身 inode 在
+ * file_ino 维并查 (基线+域), 祖先目录走链在 dir_ino 维并查, 取并集;
+ * miss 时再 path_fallback_mask —— path_walk.h 手工走链解析全路径,
+ * 在 file_str 维精确匹配 (编译器对每条文件规则恒双写字符串身份,
+ * 重建/新建文件的 inode 变化不再逃逸)。file_open 也是同一套
+ * (非 sleepable, bpf_d_path 已弃用, 见钩子注释)。
  * =================================================================== */
 
 /* 文件钩子统一开场: 全局开关 + 进程树 scope + 文件两维 inner 定位 */
@@ -1502,9 +1742,16 @@ static __always_inline void report_path_op(__u32 op, __u32 allowed,
     if (!file_policy_setup(cfg, &fp))              \
         return 0
 
-/* lsm.s/file_open: 按 f_flags 区分读/写意图。
- * 注意: open(O_TRUNC) / ">" 重定向 / cp 覆盖 / 编辑器写 都走这里。 */
-SEC("lsm.s/file_open")
+/* lsm/file_open: 按 f_flags 区分读/写意图。
+ * 注意: open(O_TRUNC) / ">" 重定向 / cp 覆盖 / 编辑器写 都走这里。
+ *
+ * 非 sleepable + 手工走链 (与其他文件钩子同一套): 曾经用 sleepable +
+ * bpf_d_path 拿路径, 但 6.6 的 bpf_d_path 是 d_path 右对齐写入 +
+ * memmove(len), 缓冲尾部 [len, sz) 残留字符串副本不清零 —— 256B key
+ * 直接强转 buffer 会因残留字节与编译器零填充 key 不等而恒 miss
+ * (实测 phase A 回归)。走链方案缓冲/key 全在 per-cpu map, 无此问题,
+ * 且只在 inode miss 时触发, 比每次 open 都 bpf_d_path 更便宜。 */
+SEC("lsm/file_open")
 int BPF_PROG(enforce_file_open, struct file *file)
 {
     FILE_HOOK_PREAMBLE();
@@ -1514,42 +1761,30 @@ int BPF_PROG(enforce_file_open, struct file *file)
     if (flags & O_PATH)
         return 0;
 
-    char path[256];
-    long ret = bpf_d_path(&file->f_path, path, sizeof(path));
-    if (ret < 0) {
-        /* bpf_d_path 失败不能静默放行 (fail-open 洞): inode 判定不依赖
-         * 路径字符串, 照常执行; detail 用占位符, 字符串兜底只是用不了 */
-        __builtin_memcpy(path, "<d_path_err>", 13);
-    }
-
-    /* 字符串兜底 (file_str 维) 的基线/域 inner */
-    __u32 base = physical_slot(cfg, BASE_SLOT);
-    struct bpf_map *base_fstr = bpf_map_lookup_elem(&dom_file_str, &base);
-    struct bpf_map *dom_fstr  = bpf_map_lookup_elem(&dom_file_str, &fp.slot);
-
-    /* (dev,ino) 主键 (含目录祖先) | 字符串兜底 */
+    struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     __u32 rule_ver = 0;
-    __u8 mask = victim_mask(BPF_CORE_READ(file, f_path.dentry), &fp, &rule_ver);
-    if (ret >= 0)
-        mask |= file_deny_mask(path, base_fstr, dom_fstr, &rule_ver);
-    if (!mask) {
-        report(1, 0, 1, path, fp.policy_ver, 0);  /* OK */
-        return 0;
-    }
+    __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+                                  &fp, &rule_ver, fb_path);
 
     __u32 acc = flags & O_ACCMODE;
     bool want_write = (acc != O_RDONLY) ||
                       (flags & (O_CREAT | O_TRUNC | O_APPEND));
     if (want_write && (mask & DENY_WRITE)) {
-        report(1, FILE_OP_OPEN_WRITE, 0, path, fp.policy_ver, rule_ver);  /* DENY */
+        report_file_op(FILE_OP_OPEN_WRITE, 0, dentry, fb_path,
+                       fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
     if (!want_write && (mask & DENY_READ)) {
-        report(1, FILE_OP_OPEN_READ, 0, path, fp.policy_ver, rule_ver);   /* DENY */
+        report_file_op(FILE_OP_OPEN_READ, 0, dentry, fb_path,
+                       fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
 
-    report(1, 0, 1, path, fp.policy_ver, rule_ver);  /* OK: 命中名单但该操作不在 deny 列表 */
+    report_file_op(0, 1, dentry, fb_path, fp.policy_ver,
+                   mask ? rule_ver : 0);  /* OK (含命中名单但操作允许) */
     return 0;
 }
 
@@ -1558,7 +1793,9 @@ int BPF_PROG(enforce_file_open, struct file *file)
  *
  * 该 hook 位于高频 VFS 热路径：非读写请求最先返回；允许操作不产生事件。
  * file_open 等判决点已覆盖普通 ALLOW 审计，避免每次 read/write 都消耗采样
- * 预算并制造无意义事件。 */
+ * 预算并制造无意义事件。
+ * 不接路径兜底: 每次 read/write 都走链的开销不可接受; 且重建文件的 fd
+ * 必先过 file_open (sleepable, 字符串规则在那里生效), 无绕过窗口。 */
 SEC("lsm/file_permission")
 int BPF_PROG(enforce_file_permission, struct file *file, int mask)
 {
@@ -1588,7 +1825,7 @@ int BPF_PROG(enforce_file_permission, struct file *file, int mask)
 
 /* lsm/path_truncate: truncate()/ftruncate() 不开文件直接截断,
  * file_open 抓不到, 单独拦。非 sleepable (该钩子不在内核 sleepable
- * 名单里), bpf_d_path 被禁, 判定全靠 (dev,ino)。 */
+ * 名单里), bpf_d_path 被禁, 判定靠 (dev,ino) + 走链路径兜底。 */
 SEC("lsm/path_truncate")
 int BPF_PROG(enforce_path_truncate, const struct path *path)
 {
@@ -1600,13 +1837,17 @@ int BPF_PROG(enforce_path_truncate, const struct path *path)
 
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+                                  &rule_ver, fb_path);
     /* DEBUG: 排障用, 正常时注释掉。bpf_trace_printk 不支持 %#x, 用 %x */
     // bpf_printk("[trunc] mask=%x", mask);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_TRUNCATE, 0, dentry, fp.policy_ver, rule_ver);  /* DENY */
+        report_file_op(FILE_OP_TRUNCATE, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_TRUNCATE, 1, dentry, fp.policy_ver, rule_ver);      /* OK */
+    report_file_op(FILE_OP_TRUNCATE, 1, dentry, fb_path, fp.policy_ver, rule_ver);      /* OK */
     return 0;
 }
 
@@ -1620,12 +1861,16 @@ int BPF_PROG(enforce_path_unlink, const struct path *dir,
 
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     // bpf_printk("[unlink] mask=%x", mask);
     if (mask & (DENY_DELETE | DENY_RENAME)) {
-        report_path_op(FILE_OP_UNLINK, 0, dentry, fp.policy_ver, rule_ver);  /* DENY */
+        report_file_op(FILE_OP_UNLINK, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_UNLINK, 1, dentry, fp.policy_ver, rule_ver);      /* OK */
+    report_file_op(FILE_OP_UNLINK, 1, dentry, fb_path, fp.policy_ver, rule_ver);      /* OK */
     return 0;
 }
 
@@ -1638,22 +1883,30 @@ int BPF_PROG(enforce_path_rmdir, const struct path *dir,
 
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     // bpf_printk("[rmdir] mask=%x", mask);
     if (mask & (DENY_DELETE | DENY_RENAME)) {
-        report_path_op(FILE_OP_RMDIR, 0, dentry, fp.policy_ver, rule_ver);   /* DENY */
+        report_file_op(FILE_OP_RMDIR, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_RMDIR, 1, dentry, fp.policy_ver, rule_ver);       /* OK */
+    report_file_op(FILE_OP_RMDIR, 1, dentry, fb_path, fp.policy_ver, rule_ver);       /* OK */
     return 0;
 }
 
-/* lsm/path_rename: mv 改名/移动, 双向判定 ——
- * 源侧视为"删除" (DENY_DELETE|DENY_RENAME),
- * 目标侧视为"写入" (DENY_WRITE|DENY_RENAME)。
- * vim 保存 = 写临时文件再 rename 覆盖, 必须靠目标侧拦截。
+/* lsm/path_rename: mv 改名/移动, 双向判定, 但拆成两段尾调用程序
+ * (流水线架构, 根治单侧 ×2 叠加冲破 verifier 100 万指令上限):
+ *   段 1 (本程序, attach): 源侧视为"删除" (DENY_DELETE|DENY_RENAME);
+ *   段 2 (enforce_path_rename_dst, 同段名 lsm/path_rename 保证
+ *        PROG_ARRAY 类型兼容, 不 attach): 目标侧视为"写入"
+ *        (DENY_WRITE|DENY_RENAME)。
+ * vim 保存 = 写临时文件再 rename 覆盖, 靠段 2 的目标侧拦截。
  * 目标不存在时 new_dentry->d_inode 为 NULL: 自身查询跳过,
  * 祖先目录判定照常 (victim_mask 内部处理)。
- * 非 sleepable (同 path_truncate) */
+ * 尾调用是终端跳转: 段 2 拿到同一个 ctx 重读参数、重跑 preamble,
+ * 其返回值直接成为本钩子返回值。非 sleepable (同 path_truncate)。 */
 SEC("lsm/path_rename")
 int BPF_PROG(enforce_path_rename, const struct path *old_dir,
              struct dentry *old_dentry, const struct path *new_dir,
@@ -1663,28 +1916,54 @@ int BPF_PROG(enforce_path_rename, const struct path *old_dir,
 
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(old_dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(old_dentry, BPF_CORE_READ(old_dir, mnt),
+                                  &fp, &rule_ver, fb_path);
     // bpf_printk("[rename] src mask=%x", mask);
     if (mask & (DENY_DELETE | DENY_RENAME)) {
-        report_path_op(FILE_OP_RENAME, 0, old_dentry, fp.policy_ver, rule_ver);  /* DENY (源侧) */
+        report_file_op(FILE_OP_RENAME, 0, old_dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY (源侧) */
         return -1;
     }
 
-    rule_ver = 0;
-    mask = victim_mask(new_dentry, &fp, &rule_ver);
+    /* 目标侧移交段 2。尾调用失败 (正常不会发生) = loader 未灌阶段表,
+     * 目标侧判定缺失不能静默放行: 计数 + fail-closed。 */
+    bpf_tail_call(ctx, &file_stage_calls, FILE_STAGE_RENAME_DST);
+    count_tailcall_miss();
+    return -1;
+}
+
+/* rename 段 2: 目标侧判定。同段名 lsm/path_rename (类型/attach id 与
+ * 段 1 一致, 满足 PROG_ARRAY 兼容检查), 由 file_stage_calls 尾调用
+ * 进入, 不经 manifest attach。 */
+SEC("lsm/path_rename")
+int BPF_PROG(enforce_path_rename_dst, const struct path *old_dir,
+             struct dentry *old_dentry, const struct path *new_dir,
+             struct dentry *new_dentry, unsigned int flags)
+{
+    FILE_HOOK_PREAMBLE();
+
+    __u32 rule_ver = 0;
+    __u8 mask = victim_mask(new_dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(new_dentry, BPF_CORE_READ(new_dir, mnt),
+                                  &fp, &rule_ver, fb_path);
     // bpf_printk("[rename] dst mask=%x", mask);
     if (mask & (DENY_WRITE | DENY_RENAME)) {
-        report_path_op(FILE_OP_RENAME, 0, new_dentry, fp.policy_ver, rule_ver);  /* DENY (目标侧) */
+        report_file_op(FILE_OP_RENAME, 0, new_dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY (目标侧) */
         return -1;
     }
-    report_path_op(FILE_OP_RENAME, 1, new_dentry, fp.policy_ver, rule_ver);      /* OK */
+    report_file_op(FILE_OP_RENAME, 1, new_dentry, fb_path, fp.policy_ver, rule_ver);      /* OK */
     return 0;
 }
 
 /* ===================================================================
  * L1 议题一补齐钩子: ftruncate / link / symlink / mkdir /
  * chmod / chown / setxattr / mmap 写。
- * 判定骨架与上面五个钩子一致: victim_mask(dentry) 取掩码,
- * 按操作位判定。全部非 sleepable, 只靠 (dev,ino), 不用 bpf_d_path。
+ * 判定骨架与上面五个钩子一致: victim_mask(dentry) 取 (dev,ino) 掩码,
+ * miss 时走路径兜底 (path_fallback_mask), 按操作位判定。
+ * 全部非 sleepable, 不用 bpf_d_path (路径来自手工走链)。
  * =================================================================== */
 
 /* lsm/file_truncate: ftruncate(fd) —— fd 在策略装载前已打开时,
@@ -1699,17 +1978,22 @@ int BPF_PROG(enforce_file_truncate, struct file *file)
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+                                  &fp, &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_FTRUNCATE, 0, dentry, fp.policy_ver, rule_ver);   /* DENY */
+        report_file_op(FILE_OP_FTRUNCATE, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_FTRUNCATE, 1, dentry, fp.policy_ver, rule_ver);       /* OK */
+    report_file_op(FILE_OP_FTRUNCATE, 1, dentry, fb_path, fp.policy_ver, rule_ver);       /* OK */
     return 0;
 }
 
 /* lsm/path_link: ln 建硬链。
  * 源侧查 DENY_RENAME (给受保护 inode 起新别名 = 别名操纵;
  * 注意 (dev,ino) 主键下硬链带不走内容防护, 此判定主要为语义完整)。
+ * 源侧钩子签名没有 path, 拿不到 vfsmount, 路径兜底跳过 (partial 语义)。
  * 目标侧父目录查 DENY_WRITE (在受保护目录内建新条目)。 */
 SEC("lsm/path_link")
 int BPF_PROG(enforce_path_link, struct dentry *old_dentry,
@@ -1726,16 +2010,22 @@ int BPF_PROG(enforce_path_link, struct dentry *old_dentry,
     struct dentry *ndir = BPF_CORE_READ(new_dir, dentry);
     rule_ver = 0;
     mask = victim_mask(ndir, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(ndir, BPF_CORE_READ(new_dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_LINK, 0, ndir, fp.policy_ver, rule_ver);          /* DENY (目标父目录) */
+        report_file_op(FILE_OP_LINK, 0, ndir, fb_path, fp.policy_ver, rule_ver);          /* DENY (目标父目录) */
         return -1;
     }
-    report_path_op(FILE_OP_LINK, 1, old_dentry, fp.policy_ver, rule_ver);        /* OK */
+    report_file_op(FILE_OP_LINK, 1, ndir, fb_path, fp.policy_ver, rule_ver);              /* OK */
     return 0;
 }
 
 /* lsm/path_symlink: ln -s 建软链。新条目不经过 file_open,
- * 受害者在创建时刻还不存在 inode, 只能查父目录: DENY_WRITE。 */
+ * 受害者在创建时刻还不存在 inode, inode 维只能查父目录: DENY_WRITE。
+ * 路径兜底走链直接用新条目 dentry (负 dentry 的 d_parent 链完整),
+ * 能按完整路径拦"在任意目录下重建受控路径"。 */
 SEC("lsm/path_symlink")
 int BPF_PROG(enforce_path_symlink, const struct path *dir,
              struct dentry *dentry, const char *old_name)
@@ -1745,15 +2035,20 @@ int BPF_PROG(enforce_path_symlink, const struct path *dir,
     struct dentry *pd = BPF_CORE_READ(dir, dentry);
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_SYMLINK, 0, pd, fp.policy_ver, rule_ver);         /* DENY */
+        report_file_op(FILE_OP_SYMLINK, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_SYMLINK, 1, pd, fp.policy_ver, rule_ver);             /* OK */
+    report_file_op(FILE_OP_SYMLINK, 1, dentry, fb_path, fp.policy_ver, rule_ver);       /* OK */
     return 0;
 }
 
-/* lsm/path_mkdir: mkdir 同理, 查父目录 DENY_WRITE。 */
+/* lsm/path_mkdir: mkdir 同理, inode 维查父目录 DENY_WRITE,
+ * 路径兜底用新条目 dentry 走全路径。 */
 SEC("lsm/path_mkdir")
 int BPF_PROG(enforce_path_mkdir, const struct path *dir,
              struct dentry *dentry, umode_t mode)
@@ -1763,11 +2058,15 @@ int BPF_PROG(enforce_path_mkdir, const struct path *dir,
     struct dentry *pd = BPF_CORE_READ(dir, dentry);
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_MKDIR, 0, pd, fp.policy_ver, rule_ver);           /* DENY */
+        report_file_op(FILE_OP_MKDIR, 0, dentry, fb_path, fp.policy_ver, rule_ver);     /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_MKDIR, 1, pd, fp.policy_ver, rule_ver);               /* OK */
+    report_file_op(FILE_OP_MKDIR, 1, dentry, fb_path, fp.policy_ver, rule_ver);         /* OK */
     return 0;
 }
 
@@ -1782,11 +2081,15 @@ int BPF_PROG(enforce_path_chmod, const struct path *path, umode_t mode)
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_ATTR) {
-        report_path_op(FILE_OP_CHMOD, 0, dentry, fp.policy_ver, rule_ver);       /* DENY */
+        report_file_op(FILE_OP_CHMOD, 0, dentry, fb_path, fp.policy_ver, rule_ver);       /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_CHMOD, 1, dentry, fp.policy_ver, rule_ver);           /* OK */
+    report_file_op(FILE_OP_CHMOD, 1, dentry, fb_path, fp.policy_ver, rule_ver);           /* OK */
     return 0;
 }
 
@@ -1804,15 +2107,21 @@ int BPF_PROG(enforce_path_chown, const struct path *path,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_ATTR) {
-        report_path_op(FILE_OP_CHOWN, 0, dentry, fp.policy_ver, rule_ver);       /* DENY */
+        report_file_op(FILE_OP_CHOWN, 0, dentry, fb_path, fp.policy_ver, rule_ver);       /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_CHOWN, 1, dentry, fp.policy_ver, rule_ver);           /* OK */
+    report_file_op(FILE_OP_CHOWN, 1, dentry, fb_path, fp.policy_ver, rule_ver);           /* OK */
     return 0;
 }
 
 /* lsm/inode_setxattr: setxattr 改扩展属性。查 DENY_ATTR。
+ * 不接路径兜底: 钩子签名只有 dentry 没有 vfsmount, 走链无法跨挂载,
+ * partial 语义下不表态 (inode 维判定仍然有效)。
  * 签名注意: 内核 6.x (idmapped mounts 改造后) 首参是 mnt_idmap*,
  * 旧 5 参签名 (dentry 打头) BTF 对不上, attach 直接失败。 */
 SEC("lsm/inode_setxattr")
@@ -1834,7 +2143,8 @@ int BPF_PROG(enforce_inode_setxattr, struct mnt_idmap *idmap,
     return 0;
 }
 
-/* lsm/inode_removexattr: setfattr -x 删扩展属性。查 DENY_ATTR。 */
+/* lsm/inode_removexattr: setfattr -x 删扩展属性。查 DENY_ATTR。
+ * 不接路径兜底: 同 inode_setxattr, 无 vfsmount 可用。 */
 SEC("lsm/inode_removexattr")
 int BPF_PROG(enforce_inode_removexattr, struct mnt_idmap *idmap,
              struct dentry *dentry, const char *name)
@@ -1853,7 +2163,8 @@ int BPF_PROG(enforce_inode_removexattr, struct mnt_idmap *idmap,
     return 0;
 }
 
-/* lsm/inode_set_acl: setfacl 改 ACL (不走 path_chmod)。查 DENY_ATTR。 */
+/* lsm/inode_set_acl: setfacl 改 ACL (不走 path_chmod)。查 DENY_ATTR。
+ * 不接路径兜底: 同 inode_setxattr, 无 vfsmount 可用。 */
 SEC("lsm/inode_set_acl")
 int BPF_PROG(enforce_inode_set_acl, struct mnt_idmap *idmap,
              struct dentry *dentry, const char *acl_name,
@@ -1875,7 +2186,8 @@ int BPF_PROG(enforce_inode_set_acl, struct mnt_idmap *idmap,
 
 /* lsm/path_mknod: mknod(2) + open(O_CREAT) 的创建入口
  * (vfs_creat 内部调 security_path_mknod)。与 file_open 的创建判定
- * 互为纵深: 新条目尚无 inode, 查父目录 DENY_WRITE。 */
+ * 互为纵深: inode 维查父目录 DENY_WRITE (新条目尚无 inode);
+ * 路径兜底用新条目 dentry 走全路径, 按名拦"重建受控路径"。 */
 SEC("lsm/path_mknod")
 int BPF_PROG(enforce_path_mknod, const struct path *dir,
              struct dentry *dentry, umode_t mode, unsigned int dev)
@@ -1885,11 +2197,15 @@ int BPF_PROG(enforce_path_mknod, const struct path *dir,
     struct dentry *pd = BPF_CORE_READ(dir, dentry);
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+                                  &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_MKNOD, 0, pd, fp.policy_ver, rule_ver);           /* DENY */
+        report_file_op(FILE_OP_MKNOD, 0, dentry, fb_path, fp.policy_ver, rule_ver);     /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_MKNOD, 1, pd, fp.policy_ver, rule_ver);               /* OK */
+    report_file_op(FILE_OP_MKNOD, 1, dentry, fb_path, fp.policy_ver, rule_ver);         /* OK */
     return 0;
 }
 
@@ -1913,11 +2229,15 @@ int BPF_PROG(enforce_mmap_file, struct file *file, unsigned long reqprot,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+                                  &fp, &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_MMAP_WRITE, 0, dentry, fp.policy_ver, rule_ver);  /* DENY */
+        report_file_op(FILE_OP_MMAP_WRITE, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_MMAP_WRITE, 1, dentry, fp.policy_ver, rule_ver);      /* OK */
+    report_file_op(FILE_OP_MMAP_WRITE, 1, dentry, fb_path, fp.policy_ver, rule_ver);      /* OK */
     return 0;
 }
 
@@ -1946,11 +2266,15 @@ int BPF_PROG(enforce_file_mprotect, struct vm_area_struct *vma,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
+    char fb_path[64] = {};
+    if (!mask)
+        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+                                  &fp, &rule_ver, fb_path);
     if (mask & DENY_WRITE) {
-        report_path_op(FILE_OP_MPROTECT, 0, dentry, fp.policy_ver, rule_ver);  /* DENY */
+        report_file_op(FILE_OP_MPROTECT, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
-    report_path_op(FILE_OP_MPROTECT, 1, dentry, fp.policy_ver, rule_ver);      /* OK */
+    report_file_op(FILE_OP_MPROTECT, 1, dentry, fb_path, fp.policy_ver, rule_ver);      /* OK */
     return 0;
 }
 
@@ -2031,7 +2355,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
 
     struct file *executable = BPF_CORE_READ(bprm, file);
     const char *filename = BPF_CORE_READ(bprm, filename);
-    char fn[64] = {};
+    char fn[256] = {};   /* 与 cmd_key 等长: 命令规则上限已扩到 NAME_MAX */
     long fn_ret = filename ?
         bpf_probe_read_kernel_str(fn, sizeof(fn), filename) : -1;
     if (fn_ret <= 0)

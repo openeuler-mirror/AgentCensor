@@ -1,29 +1,370 @@
 #!/usr/bin/env bash
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化), 固定 C locale。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 基础验收测试 (一行式策略 + 运行时开关模型)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 风格对齐 ohmyguard-link/scripts/pidtree_p1_test.sh
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 用法: sudo bash scripts/integration-basic.sh
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 前置: cargo build --workspace && make bpf
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 覆盖:
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T1  文件读拦截 (基线规则) + audit DENY 事件
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T2  文件写拦截 + 内容未被破坏
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T3  无规则文件放行 (不误伤)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T4  exec 拦截 (组规则)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T5  组隔离: 未绑定组规则的域放行同一命令
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T6  嵌套子孙 exec 仍被拦 (进程树继承)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T7  运行时开关: set --audit-exec on 后 ALLOW 事件可见 (替代旧 allow_sample_rate)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T8  运行时开关: set --enable-exec off 后 exec 维 fail-open
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T9  整份热更新: reload --file 后新规则生效
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T10 组级热更新: policy apply 新组 + bind 换绑生效 (整组替换语义)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T11 旧格式/非法 YAML 被拒且旧策略保留
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T12 attach --pid: 已运行进程纳管后新子孙受控
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T13 根退出后追踪集清理 (有 bpftool 才跑)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   T14 daemon 未起时 ctl 非 0 退出
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # socket/状态目录全部隔离在 $TDIR, 不碰 /run 与生产 state。
 
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
+
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -u
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 cd "$(dirname "$0")/../.."
 
 DAEMON=target/debug/censorguardd

@@ -86,6 +86,8 @@ static void cleanup(struct as_kernel *kernel)
 struct as_kernel *as_kernel_load(const char *path,
                                  const char *const *programs,
                                  size_t count,
+                                 const char *const *stage_programs,
+                                 size_t stage_count,
                                  char *error,
                                  size_t error_size)
 {
@@ -125,8 +127,12 @@ struct as_kernel *as_kernel_load(const char *path,
 
     struct bpf_program *program = NULL;
     bpf_object__for_each_program(program, kernel->object) {
-        int result = bpf_program__set_autoload(
-            program, required(bpf_program__name(program), programs, count));
+        const char *name = bpf_program__name(program);
+        /* manifest 程序: 加载 + attach; 尾调用阶段程序: 只加载不 attach
+         * (经 file_stage_calls 进入, attach 它们没有对应钩子可挂) */
+        bool load = required(name, programs, count) ||
+                    required(name, stage_programs, stage_count);
+        int result = bpf_program__set_autoload(program, load);
         if (result != 0) {
             set_error(error, error_size, "set autoload for %s: %s",
                       bpf_program__name(program), strerror(-result));
@@ -149,6 +155,38 @@ struct as_kernel *as_kernel_load(const char *path,
         set_error(error, error_size, "load BPF object: %s", strerror(-result));
         cleanup(kernel);
         return NULL;
+    }
+
+    /* 尾调用阶段表: 阶段程序已加载 (autoload) 但不 attach, 这里把它们的
+     * fd 灌入 file_stage_calls, 钩子内 bpf_tail_call 才能进入。
+     * 阶段程序未加载 (enable_file=false 时 autoload=false, fd<0) 则跳过
+     * —— 此时源侧钩子同样不在 attach 名单, 语义一致。
+     * 灌入失败 = READY 门禁失守, 拒绝启动。 */
+    static const struct {
+        const char *program;
+        unsigned int index;   /* 与 enforce.bpf.c 的 FILE_STAGE_* 对齐 */
+    } file_stages[] = {
+        { "enforce_path_rename_dst", 0 },   /* FILE_STAGE_RENAME_DST */
+    };
+    struct bpf_map *stages =
+        bpf_object__find_map_by_name(kernel->object, "file_stage_calls");
+    if (stages != NULL) {
+        for (size_t index = 0; index < sizeof(file_stages) / sizeof(file_stages[0]); index++) {
+            struct bpf_program *stage =
+                bpf_object__find_program_by_name(kernel->object, file_stages[index].program);
+            if (stage == NULL)
+                continue;
+            int program_fd = bpf_program__fd(stage);
+            if (program_fd < 0)
+                continue;
+            if (bpf_map_update_elem(bpf_map__fd(stages), &file_stages[index].index,
+                                    &program_fd, BPF_ANY) != 0) {
+                set_error(error, error_size, "install tail-call stage %s: %s",
+                          file_stages[index].program, strerror(errno));
+                cleanup(kernel);
+                return NULL;
+            }
+        }
     }
 
     kernel->links = calloc(count, sizeof(*kernel->links));

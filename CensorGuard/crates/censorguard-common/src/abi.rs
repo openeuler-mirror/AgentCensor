@@ -3,8 +3,8 @@
 //! These structures deliberately contain no pointers. Keep field order, widths, padding and
 //! constants synchronized with the C source. Layout tests make accidental drift visible.
 
-/// Maximum bytes in a path or executable map key.
-pub const PATH_KEY_LEN: usize = 64;
+/// Maximum bytes in a path or executable map key (NAME_MAX + NUL).
+pub const PATH_KEY_LEN: usize = 256;
 /// Number of captured exec tokens.
 pub const ARG_TOKEN_COUNT: usize = 4;
 /// Bytes per exec token, including the trailing NUL.
@@ -202,6 +202,9 @@ pub struct PidTrackingStats {
 pub struct SlotMeta {
     pub version: u32,
     pub policy_group: u32,
+    /// Number of file-string rules in the slot; zero lets BPF skip path-walk fallback entirely.
+    pub file_str_count: u32,
+    pub pad: u32,
     pub switch_ts: u64,
 }
 
@@ -254,7 +257,7 @@ mod tests {
     #[test]
     fn abi_sizes_match_c() {
         assert_eq!(size_of::<FilterConfig>(), 40);
-        assert_eq!(size_of::<PathKey>(), 64);
+        assert_eq!(size_of::<PathKey>(), 256);
         assert_eq!(size_of::<InodeKey>(), 16);
         assert_eq!(size_of::<ArgKey>(), 128);
         assert_eq!(size_of::<NetLpmKey>(), 12);
@@ -267,7 +270,7 @@ mod tests {
         assert_eq!(size_of::<PendingProcessOp>(), 16);
         assert_eq!(size_of::<ScopePolicyValue>(), 8);
         assert_eq!(size_of::<PidTrackingStats>(), 40);
-        assert_eq!(size_of::<SlotMeta>(), 16);
+        assert_eq!(size_of::<SlotMeta>(), 24);
         assert_eq!(size_of::<RawEvent>(), 360);
         assert_eq!(align_of::<RawEvent>(), 8);
     }
