@@ -143,7 +143,8 @@ pub struct DaemonServiceHost {
     root_channels: BTreeMap<TraceId, BTreeSet<u64>>,
     collector_drop_totals: BTreeMap<String, u64>,
     collector_health_reported: bool,
-    payload_action_heads:
+    llm_exchange: semantic_action_runtime::LlmExchangeRuntime,
+    mcp_payload_action_heads:
         BTreeMap<(TraceId, String), (String, semantic_action_contract::SemanticActionKind)>,
     /// Plaintext retained per trace and stream for protocol parsing. Raw chunks
     /// are always persisted independently; this state only feeds protocol
@@ -263,7 +264,8 @@ impl DaemonServiceHost {
             root_channels: BTreeMap::new(),
             collector_drop_totals: BTreeMap::new(),
             collector_health_reported: false,
-            payload_action_heads: BTreeMap::new(),
+            llm_exchange: semantic_action_runtime::LlmExchangeRuntime::default(),
+            mcp_payload_action_heads: BTreeMap::new(),
             payload_reassembly: BTreeMap::new(),
             payload_call_buffers: BTreeMap::new(),
             command_heads: BTreeMap::new(),
@@ -864,13 +866,29 @@ impl DaemonServiceHost {
                 self.ingested.bytes = self.ingested.bytes.saturating_add(bytes.len() as u64)
             }
         }
+        if matches!(
+            segment.content_state,
+            model_core::payload::PayloadContentState::Loss
+        ) {
+            writes.push(PersistWrite::Diagnostic(CaptureDiagnostic::loss(
+                trace_id,
+                segment.observed_at,
+                model_core::ids::CollectorName::new("payload"),
+                "payload_loss".to_string(),
+                1,
+                segment.original_size.saturating_sub(segment.captured_size),
+            )));
+        }
         let mut parse_segment = segment.clone();
         let mut reassembly_report: Option<u64> = None;
-        let (http_action, sse_actions, llm_actions, mcp_actions) = match (
+        let (http_actions, sse_actions, llm_actions, mcp_actions, parser_diagnostics) = match (
             parse_segment.stream_key.clone(),
             parse_segment.bytes.clone(),
         ) {
             (Some(stream), Some(bytes)) => {
+                let is_h2 = parse_segment.protocol_hint.as_deref().is_some_and(|hint| {
+                    hint.eq_ignore_ascii_case("http2") || hint.eq_ignore_ascii_case("h2")
+                });
                 let call_key = (
                     trace_id,
                     stream.clone(),
@@ -909,21 +927,69 @@ impl DaemonServiceHost {
                 }
                 let state = self
                     .payload_reassembly
-                    .entry((trace_id, stream))
+                    .entry((trace_id, stream.clone()))
                     .or_default();
-                if let Some(call) = finished_call {
+                let h2_output = finished_call.as_deref().filter(|_| is_h2).map(|call| {
+                    let assembler = match parse_segment.direction {
+                        model_core::payload::PayloadDirection::Inbound => &mut state.http2_inbound,
+                        _ => &mut state.http2_outbound,
+                    };
+                    assembler.ingest(call, parse_segment.content_state)
+                });
+                if !is_h2 && let Some(call) = finished_call {
                     state.tail.extend_from_slice(&call);
                 }
                 if state.tail.len() * 2 < STREAM_PLAINTEXT_MAX_BYTES {
                     state.cap_reported = false;
                 }
 
-                let mut parsed = (None, Vec::new(), Vec::new(), Vec::new());
+                let mut parsed = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                if let Some(h2_output) = h2_output {
+                    let http = h2_output
+                        .messages
+                        .iter()
+                        .map(|message| {
+                            semantic_action_runtime::project_http2_message(
+                                &parse_segment,
+                                message,
+                                session.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let (llm, mut diagnostics) =
+                        semantic_action_runtime::project_llm_http2_messages_with_diagnostics(
+                            &parse_segment,
+                            session.clone(),
+                            h2_output.messages,
+                        );
+                    diagnostics.extend(h2_output.diagnostics.into_iter().map(|message| {
+                        CaptureDiagnostic {
+                            trace_id,
+                            observed_at: parse_segment.observed_at,
+                            collector: model_core::ids::CollectorName::new("http2-assembler"),
+                            kind: model_core::diagnostics::DiagnosticKind::CaptureGap,
+                            severity: model_core::diagnostics::DiagnosticSeverity::Warning,
+                            dedupe_key: Some(format!(
+                                "http2:{}:{}:{}:{}",
+                                trace_id.get(),
+                                stream,
+                                parse_segment.sequence,
+                                message
+                            )),
+                            message,
+                            dropped: 0,
+                            dropped_bytes: 0,
+                        }
+                    }));
+                    parsed = (http, Vec::new(), llm, Vec::new(), diagnostics);
+                }
                 // Re-scanning the accumulated stream costs time proportional to its
                 // length, so it is worth doing only when the bytes just added can end a
                 // message: a record that cannot complete one leaves the parsers with
                 // nothing new to find.
-                if completes || parse_segment.completed || tail_ends_message(&state.tail) {
+                if !is_h2
+                    && (completes || parse_segment.completed || tail_ends_message(&state.tail))
+                {
                     state.view.clear();
                     state.view.extend_from_slice(&state.tail);
                     // A call still in flight is not part of the retained tail yet.
@@ -933,7 +999,12 @@ impl DaemonServiceHost {
                     parse_segment.captured_size = state.view.len() as u64;
                     parse_segment.original_size =
                         parse_segment.original_size.max(parse_segment.captured_size);
-                    parse_segment.content_state = if parse_segment.completed && call_complete {
+                    parse_segment.content_state = if matches!(
+                        segment.content_state,
+                        model_core::payload::PayloadContentState::Loss
+                    ) {
+                        model_core::payload::PayloadContentState::Loss
+                    } else if parse_segment.completed && call_complete {
                         model_core::payload::PayloadContentState::Complete
                     } else {
                         model_core::payload::PayloadContentState::Truncated
@@ -950,10 +1021,11 @@ impl DaemonServiceHost {
                         &parse_segment,
                         session.clone(),
                     );
-                    let llm = semantic_action_runtime::project_llm_payload(
-                        &parse_segment,
-                        session.clone(),
-                    );
+                    let (llm, parser_diagnostics) =
+                        semantic_action_runtime::project_llm_http_message_with_diagnostics(
+                            &parse_segment,
+                            session.clone(),
+                        );
                     let mcp = semantic_action_runtime::project_mcp_payload(
                         &parse_segment,
                         session.clone(),
@@ -961,7 +1033,20 @@ impl DaemonServiceHost {
                     // A message the parsers recognized is consumed: keeping it would
                     // re-derive the same action for every later record of the stream.
                     let consumed = if http.is_some() {
-                        header_block_end(&state.view)
+                        semantic_action_runtime::extract_http1_message(&parse_segment)
+                            .map(|message| message.message_len)
+                            .or_else(|| {
+                                semantic_action_runtime::extract_http2_message(&parse_segment)
+                                    .map(|message| message.message_len)
+                            })
+                            .or_else(|| {
+                                let messages =
+                                    semantic_action_runtime::extract_http2_messages(&parse_segment);
+                                (!messages.is_empty()
+                                    && messages.iter().all(|message| message.complete))
+                                .then_some(state.view.len())
+                            })
+                            .or_else(|| header_block_end(&state.view))
                     } else if !llm.is_empty() || !mcp.is_empty() {
                         // These parsers read the window as one document, so everything
                         // they saw was consumed -- except under a framing protocol,
@@ -971,7 +1056,14 @@ impl DaemonServiceHost {
                             .protocol_hint
                             .as_deref()
                             .is_some_and(|hint| hint.eq_ignore_ascii_case("websocket"));
-                        (!framed).then_some(state.view.len())
+                        if framed {
+                            semantic_action_runtime::extract_websocket_message(&parse_segment)
+                                .map(|message| message.message_len)
+                        } else {
+                            semantic_action_runtime::extract_http1_message(&parse_segment)
+                                .map(|message| message.message_len)
+                                .or(Some(state.view.len()))
+                        }
                     } else if !sse.is_empty() {
                         last_event_boundary(&state.view)
                     } else {
@@ -984,7 +1076,13 @@ impl DaemonServiceHost {
                             consumed,
                         );
                     }
-                    parsed = (http, sse, llm, mcp);
+                    parsed = (
+                        http.into_iter().collect(),
+                        sse,
+                        llm,
+                        mcp,
+                        parser_diagnostics,
+                    );
                 }
 
                 // Bytes past the cap are dropped from the parse window only: the
@@ -1004,8 +1102,9 @@ impl DaemonServiceHost {
                 }
                 parsed
             }
-            _ => (None, Vec::new(), Vec::new(), Vec::new()),
+            _ => (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
+        writes.extend(parser_diagnostics.into_iter().map(PersistWrite::Diagnostic));
         if let Some(dropped_bytes) = reassembly_report {
             writes.push(PersistWrite::Diagnostic(CaptureDiagnostic::loss(
                 trace_id,
@@ -1023,9 +1122,7 @@ impl DaemonServiceHost {
         let segment_reference = format!("payload:{}:{}", stream_key, segment.sequence);
         self.queue_payload(segment);
         let mut actions = Vec::new();
-        if let Some(action) = http_action {
-            actions.push(action);
-        }
+        actions.extend(http_actions);
         actions.extend(sse_actions);
         actions.extend(llm_actions);
         actions.extend(mcp_actions);
@@ -1049,25 +1146,19 @@ impl DaemonServiceHost {
                         });
                     }
                 }
-                semantic_action_contract::SemanticActionKind::LlmRequest
-                | semantic_action_contract::SemanticActionKind::McpRequest
+                semantic_action_contract::SemanticActionKind::McpRequest
                 | semantic_action_contract::SemanticActionKind::McpToolCall => {
-                    self.payload_action_heads.insert(
+                    self.mcp_payload_action_heads.insert(
                         (action.trace_id, stream_key.clone()),
                         (action.action_id.clone(), action.kind),
                     );
                 }
-                semantic_action_contract::SemanticActionKind::LlmResponse
-                | semantic_action_contract::SemanticActionKind::McpResponse => {
+                semantic_action_contract::SemanticActionKind::McpResponse => {
                     if let Some((source, source_kind)) = self
-                        .payload_action_heads
+                        .mcp_payload_action_heads
                         .get(&(action.trace_id, stream_key.clone()))
                     {
-                        let role = if action.kind
-                            == semantic_action_contract::SemanticActionKind::LlmResponse
-                        {
-                            semantic_action_contract::SemanticActionLinkRole::LlmRequestLlmResponse
-                        } else if *source_kind
+                        let role = if *source_kind
                             == semantic_action_contract::SemanticActionKind::McpToolCall
                         {
                             semantic_action_contract::SemanticActionLinkRole::McpToolCallResponse
@@ -1086,6 +1177,98 @@ impl DaemonServiceHost {
                     }
                 }
                 _ => {}
+            }
+        }
+        let llm_actions = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind,
+                    semantic_action_contract::SemanticActionKind::LlmRequest
+                        | semantic_action_contract::SemanticActionKind::LlmResponse
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let llm_output = self.llm_exchange.observe(llm_actions);
+        writes.extend(
+            llm_output
+                .diagnostics
+                .iter()
+                .cloned()
+                .map(PersistWrite::Diagnostic),
+        );
+        actions.retain(|action| {
+            !matches!(
+                action.kind,
+                semantic_action_contract::SemanticActionKind::LlmRequest
+                    | semantic_action_contract::SemanticActionKind::LlmResponse
+            )
+        });
+        actions.extend(llm_output.actions);
+        links.extend(llm_output.links);
+        let sse_stream_action_id = actions
+            .iter()
+            .find(|action| action.kind == semantic_action_contract::SemanticActionKind::SseStream)
+            .map(|action| action.action_id.clone());
+        for action in &actions {
+            let role = match action.kind {
+                semantic_action_contract::SemanticActionKind::LlmRequest => {
+                    semantic_action_contract::SemanticActionLinkRole::LlmRequestHttpMessage
+                }
+                semantic_action_contract::SemanticActionKind::LlmResponse => {
+                    semantic_action_contract::SemanticActionLinkRole::LlmResponseHttpMessage
+                }
+                _ => continue,
+            };
+            let http_stream_id = action.attributes.get("http.stream_id");
+            let http_action_id = actions
+                .iter()
+                .find(|candidate| {
+                    candidate.kind == semantic_action_contract::SemanticActionKind::HttpMessage
+                        && match http_stream_id {
+                            Some(stream_id) => {
+                                candidate.attributes.get("http.stream_id") == Some(stream_id)
+                            }
+                            None => !candidate.attributes.contains_key("http.stream_id"),
+                        }
+                })
+                .map(|candidate| candidate.action_id.clone());
+            if let Some(target_action_id) = &http_action_id {
+                links.push(semantic_action_contract::SemanticActionLink {
+                    trace_id: action.trace_id,
+                    source_action_id: action.action_id.clone(),
+                    target_action_id: target_action_id.clone(),
+                    role,
+                    confidence: semantic_action_contract::SemanticActionLinkConfidence::Observed,
+                    valid: true,
+                });
+            }
+            if action.kind == semantic_action_contract::SemanticActionKind::LlmResponse
+                && let Some(target_action_id) = &sse_stream_action_id
+            {
+                links.push(semantic_action_contract::SemanticActionLink {
+                    trace_id: action.trace_id,
+                    source_action_id: action.action_id.clone(),
+                    target_action_id: target_action_id.clone(),
+                    role: semantic_action_contract::SemanticActionLinkRole::LlmResponseSseStream,
+                    confidence: semantic_action_contract::SemanticActionLinkConfidence::Observed,
+                    valid: true,
+                });
+            }
+        }
+        for action in &actions {
+            if action.kind == semantic_action_contract::SemanticActionKind::LlmCall
+                && let Some(command_id) = self.command_heads.get(&(trace_id, action.process.get()))
+            {
+                links.push(semantic_action_contract::SemanticActionLink {
+                    trace_id,
+                    source_action_id: command_id.clone(),
+                    target_action_id: action.action_id.clone(),
+                    role: semantic_action_contract::SemanticActionLinkRole::CommandContainsLlmCall,
+                    confidence: semantic_action_contract::SemanticActionLinkConfidence::Derived,
+                    valid: true,
+                });
             }
         }
         for action in actions {
@@ -1177,6 +1360,12 @@ impl DaemonServiceHost {
                 .runtime
                 .get_trace(trace_id)
                 .map(|entry| entry.trace.lifecycle_state);
+            writes.extend(
+                self.llm_exchange
+                    .finalize_trace(trace_id)
+                    .into_iter()
+                    .map(PersistWrite::SemanticAction),
+            );
             if lifecycle.is_some_and(|state| !state.is_terminal()) {
                 let now = SystemTime::now();
                 self.runtime
@@ -1196,6 +1385,7 @@ impl DaemonServiceHost {
                     kind: model_core::diagnostics::DiagnosticKind::Truncated,
                     severity: model_core::diagnostics::DiagnosticSeverity::Warning,
                     message: "payload_metadata_only_aggregate".to_string(),
+                    dedupe_key: None,
                     dropped: retention.metadata_only_segments,
                     dropped_bytes: retention.metadata_only_bytes,
                 }));
@@ -2074,6 +2264,7 @@ impl DaemonServiceHost {
                 kind: model_core::diagnostics::DiagnosticKind::Truncated,
                 severity: model_core::diagnostics::DiagnosticSeverity::Warning,
                 message: "payload_metadata_only_aggregate".to_string(),
+                dedupe_key: None,
                 dropped: retention.metadata_only_segments,
                 dropped_bytes: retention.metadata_only_bytes,
             }));
@@ -2084,6 +2275,19 @@ impl DaemonServiceHost {
         self.payload_reassembly.retain(|(id, _), _| *id != trace_id);
         self.payload_call_buffers
             .retain(|(id, _, _), _| *id != trace_id);
+        let finalized = self
+            .llm_exchange
+            .finalize_trace(trace_id)
+            .into_iter()
+            .map(PersistWrite::SemanticAction)
+            .collect::<Vec<_>>();
+        if !finalized.is_empty() {
+            self.writer
+                .persist_async(finalized)
+                .map_err(|error| control_error("trace_remove_finalize", error))?;
+        }
+        self.mcp_payload_action_heads
+            .retain(|(id, _), _| *id != trace_id);
         self.runtime.forget_trace(trace_id);
         self.roots.remove(&trace_id);
         Ok(trace_id)
@@ -2593,6 +2797,9 @@ struct StreamPlaintext {
     tail: Vec<u8>,
     /// View handed to the parsers, reused so a record costs no allocation.
     view: Vec<u8>,
+    /// HTTP/2 HPACK tables are independent for each connection direction.
+    http2_inbound: semantic_action_runtime::Http2ConnectionAssembler,
+    http2_outbound: semantic_action_runtime::Http2ConnectionAssembler,
     /// Whether the cap has already been reported for the current episode.
     cap_reported: bool,
 }
@@ -3917,6 +4124,675 @@ mod plaintext_window_tests {
             );
         }
         let db = fixture.finish();
+        remove_db(&db);
+    }
+}
+
+#[cfg(test)]
+mod llm_runtime_tests {
+    use super::test_harness::{remove_db, test_host};
+    use super::*;
+    use collector_event::{RawEventEnvelope, RawPayloadSegment};
+    use model_core::ids::CollectorName;
+    use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBoundary};
+    use rusqlite::Connection;
+
+    fn h2_frame(frame_type: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
+        let length = body.len();
+        let mut bytes = vec![
+            ((length >> 16) & 0xff) as u8,
+            ((length >> 8) & 0xff) as u8,
+            (length & 0xff) as u8,
+            frame_type,
+            flags,
+            ((stream >> 24) & 0x7f) as u8,
+            (stream >> 16) as u8,
+            (stream >> 8) as u8,
+            stream as u8,
+        ];
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    struct Fixture {
+        host: DaemonServiceHost,
+        db: std::path::PathBuf,
+        trace_id: TraceId,
+        observation: ProcessObservation,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let (mut host, db) = test_host();
+            let observation = ProcfsIdentityReader
+                .read_identity(std::process::id())
+                .expect("identity of the test process");
+            let (root, _) = host.resolve_process(observation.clone()).expect("root");
+            let trace_id = host.runtime.reserve_trace_id();
+            let snapshot = CaptureProfileSnapshot::from_profile(&host.profile, SystemTime::now());
+            let plan = host.runtime.negotiate(&snapshot).expect("sensor plan");
+            host.runtime
+                .create_starting_trace(
+                    trace_id,
+                    TrackTraceRequest {
+                        root_identity: root,
+                        root_pid_namespace: None,
+                        root_container_id: None,
+                        root_working_directory: None,
+                        display_name: model_core::ids::TraceName::new("llm-runtime"),
+                        profile_snapshot: snapshot,
+                        tags: BTreeSet::new(),
+                        created_at: SystemTime::now(),
+                    },
+                    plan,
+                )
+                .expect("create trace");
+            Self {
+                host,
+                db,
+                trace_id,
+                observation,
+            }
+        }
+
+        fn feed(&mut self, direction: PayloadDirection, sequence: u64, bytes: &[u8]) {
+            let direction_code = u8::from(direction == PayloadDirection::Inbound);
+            self.host
+                .apply_payload_segment(RawPayloadSegment {
+                    envelope: RawEventEnvelope {
+                        trace_id: Some(self.trace_id),
+                        observed_at: SystemTime::now(),
+                        process: self.observation.clone(),
+                        collector: CollectorName::new("ebpf"),
+                        session_id: Some(SessionIdentity::new("llm-session")),
+                        call_id: Some("llm-call".to_string()),
+                    },
+                    source: PayloadSourceBoundary::Uprobe,
+                    content_state: PayloadContentState::Complete,
+                    direction,
+                    stream_key: Some(format!("tls:123:456:{direction_code}")),
+                    sequence,
+                    operation_id: Some(sequence),
+                    offset: Some(0),
+                    completed: true,
+                    original_size: bytes.len() as u64,
+                    captured_size: bytes.len() as u64,
+                    library: Some("openssl".to_string()),
+                    symbol: Some(
+                        match direction {
+                            PayloadDirection::Outbound => "SSL_write",
+                            _ => "SSL_read",
+                        }
+                        .to_string(),
+                    ),
+                    protocol_hint: Some("http".to_string()),
+                    loss_reason: None,
+                    bytes: Some(bytes.to_vec()),
+                })
+                .expect("apply payload");
+        }
+
+        fn feed_h2(&mut self, direction: PayloadDirection, sequence: u64, bytes: &[u8]) {
+            let direction_code = u8::from(direction == PayloadDirection::Inbound);
+            self.host
+                .apply_payload_segment(RawPayloadSegment {
+                    envelope: RawEventEnvelope {
+                        trace_id: Some(self.trace_id),
+                        observed_at: SystemTime::now(),
+                        process: self.observation.clone(),
+                        collector: CollectorName::new("ebpf"),
+                        session_id: Some(SessionIdentity::new("h2-session")),
+                        call_id: Some("h2-call".to_string()),
+                    },
+                    source: PayloadSourceBoundary::Uprobe,
+                    content_state: PayloadContentState::Complete,
+                    direction,
+                    stream_key: Some(format!("tls:123:789:{direction_code}")),
+                    sequence,
+                    operation_id: Some(sequence),
+                    offset: Some(0),
+                    completed: true,
+                    original_size: bytes.len() as u64,
+                    captured_size: bytes.len() as u64,
+                    library: Some("boringssl".to_string()),
+                    symbol: Some("SSL_write".to_string()),
+                    protocol_hint: Some("http2".to_string()),
+                    loss_reason: None,
+                    bytes: Some(bytes.to_vec()),
+                })
+                .expect("apply h2 payload");
+        }
+
+        fn feed_loss(&mut self, direction: PayloadDirection, sequence: u64, bytes: &[u8]) {
+            let direction_code = u8::from(direction == PayloadDirection::Inbound);
+            self.host
+                .apply_payload_segment(RawPayloadSegment {
+                    envelope: RawEventEnvelope {
+                        trace_id: Some(self.trace_id),
+                        observed_at: SystemTime::now(),
+                        process: self.observation.clone(),
+                        collector: CollectorName::new("ebpf"),
+                        session_id: Some(SessionIdentity::new("llm-session")),
+                        call_id: Some("llm-loss".to_string()),
+                    },
+                    source: PayloadSourceBoundary::Uprobe,
+                    content_state: PayloadContentState::Loss,
+                    direction,
+                    stream_key: Some(format!("tls:123:456:{direction_code}")),
+                    sequence,
+                    operation_id: Some(sequence),
+                    offset: Some(0),
+                    completed: true,
+                    original_size: (bytes.len() + 32) as u64,
+                    captured_size: bytes.len() as u64,
+                    library: Some("openssl".to_string()),
+                    symbol: Some("SSL_write".to_string()),
+                    protocol_hint: Some("http".to_string()),
+                    loss_reason: Some("collector_loss".to_string()),
+                    bytes: Some(bytes.to_vec()),
+                })
+                .expect("apply lost payload");
+        }
+
+        fn finish(mut self) -> (std::path::PathBuf, TraceId) {
+            self.host.shutdown().expect("shutdown");
+            drop(self.host);
+            (self.db, self.trace_id)
+        }
+    }
+
+    #[test]
+    fn http_exchange_persists_request_response_call_and_links() {
+        let mut fixture = Fixture::new();
+        fixture.feed(
+            PayloadDirection::Outbound,
+            1,
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"model\":\"test\",\"messages\":[]}",
+        );
+        fixture.feed(
+            PayloadDirection::Inbound,
+            2,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\n{\"choices\":[],\"usage\":{}}",
+        );
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+
+        for kind in ["llm.request", "llm.response", "llm.call"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM semantic_actions WHERE trace_id = ?1 AND kind_name = ?2",
+                    (trace_id.get(), kind),
+                    |row| row.get(0),
+                )
+                .expect("count semantic actions");
+            assert_eq!(count, 1, "one {kind}");
+        }
+        let (status, completeness, closed): (i64, i64, bool) = connection
+            .query_row(
+                "SELECT status, completeness, end_time IS NOT NULL
+                 FROM semantic_actions WHERE trace_id = ?1 AND kind_name = 'llm.call'",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load llm call");
+        assert_eq!(
+            status,
+            semantic_action_contract::SemanticActionStatus::Success as i64
+        );
+        assert_eq!(
+            completeness,
+            semantic_action_contract::SemanticActionCompleteness::Complete as i64
+        );
+        assert!(closed);
+
+        let provider: String = connection
+            .query_row(
+                "SELECT attr_value FROM semantic_action_attributes a
+                 JOIN semantic_actions s USING (trace_id, action_id)
+                 WHERE a.trace_id = ?1 AND s.kind_name = 'llm.request'
+                   AND a.attr_key = 'llm.provider_id'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("request provider");
+        assert_eq!(provider, "openai");
+
+        let mut statement = connection
+            .prepare(
+                "SELECT role_name FROM semantic_action_links
+                 WHERE trace_id = ?1 ORDER BY role_name",
+            )
+            .expect("prepare links");
+        let roles = statement
+            .query_map([trace_id.get()], |row| row.get::<_, String>(0))
+            .expect("query links")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read links");
+        for role in [
+            "llm_call.request",
+            "llm_call.response",
+            "llm_request.http_message",
+            "llm_response.http_message",
+        ] {
+            assert!(roles.iter().any(|value| value == role), "missing {role}");
+        }
+        drop(statement);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn split_sse_exchange_persists_one_terminal_response() {
+        let mut fixture = Fixture::new();
+        fixture.feed(
+            PayloadDirection::Outbound,
+            1,
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"model\":\"test\",\"messages\":[]}",
+        );
+        fixture.feed(
+            PayloadDirection::Inbound,
+            2,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n\n",
+        );
+        fixture.feed(
+            PayloadDirection::Inbound,
+            3,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"},\"finish_reason\":null}]}\n\n",
+        );
+        fixture.feed(PayloadDirection::Inbound, 4, b"data: [DONE]\n\n");
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+
+        let (responses, calls): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    SUM(kind_name = 'llm.response'),
+                    SUM(kind_name = 'llm.call')
+                 FROM semantic_actions WHERE trace_id = ?1",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count streaming actions");
+        assert_eq!((responses, calls), (1, 1));
+        let chunk_count: String = connection
+            .query_row(
+                "SELECT attr_value FROM semantic_action_attributes a
+                 JOIN semantic_actions s USING (trace_id, action_id)
+                 WHERE a.trace_id = ?1 AND s.kind_name = 'llm.response'
+                   AND a.attr_key = 'llm.response.chunk_count'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("streaming chunk count");
+        assert_eq!(chunk_count, "3");
+        let evidence_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_action_evidence e
+                 JOIN semantic_actions s USING (trace_id, action_id)
+                 WHERE e.trace_id = ?1 AND s.kind_name = 'llm.response'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("streaming evidence count");
+        assert_eq!(evidence_count, 3);
+        let call_status: i64 = connection
+            .query_row(
+                "SELECT status FROM semantic_actions
+                 WHERE trace_id = ?1 AND kind_name = 'llm.call'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("streaming call status");
+        assert_eq!(
+            call_status,
+            semantic_action_contract::SemanticActionStatus::Success as i64
+        );
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn response_without_request_persists_orphan_diagnostic() {
+        let mut fixture = Fixture::new();
+        fixture.feed(
+            PayloadDirection::Inbound,
+            1,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n{\"choices\":[]}",
+        );
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let association: String = connection
+            .query_row(
+                "SELECT attr_value FROM semantic_action_attributes a
+                 JOIN semantic_actions s USING (trace_id, action_id)
+                 WHERE a.trace_id = ?1 AND s.kind_name = 'llm.response'
+                   AND a.attr_key = 'llm.association_state'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("orphan association");
+        assert_eq!(association, "orphan");
+        let diagnostic_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics
+                 WHERE trace_id = ?1 AND message = 'llm_response_orphan'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("orphan diagnostics");
+        assert_eq!(diagnostic_count, 1);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn correlated_http_error_closes_call_as_error() {
+        let mut fixture = Fixture::new();
+        fixture.feed(
+            PayloadDirection::Outbound,
+            1,
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"model\":\"test\",\"messages\":[]}",
+        );
+        let body = br#"{"error":{"message":"rate limited","type":"rate_limit"}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("JSON")
+        );
+        fixture.feed(PayloadDirection::Inbound, 2, response.as_bytes());
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let (call_status, response_status): (i64, i64) = connection
+            .query_row(
+                "SELECT
+                    MAX(CASE WHEN kind_name = 'llm.call' THEN status END),
+                    MAX(CASE WHEN kind_name = 'llm.response' THEN status END)
+                 FROM semantic_actions WHERE trace_id = ?1",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("error statuses");
+        let error = semantic_action_contract::SemanticActionStatus::Error as i64;
+        assert_eq!((call_status, response_status), (error, error));
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn payload_loss_does_not_create_complete_llm_call_and_is_persisted() {
+        let mut fixture = Fixture::new();
+        fixture.feed_loss(
+            PayloadDirection::Outbound,
+            1,
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 80\r\n\r\n{\"model\":\"lost\"",
+        );
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let complete_calls: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_actions
+                 WHERE trace_id = ?1 AND kind_name = 'llm.call' AND completeness = ?2",
+                (
+                    trace_id.get(),
+                    semantic_action_contract::SemanticActionCompleteness::Complete as i64,
+                ),
+                |row| row.get(0),
+            )
+            .expect("complete calls");
+        assert_eq!(complete_calls, 0);
+        let diagnostics: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics
+                 WHERE trace_id = ?1 AND message = 'payload_loss'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("payload loss diagnostic");
+        assert_eq!(diagnostics, 1);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn response_loss_finalizes_open_call_as_partial_error() {
+        let mut fixture = Fixture::new();
+        fixture.feed(
+            PayloadDirection::Outbound,
+            1,
+            b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 30\r\n\r\n{\"model\":\"test\",\"messages\":[]}",
+        );
+        fixture.feed_loss(
+            PayloadDirection::Inbound,
+            2,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\n\r\n{\"choices\":",
+        );
+        let trace_id = fixture.trace_id;
+        let finalized = fixture
+            .host
+            .llm_exchange
+            .finalize_trace(trace_id)
+            .into_iter()
+            .map(PersistWrite::SemanticAction)
+            .collect::<Vec<_>>();
+        fixture.host.push_writes(finalized);
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let (status, completeness): (i64, i64) = connection
+            .query_row(
+                "SELECT status, completeness FROM semantic_actions
+                 WHERE trace_id = ?1 AND kind_name = 'llm.call'",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("partial call");
+        assert_eq!(
+            status,
+            semantic_action_contract::SemanticActionStatus::Error as i64
+        );
+        assert_eq!(
+            completeness,
+            semantic_action_contract::SemanticActionCompleteness::Partial as i64
+        );
+        let diagnostics: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics
+                 WHERE trace_id = ?1 AND message = 'payload_loss'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("loss diagnostic");
+        assert_eq!(diagnostics, 1);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn ambiguous_provider_match_is_persisted_as_diagnostic() {
+        let mut fixture = Fixture::new();
+        let ambiguous =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\n{\"choices\":[],\"candidates\":[]}";
+        fixture.feed(PayloadDirection::Inbound, 1, ambiguous);
+        fixture.feed(PayloadDirection::Inbound, 1, ambiguous);
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let diagnostics: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics
+                 WHERE trace_id = ?1 AND message LIKE 'llm_provider_ambiguous:%'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("ambiguity diagnostic");
+        assert_eq!(diagnostics, 1);
+        let responses: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_actions
+                 WHERE trace_id = ?1 AND kind_name = 'llm.response'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("ambiguous response count");
+        assert_eq!(responses, 0);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn interleaved_http2_streams_persist_independent_calls() {
+        let mut request_headers = vec![0x83, 0x04, b"/v1/chat/completions".len() as u8];
+        request_headers.extend_from_slice(b"/v1/chat/completions");
+        let response_headers = [0x88];
+        let request_body = br#"{"model":"test","messages":[]}"#;
+        let response_body = br#"{"choices":[]}"#;
+        let mut request_bytes = h2_frame(1, 0x4, 1, &request_headers);
+        request_bytes.extend(h2_frame(1, 0x4, 3, &request_headers));
+        request_bytes.extend(h2_frame(0, 0x1, 1, request_body));
+        request_bytes.extend(h2_frame(0, 0x1, 3, request_body));
+        let mut response_bytes = h2_frame(1, 0x4, 3, &response_headers);
+        response_bytes.extend(h2_frame(1, 0x4, 1, &response_headers));
+        response_bytes.extend(h2_frame(0, 0x1, 3, response_body));
+        response_bytes.extend(h2_frame(0, 0x1, 1, response_body));
+
+        let mut fixture = Fixture::new();
+        fixture.feed_h2(PayloadDirection::Outbound, 1, &request_bytes);
+        fixture.feed_h2(PayloadDirection::Inbound, 2, &response_bytes);
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let calls: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_actions
+                 WHERE trace_id = ?1 AND kind_name = 'llm.call'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("h2 calls");
+        assert_eq!(calls, 2);
+        let stream_ids: i64 = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT attr_value) FROM semantic_action_attributes a
+                 JOIN semantic_actions s USING (trace_id, action_id)
+                 WHERE s.trace_id = ?1 AND s.kind_name = 'llm.response'
+                   AND a.attr_key = 'http.stream_id'",
+                [trace_id.get()],
+                |row| row.get(0),
+            )
+            .expect("h2 stream ids");
+        assert_eq!(stream_ids, 2);
+        let mut statement = connection
+            .prepare(
+                "SELECT source_stream.attr_value, target_stream.attr_value
+                 FROM semantic_action_links links
+                 JOIN semantic_action_attributes source_stream
+                   ON source_stream.trace_id = links.trace_id
+                  AND source_stream.action_id = links.source_action_id
+                  AND source_stream.attr_key = 'http.stream_id'
+                 JOIN semantic_action_attributes target_stream
+                   ON target_stream.trace_id = links.trace_id
+                  AND target_stream.action_id = links.target_action_id
+                  AND target_stream.attr_key = 'http.stream_id'
+                 WHERE links.trace_id = ?1
+                   AND links.role_name IN (
+                       'llm_request.http_message',
+                       'llm_response.http_message'
+                   )",
+            )
+            .expect("prepare h2 evidence links");
+        let linked_streams = statement
+            .query_map([trace_id.get()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query h2 evidence links")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read h2 evidence links");
+        assert_eq!(linked_streams.len(), 4);
+        assert!(
+            linked_streams
+                .iter()
+                .all(|(source, target)| source == target)
+        );
+        drop(statement);
+        drop(connection);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn split_http2_frames_persist_one_closed_exchange() {
+        let path = b"/v1/chat/completions";
+        let split = 7;
+        let mut header_block = vec![0x83, 0x44, path.len() as u8];
+        header_block.extend_from_slice(path);
+        let request_body = br#"{"model":"split","messages":[]}"#;
+        let response_body = br#"{"choices":[],"usage":{"total_tokens":2}}"#;
+
+        let mut fixture = Fixture::new();
+        fixture.feed_h2(
+            PayloadDirection::Outbound,
+            1,
+            &h2_frame(1, 0, 1, &header_block[..split]),
+        );
+        fixture.feed_h2(
+            PayloadDirection::Outbound,
+            2,
+            &h2_frame(9, 0x4, 1, &header_block[split..]),
+        );
+        fixture.feed_h2(
+            PayloadDirection::Outbound,
+            3,
+            &h2_frame(0, 0, 1, &request_body[..10]),
+        );
+        fixture.feed_h2(
+            PayloadDirection::Outbound,
+            4,
+            &h2_frame(0, 0x1, 1, &request_body[10..]),
+        );
+        fixture.feed_h2(PayloadDirection::Inbound, 5, &h2_frame(1, 0x4, 1, &[0x88]));
+        fixture.feed_h2(
+            PayloadDirection::Inbound,
+            6,
+            &h2_frame(0, 0x1, 1, response_body),
+        );
+
+        let (db, trace_id) = fixture.finish();
+        let connection = Connection::open(&db).expect("open database");
+        let (http, requests, responses, calls): (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    SUM(kind_name = 'http.message'),
+                    SUM(kind_name = 'llm.request'),
+                    SUM(kind_name = 'llm.response'),
+                    SUM(kind_name = 'llm.call')
+                 FROM semantic_actions WHERE trace_id = ?1",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("count split h2 exchange");
+        assert_eq!((http, requests, responses, calls), (2, 1, 1, 1));
+        let (status, completeness, total_tokens): (i64, i64, String) = connection
+            .query_row(
+                "SELECT call.status, call.completeness, usage.attr_value
+                 FROM semantic_actions call
+                 JOIN semantic_actions response
+                   ON response.trace_id = call.trace_id
+                  AND response.kind_name = 'llm.response'
+                 JOIN semantic_action_attributes usage
+                   ON usage.trace_id = response.trace_id
+                  AND usage.action_id = response.action_id
+                  AND usage.attr_key = 'llm.usage.total_tokens'
+                 WHERE call.trace_id = ?1 AND call.kind_name = 'llm.call'",
+                [trace_id.get()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load split h2 call");
+        assert_eq!(
+            status,
+            semantic_action_contract::SemanticActionStatus::Success as i64
+        );
+        assert_eq!(
+            completeness,
+            semantic_action_contract::SemanticActionCompleteness::Complete as i64
+        );
+        assert_eq!(total_tokens, "2");
+        drop(connection);
         remove_db(&db);
     }
 }
