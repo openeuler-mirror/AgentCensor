@@ -13,7 +13,7 @@
   "keywords": ["deepseek", "harness", "censorfs", "agent", "sandbox", "fuse"],
   "engines": { "node": ">=22.0.0" },
   "author": "CensorFS Contributors",
-  "license": "Apache-2.0",
+  "license": "MulanPSL-2.0",
   "exports": {
     ".": { "default": "./src/index.js" },
     "./client": { "default": "./client/index.js" },

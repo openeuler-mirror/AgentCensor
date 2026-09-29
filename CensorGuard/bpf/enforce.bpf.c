@@ -1,12 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0
-/*
- * Migration baseline: ohmyguard feat/pidtree-domain
- * commit fa1f28546abecd01fe07c0e14bad3aad1d077070.
- *
- * During parity phases this file intentionally keeps the verified hook semantics intact. Safety
- * enhancements are introduced only after the Rust/C integration matrix has a matching regression
- * test, so loader, policy compiler and kernel behavior are not changed simultaneously.
- */
 /*
  * enforce.bpf.c —— 进程树作用域 (pidtree) + 多域策略 (map-in-map) eBPF 拦截
  *

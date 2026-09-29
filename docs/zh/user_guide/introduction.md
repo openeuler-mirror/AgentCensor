@@ -193,10 +193,10 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 
 各组件保留自己的许可证声明：
 
-- [CensorFS Cargo.toml](../../../CensorFs/Cargo.toml)：Apache-2.0；
-- [CensorGuard LICENSE](../../../CensorGuard/LICENSE)：GPL-2.0-only；
+- [CensorFS Cargo.toml](../../../CensorFs/Cargo.toml)：MulanPSL-2.0；
+- [CensorGuard LICENSE](../../../CensorGuard/LICENSE)：MulanPSL-2.0；
 - [CensorScope LICENSE](../../../CensorScope/LICENSE)：MulanPSL-2.0；
-- [CensorPivot Cargo.toml](../../../CensorPivot/Cargo.toml)：Apache-2.0。
+- [CensorPivot Cargo.toml](../../../CensorPivot/Cargo.toml)：MulanPSL-2.0。
 
 使用、分发或组合部署时，请同时遵守对应组件及其依赖的许可证要求。
 
