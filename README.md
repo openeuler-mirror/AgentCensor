@@ -2,7 +2,7 @@
 
 <h1>AgentCensor</h1>
 
-<p><strong>面向 Agent 的文件隔离、安全强制与运行观测</strong></p>
+<p><strong>面向 Agent 的文件隔离、安全治理与运行观测</strong></p>
 
 <p>在私有工作区中探索，在内核边界内执行，让工具调用与文件变更可以追溯。</p>
 
