@@ -77,7 +77,14 @@ import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createScope } from '@deepseek-ai/dsh-scope'
+// The source CLI runs through tsx and loads DSH's TS source graph. Importing
+// the package default from this external .mjs would load its built lib graph
+// instead, minting a second private scope Symbol. Use the same entry as DSH.
+const { createScope } = await import(
+  process.execArgv.some((arg) => arg.includes('tsx/esm'))
+    ? '@deepseek-ai/dsh-scope/src/index.ts'
+    : '@deepseek-ai/dsh-scope'
+)
 import { agentEvents } from '@deepseek-ai/dsh-agent'
 import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -281,7 +288,7 @@ class WebDriverAgent {
     this.inbox = { nextTurn: [], nextStep: [] }
     this.dispatch = agentEvents(rootCtx, this)
     this.scope = createScope(rootCtx, this)
-    this.ctx = this.scope.ctx.extend({ agent: this })
+    this.ctx = this.scope.ctx
     this.rootCtx = rootCtx
     this.turn = 0
     // Resident worker lifecycle: workerState is undefined until the session's
@@ -430,7 +437,7 @@ class WebDriverAgent {
     if (sessions === undefined || persistence === undefined) {
       throw new Error('agentcensor: sessions/sessionPersistence unavailable')
     }
-    const dshBin = process.env.AGENTCENSOR_DSH_BIN ?? 'dsh'
+    const dshLauncher = await resolveDshWorkerLauncher()
 
     await sessions.flush(this.session)
     this.endSeedInserted = false
@@ -439,7 +446,11 @@ class WebDriverAgent {
     const header = this.session.header
     const located = persistence.locate?.(header)
     const realFile = located?.path
-    const resume = realFile !== undefined && await fileHasEvents(realFile)
+    if (typeof realFile !== 'string') {
+      throw new Error('agentcensor: session persistence must provide a JSONL artifact location')
+    }
+    await fsp.stat(realFile)
+    const resume = true
 
     const privHome = await fsp.mkdtemp(join(tmpdir(), 'agentcensor-worker-'))
     const privRoot = join(privHome, 'sessions')
@@ -461,6 +472,7 @@ class WebDriverAgent {
       DSH_TELEMETRY_DISABLED: '1',
       AGENTCENSOR_SESSION_ID: this.session.id,
       AGENTCENSOR_MODE: resume ? 'resume' : 'create',
+      AGENTCENSOR_HOST_SEQ: String(this.session.seq),
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
     process.stdout.write(`[agentcensor] worker shares host home DSH_HOME=${hostHome} (no key/model env)\n`)
@@ -828,16 +840,6 @@ function normalizeCancelCause(cause) {
   return { kind: 'user' }
 }
 
-/** Whether the durable artifact exists and contains at least one event. */
-async function fileHasEvents(path) {
-  try {
-    const text = await fsp.readFile(path, 'utf8')
-    return text.split('\n').filter(Boolean).length > 1
-  } catch {
-    return false
-  }
-}
-
 /** Copy the shared durable log into the worker's private root, same layout. */
 async function seedLogCopy(realFile, privRoot) {
   const sessionDir = dirname(realFile)
@@ -850,7 +852,7 @@ async function seedLogCopy(realFile, privRoot) {
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source, parentAgent) {
+async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle) {
   const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
   // dsh 0.1.5 removes the implicit ctx.agent accessor.
@@ -875,7 +877,11 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent)
       detachAgent?.()
     } finally {
       detachSession?.()
-      await agent.scope.dispose()
+      try {
+        await agent.scope.dispose()
+      } finally {
+        await storageHandle?.close()
+      }
     }
   })
   return { agent, dispose }
@@ -923,25 +929,33 @@ export async function apply(ctx) {
     async createAgent(ownerCtx, options) {
       const id = String(options.sessionId)
       process.stdout.write(`[agentcensor] createAgent id=${id}\n`)
-      const session = ctx.sessions.prepare(id, { meta: options.meta ?? {} })
+      const session = ctx.sessions.prepare(id, {
+        meta: options.meta ?? {},
+        ...(options.seed === undefined ? {} : { seed: options.seed }),
+        ...(options.inheritedEventCount === undefined ? {} : {
+          inheritedEventCount: options.inheritedEventCount,
+        }),
+      })
       let handle
       try {
         if (persistence !== undefined) {
-          handle = await persistence.create(session.header, session.inheritedEventCount)
+          handle = await persistence.create(session.header, {
+            inheritedEventCount: session.inheritedEventCount,
+          })
+          const seed = session.snapshotEvents()
+          if (seed.length > 0) await handle.append(seed)
         }
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent, handle)
       } catch (error) {
-        process.stdout.write(`[agentcensor] persistence.create: ${error?.message ?? String(error)}\n`)
+        await handle?.close().catch(() => undefined)
+        throw error
       }
-      return publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent)
     },
     async resume(ownerCtx, options) {
       const id = String(options.resumeSessionId)
       process.stdout.write(`[agentcensor] resume id=${id}\n`)
       if (persistence === undefined) throw new Error('agentcensor: no sessionPersistence')
-      // dsh 0.1.5 exposes persistence through per-session handles. The
-      // previous prepare(id) convenience API is no longer part of the
-      // service, so reconstruct the live session from a read-only snapshot.
-      const handle = await persistence.open(id, 'read')
+      const handle = await persistence.open(id, 'write')
       try {
         const snapshot = await handle.read(0)
         const session = ctx.sessions.prepare(id, {
@@ -950,9 +964,12 @@ export async function apply(ctx) {
           inheritedEventCount: handle.inheritedEventCount,
           eventState: snapshot.eventState,
         })
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent)
-      } finally {
-        await handle.close()
+        const suffix = session.snapshotEvents(snapshot.events.length)
+        if (suffix.length > 0) await handle.append(suffix)
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent, handle)
+      } catch (error) {
+        await handle.close().catch(() => undefined)
+        throw error
       }
     },
   }

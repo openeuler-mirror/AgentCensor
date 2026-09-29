@@ -164,6 +164,13 @@ async function run(ctx) {
       })
   const agent = handle.agent
   const firstSeq = agent.session.seq
+  const hostSeq = Number(process.env.AGENTCENSOR_HOST_SEQ)
+  if (!Number.isSafeInteger(hostSeq) || hostSeq < 0 || hostSeq > firstSeq) {
+    throw new Error(`invalid host session sequence: ${process.env.AGENTCENSOR_HOST_SEQ}`)
+  }
+  for (const event of agent.session.snapshotEvents(hostSeq)) {
+    process.stdout.write(`ACEVT\t${JSON.stringify(event)}\n`)
+  }
 
   // …then the session's current choice is derived from this worker's own
   // durable log replay (the seed the host copied into its private persistence

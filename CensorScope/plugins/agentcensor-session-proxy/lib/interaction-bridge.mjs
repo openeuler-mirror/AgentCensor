@@ -38,7 +38,11 @@
  * worker as "no answer", so the worker fails closed exactly as it does today.
  */
 import { randomUUID } from 'node:crypto'
-import { scopeTarget } from '@deepseek-ai/dsh-scope'
+const { scopeTarget } = await import(
+  process.execArgv.some((arg) => arg.includes('tsx/esm'))
+    ? '@deepseek-ai/dsh-scope/src/index.ts'
+    : '@deepseek-ai/dsh-scope'
+)
 
 /** Approval outcomes the native service accepts; anything else fails closed. */
 const APPROVAL_OUTCOMES = new Set(['allowed-once', 'rejected', 'cancelled', 'unavailable'])

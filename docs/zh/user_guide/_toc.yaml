@@ -1,0 +1,47 @@
+label: AgentCensor 用户指南
+isManual: true
+description: AgentCensor 面向 Agent 工作负载，提供文件隔离、安全强制、运行观测和事务编排能力
+sections:
+
+- label: AgentCensor 简介
+  sections:
+  - label: 项目概览
+    href: ./introduction.md
+  - label: CensorPivot 概览
+    href: ./introduction/censorpivot.md
+  - label: CensorFS 概览
+    href: ./introduction/censorfs.md
+  - label: CensorGuard 概览
+    href: ./introduction/censorguard.md
+  - label: CensorScope 概览
+    href: ./introduction/censorscope.md
+
+- label: 部署指南
+  sections:
+  - label: 安装与启动
+    href: ./deployment_guide/deployment.md
+
+- label: 运行使用指南
+  sections:
+  - label: 提交和管理事务
+    href: ./usage_guide/censorpivot.md
+  - label: CensorFS 命令行指南
+    href: ./usage_guide/censorfs_cli.md
+  - label: CensorGuard 使用手册
+    href: ./usage_guide/censorguard.md
+  - label: CensorScope 插件指南
+    href: ./usage_guide/censorscope_plugins.md
+
+- label: 组件使用指南
+  sections:
+  - label: CensorGuard DSH 插件指南
+    href: ./component_guide/censorguard_dsh.md
+  - label: CensorScope 主机观测指南
+    href: ./component_guide/censorscope.md
+
+- label: DeepSeek Harness 指南
+  sections:
+  - label: DeepSeek Harness 集成
+    href: ./deepseek_harness_guide/integration.md
+  - label: DeepSeek Harness In-Process 指南
+    href: ./deepseek_harness_guide/in_process.md
