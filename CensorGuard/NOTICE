@@ -2,5 +2,4 @@ Censorguard contains a migrated eBPF data-plane source derived from the local oh
 repository, branch feat/pidtree-domain, commit fa1f28546abecd01fe07c0e14bad3aad1d077070.
 
 The migration preserves the original `bpf/enforce.bpf.c` behavior during parity phases. New Rust
-userspace code and the C libbpf shim are maintained in this repository under GPL-2.0-only.
-
+Project-owned userspace code and the C libbpf shim are maintained in this repository under MulanPSL-2.0.
