@@ -8,3 +8,4 @@ license = "MulanPSL-2.0"
 model_core = { path = "../model" }
 semantic_action_contract = { path = "../../contracts/semantic_action" }
 serde_json = "1.0"
+httlib-huffman = "0.3.4"

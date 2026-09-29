@@ -886,8 +886,9 @@ impl SqliteStorage {
         self.execute_cached(
             "INSERT INTO diagnostics (
                 trace_id, observed_at, collector, kind, severity, message,
-                dropped, dropped_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                dedupe_key, dropped, dropped_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(trace_id, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING",
             params![
                 diagnostic.trace_id.get(),
                 encode_time(diagnostic.observed_at),
@@ -895,6 +896,7 @@ impl SqliteStorage {
                 diagnostic_kind_code(diagnostic.kind),
                 diagnostic_severity_code(diagnostic.severity),
                 diagnostic.message,
+                diagnostic.dedupe_key,
                 diagnostic.dropped,
                 diagnostic.dropped_bytes,
             ],
@@ -1548,7 +1550,7 @@ mod tests {
             .borrow()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]
@@ -1781,6 +1783,7 @@ mod tests {
                 kind: DiagnosticKind::CaptureGap,
                 severity: DiagnosticSeverity::Warning,
                 message: "lost bytes".to_string(),
+                dedupe_key: None,
                 dropped: 2,
                 dropped_bytes: 9,
             })
@@ -1802,6 +1805,34 @@ mod tests {
                 9
             )
         );
+    }
+
+    #[test]
+    fn diagnostics_with_dedupe_key_are_idempotent() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let diagnostic = CaptureDiagnostic {
+            trace_id: TraceId::new(7),
+            observed_at: SystemTime::UNIX_EPOCH,
+            collector: model_core::ids::CollectorName::new("test"),
+            kind: DiagnosticKind::CaptureGap,
+            severity: DiagnosticSeverity::Warning,
+            message: "ambiguous".to_string(),
+            dedupe_key: Some("ambiguity:7:stream:1".to_string()),
+            dropped: 0,
+            dropped_bytes: 0,
+        };
+        storage.append_diagnostic(&diagnostic).unwrap();
+        storage.append_diagnostic(&diagnostic).unwrap();
+        let count: i64 = storage
+            .connection
+            .borrow()
+            .query_row(
+                "SELECT COUNT(*) FROM diagnostics WHERE trace_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     fn action(trace_id: TraceId, action_id: &str) -> SemanticAction {

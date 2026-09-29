@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const SQLITE_SCHEMA_VERSION_CURRENT: i32 = 1;
+const SQLITE_SCHEMA_VERSION_CURRENT: i32 = 2;
 const CREATE_TABLES_SQL: &str = r#"
 CREATE TABLE process_id_sequence (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -200,6 +200,7 @@ CREATE TABLE diagnostics (
     kind INTEGER NOT NULL,
     severity INTEGER NOT NULL,
     message TEXT NOT NULL,
+    dedupe_key TEXT,
     dropped INTEGER NOT NULL,
     dropped_bytes INTEGER NOT NULL
 );
@@ -320,6 +321,16 @@ pub fn initialize(connection: &Connection) -> Result<(), rusqlite::Error> {
     if version == SQLITE_SCHEMA_VERSION_CURRENT {
         return validate_current_schema(connection);
     }
+    if version == 1 {
+        connection.execute_batch(
+            "ALTER TABLE diagnostics ADD COLUMN dedupe_key TEXT;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_diagnostics_dedupe
+             ON diagnostics (trace_id, dedupe_key)
+             WHERE dedupe_key IS NOT NULL;
+             PRAGMA user_version = 2;",
+        )?;
+        return validate_current_schema(connection);
+    }
     if version != 0 || user_table_count(connection)? != 0 {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -347,6 +358,7 @@ fn validate_current_schema(connection: &Connection) -> Result<(), rusqlite::Erro
         ("payload_segments", "session_id"),
         ("payload_segments", "call_id"),
         ("diagnostics", "diagnostic_id"),
+        ("diagnostics", "dedupe_key"),
         ("semantic_actions", "action_id"),
         ("semantic_actions", "session_id"),
         ("semantic_action_attributes", "attr_value"),
@@ -362,13 +374,15 @@ fn validate_current_schema(connection: &Connection) -> Result<(), rusqlite::Erro
             return Err(rusqlite::Error::InvalidQuery);
         }
     }
-    // Keep performance indexes present when opening databases created before
-    // these indexes were introduced; schema version 1 remains wire-compatible.
+    // Preserve performance indexes when opening databases created before this schema revision.
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_events_unassigned_trace_time
              ON events (trace_id, observed_at, event_id) WHERE call_id IS NULL;
          CREATE INDEX IF NOT EXISTS idx_call_spans_trace_start
-             ON call_spans(trace_id, started_at, call_id);",
+             ON call_spans(trace_id, started_at, call_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_diagnostics_dedupe
+             ON diagnostics (trace_id, dedupe_key)
+             WHERE dedupe_key IS NOT NULL;",
     )?;
     Ok(())
 }
