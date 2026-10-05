@@ -281,7 +281,13 @@ impl NativeKernel {
         let offset = (bank & 1) * 64;
         let baseline = policy.baseline.as_ref().unwrap_or(&empty);
         self.replace_rule_set(offset, baseline, version)?;
-        self.write_slot_meta(offset, 0, version, baseline.file_strings.len() as u32)?;
+        self.write_slot_meta(
+            offset,
+            0,
+            version,
+            baseline.file_strings.len() as u32,
+            baseline.arguments.len() as u32,
+        )?;
 
         let mut representatives: Vec<(&CompiledRules, u32)> = vec![(baseline, offset)];
 
@@ -307,6 +313,7 @@ impl NativeKernel {
                 *slot,
                 version,
                 rules.file_strings.len() as u32,
+                rules.arguments.len() as u32,
             )?;
         }
         Ok(())
@@ -345,6 +352,7 @@ impl NativeKernel {
         logical_slot: u32,
         version: u32,
         file_str_count: u32,
+        arg_count: u32,
     ) -> Result<(), KernelError> {
         self.update_map(
             "slot_meta_map",
@@ -353,7 +361,7 @@ impl NativeKernel {
                 version,
                 policy_group: logical_slot,
                 file_str_count,
-                pad: 0,
+                arg_count,
                 switch_ts: unix_nanos(),
             },
         )
@@ -1029,11 +1037,28 @@ const EXEC: &[ProgramSpec] = &[
     },
 ];
 
-const NETWORK: &[ProgramSpec] = &[ProgramSpec {
-    name: "enforce_socket_connect",
-    section: "lsm/socket_connect",
-    feature: Feature::Network,
-}];
+const NETWORK: &[ProgramSpec] = &[
+    ProgramSpec {
+        name: "enforce_socket_connect",
+        section: "lsm/socket_connect",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "enforce_socket_bind",
+        section: "lsm/socket_bind",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "enforce_socket_sendmsg",
+        section: "lsm/socket_sendmsg",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "enforce_socket_accept",
+        section: "lsm/socket_accept",
+        feature: Feature::Network,
+    },
+];
 
 /// Tail-call stage programs: loaded with the file hooks but never attached;
 /// entered via the file_stage_calls prog array (see native.c file_stages).

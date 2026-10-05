@@ -134,7 +134,10 @@ fn operation_name(kind: u32, op: u32) -> &'static str {
         (1, 19) => "fd_read",
         (1, 20) => "fd_write",
         (2, _) => "exec",
-        (3, _) => "connect",
+        (3, 0) => "connect",
+        (3, 1) => "bind",
+        (3, 2) => "sendmsg",
+        (3, 3) => "accept",
         (4, 1) => "kill",
         (4, 2) => "ptrace",
         (4, 3) => "traceme",
@@ -154,6 +157,9 @@ mod tests {
         assert_eq!(operation_name(1, 20), "fd_write");
         assert_eq!(operation_name(2, 0), "exec");
         assert_eq!(operation_name(3, 0), "connect");
+        assert_eq!(operation_name(3, 1), "bind");
+        assert_eq!(operation_name(3, 2), "sendmsg");
+        assert_eq!(operation_name(3, 3), "accept");
         assert_eq!(operation_name(4, 4), "bpf");
     }
 }

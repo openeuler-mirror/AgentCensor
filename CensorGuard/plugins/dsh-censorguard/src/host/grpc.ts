@@ -106,7 +106,7 @@ export interface EventsRequest {
 export interface AuditEvent {
   ts: string;               // RFC3339, daemon 收到事件的时刻
   kind: number;             // 1=FILE 2=EXEC 3=NET 4=GUARD
-  op: number;               // kind=1 时 FILE_OP_*, kind=4 时 GUARD_OP_*
+  op: number;               // kind=1 FILE_OP_*, kind=3 NET_OP_*, kind=4 GUARD_OP_*
   pid: number;
   tgid: number;
   allowed: boolean;

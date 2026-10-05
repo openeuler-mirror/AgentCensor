@@ -204,7 +204,8 @@ pub struct SlotMeta {
     pub policy_group: u32,
     /// Number of file-string rules in the slot; zero lets BPF skip path-walk fallback entirely.
     pub file_str_count: u32,
-    pub pad: u32,
+    /// Number of exec argument rules in the slot. Zero means argument matching is disabled.
+    pub arg_count: u32,
     pub switch_ts: u64,
 }
 

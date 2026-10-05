@@ -19,7 +19,7 @@
  *              lsm/path_rmdir (删目录), lsm/path_rename (改名/移动),
  *              等 18 个文件钩子 + lsm/bprm_check_security,
  *              tracepoint/syscalls/sys_enter_execve/execveat (取 argv 暂存),
- *              lsm/socket_connect + 守护四钩 + 进程树追踪三钩
+ *              lsm/socket_connect/bind/sendmsg/accept + 守护四钩 + 进程树追踪三钩
  *
  * 注意: path_truncate/unlink/rmdir/rename 不在内核 sleepable LSM
  * 钩子名单里 (inode 锁上下文), 只能用非 sleepable lsm/ 挂载;
@@ -159,7 +159,14 @@ struct arg_key {
 /* sys_enter_execve 暂存的 argv: 4 个定长 token 槽 */
 struct exec_args {
     char tok[ARG_TOKEN_N][ARG_TOKEN_LEN];
+    __u8 capture_status;
+    __u8 pad[3];
 };
+#define EXEC_ARGS_CAPTURED 0
+#define EXEC_ARGS_FAILED   1
+#define ARG_CHECK_NO_MATCH 0
+#define ARG_CHECK_MATCH    1
+#define ARG_CHECK_UNAVAILABLE 2
 
 /* ============ 规则 value 定义 (P2: 全部携带策略版本) ============
  *
@@ -260,6 +267,12 @@ struct net_rule_val {
 #define GUARD_OP_PTRACE   2
 #define GUARD_OP_TRACEME  3
 #define GUARD_OP_BPF      4
+
+/* 网络事件 op (kind=3): 保持 connect 为 0 以兼容现有消费者。 */
+#define NET_OP_CONNECT 0
+#define NET_OP_BIND 1
+#define NET_OP_SENDMSG 2
+#define NET_OP_ACCEPT 3
 
 /* ============ 运行时可热更的过滤配置 (array map) ============
  *
@@ -680,7 +693,7 @@ struct slot_meta {
     __u32 version;       /* 当前槽位生效的策略版本 */
     __u32 policy_group;  /* 绑定的策略组 id */
     __u32 file_str_count; /* 该槽 file_str 规则条数: 0 = 路径兜底判定整体跳过 */
-    __u32 pad;
+    __u32 arg_count;     /* 该槽 exec 参数规则条数 */
     __u64 switch_ts;     /* 换槽时间戳 (控制面写入, UnixNano), 审计用 */
 };
 struct {
@@ -1535,7 +1548,7 @@ static __always_inline bool arg_key_in_blacklist(struct arg_key *k,
  * 实现前缀语义: 写 "/usr/bin/git push" 即禁所有 "git push *"。
  * 全部定长 memcpy/memset, 无变长操作。
  * 每一级回退都是 基线→域 并查; outer 由调用方各查一次传入复用。 */
-static __always_inline bool is_args_in_blacklist(const struct exec_args *ea,
+static __always_inline int is_args_in_blacklist(const struct exec_args *ea,
                                                  struct file *file,
                                                  const char *filename,
                                                  struct bpf_map *base,
@@ -1545,7 +1558,7 @@ static __always_inline bool is_args_in_blacklist(const struct exec_args *ea,
     __u32 z = 0;
     struct arg_key *k = bpf_map_lookup_elem(&arg_key_scratch, &z);
     if (!k)
-        return false;
+        return ARG_CHECK_UNAVAILABLE;
 
     if (file) {
         struct inode *inode = BPF_CORE_READ(file, f_inode);
@@ -1557,7 +1570,7 @@ static __always_inline bool is_args_in_blacklist(const struct exec_args *ea,
             k->tok[0][0] = ARG_INODE_MARKER;
             __builtin_memcpy(k->tok[0] + ARG_INODE_OFFSET, &ik, sizeof(ik));
             if (arg_key_in_blacklist(k, base, dom, rule_ver))
-                return true;
+                return ARG_CHECK_MATCH;
         }
     }
 
@@ -1565,9 +1578,9 @@ static __always_inline bool is_args_in_blacklist(const struct exec_args *ea,
         __builtin_memcpy(k, ea->tok, sizeof(*k));
         bpf_probe_read_kernel_str(k->tok[0], ARG_TOKEN_LEN, filename);
         if (arg_key_in_blacklist(k, base, dom, rule_ver))
-            return true;
+            return ARG_CHECK_MATCH;
     }
-    return false;
+    return ARG_CHECK_NO_MATCH;
 }
 
 /* 把一个 0-255 的八位组定宽写成 3 个 ASCII 字符 (带前导零)。
@@ -2349,6 +2362,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
     struct bpf_map *dom_cmd_ino_m = bpf_map_lookup_elem(&dom_cmd_ino, &domain);
     struct bpf_map *base_arg = bpf_map_lookup_elem(&dom_arg, &base);
     struct bpf_map *dom_arg_m = bpf_map_lookup_elem(&dom_arg, &domain);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
     struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
     __u32 policy_ver = sm ? sm->version : 0;
     __u32 rule_ver = 0;
@@ -2381,9 +2395,24 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
      * 所以参数只能从 sys_enter_execve 提前暂存。
      * tok[0] 不用 argv[0] (可伪造/随敲法变化), 统一用 bprm->filename。 */
     {
-        if (ea && is_args_in_blacklist(ea, executable,
-                                       fn_ret > 0 ? fn : NULL,
-                                       base_arg, dom_arg_m, &rule_ver)) {
+        int arg_result = ARG_CHECK_NO_MATCH;
+        if ((sm && sm->arg_count) || (bm && bm->arg_count)) {
+            if (!ea || ea->capture_status != EXEC_ARGS_CAPTURED) {
+                report_exec(0, fn, ea, policy_ver, 0, si.scope_id);
+                if (ea)
+                    bpf_map_delete_elem(&exec_args_map, &tid);
+                return -1;
+            }
+            arg_result = is_args_in_blacklist(ea, executable,
+                                              fn_ret > 0 ? fn : NULL,
+                                              base_arg, dom_arg_m, &rule_ver);
+            if (arg_result == ARG_CHECK_UNAVAILABLE) {
+                report_exec(0, fn, ea, policy_ver, 0, si.scope_id);
+                bpf_map_delete_elem(&exec_args_map, &tid);
+                return -1;
+            }
+        }
+        if (arg_result == ARG_CHECK_MATCH) {
             report_exec(0, fn, ea, policy_ver, rule_ver, si.scope_id);  /* DENY (参数级) */
             bpf_map_delete_elem(&exec_args_map, &tid);
             return -1;
@@ -2432,29 +2461,38 @@ static __always_inline int capture_exec_argv(const char *const *argv)
     if (!in_scope_exec(&si))
         return 0;
 
-    if (!argv)
-        return 0;
-
     struct exec_args ea = {};
+    ea.capture_status = EXEC_ARGS_FAILED;
+    __u64 id = bpf_get_current_pid_tgid();
+    if (!argv)
+        goto store;
+
     bool stop = false;
 #pragma unroll
     for (int i = 1; i < ARG_TOKEN_N; i++) {
         if (!stop) {
             const char *p = NULL;
-            bpf_probe_read_user(&p, sizeof(p), &argv[i]);
-            if (!p) {
+            long ptr_ret = bpf_probe_read_user(&p, sizeof(p), &argv[i]);
+            if (ptr_ret < 0) {
+                goto store;
+            } else if (!p) {
                 stop = true;
             } else {
                 /* 定长槽, verifier 友好; 拼接展示在 Rust audit 做 */
-                bpf_probe_read_user_str(ea.tok[i], ARG_TOKEN_LEN, p);
+                long str_ret = bpf_probe_read_user_str(ea.tok[i], ARG_TOKEN_LEN, p);
+                if (str_ret < 0 || str_ret >= ARG_TOKEN_LEN)
+                    goto store;
             }
         }
     }
+    ea.capture_status = EXEC_ARGS_CAPTURED;
 
     /* DEBUG: 排障时取消注释 */
     // bpf_printk("[execve] tok1=%s tok2=%s", ea.tok[1], ea.tok[2]);
 
-    __u64 id = bpf_get_current_pid_tgid();
+store:
+    /* Remove a prior exec entry first so an update failure cannot reuse stale argv. */
+    bpf_map_delete_elem(&exec_args_map, &id);
     bpf_map_update_elem(&exec_args_map, &id, &ea, BPF_ANY);
     return 0;
 }
@@ -2488,7 +2526,8 @@ int capture_execveat_args(struct trace_event_raw_sys_enter *ctx)
 static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
                                                 const struct scope_info *si,
                                                 struct sockaddr *addr,
-                                                int addrlen)
+                                                int addrlen,
+                                                __u32 op)
 {
     /* sockaddr_in6: family(2), port(2), flowinfo(4), addr(16), scope(4)。
      * 只读取到 address 末尾，因此 24 字节是本程序需要的最小可信长度。 */
@@ -2545,16 +2584,18 @@ static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
         goto deny6;
 
 allow6:
-    report(3, 0, 1, detail, policy_ver, rule_ver);
+    report(3, op, 1, detail, policy_ver, rule_ver);
     return 0;
 
 deny6:
-    report(3, 0, 0, detail, policy_ver, rule_ver);
+    report(3, op, 0, detail, policy_ver, rule_ver);
     return -1;
 }
 
-SEC("lsm/socket_connect")
-int BPF_PROG(enforce_socket_connect, struct socket *sock, struct sockaddr *addr, int addrlen)
+static __always_inline int enforce_socket_addr(struct socket *sock,
+                                               struct sockaddr *addr,
+                                               int addrlen,
+                                               __u32 op)
 {
     const struct filter_config *cfg = get_cfg();
     if (!cfg)
@@ -2575,7 +2616,7 @@ int BPF_PROG(enforce_socket_connect, struct socket *sock, struct sockaddr *addr,
     // bpf_printk("[net] ENTER family=%d addrlen=%d", family, addrlen);
 
     if (family == 10)
-        return enforce_ipv6_connect(cfg, &si, addr, addrlen);
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, op);
     if (family != 2)
         return 0;
 
@@ -2657,12 +2698,97 @@ int BPF_PROG(enforce_socket_connect, struct socket *sock, struct sockaddr *addr,
         goto deny;
 
 allow:
-    report(3, 0, 1, detail, policy_ver, rule_ver);  /* OK */
+    report(3, op, 1, detail, policy_ver, rule_ver);  /* OK */
     return 0;
 
 deny:
-    report(3, 0, 0, detail, policy_ver, rule_ver);  /* DENY */
+    report(3, op, 0, detail, policy_ver, rule_ver);  /* DENY */
     return -1;
+}
+
+SEC("lsm/socket_connect")
+int BPF_PROG(enforce_socket_connect, struct socket *sock, struct sockaddr *addr, int addrlen)
+{
+    return enforce_socket_addr(sock, addr, addrlen, NET_OP_CONNECT);
+}
+
+/* bind 使用与 connect 相同的地址查表和 deny 优先语义。 */
+SEC("lsm/socket_bind")
+int BPF_PROG(enforce_socket_bind, struct socket *sock, struct sockaddr *addr, int addrlen)
+{
+    const struct filter_config *cfg = get_cfg();
+    if (!cfg || !cfg->enable_net)
+        return 0;
+    struct scope_info si = {};
+    if (!current_scope_info(&si) || !sock || !addr)
+        return 0;
+    struct sock *skp = BPF_CORE_READ(sock, sk);
+    if (!skp)
+        return 0;
+    short family = BPF_CORE_READ(skp, __sk_common.skc_family);
+    if (family == 10)
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_BIND);
+    if (family == 2)
+        return enforce_socket_addr(sock, addr, addrlen, NET_OP_BIND);
+    return 0;
+}
+
+/* sendmsg 能提供明确目标时检查该目标。已连接 socket 的 msg_name 通常为空，
+ * 其连接阶段已经由 socket_connect 检查，避免在这里重复阻断合法 TCP 发送。 */
+SEC("lsm/socket_sendmsg")
+int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, int size)
+{
+    (void)size;
+    const struct filter_config *cfg = get_cfg();
+    if (!cfg || !cfg->enable_net || !sock || !msg)
+        return 0;
+    struct sockaddr *addr = BPF_CORE_READ(msg, msg_name);
+    int addrlen = BPF_CORE_READ(msg, msg_namelen);
+    if (!addr || addrlen <= 0)
+        return 0;
+    struct scope_info si = {};
+    if (!current_scope_info(&si))
+        return 0;
+    struct sock *skp = BPF_CORE_READ(sock, sk);
+    if (!skp)
+        return 0;
+    short family = BPF_CORE_READ(skp, __sk_common.skc_family);
+    if (family == 10)
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_SENDMSG);
+    if (family == 2)
+        return enforce_socket_addr(sock, addr, addrlen, NET_OP_SENDMSG);
+    return 0;
+}
+
+/* accept 没有 sockaddr 参数，从新 socket 的远端地址构造内核地址，复用查表。 */
+SEC("lsm/socket_accept")
+int BPF_PROG(enforce_socket_accept, struct socket *sock, struct socket *newsock)
+{
+    const struct filter_config *cfg = get_cfg();
+    if (!cfg || !cfg->enable_net || !newsock)
+        return 0;
+    struct scope_info si = {};
+    if (!current_scope_info(&si))
+        return 0;
+    struct sock *skp = BPF_CORE_READ(newsock, sk);
+    if (!skp)
+        return 0;
+    short family = BPF_CORE_READ(skp, __sk_common.skc_family);
+    if (family == 2) {
+        struct sockaddr_in sin = {};
+        sin.sin_family = 2;
+        sin.sin_port = BPF_CORE_READ(skp, __sk_common.skc_dport);
+        sin.sin_addr.s_addr = BPF_CORE_READ(skp, __sk_common.skc_daddr);
+        return enforce_socket_addr(newsock, (struct sockaddr *)&sin, sizeof(sin), NET_OP_ACCEPT);
+    }
+    if (family == 10) {
+        struct sockaddr_in6 sin6 = {};
+        sin6.sin6_family = 10;
+        sin6.sin6_port = BPF_CORE_READ(skp, __sk_common.skc_dport);
+        BPF_CORE_READ_INTO(&sin6.sin6_addr, skp, __sk_common.skc_v6_daddr);
+        return enforce_ipv6_connect(cfg, &si, (struct sockaddr *)&sin6, sizeof(sin6), NET_OP_ACCEPT);
+    }
+    return 0;
 }
 
 /* ===================================================================

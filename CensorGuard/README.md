@@ -37,6 +37,16 @@ rules:
 读取），这表示文件打开检查点，不表示执行了多个可执行文件。只看执行事件可使用
 `censorguard-audit launch --kind 2` 过滤。
 
+文件规则同时编译为 inode 身份和同一规则的规范化路径身份：内核先查 inode，inode
+未命中时才使用路径兜底，以覆盖文件重建或新建后的短期窗口。当前 exec 参数规则依赖
+execve/execveat 入口暂存 argv；当当前策略存在参数规则而采集失败、scratch 不可用或
+暂存更新失败时，`bprm_check_security` 按 fail-closed 拒绝该次执行。网络策略覆盖
+`socket_connect`、`socket_bind`、带目标地址的 `socket_sendmsg` 和已建立入站连接的
+`socket_accept`；无法从 sendmsg 取得目标地址的已连接发送由 connect 检查负责，仍不
+等价于包级防火墙。
+文件 `allow` 不构成白名单；网络规则按带端口优先、同层级 deny 优先的顺序判定。
+启动和 hook 的微秒级延迟尚未由现有启动 smoke test 证明。
+
 ## 构建
 
 ```bash

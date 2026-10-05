@@ -204,7 +204,7 @@ message EventsReq {
 }
 
 // Event 事件面消息 (ringbuf enforceEvent 的纯数据形态)。
-// kind: 1=FILE 2=EXEC 3=NET 4=GUARD; op: kind=1 时 FILE_OP_*, kind=4 时 GUARD_OP_*。
+// kind: 1=FILE 2=EXEC 3=NET 4=GUARD; op: FILE_OP_* / NET_OP_* / GUARD_OP_*。
 message Event {
   string ts = 1;                      // RFC3339 (daemon 收到事件的时刻)
   uint32 kind = 2;
