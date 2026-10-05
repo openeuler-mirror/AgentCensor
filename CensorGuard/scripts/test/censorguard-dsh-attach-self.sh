@@ -1,21 +1,258 @@
 #!/usr/bin/env bash
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化), 固定 C locale。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # Censorguard DSH attach 自助面验收 (对照 ohmyguard scripts/dsh_attach_self_test.sh A1-A9)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 验证点:
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A1  ctl.sock (root) 下发 censorguard-dsh-default 策略组
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A2  非 root 经 dsh.sock attach_self 成功, 回执带 daemonBootId + hooksHealthy
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A3  两个并发 attach (不同 uid) 得到不同 Domain
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A4  dsh.sock ACL: 非自助 op (health) 被拒 "not allowed on the Dsh socket"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A5  attach_self 忽略伪造 pid (params.pid=1, 域名仍取 SO_PEERCRED 真实 tgid)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A6  status_self: 新进程不属于任何 Domain (ok=true, domains 空)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A7  attach_self 在 ctl.sock (Admin 角色) 被 ACL 拒
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A8  白名单外组 (__base__) attach_self 被拒 "not in the DSH self-serve whitelist"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A9  Domain 名格式 dsh:<uid>:<tgid>-<starttime>
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 用法: sudo bash scripts/test/censorguard-dsh-attach-self.sh
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 前置: cargo build (target/debug/censorguardd, censorguardctl) + 插件 pnpm build
 
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
+
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -u
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 FAILS=0

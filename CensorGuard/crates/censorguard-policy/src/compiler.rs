@@ -343,6 +343,9 @@ fn add_file_rule(
     warnings: &mut Vec<CompileWarning>,
 ) -> Result<(), PolicyError> {
     let key = pack_absolute_path("file rule", value)?;
+    // Dual identity: the inode key binds the current file object, the path string key
+    // survives delete+recreate (new inode) and is matched by the kernel path-walk
+    // fallback in non-sleepable hooks and by bpf_d_path in file_open.
     match fs::metadata(value) {
         Ok(metadata) => {
             let inode = InodeKey {
@@ -371,6 +374,12 @@ fn add_file_rule(
                         version: 0,
                     });
             }
+            rules.file_strings.entry(key).or_default().merge(RuleValue {
+                mask,
+                action,
+                audit,
+                version: 0,
+            });
         }
         Err(error) => {
             rules.file_strings.entry(key).or_default().merge(RuleValue {
@@ -686,7 +695,31 @@ mod tests {
         let compiled = compile(root)?;
         let rules = &compiled.groups["lab"];
         assert_eq!(rules.file_inodes.len(), 1);
-        assert!(rules.file_strings.is_empty());
+        // Dual identity: existing files also get a path-string rule so a
+        // delete+recreate (new inode) is still caught by the path-walk fallback.
+        assert_eq!(rules.file_strings.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_long_file_rule_paths_up_to_name_max() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        // 100-byte path: above the old 63-byte key limit, below NAME_MAX.
+        let file = directory
+            .path()
+            .join("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.txt");
+        File::create(&file)?;
+        let path = file.to_string_lossy().into_owned();
+        assert!(path.len() > 63 && path.len() <= 255);
+        let group = GroupPolicy {
+            rules: vec![format!("file deny {path}")],
+        };
+        let mut root = PolicyRoot::default();
+        root.groups.insert("lab".into(), group);
+        let compiled = compile(root)?;
+        let rules = &compiled.groups["lab"];
+        assert_eq!(rules.file_inodes.len(), 1);
+        assert_eq!(rules.file_strings.len(), 1);
         Ok(())
     }
 

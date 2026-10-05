@@ -41,6 +41,8 @@ pub struct ProgramSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookManifest {
     required: Vec<ProgramSpec>,
+    /// Programs loaded but never attached (tail-call stages entered via file_stage_calls).
+    load_only: Vec<&'static str>,
 }
 
 impl HookManifest {
@@ -48,8 +50,10 @@ impl HookManifest {
     pub fn for_policy(enables: [bool; 3]) -> Self {
         let mut required = PROCESS_TREE.to_vec();
         required.extend_from_slice(SELF_PROTECTION);
+        let mut load_only = Vec::new();
         if enables[0] {
             required.extend_from_slice(FILE);
+            load_only.extend_from_slice(FILE_STAGES);
         }
         if enables[1] {
             required.extend_from_slice(EXEC);
@@ -57,7 +61,10 @@ impl HookManifest {
         if enables[2] {
             required.extend_from_slice(NETWORK);
         }
-        Self { required }
+        Self {
+            required,
+            load_only,
+        }
     }
 
     #[must_use]
@@ -198,6 +205,14 @@ impl NativeKernel {
             .collect();
         let names = names.map_err(|_| KernelError::EmbeddedNul("program name".into()))?;
         let pointers: Vec<_> = names.iter().map(|name| name.as_ptr()).collect();
+        let stage_names: Result<Vec<_>, _> = manifest
+            .load_only
+            .iter()
+            .map(|name| CString::new(*name))
+            .collect();
+        let stage_names =
+            stage_names.map_err(|_| KernelError::EmbeddedNul("stage program name".into()))?;
+        let stage_pointers: Vec<_> = stage_names.iter().map(|name| name.as_ptr()).collect();
         let mut error = [0 as c_char; 4096];
         // SAFETY: every pointer is NUL-terminated and remains alive for the call. The C function
         // either returns an owned opaque handle or null and writes at most `error.len()` bytes.
@@ -206,6 +221,8 @@ impl NativeKernel {
                 path.as_ptr(),
                 pointers.as_ptr(),
                 pointers.len(),
+                stage_pointers.as_ptr(),
+                stage_pointers.len(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -262,11 +279,11 @@ impl NativeKernel {
     ) -> Result<(), KernelError> {
         let empty = CompiledRules::default();
         let offset = (bank & 1) * 64;
-        self.replace_rule_set(offset, policy.baseline.as_ref().unwrap_or(&empty), version)?;
-        self.write_slot_meta(offset, 0, version)?;
+        let baseline = policy.baseline.as_ref().unwrap_or(&empty);
+        self.replace_rule_set(offset, baseline, version)?;
+        self.write_slot_meta(offset, 0, version, baseline.file_strings.len() as u32)?;
 
-        let mut representatives: Vec<(&CompiledRules, u32)> =
-            vec![(policy.baseline.as_ref().unwrap_or(&empty), offset)];
+        let mut representatives: Vec<(&CompiledRules, u32)> = vec![(baseline, offset)];
 
         for (group, slot) in &layout.group_slots {
             let rules = if group.is_empty() {
@@ -285,7 +302,12 @@ impl NativeKernel {
                 self.replace_rule_set(offset + slot, rules, version)?;
                 representatives.push((rules, offset + slot));
             }
-            self.write_slot_meta(offset + slot, *slot, version)?;
+            self.write_slot_meta(
+                offset + slot,
+                *slot,
+                version,
+                rules.file_strings.len() as u32,
+            )?;
         }
         Ok(())
     }
@@ -322,6 +344,7 @@ impl NativeKernel {
         physical_slot: u32,
         logical_slot: u32,
         version: u32,
+        file_str_count: u32,
     ) -> Result<(), KernelError> {
         self.update_map(
             "slot_meta_map",
@@ -329,6 +352,8 @@ impl NativeKernel {
             &SlotMeta {
                 version,
                 policy_group: logical_slot,
+                file_str_count,
+                pad: 0,
                 switch_ts: unix_nanos(),
             },
         )
@@ -896,7 +921,7 @@ const SELF_PROTECTION: &[ProgramSpec] = &[
 const FILE: &[ProgramSpec] = &[
     ProgramSpec {
         name: "enforce_file_open",
-        section: "lsm.s/file_open",
+        section: "lsm/file_open",
         feature: Feature::File,
     },
     ProgramSpec {
@@ -1009,6 +1034,10 @@ const NETWORK: &[ProgramSpec] = &[ProgramSpec {
     section: "lsm/socket_connect",
     feature: Feature::Network,
 }];
+
+/// Tail-call stage programs: loaded with the file hooks but never attached;
+/// entered via the file_stage_calls prog array (see native.c file_stages).
+const FILE_STAGES: &[&str] = &["enforce_path_rename_dst"];
 
 #[cfg(test)]
 mod tests {

@@ -8,6 +8,8 @@ unsafe extern "C" {
         path: *const c_char,
         programs: *const *const c_char,
         count: usize,
+        stage_programs: *const *const c_char,
+        stage_count: usize,
         error: *mut c_char,
         error_size: usize,
     ) -> *mut KernelHandle;

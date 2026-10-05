@@ -1,5 +1,35 @@
 #!/usr/bin/env bash
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-file-stress
@@ -59,7 +89,7 @@ YAML
     --event-sock "${runtime_dir}/events.sock" \
     --duration 90 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
@@ -68,7 +98,7 @@ grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log"
 "${runtime_dir}/file-stress-probe" "${protected_file}" "${allowed_file}" \
     "${threads}" "${iterations}" >"${runtime_dir}/probe.log" 2>&1 &
 probe_pid=$!
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^State:[[:space:]]*T' "/proc/${probe_pid}/status" 2>/dev/null && break
     /usr/bin/sleep 0.01
 done
@@ -107,7 +137,7 @@ grep -q "denied_ok=${expected_denied} allowed_ok=${expected_allowed} errors=0" \
 [[ ${responsive} -gt 0 ]]
 [[ $(sha256sum "${protected_file}" | awk '{ print $1 }') == "${protected_hash}" ]]
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
         status >"${runtime_dir}/status-final.log"
     grep -q '"tracked": 0' "${runtime_dir}/status-final.log" && break
