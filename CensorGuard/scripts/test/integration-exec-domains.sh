@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -65,11 +66,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -80,30 +79,30 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW 事件现在由运行时开关控制（替代旧 allow_sample_rate）
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     set --audit-exec on >/dev/null
 
-"${repo_dir}/target/debug/censorguard-audit" launch --socket "${runtime_dir}/events.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit \
     --kind 2 >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain arg-domain -- /usr/bin/echo allowed >"${runtime_dir}/arg-allow.log" 2>&1
 grep -q '^allowed$' "${runtime_dir}/arg-allow.log"
 
 set +e
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain arg-domain -- /usr/bin/echo blocked extra \
     >"${runtime_dir}/arg-deny.log" 2>&1
 arg_rc=$?
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain deny-domain -- /usr/bin/id >"${runtime_dir}/cmd-deny.log" 2>&1
 deny_rc=$?
 set -e
 [[ ${arg_rc} -ne 0 ]]
 [[ ${deny_rc} -ne 0 ]]
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain allow-domain -- /usr/bin/id >"${runtime_dir}/cmd-allow.log" 2>&1
 # id 的输出随 locale 本地化 (zh_CN 为 "用户id=0(root)"), 统一按 "(root)" 判
 grep -q '(root)' "${runtime_dir}/cmd-allow.log"

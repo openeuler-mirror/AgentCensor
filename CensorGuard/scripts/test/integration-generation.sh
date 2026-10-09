@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -60,11 +61,9 @@ YAML
 unlink "${runtime_dir}/start" 2>/dev/null || true
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 4 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -81,7 +80,7 @@ done
 /usr/bin/cat /tmp/censorguard-generation/protected.txt
 ' >"${runtime_dir}/victim.log" 2>&1 &
 victim_pid=$!
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${victim_pid}" --domain generation-domain >"${runtime_dir}/attach.log"
 
 bpftool -j map show >"${runtime_dir}/maps.json"
@@ -114,7 +113,7 @@ touch "${runtime_dir}/start"
 wait "${victim_pid}"
 victim_pid=
 grep -q '^generation-safe$' "${runtime_dir}/victim.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
 grep -q '"tracked": 0' "${runtime_dir}/status.log"
 

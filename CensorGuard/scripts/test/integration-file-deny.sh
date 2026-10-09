@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -58,14 +59,12 @@ printf "%s\n" "$?" >/tmp/censorguard/rc
 ' &
 victim_pid=$!
 
+write_test_config "${lab_dir}/config.yaml" "${lab_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${lab_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${lab_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${lab_dir}/ctl.sock" \
-    --event-sock "${lab_dir}/events.sock" \
+    --config "${lab_dir}/config.yaml" \
     --track-pid "${victim_pid}" \
     --domain lab-agent \
-    --hold-seconds 3 >"${lab_dir}/daemon.log" 2>&1 &
+    --duration 3 >"${lab_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
 ready=false

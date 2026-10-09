@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -62,12 +63,9 @@ YAML
 : >"${runtime_dir}/drain.log"
 : >"${runtime_dir}/slow.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 45 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -79,7 +77,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW auditing is a runtime switch now: enable global file allow auditing
 # (the daemon internally runs it at full rate).
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     set --audit-file on >"${runtime_dir}/set-audit.log"
 
 "${runtime_dir}/event-stress-probe" drain "${runtime_dir}/events.sock" \
@@ -104,7 +102,7 @@ status_value() {
     sed -n "s/.*\"${field}\": \([0-9][0-9]*\).*/\1/p" "${file}"
 }
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/before.log"
 [[ $(status_value event_subscribers "${runtime_dir}/before.log") == 2 ]]
 
@@ -113,12 +111,12 @@ reader_dropped=0
 subscriber_dropped=0
 generated=0
 for count in 50000 100000 250000 500000; do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain event-domain -- "${runtime_dir}/event-stress-probe" \
         generate /etc/hosts "${count}" >"${runtime_dir}/generate-${count}.log" 2>&1
     generated=$((generated + count))
     /usr/bin/sleep 0.2
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/pressure.log"
     kernel_dropped=$(status_value event_kernel_dropped "${runtime_dir}/pressure.log")
     reader_dropped=$(status_value event_reader_dropped "${runtime_dir}/pressure.log")
@@ -142,7 +140,7 @@ fi
 /usr/bin/sleep 1
 for _ in 1 2 3; do
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain event-domain -- /usr/bin/cat "${protected_file}" \
         >/dev/null 2>&1
     sentinel_rc=$?
@@ -150,7 +148,7 @@ for _ in 1 2 3; do
     [[ ${sentinel_rc} -ne 0 ]]
 done
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/after.log"
 [[ $(status_value event_kernel_dropped "${runtime_dir}/after.log") -ge ${kernel_dropped} ]]
 [[ $(status_value event_reader_dropped "${runtime_dir}/after.log") -ge ${reader_dropped} ]]

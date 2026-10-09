@@ -10,9 +10,10 @@
 // tonic mandates `Result<_, Status>` handler signatures; Status is large by design.
 #![allow(clippy::result_large_err)]
 
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_common::protocol::{
-    DEFAULT_EVENT_SOCKET, DEFAULT_UI_SOCKET, Event, ProtocolError, RpcError, RpcErrorCode,
-    RpcMethod, RpcParams, RpcRequest, RpcResponse, VERSION, read_json_line, write_json_line,
+    Event, ProtocolError, RpcError, RpcErrorCode, RpcMethod, RpcParams, RpcRequest, RpcResponse,
+    VERSION, read_json_line, write_json_line,
 };
 use std::collections::HashSet;
 use std::io::BufReader;
@@ -490,22 +491,20 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut sock = PathBuf::from(DEFAULT_UI_SOCKET);
-    let mut ev_sock = PathBuf::from(DEFAULT_EVENT_SOCKET);
-    let mut listen = String::from("127.0.0.1:50051");
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let mut explicit_config = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--sock" => sock = PathBuf::from(next_value(&mut args, "--sock")?),
-            "--ev-sock" => ev_sock = PathBuf::from(next_value(&mut args, "--ev-sock")?),
-            "--listen" => listen = next_value(&mut args, "--listen")?,
+            "--config" => {
+                if explicit_config {
+                    return Err(Status::invalid_argument("duplicate --config option").into());
+                }
+                explicit_config = true;
+                config_path = PathBuf::from(next_value(&mut args, "--config")?);
+            }
             "-h" | "--help" => {
-                println!(
-                    "usage: censorguard-grpc [--sock PATH] [--ev-sock PATH] [--listen ADDR]\n\
-                     defaults: --sock {DEFAULT_UI_SOCKET} --ev-sock {DEFAULT_EVENT_SOCKET} \\\n\
-                     --listen 127.0.0.1:50051 (loopback only; add mTLS at the deployment layer \
-                     for cross-machine access)"
-                );
+                println!("usage: censorguard-grpc [--config PATH]");
                 return Ok(());
             }
             _ => {
@@ -515,6 +514,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let daemon = if explicit_config || config_path.exists() {
+        config::load(&config_path)?
+    } else {
+        config::DaemonConfig::default()
+    };
+    let sock = daemon.ui_socket;
+    let ev_sock = daemon.event_socket;
+    let listen = daemon
+        .grpc_listen
+        .unwrap_or_else(|| "127.0.0.1:50051".to_owned());
     let addr: std::net::SocketAddr = listen.parse()?;
     let adapter = Adapter {
         client: Arc::new(DaemonClient::new(sock.clone())),

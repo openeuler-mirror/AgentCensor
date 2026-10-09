@@ -4,14 +4,22 @@ import json
 import socket
 import time
 
+import yaml
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--socket", required=True)
+    parser.add_argument("--config", required=True)
     parser.add_argument("--method", required=True)
     parser.add_argument("--params", default="{}")
     parser.add_argument("--policy-file")
     args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as source:
+        config = yaml.safe_load(source) or {}
+    control_socket = config.get("daemon", {}).get(
+        "control_socket", "/run/censorguard/ctl.sock"
+    )
 
     params = json.loads(args.params)
     if args.policy_file:
@@ -26,7 +34,7 @@ def main() -> None:
     payload = json.dumps(request, separators=(",", ":")).encode() + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(10)
-        client.connect(args.socket)
+        client.connect(control_socket)
         client.sendall(payload)
         chunks = bytearray()
         while not chunks.endswith(b"\n"):

@@ -6,8 +6,6 @@ members = [
     "crates/censorguard-kernel",
     "crates/censorguard-daemon",
     "crates/censorguardctl",
-    "crates/censorguard-audit",
-    "crates/censorguard-exec",
     "crates/censorguard-grpc",
 ]
 

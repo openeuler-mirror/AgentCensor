@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -48,7 +49,7 @@ run_denied() {
     shift
     set +e
     "${repo_dir}/target/debug/censorguardctl" \
-        --socket "${runtime_dir}/ctl.sock" spawn --domain execveat-domain -- \
+        --config "${runtime_dir}/config.yaml" spawn --domain execveat-domain -- \
         "$@" >"${runtime_dir}/${label}.log" 2>&1
     local rc=$?
     set -e
@@ -64,7 +65,7 @@ run_allowed() {
     local expected=$2
     shift 2
     "${repo_dir}/target/debug/censorguardctl" \
-        --socket "${runtime_dir}/ctl.sock" spawn --domain execveat-domain -- \
+        --config "${runtime_dir}/config.yaml" spawn --domain execveat-domain -- \
         "$@" >"${runtime_dir}/${label}.log" 2>&1
     grep -qx "${expected}" "${runtime_dir}/${label}.log"
 }
@@ -86,11 +87,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 25 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -101,11 +100,10 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW 事件现在由运行时开关控制（替代旧 allow_sample_rate）
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     set --audit-exec on >/dev/null
 
-"${repo_dir}/target/debug/censorguard-audit" launch \
-    --socket "${runtime_dir}/events.sock" --kind 2 \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit --kind 2 \
     >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 /usr/bin/sleep 0.1

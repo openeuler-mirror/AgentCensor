@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -43,11 +44,9 @@ trap cleanup EXIT
 install -d -m 0700 "${runtime_dir}"
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${repo_dir}/config/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${repo_dir}/config/base.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 

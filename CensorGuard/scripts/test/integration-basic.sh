@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化), 固定 C locale。
 export LC_ALL=C
@@ -369,7 +370,6 @@ cd "$(dirname "$0")/../.."
 
 DAEMON=target/debug/censorguardd
 CTL=target/debug/censorguardctl
-AUDIT=target/debug/censorguard-audit
 FAILS=0
 pass() { echo "  [PASS] $1"; }
 fail() { echo "  [FAIL] $1"; FAILS=$((FAILS+1)); }
@@ -378,7 +378,7 @@ skip() { echo "  [SKIP] $1"; }
 if [ "$(id -u)" -ne 0 ]; then
     echo "需要 root: sudo bash $0"; exit 1
 fi
-for b in "$DAEMON" "$CTL" "$AUDIT"; do
+for b in "$DAEMON" "$CTL"; do
     [ -x "$b" ] || { echo "找不到 $b, 先 cargo build --workspace && make bpf"; exit 1; }
 done
 [ -f bpf/enforce.bpf.o ] || { echo "找不到 bpf/enforce.bpf.o, 先 make bpf"; exit 1; }
@@ -412,16 +412,16 @@ domains:
   - name: plain
 YAML
 
+write_test_config "$TDIR/config.yaml" "$POL" "$(pwd)/bpf/enforce.bpf.o" "$TDIR"
+CONFIG=$TDIR/config.yaml
+
 CTL_SOCK=$TDIR/ctl.sock
 EV_SOCK=$TDIR/events.sock
 DAEMON_LOG=$TDIR/daemon.log
 AUDIT_LOG=$TDIR/audit.log
 
 "$DAEMON" \
-    --config "$POL" \
-    --bpf-object bpf/enforce.bpf.o \
-    --ctl-sock "$CTL_SOCK" \
-    --event-sock "$EV_SOCK" \
+    --config "$CONFIG" \
     --duration 120 >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 100); do
@@ -431,7 +431,7 @@ for _ in $(seq 1 100); do
 done
 grep -q '\[READY\]' "$DAEMON_LOG" || { echo "daemon 未 READY, 日志:"; cat "$DAEMON_LOG"; exit 1; }
 
-"$AUDIT" launch --socket "$EV_SOCK" >"$AUDIT_LOG" 2>&1 &
+"$CTL" --config "$CONFIG" audit >"$AUDIT_LOG" 2>&1 &
 AUDIT_PID=$!
 for _ in $(seq 1 50); do grep -q '^KIND' "$AUDIT_LOG" 2>/dev/null && break; sleep 0.1; done
 grep -q '^KIND' "$AUDIT_LOG" || { echo "audit 未连上事件面, 日志:"; cat "$AUDIT_LOG"; exit 1; }
@@ -450,7 +450,7 @@ echo "==  audit:    pid=$AUDIT_PID log=$AUDIT_LOG"
 # 在指定域里跑一次命令, 返回真实 rc (spawn 以子进程退出码为准)
 run_in_domain() {  # $1=域 $2..=命令
     local dom=$1; shift
-    "$CTL" --socket "$CTL_SOCK" spawn --domain "$dom" -- "$@" >/dev/null 2>&1
+    "$CTL" --config "$TDIR/config.yaml" spawn --domain "$dom" -- "$@" >/dev/null 2>&1
     echo $?
 }
 
@@ -486,20 +486,20 @@ wait_audit 'EXEC.*DENY.*web' && pass "T4 audit 日志有 EXEC DENY 事件" || fa
 
 echo
 echo "== T7/T8: 运行时开关 (ctl set) =="
-"$CTL" --socket "$CTL_SOCK" set --audit-exec on >/dev/null 2>&1 \
+"$CTL" --config "$TDIR/config.yaml" set --audit-exec on >/dev/null 2>&1 \
     || fail "T7 set --audit-exec on 调用失败"
-"$CTL" --socket "$CTL_SOCK" status 2>/dev/null | grep -q '"audit_exec": true' \
+"$CTL" --config "$TDIR/config.yaml" status 2>/dev/null | grep -q '"audit_exec": true' \
     && pass "T7 status 显示 audit_exec=true" || fail "T7 status 未见 audit_exec=true"
 rc=$(run_in_domain plain "$IDBIN" -u)
 [ "$rc" = "0" ] && wait_audit 'ALLOW.*plain' \
     && pass "T7 audit 打开后 ALLOW 事件可见" || fail "T7 ALLOW 事件未出现"
-"$CTL" --socket "$CTL_SOCK" set --audit-exec off >/dev/null 2>&1
+"$CTL" --config "$TDIR/config.yaml" set --audit-exec off >/dev/null 2>&1
 
-"$CTL" --socket "$CTL_SOCK" set --enable-exec off >/dev/null 2>&1 \
+"$CTL" --config "$TDIR/config.yaml" set --enable-exec off >/dev/null 2>&1 \
     || fail "T8 set --enable-exec off 调用失败"
 rc=$(run_in_domain web "$IDBIN" -u)
 [ "$rc" = "0" ] && pass "T8 enable-exec=off 后 exec 维 fail-open" || fail "T8 关闭后仍被拦"
-"$CTL" --socket "$CTL_SOCK" set --enable-exec on >/dev/null 2>&1
+"$CTL" --config "$TDIR/config.yaml" set --enable-exec on >/dev/null 2>&1
 rc=$(run_in_domain web "$IDBIN")
 [ "$rc" != "0" ] && pass "T8 enable-exec=on 恢复后拦截恢复" || fail "T8 恢复后未拦截"
 
@@ -519,7 +519,7 @@ domains:
   - name: plain
 YAML
 rc_before=$(run_in_domain plain cat "$VICTIM2")
-"$CTL" --socket "$CTL_SOCK" reload --file "$TDIR/policy-v2.yaml" >/dev/null 2>&1 \
+"$CTL" --config "$TDIR/config.yaml" reload --file "$TDIR/policy-v2.yaml" >/dev/null 2>&1 \
     || fail "T9 reload 调用失败"
 rc_after=$(run_in_domain plain cat "$VICTIM2")
 [ "$rc_before" = "0" ] && [ "$rc_after" != "0" ] \
@@ -529,19 +529,19 @@ rc_after=$(run_in_domain plain cat "$VICTIM2")
 echo
 echo "== T10: 组级热更新 (policy apply + bind 换绑) =="
 printf 'rules:\n  - exec deny %s\n' "$WHOAMIBIN" | \
-    "$CTL" --socket "$CTL_SOCK" policy apply --name ops2 --stdin >/dev/null 2>&1 \
+    "$CTL" --config "$TDIR/config.yaml" policy apply --policy ops2 --stdin >/dev/null 2>&1 \
     || fail "T10 policy apply ops2 调用失败"
-"$CTL" --socket "$CTL_SOCK" bind web --group ops2 >/dev/null 2>&1 \
+"$CTL" --config "$TDIR/config.yaml" bind --domain web --policy ops2 >/dev/null 2>&1 \
     || fail "T10 bind web -> ops2 失败"
 rc=$(run_in_domain web "$WHOAMIBIN")
 [ "$rc" != "0" ] && pass "T10 换绑后 ops2 规则生效 (whoami 被拦)" || fail "T10 whoami 未被拦"
 rc=$(run_in_domain web "$IDBIN" -u)
 [ "$rc" = "0" ] && pass "T10 整组替换: 旧组 ops 的 id 规则已失效" || fail "T10 整组替换语义不成立"
-"$CTL" --socket "$CTL_SOCK" bind web --group ops >/dev/null 2>&1
+"$CTL" --config "$TDIR/config.yaml" bind --domain web --policy ops >/dev/null 2>&1
 
 echo
 echo "== T11: 旧格式 YAML 被拒且旧策略保留 =="
-printf 'enable_file: true\n' | "$CTL" --socket "$CTL_SOCK" reload --stdin >/dev/null 2>&1 \
+printf 'enable_file: true\n' | "$CTL" --config "$TDIR/config.yaml" reload --stdin >/dev/null 2>&1 \
     && fail "T11 旧格式竟被接受" || pass "T11 旧格式 (enable_file) 被 reload 拒绝"
 rc=$(run_in_domain web cat "$VICTIM")
 [ "$rc" != "0" ] && pass "T11 失败后旧策略保留" || fail "T11 失败后策略失效"
@@ -553,7 +553,7 @@ bash -c 'while [ ! -f "$0" ]; do sleep 0.1; done
          cat "$1" >/dev/null 2>&1; echo "rc=$?" > "$2/rcA"' "$GO" "$VICTIM" "$OUT" &
 BPID=$!
 sleep 0.3
-if "$CTL" --socket "$CTL_SOCK" attach --pid "$BPID" --domain web >/dev/null 2>&1; then
+if "$CTL" --config "$TDIR/config.yaml" attach --pid "$BPID" --domain web >/dev/null 2>&1; then
     touch "$GO"
     for _ in $(seq 1 50); do [ -s "$OUT/rcA" ] && break; sleep 0.1; done
     . "$OUT/rcA"
@@ -566,7 +566,7 @@ fi
 echo
 echo "== T13: 根退出后追踪集清理 =="
 if [ "$HAVE_BPFTOOL" = 1 ]; then
-    TRACK_OUT=$("$CTL" --socket "$CTL_SOCK" spawn --domain plain -- sleep 0.3 2>/dev/null)
+    TRACK_OUT=$("$CTL" --config "$TDIR/config.yaml" spawn --domain plain -- sleep 0.3 2>/dev/null)
     TRACK_PID=$(echo "$TRACK_OUT" | grep -o 'tracking pid=[0-9]*' | grep -o '[0-9]*' | head -1)
     sleep 1
     pid_key() { printf '%d %d %d %d' $(($1 & 255)) $(($1 >> 8 & 255)) $(($1 >> 16 & 255)) $(($1 >> 24 & 255)); }
@@ -582,7 +582,8 @@ fi
 
 echo
 echo "== T14: daemon 未起时的 ctl 失败语义 =="
-"$CTL" --socket "$TDIR/no-daemon.sock" status >/dev/null 2>&1 \
+write_test_config "$TDIR/no-daemon.yaml" "$POL" "$(pwd)/bpf/enforce.bpf.o" "$TDIR/no-daemon"
+"$CTL" --config "$TDIR/no-daemon.yaml" status >/dev/null 2>&1 \
     && fail "T14 daemon 未起时 status 竟成功" || pass "T14 daemon 未起时 ctl 非 0 退出"
 
 echo

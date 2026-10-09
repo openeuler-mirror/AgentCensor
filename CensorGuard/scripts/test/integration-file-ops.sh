@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -59,11 +60,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 echo "step: daemon starting (pid ${daemon_pid})"
@@ -79,7 +78,7 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
 fi
 echo "step: daemon READY"
 
-"${repo_dir}/target/debug/censorguard-audit" launch --socket "${runtime_dir}/events.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit \
     --kind 1 >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
@@ -87,7 +86,7 @@ run_denied() {
     local name=$1
     shift
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain file-domain -- "$@" >"${runtime_dir}/${name}.log" 2>&1
     local result=$?
     set -e

@@ -25,11 +25,19 @@ GRPC_PORT=50099
 GRPC_ADDR=127.0.0.1:$GRPC_PORT
 TDIR=$(mktemp -d /tmp/censorguard_offline.XXXXXX)
 GRPC_LOG=$TDIR/grpc.log
+CONFIG=$TDIR/base.yaml
 cleanup() {
     [ -n "${GRPC_PID:-}" ] && kill "$GRPC_PID" 2>/dev/null
     rm -rf "$TDIR"
 }
 trap cleanup EXIT
+
+cat >"$CONFIG" <<EOF
+daemon:
+  ui_socket: $TDIR/nonexistent-ui.sock
+  event_socket: $TDIR/nonexistent-events.sock
+  grpc_listen: $GRPC_ADDR
+EOF
 
 echo "=== O1: 插件 workspace 构建 + 单测 ==="
 if ( cd plugins/dsh-censorguard && pnpm build >/dev/null 2>&1 && pnpm test >/dev/null 2>&1 ); then
@@ -51,8 +59,7 @@ if [ ! -x "$GRPC_BIN" ]; then
     cargo build -p censorguard-grpc >/dev/null 2>&1 || { fail "censorguard-grpc 构建失败"; }
 fi
 if [ -x "$GRPC_BIN" ]; then
-    "$GRPC_BIN" --sock "$TDIR/nonexistent-ui.sock" --ev-sock "$TDIR/nonexistent-events.sock" \
-        --listen "$GRPC_ADDR" >"$GRPC_LOG" 2>&1 &
+    "$GRPC_BIN" --config "$CONFIG" >"$GRPC_LOG" 2>&1 &
     GRPC_PID=$!
     for _ in $(seq 1 30); do
         grep -q 'READY' "$GRPC_LOG" 2>/dev/null && break

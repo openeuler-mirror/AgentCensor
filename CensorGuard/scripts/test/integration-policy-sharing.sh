@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -63,12 +64,9 @@ domains:
 YAML
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -88,12 +86,12 @@ probe_pids+=("$!")
 probe_one=${probe_pids[0]}
 probe_two=${probe_pids[1]}
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_one}" --domain lab-agent >"${runtime_dir}/attach-one.json"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_two}" --domain lab-agent-2 >"${runtime_dir}/attach-two.json"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.json"
 
 python3 - "${runtime_dir}/status.json" <<'PY'

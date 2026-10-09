@@ -15,7 +15,7 @@ StateDirectory=censorguard
 StateDirectoryMode=0750
 UMask=0027
 
-ExecStart=/usr/sbin/censorguardd launch --bpf-object /usr/lib/censorguard/enforce.bpf.o --ctl-sock /run/censorguard/ctl.sock --event-sock /run/censorguard/events.sock --launch-sock /run/censorguard/launch.sock --state-dir /var/lib/censorguard --socket-group censorguard --spawn-grpc --grpc-bin /usr/bin/censorguard-grpc
+ExecStart=/usr/sbin/censorguardd launch --config /etc/censorguard/base.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 
 Restart=on-failure

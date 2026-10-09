@@ -35,7 +35,7 @@ rules:
 
 一个动态链接程序可能产生多个 `FILE ALLOW`（动态加载器、`libc`、locale 和配置文件的
 读取），这表示文件打开检查点，不表示执行了多个可执行文件。只看执行事件可使用
-`censorguard-audit launch --kind 2` 过滤。
+`censorguardctl audit --kind 2` 过滤。
 
 文件规则同时编译为 inode 身份和同一规则的规范化路径身份：内核先查 inode，inode
 未命中时才使用路径兜底，以覆盖文件重建或新建后的短期窗口。当前 exec 参数规则依赖
@@ -59,16 +59,17 @@ cargo test --workspace --offline
 启动 daemon 需要 root、BTF、BPF LSM 和 libbpf：
 
 ```bash
-sudo target/debug/censorguardd launch \
-  --bpf-object bpf/enforce.bpf.o
+sudo target/debug/censorguardd launch --config config/base.yaml
+# launch 以空策略启动；加载配置中的规则后再纳管进程。
+sudo target/debug/censorguardctl --config config/base.yaml reload
 ```
 
 常用控制命令：
 
 ```bash
-censorguardctl --policy config/base.yaml --domain lab-agent
-censorguardctl --policy config/base.yaml --pid PID
-censorguard-audit launch
+censorguardctl --config config/base.yaml status
+censorguardctl --config config/base.yaml attach --pid PID --domain lab-agent
+censorguardctl --config config/base.yaml audit
 ```
 
 0.4.0 最小启动验证：
@@ -126,9 +127,9 @@ launcher argv 前插）升级为**整树包裹**：DSH 主进程启动时由最�
   5s 心跳比对 boot_id，daemon 重启即重 attach；
 - 委托面：Host 插件 → `censorguard-grpc`（127.0.0.1:50051，非特权，daemon 永不
   监听网络）→ `ui.sock`（0666）白名单组策略读写与运行时开关切换。systemd 部署下
-  daemon 以 `--spawn-grpc` 自动派生并守护该适配器（崩溃 1s 后重启、daemon 退出时
+  daemon 按配置文件中的 `daemon.spawn_grpc` 自动派生并守护该适配器（崩溃 1s 后重启、daemon 退出时
   TERM→KILL 回收），无需单独的 grpc unit；手动部署也可单独运行
-  `sudo censorguard-grpc`；
+  `sudo censorguard-grpc --config /etc/censorguard/base.yaml`；
 - 事件面：`events.sock` → gRPC 流 → Host 有界缓存 → Client 长轮询，事件带
   单调 `sequence`（从 1 起）、`daemon_boot_id` 与 `dropped_before`。
 
@@ -161,7 +162,6 @@ crates/censorguard-policy  YAML、文件、exec、IPv4/IPv6、A/AAAA DNS 编译
 crates/censorguard-kernel  唯一 unsafe/libbpf 边界
 crates/censorguard-daemon  特权 daemon、PID 域、热更新、角色 socket ACL
 crates/censorguardctl      控制客户端
-crates/censorguard-audit   审计客户端
 crates/censorguard-grpc    非特权 gRPC 适配器（127.0.0.1:50051 → ui.sock/events.sock）
 api/                         gRPC 契约 censorguard.v1
 plugins/dsh-censorguard    DSH 整树包裹插件（runtime/bootstrap/host/client + bundle）

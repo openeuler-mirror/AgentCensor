@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -58,11 +59,9 @@ domains:
     group: lab-policy
 YAML
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 9 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -73,15 +72,14 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW auditing is a runtime switch now: enable global exec allow auditing.
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     set --audit-exec on >"${runtime_dir}/set-audit.log"
 
-"${repo_dir}/target/debug/censorguard-audit" launch \
-    --socket "${runtime_dir}/events.sock" >"${runtime_dir}/audit.log" 2>&1 &
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
 set +e
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/before.log" 2>&1
 before_rc=$?
 set -e
@@ -91,13 +89,13 @@ if [[ ${before_rc} -eq 0 ]]; then
 fi
 
 printf 'rules: []\n' | \
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    reload --group lab-policy --stdin >"${runtime_dir}/reload.log"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    reload --policy lab-policy --stdin >"${runtime_dir}/reload.log"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
 
 grep -q '"reload_gen": 1' "${runtime_dir}/status.log"

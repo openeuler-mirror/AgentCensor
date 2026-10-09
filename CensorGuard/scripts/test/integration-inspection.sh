@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -58,11 +59,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 unlink "${runtime_dir}/process.ready" 2>/dev/null || true
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -87,11 +86,11 @@ child_pid=$(<"/proc/${root_pid}/task/${root_pid}/children")
 child_pid=${child_pid%% *}
 [[ -n ${child_pid} ]]
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${root_pid}" --domain lab-agent --seed >"${runtime_dir}/attach.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     tree >"${runtime_dir}/tree.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     policy-dump >"${runtime_dir}/policy.log"
 
 grep -q '"domain": "lab-agent"' "${runtime_dir}/tree.log"

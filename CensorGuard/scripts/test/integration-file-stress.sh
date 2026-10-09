@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -82,11 +83,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/probe.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 90 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 1 1200); do
@@ -104,7 +103,7 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^State:[[:space:]]*T' "/proc/${probe_pid}/status"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain stress-domain >"${runtime_dir}/attach.log"
 kill -CONT "${probe_pid}"
 
@@ -113,7 +112,7 @@ for _ in $(seq 1 500); do
     state=$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' \
         "/proc/${probe_pid}/status" 2>/dev/null || true)
     [[ -z ${state} || ${state} == Z ]] && break
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/status-live.log"
     responsive=$((responsive + 1))
     /usr/bin/sleep 0.02
@@ -138,7 +137,7 @@ grep -q "denied_ok=${expected_denied} allowed_ok=${expected_allowed} errors=0" \
 [[ $(sha256sum "${protected_file}" | awk '{ print $1 }') == "${protected_hash}" ]]
 
 for _ in $(seq 1 1200); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/status-final.log"
     grep -q '"tracked": 0' "${runtime_dir}/status-final.log" && break
     /usr/bin/sleep 0.01

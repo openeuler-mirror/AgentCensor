@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -58,14 +59,11 @@ domains:
 YAML
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state" nobody
 setpriv --no-new-privs \
     --bounding-set=-all,+chown,+dac_read_search,+sys_admin,+sys_resource,+perfmon,+bpf \
     "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --socket-group nobody \
+    --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -95,34 +93,34 @@ done
 [[ ${nobody_uid:-} == 65534 ]]
 
 setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${nobody_pid}" --domain auth-domain >"${runtime_dir}/own-attach.log"
 grep -q '"ok": true' "${runtime_dir}/own-attach.log"
 
 set +e
 setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${root_pid}" --domain auth-domain >"${runtime_dir}/foreign-attach.log" 2>&1
 foreign_attach_rc=$?
 set -e
 [[ ${foreign_attach_rc} -ne 0 ]]
 grep -q 'cannot track pid' "${runtime_dir}/foreign-attach.log"
 
-"${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${root_pid}" --domain auth-domain >"${runtime_dir}/root-attach.log"
 set +e
 setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     untrack --pid "${root_pid}" >"${runtime_dir}/foreign-untrack.log" 2>&1
 foreign_untrack_rc=$?
 printf 'rules: []\n' | \
     setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     reload --stdin --dry-run >"${runtime_dir}/reload.log" 2>&1
 reload_rc=$?
 setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    bind auth-domain --group empty >"${runtime_dir}/bind.log" 2>&1
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    bind --domain auth-domain --policy empty >"${runtime_dir}/bind.log" 2>&1
 bind_rc=$?
 set -e
 
@@ -134,11 +132,11 @@ grep -q 'requires root' "${runtime_dir}/reload.log"
 grep -q 'requires root' "${runtime_dir}/bind.log"
 
 setpriv --reuid=65534 --regid=65534 --clear-groups \
-    "${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     untrack --pid "${nobody_pid}" >"${runtime_dir}/own-untrack.log"
-"${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     untrack --pid "${root_pid}" >"${runtime_dir}/root-untrack.log"
-"${runtime_dir}/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
 grep -q '"tracked": 0' "${runtime_dir}/status.log"
 

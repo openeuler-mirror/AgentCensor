@@ -30,7 +30,7 @@ attach 失败则 DSH 启动失败)。
 
 委托面: DSH Host 插件 → censorguard-grpc (127.0.0.1:50051, 非特权)
         → ui.sock (0666) 白名单组策略读写 + 运行时开关切换
-        (daemon 永不监听网络; systemd 下 daemon --spawn-grpc 自动派生守护)
+        (daemon 永不监听网络; systemd 下 daemon 按 `daemon.spawn_grpc` 配置自动派生守护)
 
 事件面: eBPF ringbuf → daemon events.sock → gRPC 流
         → Host 有界缓存 (5000 条 / 10 MiB) → Client 长轮询 → WebUI 审计页签
@@ -60,7 +60,7 @@ attach 失败则 DSH 启动失败)。
 
 | 条件 | 验证方法 |
 |---|---|
-| daemon 已运行且带 `--spawn-grpc` | `systemctl status censorguardd`;`ss -tln | grep 50051` |
+| daemon 已运行且配置 `daemon.spawn_grpc: true` | `systemctl status censorguardd`;`ss -tln | grep 50051` |
 | gRPC 适配器已安装 | `ls /usr/bin/censorguard-grpc` |
 | DSH 策略组已由 root 下发 | `sudo censorguardctl policy-dump \| grep censorguard` |
 | 当前用户在 `censorguard` 组 | `id \| grep censorguard`(**加入后需重新登录才生效**) |
@@ -81,7 +81,7 @@ pnpm install && pnpm build
 ```bash
 # 下发 DSH 默认策略组(黑名单式,防 DSH 起不来;跨重启持久,只需一次)
 sudo censorguardctl policy apply \
-    --name censorguard-dsh-default \
+    --policy censorguard-dsh-default \
     --file config/policy.dsh-default.yaml
 
 # 把使用 DSH 的普通用户加入 censorguard 组(组内用户才能连各 socket)
@@ -203,7 +203,7 @@ sudo systemctl start censorguardd
 | WebUI 保护状态显示"未启用",日志有 `references uninstalled group "censorguard-dsh-default"` | 策略组未下发:root 执行 §3.2 的 `policy apply`。下发后插件后台重试会自动转 protected,无需重启 DSH |
 | WebUI 保护状态显示"未启用",日志有 `connect EACCES /run/censorguard/dsh.sock` | 用户不在 `censorguard` 组,或加组后未重新登录 |
 | DSH 启动直接失败,报 attach 相关错误 | `cordis.patch.yml` 里 `blockOnFailure` 被改成了 `true`(fail-closed);恢复默认 `false` 即可降级启动 |
-| WebUI 连不上、报 `ECONNREFUSED 127.0.0.1:50051` | gRPC 适配器未运行:systemd unit 需带 `--spawn-grpc --grpc-bin /usr/bin/censorguard-grpc`(重装后 `daemon-reload` + restart);手动部署可 `sudo censorguard-grpc` |
+| WebUI 连不上、报 `ECONNREFUSED 127.0.0.1:50051` | gRPC 适配器未运行:检查 `/etc/censorguard/base.yaml` 中 `daemon.spawn_grpc: true` 和 `daemon.grpc_bin`(重装后 `daemon-reload` + restart);手动部署可 `sudo censorguard-grpc` |
 | WebUI 报 `Cannot find module .../lib/client.js` | client 浏览器 bundle 未构建,`cd plugins/dsh-censorguard && pnpm build` |
 | 插件目录 `pnpm install` 报 `ERR_PNPM_IGNORED_BUILDS` | pnpm ≥10 拦 esbuild/protobufjs 的构建脚本:插件根的 `pnpm-workspace.yaml` 已白名单,确认它存在且未被删除 |
 | 保存策略报 `requires policy_yaml and expected_revision` | daemon 与 unit 版本不匹配的老部署问题(已修复),升级到 59d54d0 之后并同步二进制 |

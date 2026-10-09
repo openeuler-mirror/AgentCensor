@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -47,12 +48,9 @@ rules:
 YAML
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 6 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -63,10 +61,8 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 set +e
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/launch.sock" \
-    --scope launcher-test \
-    -- /usr/bin/id >"${runtime_dir}/denied.log" 2>&1
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    spawn --domain launcher-test -- /usr/bin/id >"${runtime_dir}/denied.log" 2>&1
 denied_rc=$?
 set -e
 if [[ ${denied_rc} -eq 0 ]]; then
@@ -75,17 +71,15 @@ if [[ ${denied_rc} -eq 0 ]]; then
     exit 1
 fi
 
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/launch.sock" \
-    --scope launcher-test \
-    -- /usr/bin/true
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    spawn --domain launcher-test -- /usr/bin/true
 
 marker="${runtime_dir}/must-not-exist"
 set +e
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/missing.sock" \
-    --scope unavailable-daemon \
-    -- /usr/bin/touch "${marker}" >"${runtime_dir}/fail-closed.log" 2>&1
+cp "${runtime_dir}/config.yaml" "${runtime_dir}/missing-config.yaml"
+sed -i "s#${runtime_dir}/ctl.sock#${runtime_dir}/missing.sock#" "${runtime_dir}/missing-config.yaml"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/missing-config.yaml" \
+    spawn --domain unavailable-daemon -- /usr/bin/touch "${marker}" >"${runtime_dir}/fail-closed.log" 2>&1
 unavailable_rc=$?
 set -e
 [[ ${unavailable_rc} -ne 0 ]]

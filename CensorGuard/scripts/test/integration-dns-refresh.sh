@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -71,6 +72,7 @@ domains:
 YAML
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "" "" 1
 unshare --mount --propagation private /bin/bash -c '
     set -e
     mount --bind "$1" /etc/hosts
@@ -80,11 +82,7 @@ unshare --mount --propagation private /bin/bash -c '
 ' Censorguard-dns-refresh \
     "${runtime_dir}/hosts" "${runtime_dir}/nsswitch.conf" \
     "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --dns-refresh-seconds 1 \
+    --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -107,7 +105,7 @@ probe_denied() {
     local address=$1
     local name=$2
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain dns-domain -- "${runtime_dir}/connect-probe" \
         "${address}" "${port}" >"${runtime_dir}/${name}.log" 2>&1
     local result=$?
@@ -119,7 +117,7 @@ probe_denied() {
 probe_allowed() {
     local address=$1
     local name=$2
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain dns-domain -- "${runtime_dir}/connect-probe" \
         "${address}" "${port}" >"${runtime_dir}/${name}.log" 2>&1
     grep -q 'Connection refused' "${runtime_dir}/${name}.log"
@@ -132,9 +130,9 @@ wait_dns_state() {
     local stale=$4
     local prefix=$5
     for _ in $(seq 1 120); do
-        "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+        "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
             policy-dump >"${runtime_dir}/${prefix}-policy.log"
-        "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+        "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
             status >"${runtime_dir}/${prefix}-status.log"
         if grep -q "\"${address}\"" "${runtime_dir}/${prefix}-policy.log" && \
             [[ $(status_value version "${runtime_dir}/${prefix}-status.log") == "${version}" ]] && \

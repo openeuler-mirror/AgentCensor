@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化), 固定 C locale。
 export LC_ALL=C
@@ -291,7 +292,7 @@ cp "$SELFCHECK" "$TDIR/selfcheck.mjs"
 chmod -R 0755 "$RT_TMP"
 
 CTL_SOCK=$TDIR/ctl.sock
-DSH_SOCK=$TDIR/dsh.sock   # sibling 自动推导 (--ctl-sock 非 /run 时)
+DSH_SOCK=$TDIR/dsh.sock   # dsh socket from the shared test config
 EV_SOCK=$TDIR/events.sock
 DAEMON_LOG=$TDIR/daemon.log
 
@@ -305,7 +306,8 @@ trap cleanup EXIT
 sed -i "s|'../../plugins/dsh-censorguard/dist/runtime/index.js'|'./runtime-dist/index.js'|" \
     "$TDIR/selfcheck.mjs"
 
-"$DAEMON" --ctl-sock "$CTL_SOCK" --event-sock "$EV_SOCK" --state-dir "$TDIR/state" \
+write_test_config "$TDIR/config.yaml" "$ROOT/config/base.yaml" "$ROOT/bpf/enforce.bpf.o" "$TDIR" "$TDIR/state"
+"$DAEMON" launch --config "$TDIR/config.yaml" \
     >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 100); do
@@ -318,7 +320,7 @@ grep -q 'required hooks attached' "$DAEMON_LOG" || { echo "daemon 未 READY:"; c
 run_as_nobody() { setpriv --reuid 65534 --regid 65534 --clear-groups "$@"; }
 
 echo "=== A1: ctl.sock 下发 censorguard-dsh-default ==="
-if "$CTL" --sock "$CTL_SOCK" policy apply --name censorguard-dsh-default \
+if "$CTL" --config "$TDIR/config.yaml" policy apply --policy censorguard-dsh-default \
         --file config/policy.dsh-default.yaml >/dev/null 2>&1; then
     pass "策略组下发成功"
 else

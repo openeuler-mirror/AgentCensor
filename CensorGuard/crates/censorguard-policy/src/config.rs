@@ -1,3 +1,4 @@
+use censorguard_common::config::DaemonConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -9,6 +10,8 @@ pub struct PolicyRoot {
     /// Named policy groups bindable to domains.
     pub groups: BTreeMap<String, GroupPolicy>,
     pub domains: Vec<DomainRef>,
+    /// Runtime paths and daemon settings. They do not affect policy compilation.
+    pub daemon: DaemonConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -83,11 +84,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -97,11 +96,11 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
-"${repo_dir}/target/debug/censorguard-audit" launch --socket "${runtime_dir}/events.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit \
     --kind 1 >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 for _ in $(seq 1 1200); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/status.log"
     grep -q '"event_subscribers": 1' "${runtime_dir}/status.log" && break
     /usr/bin/sleep 0.01
@@ -112,7 +111,7 @@ run_denied() {
     local name=$1
     shift
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain file-domain -- "$@" >"${runtime_dir}/${name}.log" 2>&1
     local result=$?
     set -e
@@ -134,7 +133,7 @@ run_preopened_denied() {
         /usr/bin/sleep 0.01
     done
     grep -q '^State:[[:space:]]*T' "/proc/${probe_pid}/status"
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         attach --pid "${probe_pid}" --domain file-domain >"${runtime_dir}/${mode}-attach.log"
     kill -CONT "${probe_pid}"
     set +e
@@ -149,7 +148,7 @@ run_preopened_denied() {
         exit 1
     fi
     grep -q 'errno=1 Operation not permitted' "${runtime_dir}/${mode}.log"
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         untrack --pid "${finished_pid}" >/dev/null 2>&1 || true
 }
 

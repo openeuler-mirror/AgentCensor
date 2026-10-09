@@ -140,6 +140,7 @@ impl CompiledPolicy {
                     group: group.clone(),
                 })
                 .collect(),
+            daemon: self.daemon.clone(),
         }
     }
 
@@ -168,6 +169,7 @@ pub struct CompiledPolicy {
     pub warnings: Vec<CompileWarning>,
     pub baseline_definition: Option<GroupPolicy>,
     pub group_definitions: BTreeMap<String, GroupPolicy>,
+    pub daemon: censorguard_common::config::DaemonConfig,
 }
 
 pub fn load(path: impl AsRef<Path>) -> Result<CompiledPolicy, PolicyError> {
@@ -185,6 +187,7 @@ pub fn compile_yaml(bytes: &[u8]) -> Result<CompiledPolicy, PolicyError> {
 }
 
 pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
+    let daemon = root.daemon.clone();
     for name in root.groups.keys() {
         validate_name(name).map_err(|()| PolicyError::InvalidGroupName(name.clone()))?;
     }
@@ -227,6 +230,7 @@ pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
         warnings,
         baseline_definition: Some(baseline_group),
         group_definitions,
+        daemon,
     })
 }
 

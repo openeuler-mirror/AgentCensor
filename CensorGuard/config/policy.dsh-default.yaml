@@ -1,7 +1,7 @@
 # DSH 默认策略组 censorguard-dsh-default（整树包裹模式）
 #
 # 下发 (root):
-#   sudo censorguardctl policy apply --name censorguard-dsh-default --file config/policy.dsh-default.yaml
+#   sudo censorguardctl policy apply --policy censorguard-dsh-default --file config/policy.dsh-default.yaml
 # 绑定 (DSH 普通用户): 经 dsh.sock attach_self, policy_group=censorguard-dsh-default
 #
 # 设计原则（对照 ohmyguard policies/policy.dsh-default.yaml）:

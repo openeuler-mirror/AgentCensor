@@ -1083,6 +1083,7 @@ mod tests {
             warnings: Vec::new(),
             baseline_definition: None,
             group_definitions: BTreeMap::new(),
+            daemon: censorguard_common::config::DaemonConfig::default(),
         }
     }
 

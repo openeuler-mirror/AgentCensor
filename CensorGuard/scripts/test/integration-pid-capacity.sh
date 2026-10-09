@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -66,12 +67,9 @@ for sync_file in start ready release; do
 done
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 20 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -85,7 +83,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
     "${runtime_dir}/ready" "${runtime_dir}/release" \
     "${runtime_dir}/protected.txt" 1 &
 probe_pid=$!
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain capacity-domain >"${runtime_dir}/attach.log"
 
 bpftool -j map show >"${runtime_dir}/maps.json"
@@ -128,7 +126,7 @@ with open(fill_path, "w", encoding="ascii") as fill, \
 PY
 bpftool batch file "${runtime_dir}/fill.batch" >"${runtime_dir}/fill.log"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/full.json"
 python3 - "${runtime_dir}/full.json" <<'PY'
 import json
@@ -150,7 +148,7 @@ grep -q ' 1$' "${runtime_dir}/ready"
 child_pid=$(awk 'NR == 1 { print $1 }' "${runtime_dir}/ready")
 kill -0 "${child_pid}"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/degraded.json"
 python3 - "${runtime_dir}/degraded.json" <<'PY'
 import json
@@ -166,14 +164,14 @@ assert status["pid_pending_fallbacks"] >= 1, status
 assert status["pid_pending_update_failures"] == 0, status
 assert status["version"] == 1 and status["active_bank"] == 0, status
 PY
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     tree >"${runtime_dir}/tree.json"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.json"
 
 # Removing the root while its child exists only in pending must keep the domain draining.
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     untrack --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/draining.json"
 python3 - "${runtime_dir}/draining.json" <<'PY'
 import json
@@ -187,7 +185,7 @@ assert status["pid_pending"] == 1, status
 PY
 
 bpftool batch file "${runtime_dir}/delete.batch" >"${runtime_dir}/delete.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/after-delete.json"
 python3 - "${runtime_dir}/after-delete.json" <<'PY'
 import json
@@ -204,7 +202,7 @@ touch "${runtime_dir}/release"
 wait "${probe_pid}"
 probe_pid=
 for _ in $(seq 1 240); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/final.json"
     if grep -q '"pid_pending": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "capacity-domain"' "${runtime_dir}/final.json"; then

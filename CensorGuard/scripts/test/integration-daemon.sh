@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -65,11 +66,9 @@ for file in daemon.log audit.log ctl.log status.log error.log output.log rc star
 done
 unlink "${runtime_dir}/start"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 6 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -84,8 +83,7 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
     exit 1
 fi
 
-"${repo_dir}/target/debug/censorguard-audit" launch \
-    --socket "${runtime_dir}/events.sock" >"${runtime_dir}/audit.log" 2>&1 &
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
 /bin/bash -c '
@@ -99,7 +97,7 @@ printf "%s\n" "$?" >/tmp/censorguard-runtime/rc
 victim_pid=$!
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" \
+    --config "${runtime_dir}/config.yaml" \
     attach --pid "${victim_pid}" --domain lab-agent --seed >"${runtime_dir}/ctl.log"
 
 touch "${runtime_dir}/start"
@@ -107,7 +105,7 @@ wait "${victim_pid}"
 victim_pid=
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" status >"${runtime_dir}/status.log"
+    --config "${runtime_dir}/config.yaml" status >"${runtime_dir}/status.log"
 
 rc=$(<"${runtime_dir}/rc")
 if [[ ${rc} -eq 0 || -s "${runtime_dir}/output.log" ]]; then

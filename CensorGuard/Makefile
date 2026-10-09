@@ -26,6 +26,7 @@ check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --offline -- -D warnings
 	bash -n scripts/*.sh
+	@for script in scripts/test/*.sh; do bash -n "$$script" || exit; done
 	@for source in tools/*.c; do \
 		$(CC) -O2 -Wall -Wextra -Werror -fsyntax-only "$$source"; \
 	done
@@ -44,7 +45,7 @@ vmlinux:
 	mv -f bpf/vmlinux.h.tmp bpf/vmlinux.h
 
 build:
-	cargo build --workspace --release --offline
+	cargo build -p censorguard-daemon -p censorguardctl -p censorguard-grpc --release --offline
 
 install: build bpf
 	$(MAKE) --no-print-directory install-files
@@ -53,9 +54,7 @@ install-files:
 	$(INSTALL) -d -m 0755 "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SBINDIR)"
 	$(INSTALL) -m 0755 target/release/censorguardd "$(DESTDIR)$(SBINDIR)/censorguardd"
 	$(INSTALL) -m 0755 target/release/censorguardctl "$(DESTDIR)$(BINDIR)/censorguardctl"
-	$(INSTALL) -m 0755 target/release/censorguard-audit "$(DESTDIR)$(BINDIR)/censorguard-audit"
 	$(INSTALL) -m 0755 target/release/censorguard-grpc "$(DESTDIR)$(BINDIR)/censorguard-grpc"
-	$(INSTALL) -m 0755 target/release/censorguard-exec "$(DESTDIR)$(BINDIR)/censorguard-exec"
 	$(INSTALL) -d -m 0755 "$(DESTDIR)$(AGENTLIBDIR)"
 	$(INSTALL) -m 0644 bpf/enforce.bpf.o "$(DESTDIR)$(AGENTLIBDIR)/enforce.bpf.o"
 	$(INSTALL) -d -m 0750 "$(DESTDIR)$(SYSCONFDIR)"
@@ -77,7 +76,7 @@ install-files:
 
 uninstall:
 	$(RM) "$(DESTDIR)$(SBINDIR)/censorguardd"
-	$(RM) "$(DESTDIR)$(BINDIR)/censorguardctl" "$(DESTDIR)$(BINDIR)/censorguard-audit" "$(DESTDIR)$(BINDIR)/censorguard-grpc" "$(DESTDIR)$(BINDIR)/censorguard-exec"
+	$(RM) "$(DESTDIR)$(BINDIR)/censorguardctl" "$(DESTDIR)$(BINDIR)/censorguard-grpc"
 	$(RM) "$(DESTDIR)$(AGENTLIBDIR)/enforce.bpf.o"
 	$(RM) "$(DESTDIR)$(SYSTEMDUNITDIR)/censorguardd.service"
 	$(RM) "$(DESTDIR)$(SYSUSERSDIR)/censorguard.conf"

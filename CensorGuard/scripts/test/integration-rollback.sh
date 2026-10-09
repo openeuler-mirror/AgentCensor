@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -52,11 +53,9 @@ domains:
     group: lab-policy
 YAML
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 12 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -72,14 +71,14 @@ set +e
     for index in $(seq 1 257); do
         printf '  - exec deny /tmp/censorguard-command-%s\n' "${index}"
     done
-} | "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    reload --group lab-policy --stdin >"${runtime_dir}/overflow.log" 2>&1
+} | "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    reload --policy lab-policy --stdin >"${runtime_dir}/overflow.log" 2>&1
 overflow_rc=$?
 set -e
 [[ ${overflow_rc} -ne 0 ]]
 grep -q 'maximum is 256' "${runtime_dir}/overflow.log"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/failure-status.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/failure-status.log"
 grep -q '"version": 1' "${runtime_dir}/failure-status.log"
@@ -88,28 +87,28 @@ grep -q '"last_reload_time_ms":' "${runtime_dir}/failure-status.log"
 grep -q '"last_reload_error": ".*maximum is 256' "${runtime_dir}/failure-status.log"
 
 printf 'rules: []\n' | \
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    reload --group lab-policy --stdin --dry-run >"${runtime_dir}/dry-run.log"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    reload --policy lab-policy --stdin --dry-run >"${runtime_dir}/dry-run.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/dry-run.log"
 grep -q '"version": 1' "${runtime_dir}/dry-run.log"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/status.log"
 
 set +e
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after-failure.log" 2>&1
 deny_rc=$?
 set -e
 [[ ${deny_rc} -ne 0 ]]
 
 printf 'rules: []\n' | \
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    reload --group lab-policy --stdin >"${runtime_dir}/commit.log"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    reload --policy lab-policy --stdin >"${runtime_dir}/commit.log"
 grep -q '"reload_gen": 1' "${runtime_dir}/commit.log"
 grep -q '"version": 2' "${runtime_dir}/commit.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after-commit.log" 2>&1
 grep -q 'uid=0' "${runtime_dir}/after-commit.log"
 

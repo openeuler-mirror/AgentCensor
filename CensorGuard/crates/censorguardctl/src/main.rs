@@ -1,5 +1,6 @@
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_common::protocol::{
-    DEFAULT_CONTROL_SOCKET, Operation, Request, Response, VERSION, read_json_line, write_json_line,
+    Event, Operation, ProtocolError, Request, Response, VERSION, read_json_line, write_json_line,
 };
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitOptions, getpid, kill_process, pidfd_open, pidfd_send_signal,
@@ -15,12 +16,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+// The stopped child is an internal process mode, not a public CLI command.
+const SPAWN_HELPER_ENV: &str = "_CENSORGUARD_SPAWN_HELPER";
+
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
     Request(Request),
-    ApplyPolicy {
-        policy: String,
-        domain: Option<String>,
+    Audit {
+        socket: PathBuf,
+        kind: Option<u32>,
         pid: Option<u32>,
     },
     Attach {
@@ -36,53 +40,22 @@ enum Action {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut arguments = env::args().skip(1);
-    if arguments.next().as_deref() == Some("__spawn-helper") {
-        return spawn_helper(&arguments.collect::<Vec<_>>());
+    if env::var_os(SPAWN_HELPER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        return spawn_helper(&env::args().skip(1).collect::<Vec<_>>());
+    }
+    if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
+        println!(
+            "usage: censorguardctl [--config PATH] <status|tree|policy-dump|reload|set|policy|attach|untrack|bind|spawn|audit> ..."
+        );
+        return Ok(());
     }
     let (socket, action) = parse_args(env::args().skip(1))?;
     match action {
+        Action::Audit { socket, kind, pid } => return audit(&socket, kind, pid),
         Action::Request(request) => {
             let response = call(&socket, &request)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             ensure_success(response)?;
-        }
-        Action::ApplyPolicy {
-            policy,
-            domain,
-            pid,
-        } => {
-            let response = call(
-                &socket,
-                &Request {
-                    policy_file: Some(policy),
-                    ..request(Operation::Reload)
-                },
-            )?;
-            ensure_success(response)?;
-            if let Some(pid) = pid {
-                let response = call(
-                    &socket,
-                    &Request {
-                        pid: Some(pid),
-                        domain: Some(domain.unwrap_or_else(|| "default".into())),
-                        ..request(Operation::Track)
-                    },
-                )?;
-                println!("{}", serde_json::to_string_pretty(&response)?);
-                ensure_success(response)?;
-            } else if let Some(domain) = domain {
-                let response = call(
-                    &socket,
-                    &Request {
-                        domain: Some(domain),
-                        group: Some(String::new()),
-                        ..request(Operation::Bind)
-                    },
-                )?;
-                println!("{}", serde_json::to_string_pretty(&response)?);
-                ensure_success(response)?;
-            }
         }
         Action::Attach {
             request: attach_request,
@@ -115,68 +88,57 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Action), io::Error> {
     let mut values: Vec<_> = arguments.collect();
-    let mut socket = PathBuf::from(DEFAULT_CONTROL_SOCKET);
-    if values
-        .first()
-        .is_some_and(|value| matches!(value.as_str(), "--socket" | "--sock" | "-sock"))
-    {
+    let explicit_config = values.first().is_some_and(|value| value == "--config");
+    let config_path = if values.first().is_some_and(|value| value == "--config") {
         if values.len() < 2 {
-            return Err(invalid_input("--socket requires a path"));
+            return Err(invalid_input("--config requires a path"));
         }
-        socket = values[1].clone().into();
+        let path = values[1].clone();
         values.drain(..2);
-    }
-    if values.first().is_some_and(|value| value == "--policy") {
-        let policy = values
-            .get(1)
-            .cloned()
-            .ok_or_else(|| invalid_input("--policy requires a file"))?;
-        let domain = string_option_alias(&values[2..], &["--domain", "--name"])?;
-        let pid = optional_u32_option(&values[2..], "--pid")?;
-        if domain.is_none() && pid.is_none() {
-            return Err(invalid_input("--policy requires --domain or --pid"));
-        }
-        if domain.is_some() && pid.is_some() {
-            return Err(invalid_input("--domain and --pid are mutually exclusive"));
-        }
-        return Ok((
-            socket,
-            Action::ApplyPolicy {
-                policy,
-                domain,
-                pid,
-            },
-        ));
-    }
+        path
+    } else {
+        DEFAULT_CONFIG_PATH.to_owned()
+    };
+    let daemon = if explicit_config || std::path::Path::new(&config_path).exists() {
+        config::load(&config_path)
+            .map_err(|error| invalid_input(format!("invalid config: {error}")))?
+    } else {
+        config::DaemonConfig::default()
+    };
+    let socket = daemon.control_socket.clone();
     let Some(command) = values.first().map(String::as_str) else {
         return Err(invalid_input(
-            "usage: censorguardctl [--socket PATH|-sock PATH] --policy FILE (--domain NAME|--pid PID)\n\
-             or policy|config|run|spawn|status|attach|untrack|bind|set ...\n\
+            "usage: censorguardctl [--config PATH] <status|tree|policy-dump|reload|set|policy|attach|untrack|bind|spawn|audit> ...\n\
              set [--enable-file on|off] [--enable-exec on|off] [--enable-net on|off]\n\
              [--audit-file on|off] [--audit-exec on|off] [--audit-net on|off]",
         ));
     };
     let action = match command {
-        "spawn" | "run" => parse_spawn(&values[1..])?,
+        "spawn" => parse_spawn(&values[1..])?,
         "status" if values.len() == 1 => Action::Request(request(Operation::Status)),
+        "audit" => {
+            validate_options(&values[1..], &["--kind", "--pid"], &[])?;
+            let kind = optional_u32_option(&values[1..], "--kind")?;
+            if kind.is_some_and(|kind| !(1..=4).contains(&kind)) {
+                return Err(invalid_input("--kind expects 1|2|3|4"));
+            }
+            let pid = optional_u32_option(&values[1..], "--pid")?;
+            Action::Audit {
+                socket: daemon.event_socket,
+                kind,
+                pid,
+            }
+        }
         "tree" if values.len() == 1 => Action::Request(request(Operation::Tree)),
         "policy-dump" if values.len() == 1 => Action::Request(request(Operation::PolicyDump)),
         "set" => Action::Request(parse_set(&values[1..])?),
         "policy" => parse_policy(&values[1..])?,
-        "config" if values.get(1).is_some_and(|value| value == "show") => {
-            Action::Request(request(Operation::Status))
-        }
-        "config" if values.get(1).is_some_and(|value| value == "set") => {
-            return Err(invalid_input(
-                "config set is not supported by this daemon; edit the policy YAML and use reload",
-            ));
-        }
-        "doctor" if values.len() == 1 => Action::Request(request(Operation::Status)),
         "reload" => Action::Request(parse_reload(&values[1..])?),
         "attach" => {
             let options = &values[1..];
+            validate_options(options, &["--pid", "--domain", "--policy"], &["--seed"])?;
             let pid = required_u32_option(options, "--pid")?;
-            let domain = string_option_alias(options, &["--domain", "--name"])?;
+            let domain = string_option(options, "--domain")?;
             Action::Attach {
                 request: Request {
                     pid: Some(pid),
@@ -184,29 +146,26 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
                     seed: options.iter().any(|value| value == "--seed"),
                     ..request(Operation::Track)
                 },
-                policy: string_option_alias(options, &["--policy", "--group"])?,
+                policy: string_option(options, "--policy")?,
             }
         }
-        "untrack" => Action::Request(Request {
-            pid: Some(required_u32_option(&values[1..], "--pid")?),
-            ..request(Operation::Untrack)
-        }),
+        "untrack" => {
+            validate_options(&values[1..], &["--pid"], &[])?;
+            Action::Request(Request {
+                pid: Some(required_u32_option(&values[1..], "--pid")?),
+                ..request(Operation::Untrack)
+            })
+        }
         "bind" => {
             let options = &values[1..];
-            let domain = string_option_alias(options, &["--name", "--domain"])?
-                .or_else(|| {
-                    options
-                        .first()
-                        .filter(|value| !value.starts_with('-'))
-                        .cloned()
-                })
-                .ok_or_else(|| invalid_input("bind requires --name DOMAIN (or DOMAIN)"))?;
+            validate_options(options, &["--domain", "--policy"], &[])?;
+            let domain = string_option(options, "--domain")?
+                .ok_or_else(|| invalid_input("bind requires --domain DOMAIN"))?;
             Action::Request(Request {
                 domain: Some(domain),
                 group: Some(
-                    string_option_alias(options, &["--group", "--policy"])?.ok_or_else(|| {
-                        invalid_input("bind requires --policy GROUP (or --group GROUP)")
-                    })?,
+                    string_option(options, "--policy")?
+                        .ok_or_else(|| invalid_input("bind requires --policy GROUP"))?,
                 ),
                 ..request(Operation::Bind)
             })
@@ -221,6 +180,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
 }
 
 fn parse_reload(values: &[String]) -> Result<Request, io::Error> {
+    validate_options(values, &["--file", "--policy"], &["--stdin", "--dry-run"])?;
     let policy_file = string_option(values, "--file")?;
     let use_stdin = values.iter().any(|value| value == "--stdin");
     if policy_file.is_some() && use_stdin {
@@ -236,13 +196,25 @@ fn parse_reload(values: &[String]) -> Result<Request, io::Error> {
     Ok(Request {
         policy_file,
         policy_yaml,
-        group: string_option(values, "--group")?,
+        group: string_option(values, "--policy")?,
         dry_run: values.iter().any(|value| value == "--dry-run"),
         ..request(Operation::Reload)
     })
 }
 
 fn parse_set(values: &[String]) -> Result<Request, io::Error> {
+    validate_options(
+        values,
+        &[
+            "--enable-file",
+            "--enable-exec",
+            "--enable-net",
+            "--audit-file",
+            "--audit-exec",
+            "--audit-net",
+        ],
+        &[],
+    )?;
     let enable_file = bool_option(values, "--enable-file")?;
     let enable_exec = bool_option(values, "--enable-exec")?;
     let enable_net = bool_option(values, "--enable-net")?;
@@ -289,15 +261,13 @@ fn bool_option(values: &[String], name: &str) -> Result<Option<bool>, io::Error>
 
 fn parse_policy(values: &[String]) -> Result<Action, io::Error> {
     let Some(subcommand) = values.first().map(String::as_str) else {
-        return Err(invalid_input(
-            "usage: censorguardctl policy apply|list|show ...",
-        ));
+        return Err(invalid_input("usage: censorguardctl policy apply ..."));
     };
     match subcommand {
-        "list" | "show" => Ok(Action::Request(request(Operation::PolicyDump))),
         "apply" => {
             let options = &values[1..];
-            let group = required_string_option(options, "--name")?;
+            validate_options(options, &["--policy", "--file"], &["--stdin", "--dry-run"])?;
+            let group = required_string_option(options, "--policy")?;
             let file = string_option(options, "--file")?;
             let use_stdin = options.iter().any(|value| value == "--stdin");
             if file.is_some() && use_stdin {
@@ -319,11 +289,8 @@ fn parse_policy(values: &[String]) -> Result<Action, io::Error> {
                 ..request(Operation::Reload)
             }))
         }
-        "remove" => Err(invalid_input(
-            "policy remove is not supported by this daemon; use bind --policy '' to unbind a domain",
-        )),
         _ => Err(invalid_input(format!(
-            "invalid policy command {subcommand:?}; expected apply, list, show or remove"
+            "invalid policy command {subcommand:?}; expected apply"
         ))),
     }
 }
@@ -334,13 +301,14 @@ fn parse_spawn(values: &[String]) -> Result<Action, io::Error> {
         .position(|value| value == "--")
         .ok_or_else(|| invalid_input("spawn requires -- before the command"))?;
     let options = &values[..separator];
+    validate_options(options, &["--domain", "--policy"], &["--keep"])?;
     let command = values[separator + 1..].to_vec();
     if command.is_empty() {
         return Err(invalid_input("spawn command is empty"));
     }
     Ok(Action::Spawn {
-        domain: string_option_alias(options, &["--domain", "--name"])?,
-        policy: string_option_alias(options, &["--policy", "--group"])?,
+        domain: string_option(options, "--domain")?,
+        policy: string_option(options, "--policy")?,
         keep: options.iter().any(|value| value == "--keep"),
         command,
     })
@@ -365,7 +333,7 @@ fn spawn(
         ensure_success(response)?;
     }
     let mut child = Command::new(env::current_exe()?)
-        .arg("__spawn-helper")
+        .env(SPAWN_HELPER_ENV, "1")
         .args(command)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -482,7 +450,11 @@ fn spawn_helper(command: &[String]) -> Result<(), Box<dyn Error>> {
         .split_first()
         .ok_or_else(|| invalid_input("spawn helper command is empty"))?;
     kill_process(getpid(), Signal::STOP).map_err(io::Error::from)?;
-    Err(Command::new(program).args(arguments).exec().into())
+    Err(Command::new(program)
+        .args(arguments)
+        .env_remove(SPAWN_HELPER_ENV)
+        .exec()
+        .into())
 }
 
 fn request(op: Operation) -> Request {
@@ -511,16 +483,6 @@ fn required_u32_option(values: &[String], name: &str) -> Result<u32, io::Error> 
         .map_err(|_| invalid_input(format!("{name} must be an unsigned integer")))
 }
 
-fn optional_u32_option(values: &[String], name: &str) -> Result<Option<u32>, io::Error> {
-    string_option(values, name)?
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| invalid_input(format!("{name} must be an unsigned integer")))
-        })
-        .transpose()
-}
-
 fn required_string_option(values: &[String], name: &str) -> Result<String, io::Error> {
     string_option(values, name)?.ok_or_else(|| invalid_input(format!("{name} is required")))
 }
@@ -536,13 +498,26 @@ fn string_option(values: &[String], name: &str) -> Result<Option<String>, io::Er
         .ok_or_else(|| invalid_input(format!("{name} requires a value")))
 }
 
-fn string_option_alias(values: &[String], names: &[&str]) -> Result<Option<String>, io::Error> {
-    for name in names {
-        if let Some(value) = string_option(values, name)? {
-            return Ok(Some(value));
+fn validate_options(values: &[String], valued: &[&str], flags: &[&str]) -> Result<(), io::Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 0;
+    while let Some(option) = values.get(index) {
+        if !seen.insert(option.as_str()) {
+            return Err(invalid_input(format!("duplicate option {option:?}")));
+        }
+        if valued.contains(&option.as_str()) {
+            values
+                .get(index + 1)
+                .filter(|value| !value.is_empty() && !value.starts_with("--"))
+                .ok_or_else(|| invalid_input(format!("{option} requires a value")))?;
+            index += 2;
+        } else if flags.contains(&option.as_str()) {
+            index += 1;
+        } else {
+            return Err(invalid_input(format!("unknown argument {option:?}")));
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 fn call(path: &Path, request: &Request) -> Result<Response, Box<dyn Error>> {
@@ -551,6 +526,86 @@ fn call(path: &Path, request: &Request) -> Result<Response, Box<dyn Error>> {
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     write_json_line(&mut stream, request)?;
     Ok(read_json_line(&mut BufReader::new(stream))?)
+}
+
+fn audit(path: &Path, kind: Option<u32>, pid: Option<u32>) -> Result<(), Box<dyn Error>> {
+    let stream = UnixStream::connect(path)?;
+    let mut reader = BufReader::new(stream);
+    println!("KIND   OP             PID      RESULT DOMAIN           COMM             DETAIL");
+    loop {
+        let event: Event = match read_json_line(&mut reader) {
+            Ok(event) => event,
+            Err(ProtocolError::EndOfStream) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if kind.is_some_and(|value| value != event.kind)
+            || pid.is_some_and(|value| value != event.tgid)
+        {
+            continue;
+        }
+        let result = if event.allowed { "ALLOW" } else { "DENY" };
+        let detail = if event.args.is_empty() {
+            event.detail
+        } else {
+            format!("{} args={}", event.detail, event.args.join(" "))
+        };
+        println!(
+            "{:<6} {:<14} {:<8} {:<6} {:<16} {:<16} {}",
+            event_kind_name(event.kind),
+            event_operation_name(event.kind, event.op),
+            event.tgid,
+            result,
+            event.domain,
+            event.comm,
+            detail
+        );
+    }
+}
+
+fn event_kind_name(kind: u32) -> &'static str {
+    match kind {
+        1 => "FILE",
+        2 => "EXEC",
+        3 => "NET",
+        4 => "GUARD",
+        _ => "OTHER",
+    }
+}
+
+fn event_operation_name(kind: u32, op: u32) -> &'static str {
+    match (kind, op) {
+        (1, 0) => "file",
+        (1, 1) => "open_read",
+        (1, 2) => "open_write",
+        (1, 3) => "truncate",
+        (1, 4) => "unlink",
+        (1, 5) => "rmdir",
+        (1, 6) => "rename",
+        (1, 7) => "ftruncate",
+        (1, 8) => "link",
+        (1, 9) => "symlink",
+        (1, 10) => "mkdir",
+        (1, 11) => "chmod",
+        (1, 12) => "chown",
+        (1, 13) => "setxattr",
+        (1, 14) => "mmap_write",
+        (1, 15) => "removexattr",
+        (1, 16) => "setacl",
+        (1, 17) => "mknod",
+        (1, 18) => "mprotect",
+        (1, 19) => "fd_read",
+        (1, 20) => "fd_write",
+        (2, _) => "exec",
+        (3, 0) => "connect",
+        (3, 1) => "bind",
+        (3, 2) => "sendmsg",
+        (3, 3) => "accept",
+        (4, 1) => "kill",
+        (4, 2) => "ptrace",
+        (4, 3) => "traceme",
+        (4, 4) => "bpf",
+        _ => "unknown",
+    }
 }
 
 fn ensure_success(response: Response) -> Result<(), io::Error> {
@@ -563,6 +618,16 @@ fn ensure_success(response: Response) -> Result<(), io::Error> {
                 .unwrap_or_else(|| "daemon rejected request".into()),
         ))
     }
+}
+
+fn optional_u32_option(values: &[String], name: &str) -> Result<Option<u32>, io::Error> {
+    string_option(values, name)?
+        .map(|value| {
+            value
+                .parse()
+                .map_err(|_| invalid_input(format!("{name} must be an unsigned integer")))
+        })
+        .transpose()
 }
 
 fn invalid_input(message: impl Into<String>) -> io::Error {
@@ -605,61 +670,63 @@ mod tests {
     }
 
     #[test]
-    fn reference_cli_aliases_parse() -> Result<(), io::Error> {
-        let (socket, action) = parse_args(
-            [
-                "-sock",
-                "/tmp/ctl.sock",
-                "run",
-                "--name",
-                "lab-agent",
-                "--",
-                "/bin/echo",
-                "hello world",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )?;
-        assert_eq!(socket, std::path::PathBuf::from("/tmp/ctl.sock"));
-        assert_eq!(
-            action,
-            Action::Spawn {
-                domain: Some("lab-agent".into()),
-                policy: None,
-                keep: false,
-                command: vec!["/bin/echo".into(), "hello world".into()],
-            }
+    fn legacy_socket_flag_is_rejected() {
+        assert!(
+            parse_args(
+                ["--sock", "/tmp/ctl.sock", "status"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
         );
-        Ok(())
     }
 
     #[test]
-    fn canonical_policy_command_accepts_domain_or_pid() -> Result<(), io::Error> {
-        let (_, action) = parse_args(
-            ["--policy", "base.yaml", "--domain", "worker"]
+    fn rejects_removed_aliases_and_malformed_options() {
+        for args in [
+            vec!["__spawn-helper", "/bin/true"],
+            vec!["config", "show"],
+            vec!["status", "extra"],
+            vec!["audit", "--socket", "/tmp/events.sock"],
+            vec!["audit", "--kind", "5"],
+            vec!["attach", "--pid", "12", "--name", "worker"],
+            vec!["untrack", "--pid", "12", "--extra"],
+            vec!["bind", "worker", "--policy", "g"],
+            vec!["bind", "--domain", "worker", "--group", "g"],
+            vec!["reload", "--group", "g"],
+            vec!["reload", "--file", "--dry-run"],
+            vec!["policy", "apply", "--name", "g", "--stdin"],
+            vec!["set", "--audit-file", "on", "--audit-file", "off"],
+            vec!["spawn", "--scope", "worker", "--", "/bin/true"],
+        ] {
+            assert!(parse_args(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_explicit_config_is_rejected() {
+        let parsed = parse_args(
+            ["--config", "/does-not-exist/censorguard.yaml", "status"]
                 .into_iter()
                 .map(str::to_owned),
-        )?;
-        assert_eq!(
-            action,
-            Action::ApplyPolicy {
-                policy: "base.yaml".into(),
-                domain: Some("worker".into()),
-                pid: None,
-            }
         );
+        assert!(matches!(parsed, Err(error) if error.to_string().contains("invalid config")));
+    }
+
+    #[test]
+    fn bind_uses_only_named_domain_and_policy() -> Result<(), io::Error> {
         let (_, action) = parse_args(
-            ["--policy", "base.yaml", "--pid", "42"]
+            ["bind", "--domain", "worker", "--policy", "restricted"]
                 .into_iter()
                 .map(str::to_owned),
         )?;
         assert_eq!(
             action,
-            Action::ApplyPolicy {
-                policy: "base.yaml".into(),
-                domain: None,
-                pid: Some(42),
-            }
+            Action::Request(Request {
+                domain: Some("worker".into()),
+                group: Some("restricted".into()),
+                ..request(Operation::Bind)
+            })
         );
         Ok(())
     }

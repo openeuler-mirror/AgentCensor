@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -60,11 +61,9 @@ YAML
 : >"${runtime_dir}/spawn.log"
 : >"${runtime_dir}/allowed.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 5 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -76,19 +75,18 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
-"${repo_dir}/target/debug/censorguard-audit" launch \
-    --socket "${runtime_dir}/events.sock" >"${runtime_dir}/audit.log" 2>&1 &
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" \
+    --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/printf '%s\n' 'hello world' \
     >"${runtime_dir}/allowed.log" 2>&1
 grep -qx 'hello world' "${runtime_dir}/allowed.log"
 
 set +e
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" \
+    --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/spawn.log" 2>&1
 spawn_rc=$?
 set -e

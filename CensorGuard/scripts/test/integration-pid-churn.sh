@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -65,11 +66,9 @@ for sync_file in start ready release; do
 done
 : >"${runtime_dir}/daemon.log"
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 18 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -83,7 +82,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
     "${runtime_dir}/ready" "${runtime_dir}/release" \
     "${runtime_dir}/protected.txt" "${child_count}" &
 probe_pid=$!
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain churn-domain >"${runtime_dir}/attach.log"
 touch "${runtime_dir}/start"
 
@@ -100,7 +99,7 @@ if grep -q ' 0$' "${runtime_dir}/ready"; then
     exit 1
 fi
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.json"
 python3 - "${runtime_dir}/status.json" "${child_count}" <<'PY'
 import json
@@ -167,7 +166,7 @@ wait "${probe_pid}"
 probe_pid=
 
 for _ in $(seq 1 240); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         status >"${runtime_dir}/final.json"
     if grep -q '"tracked": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "churn-domain"' "${runtime_dir}/final.json"; then

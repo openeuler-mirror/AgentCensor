@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -52,20 +53,26 @@ groups:
     rules:
       - file deny /tmp/censorguard/protected.txt [read]
       - exec deny /usr/bin/id
+domains:
+  - name: revision-test
+    group: lab-policy
+  - name: revision-after-restart
+    group: lab-policy
 YAML
 cat >"${runtime_dir}/policy-allow.yaml" <<'YAML'
 groups:
   lab-policy:
     rules: []
+domains:
+  - name: revision-test
+    group: lab-policy
+  - name: revision-after-restart
+    group: lab-policy
 YAML
 
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy-initial.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy-initial.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
-    --state-dir "${runtime_dir}/state" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -76,44 +83,44 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 rpc="${repo_dir}/scripts/test/rpc-v2.py"
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method get_capabilities \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method get_capabilities \
     >"${runtime_dir}/capabilities.json"
 grep -q 'launcher.peer-credentials' "${runtime_dir}/capabilities.json"
 grep -q 'policy.read-current' "${runtime_dir}/capabilities.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method get_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method get_policy \
     >"${runtime_dir}/policy-initial.json"
 grep -q '"revision": 1' "${runtime_dir}/policy-initial.json"
 grep -q 'lab-policy' "${runtime_dir}/policy-initial.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method evaluate_intent \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method evaluate_intent \
     --params '{"group":"lab-policy","intents":[{"kind":"file","operation":"read","path":"/tmp/censorguard/protected.txt"},{"kind":"exec","executable":"/usr/bin/id","argv":["/usr/bin/id"]}]}' \
     >"${runtime_dir}/intent-before.json"
 [[ $(grep -c '"allowed": false' "${runtime_dir}/intent-before.json") -eq 2 ]]
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method validate_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method validate_policy \
     --policy-file "${repo_dir}/config/high-priv.yaml" \
     >"${runtime_dir}/validate.json"
 grep -q '"revision": 1' "${runtime_dir}/validate.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method apply_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method apply_policy \
     --params '{"expected_revision":1,"idempotency_key":"apply-allow-v1"}' \
     --policy-file "${runtime_dir}/policy-allow.yaml" \
     >"${runtime_dir}/apply.json"
 grep -q '"revision": 2' "${runtime_dir}/apply.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method get_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method get_policy \
     >"${runtime_dir}/policy-applied.json"
 grep -q '"revision": 2' "${runtime_dir}/policy-applied.json"
 grep -q 'rules: \[\]' "${runtime_dir}/policy-applied.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method evaluate_intent \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method evaluate_intent \
     --params '{"group":"lab-policy","intents":[{"kind":"exec","executable":"/usr/bin/id","argv":["/usr/bin/id"]}]}' \
     >"${runtime_dir}/intent-after.json"
 grep -q '"allowed": true' "${runtime_dir}/intent-after.json"
 
 set +e
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method apply_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method apply_policy \
     --params '{"expected_revision":1,"idempotency_key":"stale-writer"}' \
     --policy-file "${repo_dir}/config/base.yaml" \
     >"${runtime_dir}/conflict.json"
@@ -123,22 +130,18 @@ set -e
 grep -q 'revision_conflict' "${runtime_dir}/conflict.json"
 grep -q '"current_revision": 2' "${runtime_dir}/conflict.json"
 
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/launch.sock" --scope revision-test --group lab-policy \
-    -- /usr/bin/id >"${runtime_dir}/allowed.log"
+"${repo_dir}/target/debug/censorguardctl" \
+    --config "${runtime_dir}/config.yaml" spawn --domain revision-test -- \
+    /usr/bin/id >"${runtime_dir}/allowed.log"
 grep -q 'uid=0' "${runtime_dir}/allowed.log"
 
 kill "${daemon_pid}"
 wait "${daemon_pid}" || true
 daemon_pid=
 : >"${runtime_dir}/daemon-restart.log"
+write_test_config "${runtime_dir}/config.yaml" "${repo_dir}/config/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state"
 "${repo_dir}/target/debug/censorguardd" \
-    --config "${repo_dir}/config/base.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
-    --state-dir "${runtime_dir}/state" \
+    --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon-restart.log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 1 1200); do
@@ -147,30 +150,30 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon-restart.log"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method get_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method get_policy \
     >"${runtime_dir}/policy-restarted.json"
 grep -q '"revision": 2' "${runtime_dir}/policy-restarted.json"
 grep -q 'rules: \[\]' "${runtime_dir}/policy-restarted.json"
 
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/launch.sock" --scope revision-after-restart --group lab-policy \
-    -- /usr/bin/id >"${runtime_dir}/allowed-after-restart.log"
+"${repo_dir}/target/debug/censorguardctl" \
+    --config "${runtime_dir}/config.yaml" spawn --domain revision-after-restart -- \
+    /usr/bin/id >"${runtime_dir}/allowed-after-restart.log"
 grep -q 'uid=0' "${runtime_dir}/allowed-after-restart.log"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method rollback_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method rollback_policy \
     --params '{"revision":1,"expected_revision":2,"idempotency_key":"rollback-to-v1"}' \
     >"${runtime_dir}/rollback.json"
 grep -q '"revision": 3' "${runtime_dir}/rollback.json"
 
-"${rpc}" --socket "${runtime_dir}/ctl.sock" --method get_policy \
+"${rpc}" --config "${runtime_dir}/config.yaml" --method get_policy \
     >"${runtime_dir}/policy-rolled-back.json"
 grep -q '"revision": 3' "${runtime_dir}/policy-rolled-back.json"
 grep -q '/usr/bin/id' "${runtime_dir}/policy-rolled-back.json"
 
 set +e
-"${repo_dir}/target/debug/censorguard-exec" \
-    --socket "${runtime_dir}/launch.sock" --scope revision-test --group lab-policy \
-    -- /usr/bin/id >"${runtime_dir}/denied.log" 2>&1
+"${repo_dir}/target/debug/censorguardctl" \
+    --config "${runtime_dir}/config.yaml" spawn --domain revision-test -- \
+    /usr/bin/id >"${runtime_dir}/denied.log" 2>&1
 denied_rc=$?
 set -e
 [[ ${denied_rc} -ne 0 ]]

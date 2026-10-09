@@ -3,10 +3,7 @@ mod procfs;
 mod runtime;
 mod server;
 
-use censorguard_common::protocol::{
-    DEFAULT_CONTROL_SOCKET, DEFAULT_DSH_SOCKET, DEFAULT_EVENT_SOCKET, DEFAULT_LAUNCH_SOCKET,
-    DEFAULT_UI_SOCKET,
-};
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_kernel::{HookManifest, NativeKernel};
 use censorguard_policy::{CompileWarning, CompiledPolicy, compile_yaml, load};
 use event::EventHub;
@@ -24,9 +21,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
-
-const DEFAULT_DNS_REFRESH_SECONDS: u64 = 60;
-const DEFAULT_DSH_SELF_GROUPS: &str = "censorguard-dsh-default";
 
 #[derive(Debug)]
 struct Args {
@@ -50,28 +44,26 @@ struct Args {
     dsh_self_groups: Vec<String>,
     spawn_grpc: bool,
     grpc_bin: Option<PathBuf>,
-    grpc_listen: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args(env::args().skip(1))?;
-    let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
-    let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGHUP);
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
     pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None)?;
-    let (canonical_policy, initial_revision) = if !args.policy_free && args.config.exists() {
-        if args.check_config {
-            (load(&args.config)?, 1)
+    let (canonical_policy, initial_revision) =
+        if (!args.policy_free || args.check_config) && args.config.exists() {
+            if args.check_config {
+                (load(&args.config)?, 1)
+            } else {
+                load_startup_policy(&args.config, &args.state_dir)?
+            }
         } else {
-            load_startup_policy(&args.config, &args.state_dir)?
-        }
-    } else {
-        // Policy-free daemon startup: ctl applies the canonical rules document later.
-        (compile_yaml(b"rules: []")?, 1)
-    };
+            // Policy-free daemon startup: ctl applies the canonical rules document later.
+            (compile_yaml(b"rules: []")?, 1)
+        };
     let (resolved_policy, dns_cache, dns_status) =
         canonical_policy.resolve_dns(&Default::default());
     let policy = Arc::new(resolved_policy);
@@ -80,6 +72,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("configuration is valid; kernel state was not changed");
         return Ok(());
     }
+    let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
+    let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
 
     // All policy dimensions stay attached so a later atomic reload can enable a dimension that
     // was disabled at startup. The filter_config map keeps disabled hooks fail-open and cheap.
@@ -132,9 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _grpc = if args.spawn_grpc {
         Some(start_grpc_supervisor(
             args.grpc_bin,
-            args.grpc_listen,
-            args.ui_socket.clone(),
-            args.event_socket.clone(),
+            args.config.clone(),
             Arc::clone(&grpc_shutdown),
         )?)
     } else {
@@ -234,17 +226,15 @@ fn start_signal_handler(
 
 /// Supervisor for the unprivileged gRPC adapter child process.
 ///
-/// `--spawn-grpc` lets one systemd unit own the full DSH delegated surface: the
-/// daemon spawns `censorguard-grpc` (default: sibling binary of the daemon's own
-/// executable), restarts it after a 1s backoff if it crashes, and terminates it
+/// The `daemon.spawn_grpc` setting lets one systemd unit own the full DSH delegated
+/// surface: the daemon spawns `censorguard-grpc` (default: sibling binary of the
+/// daemon's own executable), restarts it after a 1s backoff if it crashes, and terminates it
 /// (TERM, then KILL after a 2s grace period) when the daemon shuts down. The
 /// adapter keeps its own process boundary, so tonic panics never take down the
 /// eBPF enforcement plane.
 fn start_grpc_supervisor(
     grpc_bin: Option<PathBuf>,
-    grpc_listen: Option<String>,
-    ui_socket: PathBuf,
-    event_socket: PathBuf,
+    config_path: PathBuf,
     shutdown: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, io::Error> {
     let bin = grpc_bin.unwrap_or_else(|| {
@@ -258,20 +248,14 @@ fn start_grpc_supervisor(
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "gRPC adapter not found at {}; build it or pass --grpc-bin PATH",
+                "gRPC adapter not found at {}; build it or set daemon.grpc_bin in the config",
                 bin.display()
             ),
         ));
     }
-    let listen = grpc_listen.unwrap_or_else(|| "127.0.0.1:50051".to_owned());
     let mut command = Command::new(&bin);
-    command
-        .arg("--sock")
-        .arg(&ui_socket)
-        .arg("--ev-sock")
-        .arg(&event_socket)
-        .arg("--listen")
-        .arg(&listen);
+    // The adapter reads the same config as the daemon.
+    command.arg("--config").arg(config_path);
     thread::Builder::new()
         .name("censorguard-grpc".into())
         .spawn(move || {
@@ -287,7 +271,7 @@ fn start_grpc_supervisor(
                         continue;
                     }
                 };
-                eprintln!("gRPC adapter spawned: pid={} {listen}", child.id());
+                eprintln!("gRPC adapter spawned: pid={}", child.id());
                 let child_pid = nix::unistd::Pid::from_raw(child.id() as i32);
                 // Poll the shutdown flag and child liveness with short timeouts.
                 loop {
@@ -376,125 +360,56 @@ fn parse_args_with_values(
     policy_free: bool,
 ) -> Result<Args, io::Error> {
     let mut config = None;
-    let mut bpf_object = PathBuf::from("bpf/enforce.bpf.o");
-    let mut control_socket = PathBuf::from(DEFAULT_CONTROL_SOCKET);
-    let mut event_socket = PathBuf::from(DEFAULT_EVENT_SOCKET);
-    let mut launch_socket = PathBuf::from(DEFAULT_LAUNCH_SOCKET);
-    let mut dsh_socket = PathBuf::from(DEFAULT_DSH_SOCKET);
-    let mut ui_socket = PathBuf::from(DEFAULT_UI_SOCKET);
-    let mut launch_socket_explicit = false;
-    let mut dsh_socket_explicit = false;
-    let mut ui_socket_explicit = false;
-    let mut state_dir = None;
-    let mut socket_group = None;
-    let mut gateway_user = None;
+
     let mut check_config = false;
     let mut track_pid = None;
     let mut domain = String::from("default");
     let mut duration_seconds = None;
-    let mut dns_refresh_seconds = DEFAULT_DNS_REFRESH_SECONDS;
-    let mut dsh_self_groups: Vec<String> = DEFAULT_DSH_SELF_GROUPS
-        .split(',')
-        .map(str::to_owned)
-        .collect();
-    let mut spawn_grpc = false;
-    let mut grpc_bin: Option<PathBuf> = None;
-    let mut grpc_listen: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
     while let Some(argument) = args.next() {
+        if !seen.insert(argument.clone()) {
+            return Err(invalid_input(format!("duplicate option {argument:?}")));
+        }
         match argument.as_str() {
             "--config" => config = Some(next_value(&mut args, "--config")?.into()),
-            "--bpf-object" => bpf_object = next_value(&mut args, "--bpf-object")?.into(),
-            "--ctl-sock" => control_socket = next_value(&mut args, "--ctl-sock")?.into(),
-            "--event-sock" | "--ev-sock" => {
-                event_socket = next_value(&mut args, "--event-sock")?.into()
-            }
-            "--launch-sock" => {
-                launch_socket = next_value(&mut args, "--launch-sock")?.into();
-                launch_socket_explicit = true;
-            }
-            "--dsh-sock" => {
-                dsh_socket = next_value(&mut args, "--dsh-sock")?.into();
-                dsh_socket_explicit = true;
-            }
-            "--ui-sock" => {
-                ui_socket = next_value(&mut args, "--ui-sock")?.into();
-                ui_socket_explicit = true;
-            }
-            "--dsh-self-groups" => {
-                dsh_self_groups = next_value(&mut args, "--dsh-self-groups")?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|group| !group.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }
-            "--state-dir" => state_dir = Some(PathBuf::from(next_value(&mut args, "--state-dir")?)),
-            "--socket-group" => socket_group = Some(next_value(&mut args, "--socket-group")?),
-            "--gateway-user" => gateway_user = Some(next_value(&mut args, "--gateway-user")?),
             "--check-config" => check_config = true,
             "--track-pid" => track_pid = Some(parse_u32(next_value(&mut args, "--track-pid")?)?),
             "--domain" => domain = next_value(&mut args, "--domain")?,
-            "--duration" | "--hold-seconds" => {
+            "--duration" => {
                 duration_seconds = Some(parse_u64(next_value(&mut args, "--duration")?)?)
             }
-            "--dns-refresh-seconds" => {
-                dns_refresh_seconds =
-                    parse_positive_u64(next_value(&mut args, "--dns-refresh-seconds")?)?
-            }
-            "--spawn-grpc" => spawn_grpc = true,
-            "--grpc-bin" => grpc_bin = Some(PathBuf::from(next_value(&mut args, "--grpc-bin")?)),
-            "--grpc-listen" => grpc_listen = Some(next_value(&mut args, "--grpc-listen")?),
             "-h" | "--help" => {
                 println!(
-                    "usage: censorguardd launch [--bpf-object PATH]\n\
-                     [--ctl-sock PATH] [--event-sock PATH] [--launch-sock PATH]\n\
-                     [--dsh-sock PATH] [--ui-sock PATH]\n\
-                     [--dsh-self-groups NAME[,NAME...]]\n\
-                     [--socket-group NAME] [--gateway-user NAME] [--state-dir PATH]\n\
-                     [--duration SECONDS]\n\
-                     [--dns-refresh-seconds SECONDS]\n\
-                     [--spawn-grpc [--grpc-bin PATH] [--grpc-listen ADDR]]\n\
-                     [--check-config] [--track-pid PID --domain NAME]\n\
-                     policy is applied later with censorguardctl"
+                    "usage: censorguardd launch [--config PATH] [--check-config]\n\
+                     [--track-pid PID --domain NAME] [--duration SECONDS]\n\
+                     all daemon paths and runtime settings are read from the config file"
                 );
                 std::process::exit(0);
             }
             _ => return Err(invalid_input(format!("unknown argument {argument:?}"))),
         }
     }
-    let config = config.unwrap_or_else(|| PathBuf::from("/etc/censorguard/base.yaml"));
-    // Keep ad-hoc daemons isolated from the system service. The production default remains
-    // /run/censorguard/*.sock, while a custom control socket gets sibling sockets
-    // unless the caller explicitly supplied them.
-    if !control_socket.starts_with("/run/censorguard") {
-        let sibling = |name: &str| {
-            control_socket
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(name)
-        };
-        if !launch_socket_explicit {
-            launch_socket = sibling("launch.sock");
-        }
-        if !dsh_socket_explicit {
-            dsh_socket = sibling("dsh.sock");
-        }
-        if !ui_socket_explicit {
-            ui_socket = sibling("ui.sock");
-        }
-    }
-    let state_dir_ephemeral =
-        state_dir.is_none() && !control_socket.starts_with("/run/censorguard");
-    let state_dir = state_dir.unwrap_or_else(|| {
-        if control_socket.starts_with("/run/censorguard") {
-            PathBuf::from("/var/lib/censorguard")
-        } else {
-            control_socket
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(format!(".censorguard-state-{}", std::process::id()))
-        }
-    });
+    let explicit_config = config.is_some();
+    let config = config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    let daemon = if explicit_config || config.exists() {
+        config::load(&config).map_err(|error| invalid_input(format!("invalid config: {error}")))?
+    } else {
+        config::DaemonConfig::default()
+    };
+    let bpf_object = daemon.bpf_object;
+    let control_socket = daemon.control_socket;
+    let event_socket = daemon.event_socket;
+    let launch_socket = daemon.launch_socket;
+    let dsh_socket = daemon.dsh_socket;
+    let ui_socket = daemon.ui_socket;
+    let state_dir = daemon.state_dir;
+    let socket_group = daemon.socket_group;
+    let gateway_user = daemon.gateway_user;
+    let dsh_self_groups = daemon.dsh_self_groups;
+    let dns_refresh_seconds = daemon.dns_refresh_seconds;
+    let spawn_grpc = daemon.spawn_grpc;
+    let grpc_bin = daemon.grpc_bin;
+    let state_dir_ephemeral = false;
     Ok(Args {
         policy_free,
         config,
@@ -516,7 +431,6 @@ fn parse_args_with_values(
         dsh_self_groups,
         spawn_grpc,
         grpc_bin,
-        grpc_listen,
     })
 }
 
@@ -569,15 +483,6 @@ fn parse_u64(value: String) -> Result<u64, io::Error> {
     value
         .parse()
         .map_err(|_| invalid_input(format!("expected u64, got {value:?}")))
-}
-
-fn parse_positive_u64(value: String) -> Result<u64, io::Error> {
-    let parsed = parse_u64(value)?;
-    if parsed == 0 {
-        Err(invalid_input("expected a positive u64, got 0"))
-    } else {
-        Ok(parsed)
-    }
 }
 
 fn load_startup_policy(
@@ -635,33 +540,8 @@ mod tests {
 
     #[test]
     fn dns_refresh_defaults_to_sixty_seconds() -> Result<(), io::Error> {
-        let args = parse_args(["--config", "policy.yaml"].into_iter().map(str::to_owned))?;
-        assert_eq!(args.dns_refresh_seconds, DEFAULT_DNS_REFRESH_SECONDS);
-        Ok(())
-    }
-
-    #[test]
-    fn dns_refresh_rejects_zero() {
-        let result = parse_args(
-            ["--config", "policy.yaml", "--dns-refresh-seconds", "0"]
-                .into_iter()
-                .map(str::to_owned),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn socket_group_is_parsed_and_resolved() -> Result<(), io::Error> {
-        let args = parse_args(
-            ["--config", "policy.yaml", "--socket-group", "root"]
-                .into_iter()
-                .map(str::to_owned),
-        )?;
-        assert_eq!(args.socket_group.as_deref(), Some("root"));
-        assert_eq!(
-            resolve_socket_group(args.socket_group.as_deref())?,
-            Some(Gid::from_raw(0))
-        );
+        let args = parse_args(std::iter::empty())?;
+        assert_eq!(args.dns_refresh_seconds, 60);
         Ok(())
     }
 
@@ -671,52 +551,41 @@ mod tests {
     }
 
     #[test]
-    fn gateway_user_is_explicit_and_resolved() -> Result<(), io::Error> {
-        let args = parse_args(
-            ["--config", "policy.yaml", "--gateway-user", "root"]
-                .into_iter()
-                .map(str::to_owned),
-        )?;
-        assert_eq!(args.gateway_user.as_deref(), Some("root"));
-        assert_eq!(resolve_gateway_user(args.gateway_user.as_deref())?, Some(0));
-        Ok(())
-    }
-
-    #[test]
     fn unknown_gateway_user_is_rejected() {
         assert!(resolve_gateway_user(Some("censorguard-user-that-does-not-exist")).is_err());
     }
 
     #[test]
     fn spawn_grpc_defaults_to_off() -> Result<(), io::Error> {
-        let args = parse_args(["--config", "policy.yaml"].into_iter().map(str::to_owned))?;
+        let args = parse_args(std::iter::empty())?;
         assert!(!args.spawn_grpc);
         assert_eq!(args.grpc_bin, None);
-        assert_eq!(args.grpc_listen, None);
         Ok(())
     }
 
     #[test]
-    fn spawn_grpc_options_are_parsed() -> Result<(), io::Error> {
-        let args = parse_args(
-            [
-                "--config",
-                "policy.yaml",
-                "--spawn-grpc",
-                "--grpc-bin",
-                "/opt/censorguard-grpc",
-                "--grpc-listen",
-                "127.0.0.1:50052",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )?;
-        assert!(args.spawn_grpc);
-        assert_eq!(
-            args.grpc_bin.as_deref(),
-            Some(std::path::Path::new("/opt/censorguard-grpc"))
+    fn missing_explicit_config_is_rejected() {
+        assert!(
+            parse_args(
+                ["--config", "/does-not-exist/censorguard.yaml"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
         );
-        assert_eq!(args.grpc_listen.as_deref(), Some("127.0.0.1:50052"));
-        Ok(())
+    }
+
+    #[test]
+    fn removed_runtime_flags_are_rejected() {
+        for flag in [
+            "--bpf-object",
+            "--ctl-sock",
+            "--event-sock",
+            "--state-dir",
+            "--spawn-grpc",
+            "--hold-seconds",
+        ] {
+            assert!(parse_args([flag, "value"].into_iter().map(str::to_owned)).is_err());
+        }
     }
 }

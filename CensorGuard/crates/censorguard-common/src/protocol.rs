@@ -1,4 +1,4 @@
-//! Versioned JSON-lines protocol shared by daemon, ctl and audit.
+//! Versioned JSON-lines protocol shared by daemon and control clients.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -6,11 +6,6 @@ use thiserror::Error;
 
 pub const VERSION: u16 = 3;
 pub const MIN_VERSION: u16 = 1;
-pub const DEFAULT_CONTROL_SOCKET: &str = "/run/censorguard/ctl.sock";
-pub const DEFAULT_EVENT_SOCKET: &str = "/run/censorguard/events.sock";
-pub const DEFAULT_LAUNCH_SOCKET: &str = "/run/censorguard/launch.sock";
-pub const DEFAULT_DSH_SOCKET: &str = "/run/censorguard/dsh.sock";
-pub const DEFAULT_UI_SOCKET: &str = "/run/censorguard/ui.sock";
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

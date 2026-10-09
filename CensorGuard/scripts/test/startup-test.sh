@@ -39,11 +39,19 @@ trap cleanup EXIT
 
 install -d -m 0700 "${runtime_dir}"
 
-"${repo_dir}/target/release/censorguardd" launch \
-  --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-  --ctl-sock "${runtime_dir}/ctl.sock" \
-  --event-sock "${runtime_dir}/events.sock" \
-  --launch-sock "${runtime_dir}/launch.sock" \
+cat >"${runtime_dir}/base.yaml" <<EOF
+daemon:
+  bpf_object: ${repo_dir}/bpf/enforce.bpf.o
+  control_socket: ${runtime_dir}/ctl.sock
+  event_socket: ${runtime_dir}/events.sock
+  launch_socket: ${runtime_dir}/launch.sock
+  dsh_socket: ${runtime_dir}/dsh.sock
+  ui_socket: ${runtime_dir}/ui.sock
+  state_dir: ${runtime_dir}/state
+rules: []
+EOF
+
+"${repo_dir}/target/release/censorguardd" launch --config "${runtime_dir}/base.yaml" \
   --duration 20 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 1 1200); do grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break; sleep 0.05; done
@@ -53,13 +61,15 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
   exit 1
 fi
 
-"${repo_dir}/target/release/censorguard-audit" launch --socket "${runtime_dir}/events.sock" >"${runtime_dir}/audit.log" 2>&1 &
+"${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
 # Apply the only canonical policy entrypoint, then attach this probe by PID.
 sleep 0.1
-"${repo_dir}/target/release/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-  --policy "${repo_dir}/config/base.yaml" --pid "$$" >/dev/null
+"${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" \
+  reload --file "${repo_dir}/config/base.yaml" >/dev/null
+"${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" \
+  attach --pid "$$" --domain startup >/dev/null
 
 if cat /etc/shadow >/dev/null 2>"${runtime_dir}/read.err"; then
   echo 'expected /etc/shadow read to be denied' >&2
