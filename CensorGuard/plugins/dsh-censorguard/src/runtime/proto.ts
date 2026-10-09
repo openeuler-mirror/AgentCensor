@@ -65,6 +65,7 @@ export interface DomainInfo {
   id: number;
   slot: number;
   group: string;
+  policies?: string[];
   roots: number;
   version: number;
   draining?: boolean;

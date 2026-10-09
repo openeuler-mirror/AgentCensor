@@ -60,10 +60,8 @@ printf "%s\n" "$?" >/tmp/censorguard/rc
 victim_pid=$!
 
 write_test_config "${lab_dir}/config.yaml" "${lab_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${lab_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${lab_dir}/config.yaml" \
-    --track-pid "${victim_pid}" \
-    --domain lab-agent \
     --duration 3 >"${lab_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
@@ -80,6 +78,8 @@ if [[ ${ready} != true ]]; then
     kill "${victim_pid}" "${daemon_pid}" 2>/dev/null || true
     exit 1
 fi
+
+"${repo_dir}/target/debug/censorguardctl" --config "${lab_dir}/config.yaml" attach --pid "${victim_pid}" --domain lab-agent
 
 touch "${lab_dir}/start"
 wait "${victim_pid}"

@@ -46,7 +46,7 @@ clang -O2 -Wall -Wextra -Werror "${repo_dir}/tools/connect_probe.c" \
     -o "${runtime_dir}/connect-probe"
 
 write_test_config "${runtime_dir}/config.yaml" "${repo_dir}/config/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -63,19 +63,13 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 grep -q 'errno=111' "${runtime_dir}/before.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --stdin >"${runtime_dir}/reload.log" <<'YAML'
+    policy apply --policy lab-policy --stdin >"${runtime_dir}/reload.log" <<'YAML'
 rules:
-  - file deny /tmp/censorguard/protected.txt
-groups:
-  lab-policy:
-    rules:
-      - exec deny /usr/bin/id
-      - net deny 127.0.0.1:18080
-  allow-policy: {}
-domains:
-  - name: lab-agent
-    group: lab-policy
+  - exec deny /usr/bin/id
+  - net deny 127.0.0.1:18080
 YAML
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    bind --domain lab-agent --policy lab-policy
 
 set +e
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \

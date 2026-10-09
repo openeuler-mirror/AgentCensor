@@ -59,7 +59,7 @@ YAML
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 7 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -80,6 +80,16 @@ set -e
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     bind --domain lab-agent --policy allow-policy >"${runtime_dir}/bind.log"
 
+# Additive bind keeps the old deny until that group is explicitly removed.
+set +e
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/both.log" 2>&1
+both_rc=$?
+set -e
+[[ ${both_rc} -ne 0 ]]
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    remove --domain lab-agent --policy lab-policy >"${runtime_dir}/remove.log"
+
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1
 
@@ -89,5 +99,5 @@ grep -q '(root)' "${runtime_dir}/after.log"
 
 wait "${daemon_pid}"
 daemon_pid=
-echo "domain bind integration passed: lab-agent lab-policy -> allow-policy"
+echo "domain bind integration passed: additive bind and explicit removal preserve independent denies"
 

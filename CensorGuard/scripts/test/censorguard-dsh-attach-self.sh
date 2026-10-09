@@ -114,7 +114,7 @@ on_err() {
     done
 }
 trap 'on_err "${LINENO}"' ERR
-#   A5  attach_self 忽略伪造 pid (params.pid=1, 域名仍取 SO_PEERCRED 真实 tgid)
+#   A5  attach_self 拒绝客户端 pid 字段，身份只取 SO_PEERCRED
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -355,26 +355,26 @@ else
 fi
 
 echo "=== A4: dsh.sock 拒绝非自助 op (health) ==="
-OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" health '{}' 2>&1)
+OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" health '{}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not allowed on the Dsh socket'; then
     pass "health 在 dsh.sock 被 ACL 拒"
 else
     fail "dsh.sock 未拒绝 health: $OUT"
 fi
 
-echo "=== A5: attach_self 忽略伪造 pid (params.pid=1) ==="
+echo "=== A5: attach_self 拒绝伪造 pid 字段 ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" attach_self \
-    '{"policy_group":"censorguard-dsh-default","pid":1,"seed":false}' 2>&1)
-# 域名必须是 dsh-65534-<真实tgid>-..., 不能含 pid 1 的 tgid
-if echo "$OUT" | grep -q '"ok": *true' && echo "$OUT" | grep -qP '"name": *"dsh-65534-\d+-\d+"'; then
-    pass "pid 取 SO_PEERCRED, 伪造 pid=1 无效 ($(echo "$OUT" | grep -oP '"name": *"\K[^"]+'))"
+    '{"policy_group":"censorguard-dsh-default","pid":1,"seed":false}' 2>&1 || true)
+# RpcParams 严格拒绝 pid 字段，正常 attach 的域名已在 A2/A9 检查。
+if echo "$OUT" | grep -q 'unknown field `pid`'; then
+    pass "伪造 pid 字段被拒，身份只取 SO_PEERCRED"
 else
-    fail "attach_self 伪造 pid 处理异常: $OUT"
+    fail "attach_self 未拒绝伪造 pid 字段: $OUT"
 fi
 
 echo "=== A6: status_self 新进程不属于任何 Domain ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" status_self '{}' 2>&1)
-if echo "$OUT" | grep -q '"ok": *true' && echo "$OUT" | grep -qP '"domains": *\[\]'; then
+if python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(not (r["ok"] and not r["result"]["response"].get("domains", [])))' <<<"$OUT"; then
     pass "status_self 返回空域列表 (语义正确: 只有 attach 调用者自身在域内)"
 else
     fail "status_self 输出异常: $OUT"
@@ -382,7 +382,7 @@ fi
 
 echo "=== A7: attach_self 在 ctl.sock (Admin) 被拒 ==="
 OUT=$("$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$CTL_SOCK" attach_self \
-    '{"policy_group":"censorguard-dsh-default"}' 2>&1)
+    '{"policy_group":"censorguard-dsh-default"}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not allowed on the Admin socket'; then
     pass "Admin 角色拒绝 attach_self"
 else
@@ -391,7 +391,7 @@ fi
 
 echo "=== A8: 白名单外组 (__base__) attach_self 被拒 ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" attach_self \
-    '{"policy_group":"__base__","seed":false}' 2>&1)
+    '{"policy_group":"__base__","seed":false}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not in the DSH self-serve whitelist'; then
     pass "__base__ 被白名单拒"
 else

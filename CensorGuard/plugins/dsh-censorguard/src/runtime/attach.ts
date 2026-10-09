@@ -19,7 +19,7 @@ import { ProtectionStateMachine } from './state.js';
 // AttachSelf 调用参数
 export interface AttachOptions {
   dshSockPath?: string; // 默认 /run/censorguard/dsh.sock
-  policyGroup: string; // 必须在 daemon --dsh-self-groups 白名单内 (默认 censorguard-dsh-default)
+  policyGroup: string; // 必须在 daemon.dsh_self_groups 白名单内 (默认 censorguard-dsh-default)
   instanceHint?: string; // 可选, 多实例 DSH 区分用 (域名后缀)
   seed?: boolean; // 是否递归回填子孙进程 (默认 true)
   // 心跳参数: 周期校验 daemon boot ID, 变化触发重 attach
@@ -103,7 +103,7 @@ export class AttachSelfClient {
     return {
       domainId: d.id,
       domain: d.name,
-      group: d.group,
+      group: this.opts.policyGroup,
       version: d.version,
       daemonBootId: body.daemonBootId ?? '',
       hooksHealthy: body.hooksHealthy ?? false,
@@ -217,6 +217,7 @@ interface UnwrappedBody {
     id: number;
     slot: number;
     group: string;
+    policies?: string[];
     roots: number;
     version: number;
     draining?: boolean;

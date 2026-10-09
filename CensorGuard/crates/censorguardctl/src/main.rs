@@ -22,18 +22,14 @@ const SPAWN_HELPER_ENV: &str = "_CENSORGUARD_SPAWN_HELPER";
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
     Request(Request),
+    Doctor(config::DaemonConfig),
     Audit {
         socket: PathBuf,
         kind: Option<u32>,
         pid: Option<u32>,
     },
-    Attach {
-        request: Request,
-        policy: Option<String>,
-    },
     Spawn {
         domain: Option<String>,
-        policy: Option<String>,
         keep: bool,
         command: Vec<String>,
     },
@@ -45,45 +41,109 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
         println!(
-            "usage: censorguardctl [--config PATH] <status|tree|policy-dump|reload|set|policy|attach|untrack|bind|spawn|audit> ..."
+            "usage: censorguardctl [--config PATH] <status|doctor|policy|attach|unattach|bind|remove|spawn|audit> ..."
         );
         return Ok(());
     }
     let (socket, action) = parse_args(env::args().skip(1))?;
     match action {
         Action::Audit { socket, kind, pid } => return audit(&socket, kind, pid),
+        Action::Doctor(config) => return doctor(&config),
         Action::Request(request) => {
             let response = call(&socket, &request)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
             ensure_success(response)?;
         }
-        Action::Attach {
-            request: attach_request,
-            policy,
-        } => {
-            if let Some(group) = policy {
-                let response = call(
-                    &socket,
-                    &Request {
-                        domain: attach_request.domain.clone(),
-                        group: Some(group),
-                        ..request(Operation::Bind)
-                    },
-                )?;
-                ensure_success(response)?;
-            }
-            let response = call(&socket, &attach_request)?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
-            ensure_success(response)?;
-        }
         Action::Spawn {
             domain,
-            policy,
             keep,
             command,
-        } => std::process::exit(spawn(&socket, domain, policy, keep, &command)?),
+        } => std::process::exit(spawn(&socket, domain, keep, &command)?),
     }
     Ok(())
+}
+
+fn doctor(config: &config::DaemonConfig) -> Result<(), Box<dyn Error>> {
+    use std::net::{SocketAddr, TcpStream};
+    let mut checks = Vec::new();
+    let mut check = |name: &str, ok: bool, detail: String| {
+        checks.push(serde_json::json!({"component": name, "ok": ok, "detail": detail}));
+    };
+    check("config", true, "configuration decoded".into());
+    check(
+        "bpf_object",
+        config.bpf_object.is_file(),
+        config.bpf_object.display().to_string(),
+    );
+    let btf = Path::new("/sys/kernel/btf/vmlinux").is_file();
+    check("kernel_btf", btf, "/sys/kernel/btf/vmlinux".into());
+    let lsm = std::fs::read_to_string("/sys/kernel/security/lsm").unwrap_or_default();
+    check(
+        "bpf_lsm",
+        lsm.trim().split(',').any(|name| name == "bpf"),
+        lsm.trim().into(),
+    );
+    match call(&config.control_socket, &request(Operation::Status)) {
+        Ok(response) => {
+            check(
+                "daemon",
+                response.ok,
+                response
+                    .error
+                    .unwrap_or_else(|| response.daemon_boot_id.clone()),
+            );
+            check(
+                "hooks",
+                response.hooks_healthy == Some(true),
+                format!("healthy={:?}", response.hooks_healthy),
+            );
+        }
+        Err(error) => check("daemon", false, error.to_string()),
+    }
+    for (name, path) in [
+        ("events", &config.event_socket),
+        ("launch", &config.launch_socket),
+        ("dsh", &config.dsh_socket),
+        ("ui", &config.ui_socket),
+    ] {
+        match UnixStream::connect(path) {
+            Ok(_) => check(name, true, path.display().to_string()),
+            Err(error) => check(name, false, error.to_string()),
+        }
+    }
+    check(
+        "state",
+        config.state_dir.join("current").is_file(),
+        config.state_dir.display().to_string(),
+    );
+    if config.spawn_grpc {
+        let address: Result<SocketAddr, _> = config
+            .grpc_listen
+            .as_deref()
+            .unwrap_or("127.0.0.1:50051")
+            .parse();
+        let available = address.is_ok_and(|address| {
+            TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()
+        });
+        check(
+            "grpc",
+            available,
+            config
+                .grpc_listen
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1:50051".into()),
+        );
+    }
+    let healthy = checks.iter().all(|check| check["ok"] == true);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"ok":healthy, "checks":checks}))?
+    );
+    if healthy {
+        Ok(())
+    } else {
+        Err(io::Error::other("doctor found unhealthy components").into())
+    }
 }
 
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Action), io::Error> {
@@ -108,9 +168,8 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
     let socket = daemon.control_socket.clone();
     let Some(command) = values.first().map(String::as_str) else {
         return Err(invalid_input(
-            "usage: censorguardctl [--config PATH] <status|tree|policy-dump|reload|set|policy|attach|untrack|bind|spawn|audit> ...\n\
-             set [--enable-file on|off] [--enable-exec on|off] [--enable-net on|off]\n\
-             [--audit-file on|off] [--audit-exec on|off] [--audit-net on|off]",
+            "usage: censorguardctl [--config PATH] <status|doctor|policy|attach|unattach|bind|remove|spawn|audit> ...\n\
+             bind --domain NAME --policy GROUP; remove --domain NAME --policy GROUP",
         ));
     };
     let action = match command {
@@ -129,34 +188,28 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
                 pid,
             }
         }
-        "tree" if values.len() == 1 => Action::Request(request(Operation::Tree)),
-        "policy-dump" if values.len() == 1 => Action::Request(request(Operation::PolicyDump)),
-        "set" => Action::Request(parse_set(&values[1..])?),
+        "doctor" if values.len() == 1 => Action::Doctor(daemon),
         "policy" => parse_policy(&values[1..])?,
-        "reload" => Action::Request(parse_reload(&values[1..])?),
         "attach" => {
             let options = &values[1..];
-            validate_options(options, &["--pid", "--domain", "--policy"], &["--seed"])?;
+            validate_options(options, &["--pid", "--domain"], &[])?;
             let pid = required_u32_option(options, "--pid")?;
             let domain = string_option(options, "--domain")?;
-            Action::Attach {
-                request: Request {
-                    pid: Some(pid),
-                    domain,
-                    seed: options.iter().any(|value| value == "--seed"),
-                    ..request(Operation::Track)
-                },
-                policy: string_option(options, "--policy")?,
-            }
+            Action::Request(Request {
+                pid: Some(pid),
+                domain,
+                seed: true,
+                ..request(Operation::Track)
+            })
         }
-        "untrack" => {
+        "unattach" => {
             validate_options(&values[1..], &["--pid"], &[])?;
             Action::Request(Request {
                 pid: Some(required_u32_option(&values[1..], "--pid")?),
-                ..request(Operation::Untrack)
+                ..request(Operation::Unattach)
             })
         }
-        "bind" => {
+        "bind" | "remove" => {
             let options = &values[1..];
             validate_options(options, &["--domain", "--policy"], &[])?;
             let domain = string_option(options, "--domain")?
@@ -167,7 +220,11 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
                     string_option(options, "--policy")?
                         .ok_or_else(|| invalid_input("bind requires --policy GROUP"))?,
                 ),
-                ..request(Operation::Bind)
+                ..request(if command == "bind" {
+                    Operation::Bind
+                } else {
+                    Operation::Remove
+                })
             })
         }
         _ => {
@@ -179,91 +236,20 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
     Ok((socket, action))
 }
 
-fn parse_reload(values: &[String]) -> Result<Request, io::Error> {
-    validate_options(values, &["--file", "--policy"], &["--stdin", "--dry-run"])?;
-    let policy_file = string_option(values, "--file")?;
-    let use_stdin = values.iter().any(|value| value == "--stdin");
-    if policy_file.is_some() && use_stdin {
-        return Err(invalid_input("--file and --stdin are mutually exclusive"));
-    }
-    let policy_yaml = if use_stdin {
-        let mut yaml = String::new();
-        io::Read::read_to_string(&mut io::stdin().lock(), &mut yaml)?;
-        Some(yaml)
-    } else {
-        None
-    };
-    Ok(Request {
-        policy_file,
-        policy_yaml,
-        group: string_option(values, "--policy")?,
-        dry_run: values.iter().any(|value| value == "--dry-run"),
-        ..request(Operation::Reload)
-    })
-}
-
-fn parse_set(values: &[String]) -> Result<Request, io::Error> {
-    validate_options(
-        values,
-        &[
-            "--enable-file",
-            "--enable-exec",
-            "--enable-net",
-            "--audit-file",
-            "--audit-exec",
-            "--audit-net",
-        ],
-        &[],
-    )?;
-    let enable_file = bool_option(values, "--enable-file")?;
-    let enable_exec = bool_option(values, "--enable-exec")?;
-    let enable_net = bool_option(values, "--enable-net")?;
-    let audit_file = bool_option(values, "--audit-file")?;
-    let audit_exec = bool_option(values, "--audit-exec")?;
-    let audit_net = bool_option(values, "--audit-net")?;
-    if [
-        enable_file,
-        enable_exec,
-        enable_net,
-        audit_file,
-        audit_exec,
-        audit_net,
-    ]
-    .iter()
-    .all(Option::is_none)
-    {
-        return Err(invalid_input(
-            "set requires at least one switch, e.g. set --audit-file on",
-        ));
-    }
-    Ok(Request {
-        enable_file,
-        enable_exec,
-        enable_net,
-        audit_file,
-        audit_exec,
-        audit_net,
-        ..request(Operation::SetSwitches)
-    })
-}
-
-fn bool_option(values: &[String], name: &str) -> Result<Option<bool>, io::Error> {
-    string_option(values, name)?
-        .map(|value| match value.as_str() {
-            "on" => Ok(true),
-            "off" => Ok(false),
-            _ => Err(invalid_input(format!(
-                "{name} expects on|off, got {value:?}"
-            ))),
-        })
-        .transpose()
-}
-
 fn parse_policy(values: &[String]) -> Result<Action, io::Error> {
     let Some(subcommand) = values.first().map(String::as_str) else {
-        return Err(invalid_input("usage: censorguardctl policy apply ..."));
+        return Err(invalid_input(
+            "usage: censorguardctl policy apply|remove ...",
+        ));
     };
     match subcommand {
+        "remove" => {
+            validate_options(&values[1..], &["--policy"], &[])?;
+            Ok(Action::Request(Request {
+                group: Some(required_string_option(&values[1..], "--policy")?),
+                ..request(Operation::Remove)
+            }))
+        }
         "apply" => {
             let options = &values[1..];
             validate_options(options, &["--policy", "--file"], &["--stdin", "--dry-run"])?;
@@ -301,14 +287,13 @@ fn parse_spawn(values: &[String]) -> Result<Action, io::Error> {
         .position(|value| value == "--")
         .ok_or_else(|| invalid_input("spawn requires -- before the command"))?;
     let options = &values[..separator];
-    validate_options(options, &["--domain", "--policy"], &["--keep"])?;
+    validate_options(options, &["--domain"], &["--keep"])?;
     let command = values[separator + 1..].to_vec();
     if command.is_empty() {
         return Err(invalid_input("spawn command is empty"));
     }
     Ok(Action::Spawn {
         domain: string_option(options, "--domain")?,
-        policy: string_option(options, "--policy")?,
         keep: options.iter().any(|value| value == "--keep"),
         command,
     })
@@ -317,21 +302,9 @@ fn parse_spawn(values: &[String]) -> Result<Action, io::Error> {
 fn spawn(
     socket: &Path,
     domain: Option<String>,
-    policy: Option<String>,
     keep: bool,
     command: &[String],
 ) -> Result<i32, Box<dyn Error>> {
-    if let Some(group) = policy.as_deref() {
-        let response = call(
-            socket,
-            &Request {
-                domain: domain.clone(),
-                group: Some(group.to_owned()),
-                ..request(Operation::Bind)
-            },
-        )?;
-        ensure_success(response)?;
-    }
     let mut child = Command::new(env::current_exe()?)
         .env(SPAWN_HELPER_ENV, "1")
         .args(command)
@@ -657,7 +630,6 @@ mod tests {
             action,
             Action::Spawn {
                 domain: Some("lab-agent".into()),
-                policy: None,
                 keep: false,
                 command: vec![
                     "/usr/bin/printf".into(),
@@ -694,6 +666,10 @@ mod tests {
             vec!["bind", "worker", "--policy", "g"],
             vec!["bind", "--domain", "worker", "--group", "g"],
             vec!["reload", "--group", "g"],
+            vec!["reload", "--policy", "g", "--stdin"],
+            vec!["attach", "--pid", "12", "--policy", "g"],
+            vec!["attach", "--pid", "12", "--seed"],
+            vec!["spawn", "--policy", "g", "--", "/bin/true"],
             vec!["reload", "--file", "--dry-run"],
             vec!["policy", "apply", "--name", "g", "--stdin"],
             vec!["set", "--audit-file", "on", "--audit-file", "off"],

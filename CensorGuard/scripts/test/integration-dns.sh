@@ -57,7 +57,7 @@ YAML
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 7 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -69,7 +69,7 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    policy-dump >"${runtime_dir}/policy.log"
+    status >"${runtime_dir}/policy.log"
 grep -q '"domain": "localhost"' "${runtime_dir}/policy.log"
 grep -q '"127.0.0.1"' "${runtime_dir}/policy.log"
 if grep -q '"stale": true' "${runtime_dir}/policy.log"; then

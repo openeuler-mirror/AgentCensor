@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub const BASE_GROUP: &str = "__base__";
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuleValue {
     pub mask: u8,
     pub action: u8,
@@ -21,14 +21,27 @@ pub struct RuleValue {
     pub version: u32,
 }
 
-impl RuleValue {
-    fn merge(&mut self, other: Self) {
-        if self.mask == 0 && self.version == 0 && !self.audit {
-            self.action = other.action;
+impl Default for RuleValue {
+    fn default() -> Self {
+        Self {
+            mask: 0,
+            action: ACTION_ALLOW,
+            audit: false,
+            version: 0,
         }
-        self.mask |= other.mask;
+    }
+}
+
+impl RuleValue {
+    pub(crate) fn merge(&mut self, other: Self) {
         if other.action == ACTION_DENY {
+            if self.action == ACTION_ALLOW {
+                self.mask = 0;
+            }
+            self.mask |= other.mask;
             self.action = ACTION_DENY;
+        } else if self.action == ACTION_ALLOW {
+            self.mask |= other.mask;
         }
         self.audit |= other.audit;
         self.version = other.version;
@@ -124,6 +137,97 @@ impl CompiledRules {
 }
 
 impl CompiledPolicy {
+    /// Publish a domain binding independently of process-tree attachment.
+    pub fn bind_domain(
+        &self,
+        domain: &str,
+        group: &str,
+        implicit_domains: &[String],
+    ) -> Result<Self, PolicyError> {
+        let mut root = self.to_root();
+        if !self.has_explicit_domains {
+            for name in implicit_domains {
+                root.domains.push(crate::DomainRef {
+                    name: name.clone(),
+                    group: String::new(),
+                });
+            }
+        }
+        if group == BASE_GROUP || group.is_empty() {
+            return Err(PolicyError::InvalidGroupName(group.to_owned()));
+        }
+        validate_name(group).map_err(|()| PolicyError::InvalidGroupName(group.to_owned()))?;
+        if let Some(binding) = root.domains.iter_mut().find(|item| item.name == domain) {
+            let mut groups: std::collections::BTreeSet<_> = binding
+                .group
+                .split('+')
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect();
+            groups.insert(group.to_owned());
+            binding.group = groups.into_iter().collect::<Vec<_>>().join("+");
+        } else {
+            root.domains.push(crate::DomainRef {
+                name: domain.to_owned(),
+                group: group.to_owned(),
+            });
+        }
+        compile(root)
+    }
+    pub fn remove_binding(&self, domain: &str, group: &str) -> Result<Self, PolicyError> {
+        let mut root = self.to_root();
+        let binding = root
+            .domains
+            .iter_mut()
+            .find(|item| item.name == domain)
+            .ok_or_else(|| PolicyError::InvalidDomainName(domain.to_owned()))?;
+        if !binding.group.split('+').any(|name| name == group) {
+            return Err(PolicyError::MissingGroup {
+                domain: domain.to_owned(),
+                group: group.to_owned(),
+            });
+        }
+        binding.group = binding
+            .group
+            .split('+')
+            .filter(|name| *name != group)
+            .collect::<Vec<_>>()
+            .join("+");
+        compile(root)
+    }
+
+    pub fn remove_group(&self, group: &str) -> Result<Self, PolicyError> {
+        let mut root = self.to_root();
+        if root
+            .domains
+            .iter()
+            .any(|binding| binding.group.split('+').any(|name| name == group))
+        {
+            return Err(PolicyError::InvalidGroupName(format!(
+                "{group} is still bound to a domain"
+            )));
+        }
+        if root.groups.remove(group).is_none() {
+            return Err(PolicyError::InvalidGroupName(group.to_owned()));
+        }
+        compile(root)
+    }
+
+    /// Composite slots are internal, not published group definitions.
+    pub(crate) fn rebuild_combinations(&mut self) {
+        self.groups.retain(|name, _| !name.contains('+'));
+        for binding in self.domains.values() {
+            if binding.contains('+') {
+                let layers: Vec<_> = binding
+                    .split('+')
+                    .filter_map(|name| self.groups.get(name))
+                    .collect();
+                self.groups
+                    .insert(binding.clone(), crate::overlay::compose(&layers));
+            }
+        }
+    }
+
     #[must_use]
     pub fn to_root(&self) -> PolicyRoot {
         PolicyRoot {
@@ -150,7 +254,7 @@ impl CompiledPolicy {
         }
         if name == BASE_GROUP {
             return Err(PolicyError::InvalidGroupName(format!(
-                "{BASE_GROUP} must be changed through a full reload"
+                "{BASE_GROUP} is immutable until daemon restart"
             )));
         }
         let group: GroupPolicy = serde_yaml::from_slice(bytes)?;
@@ -178,7 +282,13 @@ pub fn load(path: impl AsRef<Path>) -> Result<CompiledPolicy, PolicyError> {
         path: path.to_path_buf(),
         source,
     })?;
-    compile_yaml(&bytes)
+    // Public startup input has exactly two top-level fields. Groups/bindings live in state.
+    let document: censorguard_common::config::ConfigDocument = serde_yaml::from_slice(&bytes)?;
+    compile(PolicyRoot {
+        rules: document.rules,
+        daemon: document.daemon,
+        ..PolicyRoot::default()
+    })
 }
 
 pub fn compile_yaml(bytes: &[u8]) -> Result<CompiledPolicy, PolicyError> {
@@ -189,6 +299,9 @@ pub fn compile_yaml(bytes: &[u8]) -> Result<CompiledPolicy, PolicyError> {
 pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
     let daemon = root.daemon.clone();
     for name in root.groups.keys() {
+        if name == BASE_GROUP {
+            return Err(PolicyError::InvalidGroupName(name.clone()));
+        }
         validate_name(name).map_err(|()| PolicyError::InvalidGroupName(name.clone()))?;
     }
 
@@ -201,11 +314,13 @@ pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
         if domains.contains_key(&domain.name) {
             return Err(PolicyError::DuplicateDomain(domain.name));
         }
-        if !domain.group.is_empty() && !root.groups.contains_key(&domain.group) {
-            return Err(PolicyError::MissingGroup {
-                domain: domain.name,
-                group: domain.group,
-            });
+        for group in domain.group.split('+').filter(|name| !name.is_empty()) {
+            if !root.groups.contains_key(group) {
+                return Err(PolicyError::MissingGroup {
+                    domain: domain.name.clone(),
+                    group: group.to_owned(),
+                });
+            }
         }
         domains.insert(domain.name, domain.group);
     }
@@ -222,7 +337,7 @@ pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
         group_definitions.insert(name, group);
     }
 
-    Ok(CompiledPolicy {
+    let mut policy = CompiledPolicy {
         baseline: Some(baseline),
         groups: compiled_groups,
         domains,
@@ -231,7 +346,9 @@ pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
         baseline_definition: Some(baseline_group),
         group_definitions,
         daemon,
-    })
+    };
+    policy.rebuild_combinations();
+    Ok(policy)
 }
 
 fn compile_group(
@@ -244,6 +361,11 @@ fn compile_group(
     }
     rules.network_domains.sort();
     rules.network_domains.dedup();
+    // DNS refresh rebuilds the effective maps from these immutable static rules.
+    rules.network_static = rules.network.clone();
+    rules.network_ports_static = rules.network_ports.clone();
+    rules.network6_static = rules.network6.clone();
+    rules.network6_ports_static = rules.network6_ports.clone();
     Ok(rules)
 }
 
@@ -450,9 +572,10 @@ fn compile_unified_rule(
             add_file_rule(fields[2], mask, action, audit, rules, warnings)
         }
         "exec" => {
-            add_argument_rule(&fields[2..].join(" "), action, audit, rules, warnings)?;
             if fields.len() == 3 {
                 add_command_rule(fields[2], action, audit, rules, warnings)?;
+            } else {
+                add_argument_rule(&fields[2..].join(" "), action, audit, rules, warnings)?;
             }
             Ok(())
         }
@@ -680,8 +803,86 @@ mod tests {
         assert_eq!(policy.to_root().rules.len(), 2);
         Ok(())
     }
+
+    #[test]
+    fn publishing_and_binding_groups_preserves_baseline_and_existing_domains()
+    -> Result<(), PolicyError> {
+        let initial = compile_yaml(b"rules:\n  - exec deny /bin/false\n")?;
+        let grouped = initial.replace_group_yaml("worker", b"rules:\n  - exec deny /bin/true\n")?;
+        assert_eq!(grouped.baseline, initial.baseline);
+        let bound = grouped.bind_domain("agent", "worker", &["existing".into()])?;
+        assert_eq!(
+            bound.domains.get("agent").map(String::as_str),
+            Some("worker")
+        );
+        assert_eq!(bound.domains.get("existing").map(String::as_str), Some(""));
+        assert_eq!(bound.baseline, initial.baseline);
+        let baseline_only = bound.remove_binding("agent", "worker")?;
+        assert_eq!(
+            baseline_only.domains.get("agent").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(baseline_only.groups, bound.groups);
+        assert!(bound.remove_group("worker").is_err());
+        assert!(baseline_only.remove_group("worker")?.groups.is_empty());
+        assert!(bound.bind_domain("agent", BASE_GROUP, &[]).is_err());
+        assert!(bound.remove_binding("agent", "missing").is_err());
+        assert!(bound.bind_domain("other", "missing", &[]).is_err());
+        assert!(bound.bind_domain("bad/name", "worker", &[]).is_err());
+        assert!(bound.replace_group_yaml(BASE_GROUP, b"rules: []").is_err());
+        assert!(compile_yaml(b"groups:\n  __base__:\n    rules: []\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn domain_bindings_are_additive_and_group_updates_rebuild_combinations()
+    -> Result<(), PolicyError> {
+        let initial = compile_yaml(b"rules: []")?
+            .replace_group_yaml("a", b"rules:\n  - exec deny /bin/false\n")?
+            .replace_group_yaml("b", b"rules:\n  - exec deny /bin/true\n")?;
+        let bound = initial
+            .bind_domain("agent", "b", &[])?
+            .bind_domain("agent", "a", &[])?;
+        assert_eq!(bound.domains["agent"], "a+b");
+        assert_eq!(bound.groups["a+b"].commands.len(), 2);
+        assert_eq!(bound.bind_domain("agent", "a", &[])?.domains, bound.domains);
+        assert_eq!(bound.to_root().groups.len(), 2);
+        let updated = bound.replace_group_yaml("a", b"rules: []")?;
+        assert_eq!(updated.groups["a+b"].commands.len(), 1);
+        let unbound = updated.remove_binding("agent", "b")?;
+        assert_eq!(unbound.domains["agent"], "a");
+        assert!(!unbound.groups.contains_key("a+b"));
+        assert!(unbound.remove_group("b").is_ok());
+        Ok(())
+    }
     use std::fs::File;
     use tempfile::tempdir;
+
+    #[test]
+    fn merging_file_layers_does_not_expand_deny_masks_from_allow_rules() -> Result<(), PolicyError>
+    {
+        for (a, b) in [("allow", "deny"), ("deny", "allow")] {
+            let rule = |action: &str| {
+                format!(
+                    "rules:\n  - file {action} /tmp/overlay-mask {}\n",
+                    if action == "deny" { "[write]" } else { "none" }
+                )
+            };
+            let policy = compile_yaml(b"rules: []")?
+                .replace_group_yaml("a", rule(a).as_bytes())?
+                .replace_group_yaml("b", rule(b).as_bytes())?
+                .bind_domain("agent", "a", &[])?
+                .bind_domain("agent", "b", &[])?;
+            let values = &policy.groups["a+b"].file_strings;
+            assert_eq!(values.len(), 1);
+            assert!(
+                values
+                    .values()
+                    .all(|value| value.action == ACTION_DENY && value.mask == DENY_WRITE)
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn compiles_file_and_directory_to_inode_keys() -> Result<(), Box<dyn std::error::Error>> {
@@ -734,6 +935,17 @@ mod tests {
             result,
             Err(PolicyError::ArgTokenCount { maximum: 4, .. })
         ));
+    }
+
+    #[test]
+    fn whole_command_rules_do_not_require_argument_capture()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let command = format!("/tmp/{}", "x".repeat(80));
+        let policy = compile_yaml(format!("rules:\n  - exec deny {command}\n").as_bytes())?;
+        let rules = policy.baseline.as_ref().ok_or("missing baseline")?;
+        assert_eq!(rules.commands.len(), 1);
+        assert!(rules.arguments.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -794,7 +1006,7 @@ mod tests {
         let rules = &compiled.groups["lab"];
         assert_eq!(rules.command_inodes.len(), 1);
         assert_eq!(rules.commands.len(), 1);
-        assert_eq!(rules.arguments.len(), 4);
+        assert_eq!(rules.arguments.len(), 2);
         let arguments: Vec<_> = rules.arguments.iter().collect();
         assert!(
             arguments

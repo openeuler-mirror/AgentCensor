@@ -59,8 +59,9 @@ domains:
     group: lab-policy
 YAML
 
+TEST_AUDIT_EXEC=true
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 9 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -72,8 +73,6 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW auditing is a runtime switch now: enable global exec allow auditing.
-"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    set --audit-exec on >"${runtime_dir}/set-audit.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
@@ -90,7 +89,7 @@ fi
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --policy lab-policy --stdin >"${runtime_dir}/reload.log"
+    policy apply --policy lab-policy --stdin >"${runtime_dir}/reload.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1

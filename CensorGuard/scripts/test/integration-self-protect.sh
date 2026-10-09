@@ -51,7 +51,7 @@ YAML
 cc -O2 -Wall -Wextra -Werror "${repo_dir}/tools/security_probe.c" \
     -o "${runtime_dir}/security-probe"
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!

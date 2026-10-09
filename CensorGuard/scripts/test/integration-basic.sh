@@ -198,7 +198,7 @@ on_err() {
     done
 }
 trap 'on_err "${LINENO}"' ERR
-#   T7  运行时开关: set --audit-exec on 后 ALLOW 事件可见 (替代旧 allow_sample_rate)
+#   T7  daemon 启动配置开启 ALLOW 审计
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -212,7 +212,7 @@ on_err() {
     done
 }
 trap 'on_err "${LINENO}"' ERR
-#   T8  运行时开关: set --enable-exec off 后 exec 维 fail-open
+#   T8  拒绝已删除的 ctl set，保持约束
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -226,7 +226,7 @@ on_err() {
     done
 }
 trap 'on_err "${LINENO}"' ERR
-#   T9  整份热更新: reload --file 后新规则生效
+#   T9  发布并叠加新组后规则生效
 
 # Failure checkpoint: report script/line and dump the daemon log tail.
 on_err() {
@@ -412,6 +412,7 @@ domains:
   - name: plain
 YAML
 
+TEST_AUDIT_EXEC=true
 write_test_config "$TDIR/config.yaml" "$POL" "$(pwd)/bpf/enforce.bpf.o" "$TDIR"
 CONFIG=$TDIR/config.yaml
 
@@ -420,7 +421,7 @@ EV_SOCK=$TDIR/events.sock
 DAEMON_LOG=$TDIR/daemon.log
 AUDIT_LOG=$TDIR/audit.log
 
-"$DAEMON" \
+"$DAEMON" launch \
     --config "$CONFIG" \
     --duration 120 >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
@@ -438,7 +439,7 @@ grep -q '^KIND' "$AUDIT_LOG" || { echo "audit 未连上事件面, 日志:"; cat 
 
 cleanup() {
     kill "$AUDIT_PID" "$DAEMON_PID" 2>/dev/null
-    jobs -p | xargs -r kill 2>/dev/null
+    jobs -p | xargs -r kill 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -485,46 +486,29 @@ rc=$(run_in_domain web bash -c 'bash -c "cat \"$0\""' "$VICTIM")
 wait_audit 'EXEC.*DENY.*web' && pass "T4 audit 日志有 EXEC DENY 事件" || fail "T4 audit 无 EXEC DENY"
 
 echo
-echo "== T7/T8: 运行时开关 (ctl set) =="
-"$CTL" --config "$TDIR/config.yaml" set --audit-exec on >/dev/null 2>&1 \
-    || fail "T7 set --audit-exec on 调用失败"
+echo "== T7/T8: 启动配置审计与禁止热写开关 =="
 "$CTL" --config "$TDIR/config.yaml" status 2>/dev/null | grep -q '"audit_exec": true' \
-    && pass "T7 status 显示 audit_exec=true" || fail "T7 status 未见 audit_exec=true"
+    && pass "T7 status 显示配置 audit_exec=true" || fail "T7 开关未从 daemon 配置读取"
 rc=$(run_in_domain plain "$IDBIN" -u)
 [ "$rc" = "0" ] && wait_audit 'ALLOW.*plain' \
-    && pass "T7 audit 打开后 ALLOW 事件可见" || fail "T7 ALLOW 事件未出现"
-"$CTL" --config "$TDIR/config.yaml" set --audit-exec off >/dev/null 2>&1
-
+    && pass "T7 启动配置开启 ALLOW 审计" || fail "T7 ALLOW 事件未出现"
 "$CTL" --config "$TDIR/config.yaml" set --enable-exec off >/dev/null 2>&1 \
-    || fail "T8 set --enable-exec off 调用失败"
-rc=$(run_in_domain web "$IDBIN" -u)
-[ "$rc" = "0" ] && pass "T8 enable-exec=off 后 exec 维 fail-open" || fail "T8 关闭后仍被拦"
-"$CTL" --config "$TDIR/config.yaml" set --enable-exec on >/dev/null 2>&1
+    && fail "T8 已删除的 set 被接受" || pass "T8 不允许 ctl 热写开关"
 rc=$(run_in_domain web "$IDBIN")
-[ "$rc" != "0" ] && pass "T8 enable-exec=on 恢复后拦截恢复" || fail "T8 恢复后未拦截"
+[ "$rc" != "0" ] && pass "T8 被拒的 set 不改变约束" || fail "T8 拒绝 set 后策略失效"
 
 echo
-echo "== T9: 整份热更新 (reload --file) =="
-cat > "$TDIR/policy-v2.yaml" <<YAML
-rules:
-  - file deny+audit ${VICTIM}
-  - file deny+audit ${VICTIM2}
-groups:
-  ops:
-    rules:
-      - exec deny ${IDBIN}
-domains:
-  - name: web
-    group: ops
-  - name: plain
-YAML
+echo "== T9: 新组规则叠加 =="
+printf 'rules:\n  - file deny+audit %s\n' "$VICTIM2" > "$TDIR/new-group.yaml"
 rc_before=$(run_in_domain plain cat "$VICTIM2")
-"$CTL" --config "$TDIR/config.yaml" reload --file "$TDIR/policy-v2.yaml" >/dev/null 2>&1 \
-    || fail "T9 reload 调用失败"
+"$CTL" --config "$TDIR/config.yaml" policy apply --policy files2 --file "$TDIR/new-group.yaml" >/dev/null 2>&1 \
+    || fail "T9 apply 调用失败"
+"$CTL" --config "$TDIR/config.yaml" bind --domain plain --policy files2 >/dev/null 2>&1 \
+    || fail "T9 bind 调用失败"
 rc_after=$(run_in_domain plain cat "$VICTIM2")
 [ "$rc_before" = "0" ] && [ "$rc_after" != "0" ] \
-    && pass "T9 reload 后新基线规则生效" \
-    || fail "T9 热更新未生效 (before=$rc_before after=$rc_after)"
+    && pass "T9 新组叠加后规则生效" \
+    || fail "T9 更新未生效 (before=$rc_before after=$rc_after)"
 
 echo
 echo "== T10: 组级热更新 (policy apply + bind 换绑) =="
@@ -536,13 +520,14 @@ printf 'rules:\n  - exec deny %s\n' "$WHOAMIBIN" | \
 rc=$(run_in_domain web "$WHOAMIBIN")
 [ "$rc" != "0" ] && pass "T10 换绑后 ops2 规则生效 (whoami 被拦)" || fail "T10 whoami 未被拦"
 rc=$(run_in_domain web "$IDBIN" -u)
-[ "$rc" = "0" ] && pass "T10 整组替换: 旧组 ops 的 id 规则已失效" || fail "T10 整组替换语义不成立"
+[ "$rc" != "0" ] && pass "T10 追加组保留旧组 ops 的 id 拒绝" || fail "T10 追加绑定丢失旧组"
+"$CTL" --config "$TDIR/config.yaml" remove --domain web --policy ops2 >/dev/null 2>&1
 "$CTL" --config "$TDIR/config.yaml" bind --domain web --policy ops >/dev/null 2>&1
 
 echo
 echo "== T11: 旧格式 YAML 被拒且旧策略保留 =="
-printf 'enable_file: true\n' | "$CTL" --config "$TDIR/config.yaml" reload --stdin >/dev/null 2>&1 \
-    && fail "T11 旧格式竟被接受" || pass "T11 旧格式 (enable_file) 被 reload 拒绝"
+printf 'enable_file: true\n' | "$CTL" --config "$TDIR/config.yaml" policy apply --policy invalid --stdin >/dev/null 2>&1 \
+    && fail "T11 旧格式竟被接受" || pass "T11 旧格式 (enable_file) 被 policy apply 拒绝"
 rc=$(run_in_domain web cat "$VICTIM")
 [ "$rc" != "0" ] && pass "T11 失败后旧策略保留" || fail "T11 失败后策略失效"
 

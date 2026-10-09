@@ -63,8 +63,9 @@ YAML
 : >"${runtime_dir}/drain.log"
 : >"${runtime_dir}/slow.log"
 
+TEST_AUDIT_FILE=true
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 45 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -77,8 +78,6 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW auditing is a runtime switch now: enable global file allow auditing
 # (the daemon internally runs it at full rate).
-"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    set --audit-file on >"${runtime_dir}/set-audit.log"
 
 "${runtime_dir}/event-stress-probe" drain "${runtime_dir}/events.sock" \
     >"${runtime_dir}/drain.log" 2>&1 &

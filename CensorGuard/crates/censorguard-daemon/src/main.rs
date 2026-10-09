@@ -14,6 +14,9 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::io::BufReader;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -24,8 +27,8 @@ use std::time::Duration;
 
 #[derive(Debug)]
 struct Args {
-    policy_free: bool,
     config: PathBuf,
+    reload: bool,
     bpf_object: PathBuf,
     control_socket: PathBuf,
     event_socket: PathBuf,
@@ -33,12 +36,9 @@ struct Args {
     dsh_socket: PathBuf,
     ui_socket: PathBuf,
     state_dir: PathBuf,
-    state_dir_ephemeral: bool,
     socket_group: Option<String>,
     gateway_user: Option<String>,
     check_config: bool,
-    track_pid: Option<u32>,
-    domain: String,
     duration_seconds: Option<u64>,
     dns_refresh_seconds: u64,
     dsh_self_groups: Vec<String>,
@@ -48,22 +48,36 @@ struct Args {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args(env::args().skip(1))?;
+    if args.reload {
+        load(&args.config)?;
+        let mut stream = UnixStream::connect(&args.control_socket)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        censorguard_common::protocol::write_json_line(
+            &mut stream,
+            &serde_json::json!({
+                "v": censorguard_common::protocol::VERSION, "op": "daemon_reload"
+            }),
+        )?;
+        let reply: censorguard_common::protocol::Response =
+            censorguard_common::protocol::read_json_line(&mut BufReader::new(stream))?;
+        if !reply.ok {
+            return Err(invalid_input(reply.error.unwrap_or_default()).into());
+        }
+        println!("daemon restart requested; wait for READY and reattach agents");
+        return Ok(());
+    }
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGHUP);
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
     pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None)?;
-    let (canonical_policy, initial_revision) =
-        if (!args.policy_free || args.check_config) && args.config.exists() {
-            if args.check_config {
-                (load(&args.config)?, 1)
-            } else {
-                load_startup_policy(&args.config, &args.state_dir)?
-            }
-        } else {
-            // Policy-free daemon startup: ctl applies the canonical rules document later.
-            (compile_yaml(b"rules: []")?, 1)
-        };
+    let (canonical_policy, initial_revision) = if args.check_config {
+        (load(&args.config)?, 1)
+    } else {
+        // Startup must have a real baseline/config input; never silently launch empty.
+        load(&args.config)?;
+        load_startup_policy(&args.config, &args.state_dir)?
+    };
     let (resolved_policy, dns_cache, dns_status) =
         canonical_policy.resolve_dns(&Default::default());
     let policy = Arc::new(resolved_policy);
@@ -79,8 +93,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     // was disabled at startup. The filter_config map keeps disabled hooks fail-open and cheap.
     let manifest = HookManifest::for_policy([true, true, true]);
     let kernel = Arc::new(NativeKernel::load(&args.bpf_object, &manifest)?);
-    let installed =
-        kernel.install_policy_version(&policy, initial_revision, [true; 3], [false; 3])?;
+    let installed = kernel.install_policy_version(
+        &policy,
+        initial_revision,
+        [
+            policy.daemon.enable_file,
+            policy.daemon.enable_exec,
+            policy.daemon.enable_net,
+        ],
+        [
+            policy.daemon.audit_file,
+            policy.daemon.audit_exec,
+            policy.daemon.audit_net,
+        ],
+    )?;
     kernel.protect_pid(std::process::id())?;
     // NativeKernel::load fails unless every required hook attached, so reaching this
     // point means the enforcement surface is fully mounted.
@@ -88,12 +114,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let boot_id = read_boot_id();
     let runtime = Arc::new(Runtime::new(RuntimeInit {
         kernel: Arc::clone(&kernel),
-        config_path: args.config.clone(),
         policy: Arc::clone(&policy),
         installed,
         dns_cache,
         dns_status,
         revision_dir: args.state_dir.clone(),
+        config_path: fs::canonicalize(&args.config)?,
         initial_revision,
         boot_id: boot_id.clone(),
         hooks_healthy,
@@ -133,14 +159,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
-    if let Some(pid) = args.track_pid {
-        let result = runtime.track(pid, &args.domain, true, 0)?;
-        println!(
-            "migration track: pid={pid} domain={} slot={} seeded={}",
-            result.domain.name, result.domain.slot, result.seeded
-        );
-    }
-
     println!(
         "[READY] {} required hooks attached; control={} events={} launch={} dsh={} ui={}",
         manifest.required().len(),
@@ -151,7 +169,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.ui_socket.display()
     );
 
-    wait_for_shutdown(args.duration_seconds, &shutdown_receiver)?;
+    wait_for_shutdown(args.duration_seconds, &shutdown_receiver, &runtime)?;
     grpc_shutdown.store(true, Ordering::SeqCst);
 
     let _ = fs::remove_file(&args.control_socket);
@@ -159,10 +177,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _ = fs::remove_file(&args.launch_socket);
     let _ = fs::remove_file(&args.dsh_socket);
     let _ = fs::remove_file(&args.ui_socket);
-    if args.state_dir_ephemeral {
-        let _ = fs::remove_dir_all(&args.state_dir);
+    if let Some(supervisor) = _grpc {
+        let _ = supervisor.join();
     }
     eprintln!("censorguardd shutdown complete");
+    if runtime.restart_requested() {
+        eprintln!("restarting daemon with {}", args.config.display());
+        let error = Command::new(env::current_exe()?)
+            .arg("launch")
+            .arg("--config")
+            .arg(&args.config)
+            .exec();
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -199,15 +226,11 @@ fn start_signal_handler(
         .spawn(move || {
             loop {
                 match signals.wait() {
-                    Ok(Signal::SIGHUP) => match runtime.reload(None, None, None, false) {
-                        Ok(result) => eprintln!(
-                            "SIGHUP reload complete: generation={} version={} changed={:?}",
-                            result.generation, result.version, result.changed
-                        ),
-                        Err(error) => {
-                            eprintln!("SIGHUP reload failed; old bank remains active: {error}")
+                    Ok(Signal::SIGHUP) => {
+                        if let Err(error) = runtime.request_restart() {
+                            eprintln!("restart failed: {error}");
                         }
-                    },
+                    }
                     Ok(Signal::SIGINT | Signal::SIGTERM) => {
                         eprintln!("shutdown requested by signal");
                         let _ = shutdown.send(());
@@ -328,42 +351,53 @@ fn start_reconciler(runtime: Arc<Runtime>) -> Result<thread::JoinHandle<()>, io:
 fn wait_for_shutdown(
     duration_seconds: Option<u64>,
     receiver: &Receiver<()>,
+    runtime: &Runtime,
 ) -> Result<(), io::Error> {
-    match duration_seconds {
-        Some(seconds) => match receiver.recv_timeout(Duration::from_secs(seconds)) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => Ok(()),
+    let deadline =
+        duration_seconds.map(|seconds| std::time::Instant::now() + Duration::from_secs(seconds));
+    loop {
+        if runtime.restart_requested()
+            || deadline.is_some_and(|time| std::time::Instant::now() >= time)
+        {
+            return Ok(());
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                Err(io::Error::other("signal handler stopped unexpectedly"))
+                return Err(io::Error::other("signal handler stopped unexpectedly"));
             }
-        },
-        None => receiver
-            .recv()
-            .map_err(|_| io::Error::other("signal handler stopped unexpectedly")),
+        }
     }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
-    // The daemon is a background service; `launch` is an explicit, policy-free
-    // entrypoint. Policy loading/application is performed by censorguardctl.
     let mut values: Vec<String> = args.collect();
-    let policy_free = if values.first().is_some_and(|value| value == "launch") {
+    let reload = values.first().is_some_and(|value| value == "reload");
+    if values
+        .first()
+        .is_some_and(|value| matches!(value.as_str(), "launch" | "reload"))
+    {
         values.remove(0);
-        true
-    } else {
-        false
-    };
-    parse_args_with_values(values.into_iter(), policy_free)
+    } else if !values
+        .first()
+        .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
+    {
+        return Err(invalid_input(
+            "expected launch or reload; usage: censorguardd launch|reload [--config PATH]",
+        ));
+    }
+    let parsed = parse_args_with_values(values.into_iter())?;
+    if reload && (parsed.check_config || parsed.duration_seconds.is_some()) {
+        return Err(invalid_input("reload accepts only --config PATH"));
+    }
+    Ok(Args { reload, ..parsed })
 }
 
-fn parse_args_with_values(
-    mut args: impl Iterator<Item = String>,
-    policy_free: bool,
-) -> Result<Args, io::Error> {
+fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
     let mut config = None;
 
     let mut check_config = false;
-    let mut track_pid = None;
-    let mut domain = String::from("default");
     let mut duration_seconds = None;
     let mut seen = std::collections::HashSet::new();
     while let Some(argument) = args.next() {
@@ -373,15 +407,14 @@ fn parse_args_with_values(
         match argument.as_str() {
             "--config" => config = Some(next_value(&mut args, "--config")?.into()),
             "--check-config" => check_config = true,
-            "--track-pid" => track_pid = Some(parse_u32(next_value(&mut args, "--track-pid")?)?),
-            "--domain" => domain = next_value(&mut args, "--domain")?,
             "--duration" => {
                 duration_seconds = Some(parse_u64(next_value(&mut args, "--duration")?)?)
             }
             "-h" | "--help" => {
                 println!(
                     "usage: censorguardd launch [--config PATH] [--check-config]\n\
-                     [--track-pid PID --domain NAME] [--duration SECONDS]\n\
+                     [--duration SECONDS]\n\
+                     censorguardd reload [--config PATH]\n\
                      all daemon paths and runtime settings are read from the config file"
                 );
                 std::process::exit(0);
@@ -409,10 +442,9 @@ fn parse_args_with_values(
     let dns_refresh_seconds = daemon.dns_refresh_seconds;
     let spawn_grpc = daemon.spawn_grpc;
     let grpc_bin = daemon.grpc_bin;
-    let state_dir_ephemeral = false;
     Ok(Args {
-        policy_free,
         config,
+        reload: false,
         bpf_object,
         control_socket,
         event_socket,
@@ -420,12 +452,9 @@ fn parse_args_with_values(
         dsh_socket,
         ui_socket,
         state_dir,
-        state_dir_ephemeral,
         socket_group,
         gateway_user,
         check_config,
-        track_pid,
-        domain,
         duration_seconds,
         dns_refresh_seconds,
         dsh_self_groups,
@@ -473,12 +502,6 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn parse_u32(value: String) -> Result<u32, io::Error> {
-    value
-        .parse()
-        .map_err(|_| invalid_input(format!("expected u32, got {value:?}")))
-}
-
 fn parse_u64(value: String) -> Result<u64, io::Error> {
     value
         .parse()
@@ -509,12 +532,31 @@ fn load_startup_policy(
     }
     let snapshot = state_dir.join("revisions").join(format!("{revision}.yaml"));
     let bytes = fs::read(&snapshot)?;
-    Ok((compile_yaml(&bytes)?, revision))
+    let persisted = compile_yaml(&bytes)?;
+    let base = load(config)?;
+    let mut root = persisted.to_root();
+    let changed = root.rules != base.to_root().rules || root.daemon != base.daemon;
+    root.rules = base.to_root().rules;
+    root.daemon = base.daemon;
+    let revision = if changed {
+        revision
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("revision exhausted"))?
+    } else {
+        revision
+    };
+    Ok((censorguard_policy::compile(root)?, revision))
 }
 
 fn print_summary(policy: &CompiledPolicy) {
     println!(
-        "switches: enable file=true exec=true net=true; audit file=false exec=false net=false"
+        "switches: enable file={} exec={} net={}; audit file={} exec={} net={}",
+        policy.daemon.enable_file,
+        policy.daemon.enable_exec,
+        policy.daemon.enable_net,
+        policy.daemon.audit_file,
+        policy.daemon.audit_exec,
+        policy.daemon.audit_net,
     );
     println!(
         "policy: baseline={} groups={} domains={}",
@@ -534,13 +576,70 @@ fn print_summary(policy: &CompiledPolicy) {
     }
 }
 
+/// Validate the new startup input before dropping the running enforcement plane.
+fn validate_restart_config(path: &Path) -> Result<(), io::Error> {
+    config::load(path).map_err(|error| invalid_input(error.to_string()))?;
+    let policy = load(path).map_err(|error| invalid_input(error.to_string()))?;
+    let daemon = &policy.daemon;
+    resolve_socket_group(daemon.socket_group.as_deref())?;
+    resolve_gateway_user(daemon.gateway_user.as_deref())?;
+    fs::File::open(&daemon.bpf_object)?;
+    if daemon.spawn_grpc {
+        let grpc = daemon.grpc_bin.clone().unwrap_or_else(|| {
+            env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("censorguard-grpc")
+        });
+        fs::File::open(grpc)?;
+    }
+    load_startup_policy(path, &daemon.state_dir)
+        .map_err(|error| invalid_input(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn startup_uses_current_base_settings_and_restores_dynamic_memberships()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        let state = directory.path().join("state");
+        fs::create_dir_all(state.join("revisions"))?;
+        fs::write(&config, "rules:\n  - exec deny /bin/false\n")?;
+        let saved = load(&config)?
+            .replace_group_yaml("a", b"rules:\n  - exec deny /bin/true\n")?
+            .replace_group_yaml("b", b"rules: []")?
+            .bind_domain("agent", "a", &[])?
+            .bind_domain("agent", "b", &[])?;
+        fs::write(state.join("current"), "7\n")?;
+        fs::write(
+            state.join("revisions/7.yaml"),
+            serde_yaml::to_string(&saved.to_root())?,
+        )?;
+        assert_eq!(load_startup_policy(&config, &state)?.1, 7);
+        fs::write(
+            &config,
+            "daemon:\n  audit_exec: true\n  enable_net: false\nrules:\n  - exec deny /bin/echo\n",
+        )?;
+        let (restored, revision) = load_startup_policy(&config, &state)?;
+        assert_eq!(revision, 8);
+        assert_eq!(restored.to_root().rules, vec!["exec deny /bin/echo"]);
+        assert_eq!(restored.domains["agent"], "a+b");
+        assert_eq!(restored.group_definitions, saved.group_definitions);
+        assert!(restored.daemon.audit_exec);
+        assert!(!restored.daemon.enable_net);
+        assert!(restored.groups.contains_key("a+b"));
+        // A stale snapshot never overrides a newer public baseline.
+        assert_eq!(fs::read_to_string(state.join("current"))?, "7\n");
+        Ok(())
+    }
+
+    #[test]
     fn dns_refresh_defaults_to_sixty_seconds() -> Result<(), io::Error> {
-        let args = parse_args(std::iter::empty())?;
+        let args = parse_args(["launch".to_owned()].into_iter())?;
         assert_eq!(args.dns_refresh_seconds, 60);
         Ok(())
     }
@@ -557,7 +656,7 @@ mod tests {
 
     #[test]
     fn spawn_grpc_defaults_to_off() -> Result<(), io::Error> {
-        let args = parse_args(std::iter::empty())?;
+        let args = parse_args(["launch".to_owned()].into_iter())?;
         assert!(!args.spawn_grpc);
         assert_eq!(args.grpc_bin, None);
         Ok(())
@@ -567,7 +666,7 @@ mod tests {
     fn missing_explicit_config_is_rejected() {
         assert!(
             parse_args(
-                ["--config", "/does-not-exist/censorguard.yaml"]
+                ["launch", "--config", "/does-not-exist/censorguard.yaml"]
                     .into_iter()
                     .map(str::to_owned)
             )
@@ -584,8 +683,10 @@ mod tests {
             "--state-dir",
             "--spawn-grpc",
             "--hold-seconds",
+            "--track-pid",
+            "--domain",
         ] {
-            assert!(parse_args([flag, "value"].into_iter().map(str::to_owned)).is_err());
+            assert!(parse_args(["launch", flag, "value"].into_iter().map(str::to_owned)).is_err());
         }
     }
 }

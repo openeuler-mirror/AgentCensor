@@ -86,6 +86,7 @@ message DomainInfo {
   int32 roots = 5;                    // 追踪根数量
   uint32 version = 6;                 // 当前生效策略版本
   bool draining = 7;                  // 无根但树未排干 (策略仍生效)
+  repeated string policies = 8;       // 附加策略组；空列表表示仅基线
 }
 
 message TrackReq {

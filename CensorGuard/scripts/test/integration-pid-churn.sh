@@ -67,7 +67,7 @@ done
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 18 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!

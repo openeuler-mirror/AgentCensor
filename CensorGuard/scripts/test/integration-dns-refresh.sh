@@ -81,7 +81,7 @@ unshare --mount --propagation private /bin/bash -c '
     exec "$@"
 ' Censorguard-dns-refresh \
     "${runtime_dir}/hosts" "${runtime_dir}/nsswitch.conf" \
-    "${repo_dir}/target/debug/censorguardd" \
+    "${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -131,7 +131,7 @@ wait_dns_state() {
     local prefix=$5
     for _ in $(seq 1 120); do
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-            policy-dump >"${runtime_dir}/${prefix}-policy.log"
+            status >"${runtime_dir}/${prefix}-policy.log"
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
             status >"${runtime_dir}/${prefix}-status.log"
         if grep -q "\"${address}\"" "${runtime_dir}/${prefix}-policy.log" && \

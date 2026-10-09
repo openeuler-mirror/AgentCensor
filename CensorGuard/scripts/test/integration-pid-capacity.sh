@@ -68,7 +68,7 @@ done
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 20 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -165,12 +165,12 @@ assert status["pid_pending_update_failures"] == 0, status
 assert status["version"] == 1 and status["active_bank"] == 0, status
 PY
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    tree >"${runtime_dir}/tree.json"
+    status >"${runtime_dir}/tree.json"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.json"
 
-# Removing the root while its child exists only in pending must keep the domain draining.
+# Unattach must remove the root and pending-backed child immediately.
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
+    unattach --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/draining.json"
 python3 - "${runtime_dir}/draining.json" <<'PY'
@@ -179,9 +179,8 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
-domain = next(item for item in status["domains"] if item["name"] == "capacity-domain")
-assert domain["roots"] == 0 and domain["draining"] is True, status
-assert status["pid_pending"] == 1, status
+assert not any(item["name"] == "capacity-domain" for item in status["domains"]), status
+assert status["pid_pending"] == 0, status
 PY
 
 bpftool batch file "${runtime_dir}/delete.batch" >"${runtime_dir}/delete.log"
@@ -194,8 +193,8 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
 assert status["tracked"] == 0, status
-assert status["pid_pending"] == 1, status
-assert any(item["name"] == "capacity-domain" for item in status["domains"]), status
+assert status["pid_pending"] == 0, status
+assert not any(item["name"] == "capacity-domain" for item in status["domains"]), status
 PY
 
 touch "${runtime_dir}/release"

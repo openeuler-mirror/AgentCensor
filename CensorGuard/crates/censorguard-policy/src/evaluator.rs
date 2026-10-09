@@ -117,7 +117,7 @@ fn evaluate_exec(
     for (name, definition) in policy_definitions(policy, group) {
         for rule in &definition.rules {
             let fields: Vec<_> = rule.split_whitespace().collect();
-            if fields.len() >= 3
+            if fields.len() == 3
                 && fields[0] == "exec"
                 && fields[1].starts_with("deny")
                 && fields[2] == executable
@@ -150,9 +150,7 @@ fn normalized_exec_tokens<'a>(executable: &'a str, argv: &'a [String]) -> Vec<&'
 }
 
 fn exact_argument_key(rule: &[&str], target: &[&str]) -> bool {
-    (0..4).all(|index| {
-        rule.get(index).copied().unwrap_or("") == target.get(index).copied().unwrap_or("")
-    })
+    rule.len() <= target.len() && rule.iter().zip(target).all(|(left, right)| left == right)
 }
 
 fn evaluate_network(
@@ -165,28 +163,41 @@ fn evaluate_network(
     if !enables[2] {
         return allow();
     }
-    let group_rules = (!group.is_empty())
-        .then(|| policy.groups.get(group))
-        .flatten();
     let baseline = policy.baseline.as_ref();
-    if let Ok(address) = host.parse::<IpAddr>() {
-        if let Some((action, rule)) = address_decision(group_rules, baseline, address, port) {
-            return network_decision(action, rule);
-        }
-    } else {
-        let normalized = host.trim_end_matches('.').to_ascii_lowercase();
-        for rules in [group_rules, baseline].into_iter().flatten() {
-            if let Some(rule) = rules.network_domains.iter().find(|rule| {
-                rule.domain == normalized && (rule.port.is_none() || rule.port == port)
-            }) {
-                let suffix = rule
-                    .port
-                    .map_or_else(String::new, |value| format!(":{value}"));
-                return network_decision(rule.action, format!("{}{suffix}", rule.domain));
+    let group_rules = group.split('+').filter_map(|name| policy.groups.get(name));
+    let mut allowed = None;
+    for rules in baseline.into_iter().chain(group_rules) {
+        let decision = if let Ok(address) = host.parse::<IpAddr>() {
+            address_decision(Some(rules), None, address, port)
+        } else {
+            let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+            rules
+                .network_domains
+                .iter()
+                .filter(|rule| {
+                    rule.domain == normalized && (rule.port.is_none() || rule.port == port)
+                })
+                .max_by_key(|rule| (rule.port.is_some(), rule.action == NetworkAction::Deny))
+                .map(|rule| {
+                    (
+                        rule.action,
+                        format!(
+                            "{}{}",
+                            rule.domain,
+                            rule.port
+                                .map_or_else(String::new, |port| format!(":{port}"))
+                        ),
+                    )
+                })
+        };
+        if let Some((action, rule)) = decision {
+            if action == NetworkAction::Deny {
+                return network_decision(action, rule);
             }
+            allowed = Some(network_decision(action, rule));
         }
     }
-    allow()
+    allowed.unwrap_or_else(allow)
 }
 
 fn address_decision(
@@ -304,20 +315,15 @@ fn policy_definitions<'a>(
     policy: &'a CompiledPolicy,
     group: &'a str,
 ) -> impl Iterator<Item = (&'a str, &'a GroupPolicy)> {
-    let selected = (!group.is_empty())
-        .then(|| {
+    group
+        .split('+')
+        .filter_map(|name| policy.group_definitions.get(name).map(|item| (name, item)))
+        .chain(
             policy
-                .group_definitions
-                .get(group)
-                .map(|item| (group, item))
-        })
-        .flatten();
-    selected.into_iter().chain(
-        policy
-            .baseline_definition
-            .as_ref()
-            .map(|item| ("__base__", item)),
-    )
+                .baseline_definition
+                .as_ref()
+                .map(|item| ("__base__", item)),
+        )
 }
 
 fn network_decision(action: NetworkAction, rule: String) -> IntentDecision {
@@ -354,6 +360,167 @@ mod tests {
     use crate::{PolicyError, compile_yaml};
 
     const ENABLES: [bool; 3] = [true, true, true];
+
+    #[test]
+    fn composite_network_maps_preserve_independent_layer_decisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = compile_yaml(b"rules: []")?
+            .replace_group_yaml(
+                "a",
+                br#"rules:
+  - net deny 10.0.0.0/8
+  - net allow 10.1.0.0/16:443
+  - net deny 2001:db8::/32
+  - net allow [2001:db8:1::/48]:443
+  - net deny 192.0.2.1/32
+  - net deny 2001:db9::1/128
+"#,
+            )?
+            .replace_group_yaml(
+                "b",
+                br#"rules:
+  - net allow 10.0.0.0/8:80
+  - net deny 10.1.2.0/24
+  - net allow [2001:db8::/32]:80
+  - net deny 2001:db8:1:2::/64
+  - net deny 198.51.100.0/24:8443
+  - net allow 198.51.100.42/32:8443
+"#,
+            )?
+            .bind_domain("agent", "a", &[])?
+            .bind_domain("agent", "b", &[])?;
+        let composite = &policy.groups["a+b"];
+        for host in [
+            "9.255.255.255",
+            "10.0.0.0",
+            "10.1.0.0",
+            "10.1.1.255",
+            "10.1.2.0",
+            "10.1.2.255",
+            "10.1.3.0",
+            "10.255.255.255",
+            "11.0.0.0",
+            "192.0.2.0",
+            "192.0.2.1",
+            "192.0.2.2",
+            "198.51.100.41",
+            "198.51.100.42",
+            "198.51.100.43",
+            "::",
+            "2001:db8::",
+            "2001:db8:1:1::1",
+            "2001:db8:1:2::",
+            "2001:db8:1:2:ffff:ffff:ffff:ffff",
+            "2001:db8:1:3::",
+            "2001:db9::",
+            "2001:db9::1",
+            "2001:db9::2",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            let address = host.parse()?;
+            for port in [
+                None,
+                Some(0),
+                Some(22),
+                Some(80),
+                Some(443),
+                Some(8443),
+                Some(65535),
+            ] {
+                let expected_deny = ["a", "b"].iter().any(|group| {
+                    address_decision(Some(&policy.groups[*group]), None, address, port)
+                        .is_some_and(|(action, _)| action == NetworkAction::Deny)
+                });
+                let actual_deny = address_decision(Some(composite), None, address, port)
+                    .is_some_and(|(action, _)| action == NetworkAction::Deny);
+                assert_eq!(actual_deny, expected_deny, "{host}:{port:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn baseline_and_group_are_independent_layers() -> Result<(), PolicyError> {
+        let initial = compile_yaml(
+            br#"
+rules:
+  - file deny /tmp/base-secret
+  - exec deny /usr/bin/id
+  - net deny 10.0.0.0/8
+  - net deny 2001:db8::/32
+  - net deny example.com
+"#,
+        )?;
+        let grouped = initial.replace_group_yaml(
+            "worker",
+            br#"
+rules:
+  - file allow /tmp/base-secret
+  - file deny /tmp/group-secret
+  - exec allow /usr/bin/id
+  - exec deny /usr/bin/true
+  - net allow 10.1.0.0/16:443
+  - net allow [2001:db8::/64]:443
+  - net allow example.com:443
+  - net deny 192.0.2.0/24
+"#,
+        )?;
+        let bound = grouped.bind_domain("agent", "worker", &[])?;
+        let intents = [
+            SecurityIntent::File {
+                operation: FileIntentOperation::Read,
+                path: "/tmp/base-secret".into(),
+                destination: None,
+            },
+            SecurityIntent::File {
+                operation: FileIntentOperation::Read,
+                path: "/tmp/group-secret".into(),
+                destination: None,
+            },
+            SecurityIntent::Exec {
+                executable: "/usr/bin/id".into(),
+                argv: vec![],
+            },
+            SecurityIntent::Exec {
+                executable: "/usr/bin/true".into(),
+                argv: vec![],
+            },
+            SecurityIntent::Network {
+                host: "10.1.2.3".into(),
+                port: Some(443),
+                scheme: None,
+                url: None,
+            },
+            SecurityIntent::Network {
+                host: "2001:db8::1".into(),
+                port: Some(443),
+                scheme: None,
+                url: None,
+            },
+            SecurityIntent::Network {
+                host: "example.com".into(),
+                port: Some(443),
+                scheme: None,
+                url: None,
+            },
+            SecurityIntent::Network {
+                host: "192.0.2.1".into(),
+                port: Some(22),
+                scheme: None,
+                url: None,
+            },
+        ];
+        assert!(
+            evaluate_intents(&bound, "worker", ENABLES, &intents)
+                .iter()
+                .all(|decision| !decision.allowed)
+        );
+        let replaced = bound.replace_group_yaml("worker", b"rules: []\n")?;
+        let decisions = evaluate_intents(&replaced, "worker", ENABLES, &intents);
+        assert!(!decisions[0].allowed && !decisions[2].allowed && !decisions[4].allowed);
+        assert!(decisions[1].allowed && decisions[3].allowed && decisions[7].allowed);
+        Ok(())
+    }
 
     fn policy() -> Result<CompiledPolicy, PolicyError> {
         compile_yaml(

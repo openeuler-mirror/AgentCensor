@@ -87,8 +87,9 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+TEST_AUDIT_EXEC=true
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 25 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -100,8 +101,6 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW 事件现在由运行时开关控制（替代旧 allow_sample_rate）
-"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    set --audit-exec on >/dev/null
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit --kind 2 \
     >"${runtime_dir}/audit.log" 2>&1 &

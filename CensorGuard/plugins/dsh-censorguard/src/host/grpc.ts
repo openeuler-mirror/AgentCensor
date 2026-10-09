@@ -32,6 +32,7 @@ export interface DomainInfo {
   id: number;
   slot: number;
   group: string;
+  policies?: string[];
   roots: number;
   version: number;
   draining: boolean;
@@ -333,6 +334,7 @@ export class GrpcClient {
       id: Number(d.id ?? 0),
       slot: Number(d.slot ?? 0),
       group: String(d.group ?? ''),
+      policies: (d.policies ?? []) as string[],
       roots: Number(d.roots ?? 0),
       version: Number(d.version ?? 0),
       draining: Boolean(d.draining ?? false),

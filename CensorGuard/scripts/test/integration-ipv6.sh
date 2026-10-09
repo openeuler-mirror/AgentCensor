@@ -79,6 +79,7 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+TEST_AUDIT_NET=true
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "" "" 1
 unshare --mount --propagation private /bin/bash -c '
     set -e
@@ -88,7 +89,7 @@ unshare --mount --propagation private /bin/bash -c '
     exec "$@"
 ' Censorguard-ipv6 \
     "${runtime_dir}/hosts" "${runtime_dir}/nsswitch.conf" \
-    "${repo_dir}/target/debug/censorguardd" \
+    "${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 40 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -102,10 +103,7 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
     exit 1
 fi
 
-# ALLOW auditing is a runtime switch now: enable global network allow auditing.
-"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    set --audit-net on >"${runtime_dir}/set-audit.log"
-
+# ALLOW auditing is configured before startup.
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit --kind 3 \
     >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
@@ -152,7 +150,7 @@ wait_dns_state() {
     local prefix=$5
     for _ in $(seq 1 120); do
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-            policy-dump >"${runtime_dir}/${prefix}-policy.log"
+            status >"${runtime_dir}/${prefix}-policy.log"
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
             status >"${runtime_dir}/${prefix}-status.log"
         if grep -q "\"${address}\"" "${runtime_dir}/${prefix}-policy.log" && \

@@ -43,26 +43,14 @@ trap cleanup EXIT
 
 install -d -m 0700 "${runtime_dir}"
 cat >"${runtime_dir}/policy.yaml" <<'YAML'
-groups:
-  lab-policy:
-    rules:
-      - exec deny /usr/bin/id
-domains:
-  - name: lab-agent
-    group: lab-policy
+rules:
+  - exec deny /usr/bin/id
 YAML
-cat >"${runtime_dir}/policy.relaxed.yaml" <<'YAML'
-groups:
-  lab-policy:
-    rules: []
-domains:
-  - name: lab-agent
-    group: lab-policy
-YAML
+printf 'rules: []\n' >"${runtime_dir}/policy.relaxed.yaml"
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -85,11 +73,10 @@ write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${r
 kill -HUP "${daemon_pid}"
 
 for _ in $(seq 1 1200); do
-    grep -q 'SIGHUP reload complete: generation=1 version=2' \
-        "${runtime_dir}/daemon.log" && break
+    [[ $(grep -c '^\[READY\]' "${runtime_dir}/daemon.log") -ge 2 ]] && break
     /usr/bin/sleep 0.05
 done
-grep -q 'SIGHUP reload complete: generation=1 version=2' "${runtime_dir}/daemon.log"
+[[ $(grep -c '^\[READY\]' "${runtime_dir}/daemon.log") -ge 2 ]]
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
@@ -100,6 +87,7 @@ grep -q '"reload_gen": 1' "${runtime_dir}/status.log"
 grep -q '"version": 2' "${runtime_dir}/status.log"
 grep -q 'uid=0' "${runtime_dir}/after.log"
 
+kill "${daemon_pid}"
 wait "${daemon_pid}"
 daemon_pid=
 echo "SIGHUP reload integration passed: before_rc=${before_rc}, version=2"

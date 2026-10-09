@@ -58,11 +58,16 @@ attach 失败则 DSH 启动失败)。
 
 ## 2. 前置条件
 
+daemon 使用 `censorguardd launch` 加载 base 并恢复当前策略 revision。
+接入由 Bootstrap 直接连接 `dsh.sock` 自吸附，gRPC 用于白名单组编辑和事件订阅；
+gRPC 不负责代替 DSH PID 注册。基线与组叠加，清空 DSH 组也不会移除基线 deny。
+命名与 CLI 的完整规范见 [命令手册](命令手册.md)。
+
 | 条件 | 验证方法 |
 |---|---|
 | daemon 已运行且配置 `daemon.spawn_grpc: true` | `systemctl status censorguardd`;`ss -tln | grep 50051` |
 | gRPC 适配器已安装 | `ls /usr/bin/censorguard-grpc` |
-| DSH 策略组已由 root 下发 | `sudo censorguardctl policy-dump \| grep censorguard` |
+| DSH 策略组已由 root 下发 | `sudo censorguardctl status \| grep censorguard` |
 | 当前用户在 `censorguard` 组 | `id \| grep censorguard`(**加入后需重新登录才生效**) |
 | DSH 可用且 profile 已初始化 | 四者任一:`--dsh` 指定源码仓库、`$DSH_BIN`、PATH 上的 `dsh`、npx 可达 `@deepseek-ai/dsh`;`ls ~/.dsh/profiles/web/` |
 | 插件已构建 | `plugins/dsh-censorguard/dist/` 与 `lib/client.js` 存在 |
@@ -140,9 +145,9 @@ DSH WebUI 的设置区出现"安全策略"区块:
 - **状态条**:保护状态(protected/degraded)、域名、策略版本、daemon
   boot ID、hooks 健康度。
 - **策略编辑器**:直接展示/编辑当前绑定组的 YAML 原文;**校验策略**只编译
-  不生效;**保存并重新加载**带版本乐观锁(他人改过会提示冲突重新读取)。
+  不生效;**保存并重新加载**有前置版本检查(他人改过会提示冲突重新读取)，该检查不是原子乐观锁。
   只能编辑当前绑定组,不能动 `__base__` 或其他组。
-- **运行时开关**:六个 enable/audit 开关即点即切(等价 `ctl set`)。
+- **daemon 开关**：由 base.yaml 的 daemon 段管理，需完整重启；Web/gRPC 不提供热写。
 
 权限边界:**只有本机(loopback)浏览器能调用写接口**,远程浏览器打开
 WebUI 只读——写请求在 RPC 通道层就被拒绝(403)。

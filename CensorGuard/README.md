@@ -15,11 +15,11 @@ tgid -> domain/logical slot -> active bank inner maps
 syscall -> LSM/tracepoint -> allow or -EPERM -> ringbuf audit
 ```
 
-每个 bank 有 64 个 slot，slot 0 为全局基线，1..63 为域。10 维策略全部写完后才单次切换
-active bank，因此失败 reload 不会产生“部分规则已新、部分规则仍旧”的窗口。
+每个 bank 有 64 个 slot，slot 0 为全局基线，1..63 为公开组与多组组合的有效策略。规则先写入备用 bank 再切换；
+域绑定与持久化另有阶段，不保证所有域同时切换。
 
-策略文件 schema 为根级 `rules`（全局基线）、可选 `groups`（命名规则组）与
-`domains`（域到组的绑定）；每行直接声明允许/拒绝和可选审计：
+启动配置只有 `daemon` 与 `rules`（全局基线）；附加组文件只有 `rules`，通过
+`policy apply` 发布、`bind` 追加到 domain。每行声明允许/拒绝和可选审计：
 
 ```yaml
 rules:
@@ -28,10 +28,10 @@ rules:
   - exec deny /usr/bin/nc
 ```
 
-`enable_*`/`audit_*` 不再写入策略文件，而是通过 `censorguardctl set`（或 RPC v2
-`set_switches`）调整的运行时开关：enable 默认全开、audit 默认全关，daemon 重启恢复
-默认，reload 保持当前值。任一 audit 开关打开时该类 ALLOW 全量上报，单行规则的
-`+audit` 始终生效，DENY 永远记录。
+`enable_*` / `audit_*` 放在启动配置的 `daemon` 段，默认 enable 全开、audit 全开。
+基线和 daemon 设置运行中不可热改，修改后用 `censorguardd reload` 完整重启。
+附加组可热更新；domain 支持多个组，任一层 deny 即拒绝。`remove` 移除域内一个组，
+`policy remove` 删除未被引用的组。`status` 包含 PID 进程树，`doctor` 检查组件。
 
 一个动态链接程序可能产生多个 `FILE ALLOW`（动态加载器、`libc`、locale 和配置文件的
 读取），这表示文件打开检查点，不表示执行了多个可执行文件。只看执行事件可使用
@@ -60,14 +60,15 @@ cargo test --workspace --offline
 
 ```bash
 sudo target/debug/censorguardd launch --config config/base.yaml
-# launch 以空策略启动；加载配置中的规则后再纳管进程。
-sudo target/debug/censorguardctl --config config/base.yaml reload
+# launch 加载基线与配置策略；已有 state 时恢复当前策略 revision。
 ```
 
 常用控制命令：
 
 ```bash
 censorguardctl --config config/base.yaml status
+censorguardctl --config config/base.yaml policy apply --policy lab-policy --file group.yaml
+censorguardctl --config config/base.yaml bind --domain lab-agent --policy lab-policy
 censorguardctl --config config/base.yaml attach --pid PID --domain lab-agent
 censorguardctl --config config/base.yaml audit
 ```
@@ -173,6 +174,7 @@ docs/                        架构、迁移、验证文档
 
 ## 文档
 
+- [命令手册](docs/命令手册.md)：当前 CLI、命名与策略管理规范
 - [构建指南](docs/构建指南.md)：从源码构建全部组件与离线打包
 - [使用手册](docs/使用手册.md)：核心概念、策略编写、运行时开关、观测与故障排查
 - [DSH 插件指南](docs/DSH插件指南.md)：DSH 整树包裹插件的架构、安装与使用

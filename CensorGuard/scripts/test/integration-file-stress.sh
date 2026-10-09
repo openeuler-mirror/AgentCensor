@@ -84,15 +84,15 @@ YAML
 : >"${runtime_dir}/probe.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 90 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 for _ in $(seq 1 1200); do
-    grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log" && break
+    grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
-grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log"
+grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log"
 
 "${runtime_dir}/file-stress-probe" "${protected_file}" "${allowed_file}" \
     "${threads}" "${iterations}" >"${runtime_dir}/probe.log" 2>&1 &

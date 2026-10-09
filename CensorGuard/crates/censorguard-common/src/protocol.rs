@@ -19,6 +19,9 @@ pub enum Operation {
     PolicyDump,
     Tree,
     SetSwitches,
+    Unattach,
+    Remove,
+    DaemonReload,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,7 +195,10 @@ pub struct RpcResponse {
 impl Operation {
     #[must_use]
     pub const fn requires_root(&self) -> bool {
-        matches!(self, Self::Reload | Self::Bind | Self::SetSwitches)
+        matches!(
+            self,
+            Self::Reload | Self::Bind | Self::SetSwitches | Self::Remove | Self::DaemonReload
+        )
     }
 }
 
@@ -239,6 +245,8 @@ pub struct DomainInfo {
     pub id: u64,
     pub slot: u32,
     pub group: String,
+    #[serde(default)]
+    pub policies: Vec<String>,
     pub roots: usize,
     pub version: u32,
     #[serde(default, skip_serializing_if = "is_false")]

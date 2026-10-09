@@ -1465,20 +1465,20 @@ static __always_inline bool is_cmd_in_blacklist(const char *cmd,
     struct str_rule_val *rv;
     if (base) {
         rv = bpf_map_lookup_elem(base, key);
-        if (rv) {
+        if (rv && rv->action == 0) {
             *rule_ver = rv->version;
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
-            return rv->action == 0;
+            return true;
         }
     }
     if (dom) {
         rv = bpf_map_lookup_elem(dom, key);
-        if (rv) {
+        if (rv && rv->action == 0) {
             *rule_ver = rv->version;
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
-            return rv->action == 0;
+            return true;
         }
     }
     return false;
@@ -2565,25 +2565,18 @@ static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
     struct net_rule_val *v = 0;
     struct net_rule_val *base_v = base_port ? bpf_map_lookup_elem(base_port, &pkey) : 0;
     struct net_rule_val *dom_v = dom_port ? bpf_map_lookup_elem(dom_port, &pkey) : 0;
-    if (base_v && base_v->action == 0) { rule_ver = base_v->version | (base_v->audit ? 0x80000000u : 0); goto deny6; }
-    if (dom_v && dom_v->action == 0) { rule_ver = dom_v->version | (dom_v->audit ? 0x80000000u : 0); goto deny6; }
-    v = dom_v ? dom_v : base_v;
-    if (v) { rule_ver = v->version | (v->audit ? 0x80000000u : 0); goto allow6; }
-
     struct net6_lpm_key key = { .prefixlen = 128 };
     __builtin_memcpy(key.addr, daddr, sizeof(key.addr));
-    base_v = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
-    dom_v = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
+    if (!base_v)
+        base_v = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
+    if (!dom_v)
+        dom_v = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
     if (base_v && base_v->action == 0) { rule_ver = base_v->version | (base_v->audit ? 0x80000000u : 0); goto deny6; }
     if (dom_v && dom_v->action == 0) { rule_ver = dom_v->version | (dom_v->audit ? 0x80000000u : 0); goto deny6; }
     v = dom_v ? dom_v : base_v;
-    if (!v)
-        goto allow6;
-    rule_ver = v->version | (v->audit ? 0x80000000u : 0);
-    if (v->action == 0)
-        goto deny6;
+    if (v)
+        rule_ver = v->version | (v->audit ? 0x80000000u : 0);
 
-allow6:
     report(3, op, 1, detail, policy_ver, rule_ver);
     return 0;
 
@@ -2667,7 +2660,7 @@ static __always_inline int enforce_socket_addr(struct socket *sock,
     fmt_port5(detail + 16, dport);
     detail[21] = '\0';
 
-    /* 两级查找: 相位 1 端口规则 (域→基线), 相位 2 无端口规则 (域→基线)。
+    /* 基线与组独立按端口优先查找，再合并；任一层 deny 均拒绝。
      *
      * verifier 红线 (沿用旧版的教训): 不能把 lookup/比较结果合成 bool
      * 再 "if (x) return -1" —— clang if-convert 出的算术选择会让出口
@@ -2680,24 +2673,18 @@ static __always_inline int enforce_socket_addr(struct socket *sock,
     struct net_rule_val *v = 0;
     struct net_rule_val *base_v4 = base_port ? bpf_map_lookup_elem(base_port, &pkey) : 0;
     struct net_rule_val *dom_v4 = dom_port ? bpf_map_lookup_elem(dom_port, &pkey) : 0;
-    if (base_v4 && base_v4->action == 0) { rule_ver = base_v4->version | (base_v4->audit ? 0x80000000u : 0); goto deny; }
-    if (dom_v4 && dom_v4->action == 0) { rule_ver = dom_v4->version | (dom_v4->audit ? 0x80000000u : 0); goto deny; }
-    v = dom_v4 ? dom_v4 : base_v4;
-    if (v) { rule_ver = v->version | (v->audit ? 0x80000000u : 0); goto allow; }
-
     struct net_lpm_key key = { .prefixlen = 48, .addr = daddr, .port = dport };
-    base_v4 = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
-    dom_v4 = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
+
+    if (!base_v4)
+        base_v4 = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
+    if (!dom_v4)
+        dom_v4 = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
     if (base_v4 && base_v4->action == 0) { rule_ver = base_v4->version | (base_v4->audit ? 0x80000000u : 0); goto deny; }
     if (dom_v4 && dom_v4->action == 0) { rule_ver = dom_v4->version | (dom_v4->audit ? 0x80000000u : 0); goto deny; }
     v = dom_v4 ? dom_v4 : base_v4;
-    if (!v)
-        goto allow;              /* 未命中: 默认允许 */
-    rule_ver = v->version | (v->audit ? 0x80000000u : 0);
-    if (v->action == 0)
-        goto deny;
+    if (v)
+        rule_ver = v->version | (v->audit ? 0x80000000u : 0);
 
-allow:
     report(3, op, 1, detail, policy_ver, rule_ver);  /* OK */
     return 0;
 

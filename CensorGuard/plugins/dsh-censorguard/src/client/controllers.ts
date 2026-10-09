@@ -29,7 +29,7 @@ interface StatusReply {
   daemonBootId: string;
   hooksHealthy: boolean;
   reloadGen: number;
-  domains: { name: string; id: number; group: string; version: number }[];
+  domains: { name: string; id: number; group: string; policies?: string[]; version: number }[];
 }
 
 interface GetPolicyReply {
@@ -107,13 +107,15 @@ export class SecurityController extends Store<SecurityState> {
       ]);
       // MOCK: 编辑器直接展示服务端 YAML 原文, 不拆 rules[]
       this.editor.loadCurrent(policy.policyYaml, policy.version);
-      const dom = status.domains.find((d) => d.group === policy.name);
+      const dom = status.domains.find((d) =>
+        (d.policies ?? d.group.split('+')).includes(policy.name));
       const view: ProtectionStatusView = {
         daemonConnected: true,
         hooksHealthy: status.hooksHealthy,
         domainName: dom?.name ?? '',
         domainId: dom?.id ?? 0,
         boundGroup: policy.name,
+        boundPolicies: dom?.policies ?? dom?.group.split('+').filter(Boolean) ?? [],
         policyVersion: policy.version,
         ruleVersion: 0,
         reloadGen: status.reloadGen,

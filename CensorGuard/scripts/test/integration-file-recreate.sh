@@ -179,15 +179,14 @@ start_daemon() {
     : >"${lab_dir}/daemon.log"
     echo "step: starting daemon for ${domain} (victim pid $3)"
     write_test_config "${lab_dir}/config.yaml" "${lab_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${lab_dir}"
-    "${repo_dir}/target/debug/censorguardd" \
+    "${repo_dir}/target/debug/censorguardd" launch \
         --config "${lab_dir}/config.yaml" \
-        --track-pid "$3" \
-        --domain "${domain}" \
         --duration 3 >"${lab_dir}/daemon.log" 2>&1 &
     daemon_pid=$!
     for _ in $(seq 1 1200); do
         if grep -q '^\[READY\]' "${lab_dir}/daemon.log"; then
             echo "step: daemon READY (${domain})"
+            "${repo_dir}/target/debug/censorguardctl" --config "${lab_dir}/config.yaml" attach --pid "$3" --domain "${domain}"
             return 0
         fi
         /usr/bin/sleep 0.05

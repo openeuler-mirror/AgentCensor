@@ -11,6 +11,12 @@ daemon:
   socket_group: censorguard
   dsh_self_groups:
     - censorguard-dsh-default
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
   dns_refresh_seconds: 60
   spawn_grpc: true
   grpc_bin: /usr/bin/censorguard-grpc

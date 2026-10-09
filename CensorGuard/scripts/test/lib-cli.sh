@@ -20,22 +20,48 @@ daemon:
   ui_socket: ${runtime}/ui.sock
   state_dir: ${state_dir}
   dns_refresh_seconds: ${dns_refresh}
+  audit_exec: ${TEST_AUDIT_EXEC:-false}
+  audit_file: ${TEST_AUDIT_FILE:-false}
+  audit_net: ${TEST_AUDIT_NET:-false}
 YAML
         if [[ -n ${socket_group} ]]; then
             printf '  socket_group: %s\n' "${socket_group}"
         fi
-        # Existing fixtures sometimes use config/base.yaml.  Remove its
-        # daemon section before appending the policy portion.
+        # Public startup input is always daemon + base rules only.
         awk '
-            /^daemon:[[:space:]]*$/ { skip=1; next }
-            skip && /^[^[:space:]#]/ { skip=0 }
-            !skip { print }
+            /^[^[:space:]#]/ { keep = /^rules:/ }
+            keep { print }
         ' "${policy}"
     } >"${output}"
+    # Old multi-domain fixtures model private persisted state, not public config.
+    # Keep revision 1 for lifecycle/capacity/rollback probes. New publication and
+    # binding behavior is exercised through the CLI in integration-policy-entry.py.
+    if [[ ! -f ${state_dir}/current ]] && grep -Eq '^(groups|domains):' "${policy}"; then
+        install -d -m 0700 "${state_dir}/revisions"
+        write_test_snapshot "${output}" "${policy}" "${state_dir}/revisions/1.yaml"
+        printf '1\n' >"${state_dir}/current"
+    fi
 }
 
 test_ctl() {
     local config=$1
     shift
     censorguardctl --config "${config}" "$@"
+}
+
+# Build a private snapshot with the same daemon settings as the public config.
+write_test_snapshot() {
+    local config=$1 policy=$2 output=$3
+    {
+        awk '
+            /^daemon:/ { keep=1 }
+            keep && /^[^[:space:]#]/ && !/^daemon:/ { keep=0 }
+            keep { print }
+        ' "${config}"
+        awk '
+            /^daemon:/ { skip=1; next }
+            skip && /^[^[:space:]#]/ { skip=0 }
+            !skip { print }
+        ' "${policy}"
+    } >"${output}"
 }

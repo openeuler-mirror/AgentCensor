@@ -26,6 +26,12 @@ pub struct DaemonConfig {
     pub spawn_grpc: bool,
     pub grpc_bin: Option<PathBuf>,
     pub grpc_listen: Option<String>,
+    pub enable_file: bool,
+    pub enable_exec: bool,
+    pub enable_net: bool,
+    pub audit_file: bool,
+    pub audit_exec: bool,
+    pub audit_net: bool,
 }
 
 impl Default for DaemonConfig {
@@ -45,17 +51,23 @@ impl Default for DaemonConfig {
             spawn_grpc: false,
             grpc_bin: None,
             grpc_listen: None,
+            enable_file: true,
+            enable_exec: true,
+            enable_net: true,
+            audit_file: false,
+            audit_exec: false,
+            audit_net: false,
         }
     }
 }
 
-/// Decode only the shared daemon section from a full policy document.
-/// Unknown top-level policy fields are intentionally ignored by this view;
-/// strict policy validation is still performed by `censorguard-policy`.
+/// Public startup input contains only daemon settings and immutable base rules.
+/// Dynamic group definitions and domain bindings are managed through the control API.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConfigDocument {
     pub daemon: DaemonConfig,
+    pub rules: Vec<String>,
 }
 
 pub fn load(path: impl AsRef<std::path::Path>) -> Result<DaemonConfig, Box<dyn std::error::Error>> {
@@ -74,6 +86,19 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<DaemonConfig, Box<dyn s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_config_rejects_group_and_domain_sections() -> Result<(), serde_yaml::Error> {
+        for yaml in ["groups: {}", "domains: []", "enable_file: false"] {
+            assert!(serde_yaml::from_str::<ConfigDocument>(yaml).is_err());
+        }
+        let document: ConfigDocument =
+            serde_yaml::from_str("daemon:\n  enable_net: false\n  audit_exec: true\nrules: []\n")?;
+        assert!(!document.daemon.enable_net);
+        assert!(document.daemon.audit_exec);
+        assert!(document.daemon.enable_file);
+        Ok(())
+    }
 
     #[test]
     fn rejects_unknown_daemon_setting() {

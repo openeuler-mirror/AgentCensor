@@ -95,134 +95,139 @@ package: build bpf
 	./scripts/package.sh "$(VERSION)" "$(ARCH)" "$(DISTDIR)"
 
 startup-test: build bpf
-	./scripts/test/startup-test.sh
+	bash ./scripts/test/startup-test.sh
 
 integration-install: build bpf
-	./scripts/test/integration-install.sh
+	bash ./scripts/test/integration-install.sh
 
 integration-basic: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-basic.sh
+	sudo bash ./scripts/test/integration-basic.sh
 
 integration-file-deny: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-deny.sh
+	sudo bash ./scripts/test/integration-file-deny.sh
 
 integration-file-ops: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-ops.sh
+	sudo bash ./scripts/test/integration-file-ops.sh
 
 integration-file-extended: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-extended.sh
+	sudo bash ./scripts/test/integration-file-extended.sh
 
 integration-deep-directory: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-deep-directory.sh
+	sudo bash ./scripts/test/integration-deep-directory.sh
 
 integration-file-stress: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-stress.sh
+	sudo bash ./scripts/test/integration-file-stress.sh
 
 integration-daemon: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-daemon.sh
+	sudo bash ./scripts/test/integration-daemon.sh
 
 integration-event-pressure: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-event-pressure.sh
+	sudo bash ./scripts/test/integration-event-pressure.sh
 
 integration-spawn: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-spawn.sh
+	sudo bash ./scripts/test/integration-spawn.sh
 
 integration-launcher-race: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-launcher-race.sh
+	sudo bash ./scripts/test/integration-launcher-race.sh
 
 integration-policy-revision: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-policy-revision.sh
+	sudo bash ./scripts/test/integration-policy-revision.sh
 
 integration-exec-domains: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-exec-domains.sh
+	sudo bash ./scripts/test/integration-exec-domains.sh
 
 integration-execveat: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-execveat.sh
+	sudo bash ./scripts/test/integration-execveat.sh
 
 integration-reload: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-reload.sh
+	sudo bash ./scripts/test/integration-reload.sh
 
 integration-bind: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-bind.sh
+	sudo bash ./scripts/test/integration-bind.sh
 
 integration-network: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-network.sh
+	sudo bash ./scripts/test/integration-network.sh
 
 integration-ipv6: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-ipv6.sh
+	sudo bash ./scripts/test/integration-ipv6.sh
 
 integration-self-protect: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-self-protect.sh
+	sudo bash ./scripts/test/integration-self-protect.sh
 
 integration-auth: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-auth.sh
+	sudo bash ./scripts/test/integration-auth.sh
 
 integration-sighup: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-sighup.sh
+	sudo bash ./scripts/test/integration-sighup.sh
 
 integration-shutdown: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-shutdown.sh
+	sudo bash ./scripts/test/integration-shutdown.sh
 
 integration-inspection: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-inspection.sh
+	sudo bash ./scripts/test/integration-inspection.sh
 
 integration-draining: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-draining.sh
+	sudo bash ./scripts/test/integration-draining.sh
 
 integration-pidtree: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pidtree.sh
+	sudo bash ./scripts/test/integration-pidtree.sh
 
 integration-generation: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-generation.sh
+	sudo bash ./scripts/test/integration-generation.sh
 
 integration-pid-churn: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pid-churn.sh
+	sudo bash ./scripts/test/integration-pid-churn.sh
 
 integration-pid-capacity: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pid-capacity.sh
+	sudo bash ./scripts/test/integration-pid-capacity.sh
 
 integration-rollback: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-rollback.sh
+	sudo bash ./scripts/test/integration-rollback.sh
 
 integration-policy-sharing: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-policy-sharing.sh
+	sudo bash ./scripts/test/integration-policy-sharing.sh
+
+# Requires the DSH plugin's gRPC dependencies (pnpm install in its package).
+integration-policy-entry: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-policy-entry.py
 
 integration-dns: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-dns.sh
+	sudo bash ./scripts/test/integration-dns.sh
 
 integration-dns-refresh: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-dns-refresh.sh
+	sudo bash ./scripts/test/integration-dns-refresh.sh
 
 integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh
 

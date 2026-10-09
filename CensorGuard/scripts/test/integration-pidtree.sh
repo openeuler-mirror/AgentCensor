@@ -64,7 +64,7 @@ unlink "${runtime_dir}/child.pid" 2>/dev/null || true
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 13 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -87,7 +87,7 @@ grep -q '"name": "multi-domain"' "${runtime_dir}/multi-two.log"
 grep -q '"roots": 2' "${runtime_dir}/multi-two.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${sleep_one}" >/dev/null
+    unattach --pid "${sleep_one}" >/dev/null
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/multi-one.log"
 grep -q '"roots": 1' "${runtime_dir}/multi-one.log"
@@ -97,7 +97,7 @@ if grep -A8 '"name": "multi-domain"' "${runtime_dir}/multi-one.log" | \
     exit 1
 fi
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${sleep_two}" >/dev/null
+    unattach --pid "${sleep_two}" >/dev/null
 
 "${runtime_dir}/fork-only-probe" "${runtime_dir}/go" \
     "${runtime_dir}/child.pid" 7 &
@@ -130,7 +130,7 @@ if [[ ${immediate} != true ]]; then
     exit 1
 fi
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    tree >"${runtime_dir}/fork-tree.log"
+    status >"${runtime_dir}/fork-tree.log"
 grep -q "\"pid\": ${fork_child_pid}" "${runtime_dir}/fork-tree.log"
 
 wait "${fork_root_pid}"

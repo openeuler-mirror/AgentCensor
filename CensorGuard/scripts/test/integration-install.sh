@@ -97,13 +97,13 @@ systemd-analyze verify --root="${stage}" censorguardd.service
 install -m 0640 "${repo_dir}/config/base.yaml" \
     "${stage}/etc/censorguard/base.yaml"
 write_test_config "${runtime_dir}/config.yaml" "${stage}/etc/censorguard/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${stage}/usr/sbin/censorguardd" \
+"${stage}/usr/sbin/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" --check-config \
     >"${runtime_dir}/check-config.log"
 grep -q 'configuration is valid' "${runtime_dir}/check-config.log"
 write_test_config "${runtime_dir}/bad-config.yaml" "${stage}/etc/censorguard/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}/bad" "${runtime_dir}/bad-state" censorguard-group-that-does-not-exist
 set +e
-"${stage}/usr/sbin/censorguardd" \
+"${stage}/usr/sbin/censorguardd" launch \
     --config "${runtime_dir}/bad-config.yaml" --duration 1 \
     >"${runtime_dir}/bad-group.log" 2>&1
 bad_group_rc=$?

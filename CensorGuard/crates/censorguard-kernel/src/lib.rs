@@ -160,16 +160,15 @@ impl InstalledPolicy {
 
     #[must_use]
     pub fn slot_for_group(&self, group: &str) -> Option<u32> {
+        if group.is_empty() || group == "__base__" {
+            return Some(0);
+        }
         self.group_slots.get(group).copied()
     }
 }
 
 fn required_policy_groups(policy: &CompiledPolicy) -> BTreeSet<String> {
-    let mut groups: BTreeSet<String> = policy.groups.keys().cloned().collect();
-    if !policy.has_explicit_domains || policy.domains.values().any(String::is_empty) {
-        groups.insert(String::new());
-    }
-    groups
+    policy.groups.keys().cloned().collect()
 }
 
 pub struct NativeKernel {
@@ -292,13 +291,9 @@ impl NativeKernel {
         let mut representatives: Vec<(&CompiledRules, u32)> = vec![(baseline, offset)];
 
         for (group, slot) in &layout.group_slots {
-            let rules = if group.is_empty() {
-                &empty
-            } else {
-                policy.groups.get(group).ok_or_else(|| {
-                    KernelError::Native(format!("layout policy group {group:?} is missing"))
-                })?
-            };
+            let rules = policy.groups.get(group).ok_or_else(|| {
+                KernelError::Native(format!("layout policy group {group:?} is missing"))
+            })?;
             if let Some((_, source)) = representatives
                 .iter()
                 .find(|(candidate, _)| **candidate == *rules)
@@ -1160,6 +1155,30 @@ mod tests {
     }
 
     #[test]
+    fn multi_group_combinations_share_slots_and_count_toward_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut policy = censorguard_policy::compile_yaml(b"rules: []")?;
+        for index in 0..62 {
+            policy = policy.replace_group_yaml(&format!("g{index:02}"), b"rules: []")?;
+        }
+        policy = policy
+            .bind_domain("first", "g00", &[])?
+            .bind_domain("first", "g01", &[])?;
+        policy = policy
+            .bind_domain("second", "g01", &[])?
+            .bind_domain("second", "g00", &[])?;
+        let layout = InstalledPolicy::initial(&policy)?;
+        assert_eq!(layout.group_slots.len(), 63);
+        assert_eq!(policy.domains["first"], policy.domains["second"]);
+        assert!(layout.slot_for_group("g00+g01").is_some());
+        let overflow = policy
+            .bind_domain("third", "g00", &[])?
+            .bind_domain("third", "g02", &[])?;
+        assert!(InstalledPolicy::initial(&overflow).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn evolving_layout_preserves_and_reuses_group_slots() -> Result<(), KernelError> {
         let initial = InstalledPolicy::initial(&policy_with_groups(
             &["alpha", "beta"],
@@ -1185,13 +1204,13 @@ mod tests {
     #[test]
     fn implicit_and_empty_group_domains_share_the_empty_slot() -> Result<(), KernelError> {
         let implicit = InstalledPolicy::initial(&policy_with_groups(&[], &[]))?;
-        assert_eq!(implicit.slot_for_group(""), Some(1));
+        assert_eq!(implicit.slot_for_group(""), Some(0));
 
         let explicit = InstalledPolicy::initial(&policy_with_groups(
             &["strict"],
             &[("unrestricted", ""), ("guarded", "strict")],
         ))?;
-        assert_eq!(explicit.group_slots.len(), 2);
+        assert_eq!(explicit.group_slots.len(), 1);
         assert!(explicit.slot_for_group("").is_some());
         Ok(())
     }

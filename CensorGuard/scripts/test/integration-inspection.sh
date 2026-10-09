@@ -60,7 +60,7 @@ YAML
 unlink "${runtime_dir}/process.ready" 2>/dev/null || true
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -87,11 +87,11 @@ child_pid=${child_pid%% *}
 [[ -n ${child_pid} ]]
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    attach --pid "${root_pid}" --domain lab-agent --seed >"${runtime_dir}/attach.log"
+    attach --pid "${root_pid}" --domain lab-agent >"${runtime_dir}/attach.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    tree >"${runtime_dir}/tree.log"
+    status >"${runtime_dir}/tree.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    policy-dump >"${runtime_dir}/policy.log"
+    status >"${runtime_dir}/policy.log"
 
 grep -q '"domain": "lab-agent"' "${runtime_dir}/tree.log"
 grep -q "\"pid\": ${root_pid}" "${runtime_dir}/tree.log"

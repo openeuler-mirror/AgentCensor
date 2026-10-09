@@ -127,6 +127,7 @@ fn pb_domain(info: &censorguard_common::protocol::DomainInfo) -> pb::DomainInfo 
         roots: i32::try_from(info.roots).unwrap_or(i32::MAX),
         version: info.version,
         draining: info.draining,
+        policies: info.policies.clone(),
     }
 }
 
@@ -269,30 +270,10 @@ impl pb::censorguard_server::Censorguard for Adapter {
         &self,
         request: Request<pb::SetSwitchesReq>,
     ) -> Result<Response<pb::SetSwitchesReply>, Status> {
-        let req = request.into_inner();
-        let result = self
-            .call(
-                RpcMethod::SetSwitches,
-                RpcParams {
-                    enable_file: req.enable_file,
-                    enable_exec: req.enable_exec,
-                    enable_net: req.enable_net,
-                    audit_file: req.audit_file,
-                    audit_exec: req.audit_exec,
-                    audit_net: req.audit_net,
-                    ..RpcParams::default()
-                },
-            )
-            .await?;
-        let response = result.response.unwrap_or_default();
-        Ok(Response::new(pb::SetSwitchesReply {
-            enable_file: response.enable_file,
-            enable_exec: response.enable_exec,
-            enable_net: response.enable_net,
-            audit_file: response.audit_file,
-            audit_exec: response.audit_exec,
-            audit_net: response.audit_net,
-        }))
+        let _ = request;
+        Err(Status::permission_denied(
+            "switches are configured in base.yaml daemon; restart daemon to apply",
+        ))
     }
 
     async fn get_policy(

@@ -54,7 +54,7 @@ domains:
 YAML
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 12 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -72,7 +72,7 @@ set +e
         printf '  - exec deny /tmp/censorguard-command-%s\n' "${index}"
     done
 } | "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --policy lab-policy --stdin >"${runtime_dir}/overflow.log" 2>&1
+    policy apply --policy lab-policy --stdin >"${runtime_dir}/overflow.log" 2>&1
 overflow_rc=$?
 set -e
 [[ ${overflow_rc} -ne 0 ]]
@@ -88,7 +88,7 @@ grep -q '"last_reload_error": ".*maximum is 256' "${runtime_dir}/failure-status.
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --policy lab-policy --stdin --dry-run >"${runtime_dir}/dry-run.log"
+    policy apply --policy lab-policy --stdin --dry-run >"${runtime_dir}/dry-run.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/dry-run.log"
 grep -q '"version": 1' "${runtime_dir}/dry-run.log"
 
@@ -105,7 +105,7 @@ set -e
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --policy lab-policy --stdin >"${runtime_dir}/commit.log"
+    policy apply --policy lab-policy --stdin >"${runtime_dir}/commit.log"
 grep -q '"reload_gen": 1' "${runtime_dir}/commit.log"
 grep -q '"version": 2' "${runtime_dir}/commit.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \

@@ -62,7 +62,7 @@ YAML
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state" nobody
 setpriv --no-new-privs \
     --bounding-set=-all,+chown,+dac_read_search,+sys_admin,+sys_resource,+perfmon,+bpf \
-    "${repo_dir}/target/debug/censorguardd" \
+    "${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -111,12 +111,12 @@ grep -q 'cannot track pid' "${runtime_dir}/foreign-attach.log"
 set +e
 setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${root_pid}" >"${runtime_dir}/foreign-untrack.log" 2>&1
+    unattach --pid "${root_pid}" >"${runtime_dir}/foreign-untrack.log" 2>&1
 foreign_untrack_rc=$?
 printf 'rules: []\n' | \
     setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    reload --stdin --dry-run >"${runtime_dir}/reload.log" 2>&1
+    policy apply --policy empty --stdin --dry-run >"${runtime_dir}/reload.log" 2>&1
 reload_rc=$?
 setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
@@ -133,9 +133,9 @@ grep -q 'requires root' "${runtime_dir}/bind.log"
 
 setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${nobody_pid}" >"${runtime_dir}/own-untrack.log"
+    unattach --pid "${nobody_pid}" >"${runtime_dir}/own-untrack.log"
 "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    untrack --pid "${root_pid}" >"${runtime_dir}/root-untrack.log"
+    unattach --pid "${root_pid}" >"${runtime_dir}/root-untrack.log"
 "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     status >"${runtime_dir}/status.log"
 grep -q '"tracked": 0' "${runtime_dir}/status.log"

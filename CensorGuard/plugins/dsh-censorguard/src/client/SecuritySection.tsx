@@ -194,7 +194,7 @@ export const SecuritySection: FC<SecuritySectionProps> = (props) => {
             </span>
             <span style={styles.statusLabel}>策略组</span>
             <span style={styles.statusValue} title={st.boundGroup}>
-              {st.boundGroup}
+              {st.boundPolicies?.join(', ') || st.boundGroup}
             </span>
             <span style={styles.statusLabel}>策略版本</span>
             <span style={styles.statusValue}>

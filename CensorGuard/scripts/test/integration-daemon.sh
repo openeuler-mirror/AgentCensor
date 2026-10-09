@@ -67,7 +67,7 @@ done
 unlink "${runtime_dir}/start"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 6 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -98,7 +98,7 @@ victim_pid=$!
 
 "${repo_dir}/target/debug/censorguardctl" \
     --config "${runtime_dir}/config.yaml" \
-    attach --pid "${victim_pid}" --domain lab-agent --seed >"${runtime_dir}/ctl.log"
+    attach --pid "${victim_pid}" --domain lab-agent >"${runtime_dir}/ctl.log"
 
 touch "${runtime_dir}/start"
 wait "${victim_pid}"

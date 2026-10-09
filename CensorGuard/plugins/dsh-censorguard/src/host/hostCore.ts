@@ -129,10 +129,10 @@ export class HostCore {
     return this.grpc.applyPolicy(req.group, req.policyYaml, false, this.buildAdminContext());
   }
 
-  /** setSwitches 运行时开关切换 (loopback only; 远程浏览器 403) */
-  async setSwitches(update: SwitchUpdate, clientIp: string): Promise<SetSwitchesReply> {
+  /** Legacy endpoint: daemon settings are read-only through DSH. */
+  async setSwitches(_update: SwitchUpdate, clientIp: string): Promise<SetSwitchesReply> {
     this.assertLoopback(clientIp);
-    return this.grpc.setSwitches(update, this.buildAdminContext());
+    throw new Error("开关由 base.yaml 的 daemon 配置管理，请重启 daemon 生效");
   }
 
   dispose(): void {

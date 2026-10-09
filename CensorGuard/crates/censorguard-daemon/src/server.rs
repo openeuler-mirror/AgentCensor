@@ -752,59 +752,12 @@ fn dispatch_rpc(
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
-        RpcMethod::SetSwitches => {
-            // Root/gateway on ctl.sock or any peer on the delegated ui.sock surface.
-            if !is_privileged(peer_uid, gateway_uid) && role != SocketRole::Ui {
-                return rpc_failure(
-                    request_id,
-                    RpcErrorCode::PermissionDenied,
-                    "set_switches requires root",
-                    None,
-                );
-            }
-            let updates = [
-                params.enable_file,
-                params.enable_exec,
-                params.enable_net,
-                params.audit_file,
-                params.audit_exec,
-                params.audit_net,
-            ];
-            if updates.iter().all(Option::is_none) {
-                return rpc_failure(
-                    request_id,
-                    RpcErrorCode::InvalidRequest,
-                    "set_switches requires at least one switch field",
-                    None,
-                );
-            }
-            let [
-                enable_file,
-                enable_exec,
-                enable_net,
-                audit_file,
-                audit_exec,
-                audit_net,
-            ] = updates;
-            match runtime.set_switches(
-                enable_file,
-                enable_exec,
-                enable_net,
-                audit_file,
-                audit_exec,
-                audit_net,
-            ) {
-                Ok(switches) => rpc_success(
-                    request_id,
-                    RpcResult {
-                        response: Some(switch_response(switches)),
-                        revision: runtime.current_revision().ok(),
-                        ..RpcResult::default()
-                    },
-                ),
-                Err(error) => runtime_rpc_failure(request_id, error),
-            }
-        }
+        RpcMethod::SetSwitches => rpc_failure(
+            request_id,
+            RpcErrorCode::PermissionDenied,
+            "switches are configured in base.yaml daemon; restart daemon to apply",
+            None,
+        ),
         RpcMethod::CloseScope => rpc_failure(
             request_id,
             RpcErrorCode::InvalidRequest,
@@ -831,19 +784,6 @@ fn legacy_request(op: Operation) -> Request {
         audit_file: None,
         audit_exec: None,
         audit_net: None,
-    }
-}
-
-fn switch_response(switches: crate::runtime::SwitchState) -> Response {
-    Response {
-        ok: true,
-        enable_file: switches.enables[0],
-        enable_exec: switches.enables[1],
-        enable_net: switches.enables[2],
-        audit_file: switches.audits[0],
-        audit_exec: switches.audits[1],
-        audit_net: switches.audits[2],
-        ..Response::default()
     }
 }
 
@@ -882,7 +822,9 @@ fn runtime_rpc_failure(request_id: String, error: RuntimeError) -> RpcResponse {
         }
         RuntimeError::MissingGroup { .. } => (RpcErrorCode::UnknownGroup, None),
         RuntimeError::UnknownDomain(_) => (RpcErrorCode::UnknownScope, None),
-        RuntimeError::DuplicateRoot(_) => (RpcErrorCode::ScopeAlreadyRegistered, None),
+        RuntimeError::DuplicateRoot(_) | RuntimeError::DomainBindingConflict(_) => {
+            (RpcErrorCode::ScopeAlreadyRegistered, None)
+        }
         RuntimeError::UnauthorizedPid { .. }
         | RuntimeError::UnauthorizedRoot { .. }
         | RuntimeError::GroupNotAllowed(_) => (RpcErrorCode::PermissionDenied, None),
@@ -962,12 +904,15 @@ fn dispatch(
                 Err(error) => failure(error.to_string()),
             }
         }
-        Operation::Status => match runtime.status() {
-            Ok(status) => {
+        Operation::Status => match (runtime.status(), runtime.trees(), runtime.policy_dump()) {
+            (Ok(status), Ok(trees), Ok((_, groups, dns))) => {
                 let events = hub.stats();
                 Response {
                     ok: true,
                     roots: status.roots,
+                    trees,
+                    groups,
+                    dns,
                     tracked: status.tracked,
                     pid_pending: status.pid_pending,
                     pid_generations: status.pid_generations,
@@ -1001,7 +946,9 @@ fn dispatch(
                     ..Response::default()
                 }
             }
-            Err(error) => failure(error.to_string()),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                failure(error.to_string())
+            }
         },
         Operation::Reload => match runtime.reload(
             request.policy_file.as_deref(),
@@ -1066,18 +1013,33 @@ fn dispatch(
             Err(error) => failure(error.to_string()),
         },
         Operation::SetSwitches => {
-            match runtime.set_switches(
-                request.enable_file,
-                request.enable_exec,
-                request.enable_net,
-                request.audit_file,
-                request.audit_exec,
-                request.audit_net,
-            ) {
-                Ok(switches) => switch_response(switches),
-                Err(error) => failure(error.to_string()),
-            }
+            failure("switches are configured in base.yaml daemon; restart daemon to apply")
         }
+        Operation::Unattach => match request.pid {
+            Some(pid) => match runtime.unattach(pid, peer_uid) {
+                Ok(()) => success(),
+                Err(error) => failure(error.to_string()),
+            },
+            None => failure("unattach requires pid"),
+        },
+        Operation::Remove => match request.group.as_deref() {
+            Some(group) => match runtime.remove_policy(request.domain.as_deref(), group) {
+                Ok(result) => Response {
+                    ok: true,
+                    version: result.version,
+                    reload_gen: result.generation,
+                    active_bank: result.active_bank,
+                    changed: result.changed,
+                    ..Response::default()
+                },
+                Err(error) => failure(error.to_string()),
+            },
+            None => failure("remove requires policy group"),
+        },
+        Operation::DaemonReload => match runtime.request_restart() {
+            Ok(()) => success(),
+            Err(error) => failure(error.to_string()),
+        },
         Operation::Tree => match runtime.trees() {
             Ok(trees) => Response {
                 ok: true,

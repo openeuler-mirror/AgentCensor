@@ -71,7 +71,8 @@ domains:
 YAML
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy-initial.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state"
-"${repo_dir}/target/debug/censorguardd" \
+write_test_snapshot "${runtime_dir}/config.yaml" "${runtime_dir}/policy-allow.yaml" "${runtime_dir}/allow-snapshot.yaml"
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 10 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -99,13 +100,13 @@ grep -q 'lab-policy' "${runtime_dir}/policy-initial.json"
 [[ $(grep -c '"allowed": false' "${runtime_dir}/intent-before.json") -eq 2 ]]
 
 "${rpc}" --config "${runtime_dir}/config.yaml" --method validate_policy \
-    --policy-file "${repo_dir}/config/high-priv.yaml" \
+    --policy-file "${runtime_dir}/allow-snapshot.yaml" \
     >"${runtime_dir}/validate.json"
 grep -q '"revision": 1' "${runtime_dir}/validate.json"
 
 "${rpc}" --config "${runtime_dir}/config.yaml" --method apply_policy \
     --params '{"expected_revision":1,"idempotency_key":"apply-allow-v1"}' \
-    --policy-file "${runtime_dir}/policy-allow.yaml" \
+    --policy-file "${runtime_dir}/allow-snapshot.yaml" \
     >"${runtime_dir}/apply.json"
 grep -q '"revision": 2' "${runtime_dir}/apply.json"
 
@@ -139,8 +140,8 @@ kill "${daemon_pid}"
 wait "${daemon_pid}" || true
 daemon_pid=
 : >"${runtime_dir}/daemon-restart.log"
-write_test_config "${runtime_dir}/config.yaml" "${repo_dir}/config/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "${runtime_dir}/state"
-"${repo_dir}/target/debug/censorguardd" \
+# Restore dynamic policy using the same immutable startup configuration.
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 8 >"${runtime_dir}/daemon-restart.log" 2>&1 &
 daemon_pid=$!

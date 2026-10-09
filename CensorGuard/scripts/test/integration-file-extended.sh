@@ -85,7 +85,7 @@ YAML
 : >"${runtime_dir}/audit.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -149,7 +149,7 @@ run_preopened_denied() {
     fi
     grep -q 'errno=1 Operation not permitted' "${runtime_dir}/${mode}.log"
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        untrack --pid "${finished_pid}" >/dev/null 2>&1 || true
+        unattach --pid "${finished_pid}" >/dev/null 2>&1 || true
 }
 
 run_denied link /usr/bin/ln "${protected_file}" "${runtime_dir}/hardlink"

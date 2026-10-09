@@ -86,6 +86,7 @@ message DomainInfo {
   int32 roots = 5;                    // 追踪根数量
   uint32 version = 6;                 // 当前生效策略版本
   bool draining = 7;                  // 无根但树未排干 (策略仍生效)
+  repeated string policies = 8;       // 附加策略组；空列表表示仅基线
 }
 
 message TrackReq {
@@ -204,7 +205,7 @@ message EventsReq {
 }
 
 // Event 事件面消息 (ringbuf enforceEvent 的纯数据形态)。
-// kind: 1=FILE 2=EXEC 3=NET 4=GUARD; op: FILE_OP_* / NET_OP_* / GUARD_OP_*。
+// kind: 1=FILE 2=EXEC 3=NET 4=GUARD; op: kind=1 时 FILE_OP_*, kind=4 时 GUARD_OP_*。
 message Event {
   string ts = 1;                      // RFC3339 (daemon 收到事件的时刻)
   uint32 kind = 2;

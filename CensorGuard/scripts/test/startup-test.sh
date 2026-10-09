@@ -48,7 +48,8 @@ daemon:
   dsh_socket: ${runtime_dir}/dsh.sock
   ui_socket: ${runtime_dir}/ui.sock
   state_dir: ${runtime_dir}/state
-rules: []
+rules:
+  - file deny /etc/shadow
 EOF
 
 "${repo_dir}/target/release/censorguardd" launch --config "${runtime_dir}/base.yaml" \
@@ -64,16 +65,18 @@ fi
 "${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
-# Apply the only canonical policy entrypoint, then attach this probe by PID.
+# Verify launch already installed the baseline using a separate agent tree.
+# Attaching this supervisor shell would also seed its daemon child into the domain.
 sleep 0.1
-"${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" \
-  reload --file "${repo_dir}/config/base.yaml" >/dev/null
-"${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" \
-  attach --pid "$$" --domain startup >/dev/null
-
-if cat /etc/shadow >/dev/null 2>"${runtime_dir}/read.err"; then
+if "${repo_dir}/target/release/censorguardctl" --config "${runtime_dir}/base.yaml" \
+  spawn --domain startup -- /usr/bin/cat /etc/shadow >/dev/null 2>"${runtime_dir}/read.err"; then
   echo 'expected /etc/shadow read to be denied' >&2
   exit 1
 fi
+grep -q 'Operation not permitted' "${runtime_dir}/read.err"
+for _ in $(seq 1 40); do
+  grep -q 'DENY' "${runtime_dir}/audit.log" && break
+  sleep 0.05
+done
 grep -q 'DENY' "${runtime_dir}/audit.log"
 echo "Censorguard 0.4.0 startup smoke test passed"

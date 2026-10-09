@@ -57,7 +57,7 @@ YAML
 unlink "${runtime_dir}/child.pid" 2>/dev/null || true
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 18 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -86,7 +86,7 @@ grep -q '"roots": 0' "${runtime_dir}/draining.log"
 grep -q '"draining": true' "${runtime_dir}/draining.log"
 grep -q '"tracked": 1' "${runtime_dir}/draining.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    tree >"${runtime_dir}/tree.log"
+    status >"${runtime_dir}/tree.log"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.log"
 
 for _ in $(seq 1 320); do

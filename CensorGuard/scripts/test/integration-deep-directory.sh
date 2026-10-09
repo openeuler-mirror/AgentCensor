@@ -82,16 +82,16 @@ YAML
 : >"${runtime_dir}/daemon.log"
 
 write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
-"${repo_dir}/target/debug/censorguardd" \
+"${repo_dir}/target/debug/censorguardd" launch \
     --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
 for _ in $(seq 1 1200); do
-    grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log" && break
+    grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
-grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log"
+grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log"
 
 run_denied() {
     local name=$1
