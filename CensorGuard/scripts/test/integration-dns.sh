@@ -69,7 +69,7 @@ done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/policy.log"
+    status --json >"${runtime_dir}/policy.log"
 grep -q '"domain": "localhost"' "${runtime_dir}/policy.log"
 grep -q '"127.0.0.1"' "${runtime_dir}/policy.log"
 if grep -q '"stale": true' "${runtime_dir}/policy.log"; then

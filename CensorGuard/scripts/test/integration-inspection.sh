@@ -89,9 +89,9 @@ child_pid=${child_pid%% *}
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${root_pid}" --domain lab-agent >"${runtime_dir}/attach.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/tree.log"
+    status --json >"${runtime_dir}/tree.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/policy.log"
+    status --json >"${runtime_dir}/policy.log"
 
 grep -q '"domain": "lab-agent"' "${runtime_dir}/tree.log"
 grep -q "\"pid\": ${root_pid}" "${runtime_dir}/tree.log"

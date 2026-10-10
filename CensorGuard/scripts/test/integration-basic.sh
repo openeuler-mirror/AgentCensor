@@ -487,7 +487,7 @@ wait_audit 'EXEC.*DENY.*web' && pass "T4 audit 日志有 EXEC DENY 事件" || fa
 
 echo
 echo "== T7/T8: 启动配置审计与禁止热写开关 =="
-"$CTL" --config "$TDIR/config.yaml" status 2>/dev/null | grep -q '"audit_exec": true' \
+"$CTL" --config "$TDIR/config.yaml" status --json 2>/dev/null | grep -q '"audit_exec": true' \
     && pass "T7 status 显示配置 audit_exec=true" || fail "T7 开关未从 daemon 配置读取"
 rc=$(run_in_domain plain "$IDBIN" -u)
 [ "$rc" = "0" ] && wait_audit 'ALLOW.*plain' \
@@ -568,7 +568,7 @@ fi
 echo
 echo "== T14: daemon 未起时的 ctl 失败语义 =="
 write_test_config "$TDIR/no-daemon.yaml" "$POL" "$(pwd)/bpf/enforce.bpf.o" "$TDIR/no-daemon"
-"$CTL" --config "$TDIR/no-daemon.yaml" status >/dev/null 2>&1 \
+"$CTL" --config "$TDIR/no-daemon.yaml" status --json >/dev/null 2>&1 \
     && fail "T14 daemon 未起时 status 竟成功" || pass "T14 daemon 未起时 ctl 非 0 退出"
 
 echo

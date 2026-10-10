@@ -182,6 +182,8 @@ rules:
     shutil.copyfile(SCRIPT, agent_script)
 
     def ctl(*args, success=True):
+        if args and args[0] in ('status', 'doctor'):
+            args = (*args, '--json')
         result = subprocess.run([str(BIN / 'censorguardctl'), '--config', str(config), *args],
                                 capture_output=True, text=True, timeout=12)
         assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)

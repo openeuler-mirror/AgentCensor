@@ -102,7 +102,7 @@ status_value() {
 }
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/before.log"
+    status --json >"${runtime_dir}/before.log"
 [[ $(status_value event_subscribers "${runtime_dir}/before.log") == 2 ]]
 
 kernel_dropped=0
@@ -116,7 +116,7 @@ for count in 50000 100000 250000 500000; do
     generated=$((generated + count))
     /usr/bin/sleep 0.2
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/pressure.log"
+        status --json >"${runtime_dir}/pressure.log"
     kernel_dropped=$(status_value event_kernel_dropped "${runtime_dir}/pressure.log")
     reader_dropped=$(status_value event_reader_dropped "${runtime_dir}/pressure.log")
     subscriber_dropped=$(status_value event_subscriber_dropped \
@@ -148,7 +148,7 @@ for _ in 1 2 3; do
 done
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/after.log"
+    status --json >"${runtime_dir}/after.log"
 [[ $(status_value event_kernel_dropped "${runtime_dir}/after.log") -ge ${kernel_dropped} ]]
 [[ $(status_value event_reader_dropped "${runtime_dir}/after.log") -ge ${reader_dropped} ]]
 [[ $(status_value event_subscriber_dropped "${runtime_dir}/after.log") \

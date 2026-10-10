@@ -50,6 +50,8 @@ rules:
         return result
 
     def ctl(*args, ok=True):
+        if args and args[0] in ('status', 'doctor'):
+            args = (*args, '--json')
         result = subprocess.run([str(BIN / 'censorguardctl'), '--config', str(config), *args],
                                 capture_output=True, text=True, timeout=10)
         assert (result.returncode == 0) == ok, (args, result.stdout, result.stderr)

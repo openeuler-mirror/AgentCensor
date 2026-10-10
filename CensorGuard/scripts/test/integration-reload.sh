@@ -95,7 +95,7 @@ printf 'rules: []\n' | \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.log"
+    status --json >"${runtime_dir}/status.log"
 
 grep -q '"reload_gen": 1' "${runtime_dir}/status.log"
 grep -q '"version": 2' "${runtime_dir}/reload.log"

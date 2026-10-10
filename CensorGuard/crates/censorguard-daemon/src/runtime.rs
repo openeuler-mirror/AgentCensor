@@ -358,6 +358,10 @@ impl Runtime {
         &self.boot_id
     }
 
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
     pub fn hooks_healthy(&self) -> bool {
         self.hooks_healthy
     }

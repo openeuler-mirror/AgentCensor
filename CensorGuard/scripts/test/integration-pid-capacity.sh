@@ -127,7 +127,7 @@ PY
 bpftool batch file "${runtime_dir}/fill.batch" >"${runtime_dir}/fill.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/full.json"
+    status --json >"${runtime_dir}/full.json"
 python3 - "${runtime_dir}/full.json" <<'PY'
 import json
 import sys
@@ -149,7 +149,7 @@ child_pid=$(awk 'NR == 1 { print $1 }' "${runtime_dir}/ready")
 kill -0 "${child_pid}"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/degraded.json"
+    status --json >"${runtime_dir}/degraded.json"
 python3 - "${runtime_dir}/degraded.json" <<'PY'
 import json
 import sys
@@ -165,14 +165,14 @@ assert status["pid_pending_update_failures"] == 0, status
 assert status["version"] == 1 and status["active_bank"] == 0, status
 PY
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/tree.json"
+    status --json >"${runtime_dir}/tree.json"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.json"
 
 # Unattach must remove the root and pending-backed child immediately.
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     unattach --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/draining.json"
+    status --json >"${runtime_dir}/draining.json"
 python3 - "${runtime_dir}/draining.json" <<'PY'
 import json
 import sys
@@ -185,7 +185,7 @@ PY
 
 bpftool batch file "${runtime_dir}/delete.batch" >"${runtime_dir}/delete.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/after-delete.json"
+    status --json >"${runtime_dir}/after-delete.json"
 python3 - "${runtime_dir}/after-delete.json" <<'PY'
 import json
 import sys
@@ -202,7 +202,7 @@ wait "${probe_pid}"
 probe_pid=
 for _ in $(seq 1 240); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/final.json"
+        status --json >"${runtime_dir}/final.json"
     if grep -q '"pid_pending": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "capacity-domain"' "${runtime_dir}/final.json"; then
         break

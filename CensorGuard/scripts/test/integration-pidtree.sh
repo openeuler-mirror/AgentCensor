@@ -82,14 +82,14 @@ for pid in "${sleep_one}" "${sleep_two}"; do
         attach --pid "${pid}" --domain multi-domain >"${runtime_dir}/attach-${pid}.log"
 done
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/multi-two.log"
+    status --json >"${runtime_dir}/multi-two.log"
 grep -q '"name": "multi-domain"' "${runtime_dir}/multi-two.log"
 grep -q '"roots": 2' "${runtime_dir}/multi-two.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     unattach --pid "${sleep_one}" >/dev/null
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/multi-one.log"
+    status --json >"${runtime_dir}/multi-one.log"
 grep -q '"roots": 1' "${runtime_dir}/multi-one.log"
 if grep -A8 '"name": "multi-domain"' "${runtime_dir}/multi-one.log" | \
     grep -q '"draining": true'; then
@@ -117,7 +117,7 @@ kill -0 "${fork_child_pid}"
 immediate=false
 for _ in $(seq 1 50); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/fork-status.log"
+        status --json >"${runtime_dir}/fork-status.log"
     if grep -q '"tracked": 2' "${runtime_dir}/fork-status.log"; then
         immediate=true
         break
@@ -130,7 +130,7 @@ if [[ ${immediate} != true ]]; then
     exit 1
 fi
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/fork-tree.log"
+    status --json >"${runtime_dir}/fork-tree.log"
 grep -q "\"pid\": ${fork_child_pid}" "${runtime_dir}/fork-tree.log"
 
 wait "${fork_root_pid}"
@@ -143,7 +143,7 @@ sleep_two=
 
 for _ in $(seq 1 240); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/final.log"
+        status --json >"${runtime_dir}/final.log"
     if grep -q '"tracked": 0' "${runtime_dir}/final.log" && \
         ! grep -q '"name": "fork-domain"' "${runtime_dir}/final.log" && \
         ! grep -q '"name": "multi-domain"' "${runtime_dir}/final.log"; then

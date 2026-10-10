@@ -100,7 +100,7 @@ if grep -q ' 0$' "${runtime_dir}/ready"; then
 fi
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.json"
+    status --json >"${runtime_dir}/status.json"
 python3 - "${runtime_dir}/status.json" "${child_count}" <<'PY'
 import json
 import sys
@@ -167,7 +167,7 @@ probe_pid=
 
 for _ in $(seq 1 240); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/final.json"
+        status --json >"${runtime_dir}/final.json"
     if grep -q '"tracked": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "churn-domain"' "${runtime_dir}/final.json"; then
         break

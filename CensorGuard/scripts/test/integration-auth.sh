@@ -137,7 +137,7 @@ setpriv --reuid=65534 --regid=65534 --clear-groups \
 "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     unattach --pid "${root_pid}" >"${runtime_dir}/root-untrack.log"
 "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.log"
+    status --json >"${runtime_dir}/status.log"
 grep -q '"tracked": 0' "${runtime_dir}/status.log"
 
 wait "${daemon_pid}"

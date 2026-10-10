@@ -101,7 +101,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 audit_pid=$!
 for _ in $(seq 1 1200); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/status.log"
+        status --json >"${runtime_dir}/status.log"
     grep -q '"event_subscribers": 1' "${runtime_dir}/status.log" && break
     /usr/bin/sleep 0.01
 done

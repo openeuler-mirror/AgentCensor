@@ -16,13 +16,22 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod output;
+
 // The stopped child is an internal process mode, not a public CLI command.
 const SPAWN_HELPER_ENV: &str = "_CENSORGUARD_SPAWN_HELPER";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
     Request(Request),
-    Doctor(config::DaemonConfig),
+    Status {
+        json: bool,
+    },
+    Doctor {
+        config: config::DaemonConfig,
+        json: bool,
+        verbose: bool,
+    },
     Audit {
         socket: PathBuf,
         kind: Option<u32>,
@@ -35,7 +44,14 @@ enum Action {
     },
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     if env::var_os(SPAWN_HELPER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
         return spawn_helper(&env::args().skip(1).collect::<Vec<_>>());
     }
@@ -48,14 +64,36 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
         println!(
-            "usage: censorguardctl [--config PATH] <status|doctor|policy|attach|unattach|bind|remove|spawn|audit> ..."
+            "CensorGuard control\n\n  status           Show protection and managed processes\n  doctor           Check installation and runtime health\n  policy           Inspect or publish policy groups\n  attach / unattach / bind / remove / spawn / audit\n\nUse status --json or doctor --json for scripts.\nUse doctor --verbose for individual checks.\nCustom configuration: --config PATH before the command."
         );
         return Ok(());
     }
     let (socket, action) = parse_args(env::args().skip(1))?;
     match action {
         Action::Audit { socket, kind, pid } => return audit(&socket, kind, pid),
-        Action::Doctor(config) => return doctor(&config),
+        Action::Doctor {
+            config,
+            json,
+            verbose,
+        } => {
+            if !doctor(&config, json, verbose)? {
+                std::process::exit(1);
+            }
+        }
+        Action::Status { json } => {
+            let response = call(&socket, &request(Operation::Status)).map_err(|error| {
+                io::Error::other(format!("Cannot reach CensorGuard: {error}. Check systemctl status censorguardd.service; use --config PATH for a custom instance."))
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print!("{}", output::status(&response));
+                if !response.ok {
+                    std::process::exit(1);
+                }
+            }
+            ensure_success(response)?;
+        }
         Action::Request(request) => {
             let response = call(&socket, &request)?;
             println!("{}", serde_json::to_string_pretty(&response)?);
@@ -70,11 +108,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn doctor(config: &config::DaemonConfig) -> Result<(), Box<dyn Error>> {
+fn doctor(
+    config: &config::DaemonConfig,
+    json: bool,
+    verbose: bool,
+) -> Result<bool, Box<dyn Error>> {
     use std::net::{SocketAddr, TcpStream};
     let mut checks = Vec::new();
     let mut check = |name: &str, ok: bool, detail: String| {
-        checks.push(serde_json::json!({"component": name, "ok": ok, "detail": detail}));
+        checks.push(output::Check {
+            component: name.into(),
+            ok,
+            detail,
+        });
     };
     check("config", true, "configuration decoded".into());
     check(
@@ -141,16 +187,16 @@ fn doctor(config: &config::DaemonConfig) -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|| "127.0.0.1:50051".into()),
         );
     }
-    let healthy = checks.iter().all(|check| check["ok"] == true);
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({"ok":healthy, "checks":checks}))?
-    );
-    if healthy {
-        Ok(())
+    let healthy = checks.iter().all(|check| check.ok);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"ok":healthy, "checks":checks}))?
+        );
     } else {
-        Err(io::Error::other("doctor found unhealthy components").into())
+        print!("{}", output::doctor(&checks, verbose));
     }
+    Ok(healthy)
 }
 
 fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Action), io::Error> {
@@ -181,7 +227,12 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
     };
     let action = match command {
         "spawn" => parse_spawn(&values[1..])?,
-        "status" if values.len() == 1 => Action::Request(request(Operation::Status)),
+        "status" => {
+            validate_options(&values[1..], &[], &["--json"])?;
+            Action::Status {
+                json: values.iter().any(|value| value == "--json"),
+            }
+        }
         "audit" => {
             validate_options(&values[1..], &["--kind", "--pid"], &[])?;
             let kind = optional_u32_option(&values[1..], "--kind")?;
@@ -195,7 +246,19 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
                 pid,
             }
         }
-        "doctor" if values.len() == 1 => Action::Doctor(daemon),
+        "doctor" => {
+            validate_options(&values[1..], &[], &["--json", "--verbose"])?;
+            let json = values.iter().any(|value| value == "--json");
+            let verbose = values.iter().any(|value| value == "--verbose");
+            if json && verbose {
+                return Err(invalid_input("choose --json or --verbose"));
+            }
+            Action::Doctor {
+                config: daemon,
+                json,
+                verbose,
+            }
+        }
         "policy" => parse_policy(&values[1..])?,
         "attach" => {
             let options = &values[1..];

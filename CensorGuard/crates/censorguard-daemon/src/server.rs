@@ -943,6 +943,7 @@ fn dispatch(
                     event_subscriber_dropped: events.subscriber_dropped,
                     event_subscribers: events.subscribers,
                     daemon_boot_id: runtime.boot_id().to_owned(),
+                    config_path: Some(runtime.config_path().display().to_string()),
                     hooks_healthy: Some(runtime.hooks_healthy()),
                     ..Response::default()
                 }

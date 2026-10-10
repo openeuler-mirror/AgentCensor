@@ -92,7 +92,7 @@ probe_two=${probe_pids[1]}
     attach --pid "${probe_two}" --domain lab-agent-2 >"${runtime_dir}/attach-two.json"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.json"
+    status --json >"${runtime_dir}/status.json"
 
 python3 - "${runtime_dir}/status.json" <<'PY'
 import json

@@ -105,7 +105,7 @@ wait "${victim_pid}"
 victim_pid=
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --config "${runtime_dir}/config.yaml" status >"${runtime_dir}/status.log"
+    --config "${runtime_dir}/config.yaml" status --json >"${runtime_dir}/status.log"
 
 rc=$(<"${runtime_dir}/rc")
 if [[ ${rc} -eq 0 || -s "${runtime_dir}/output.log" ]]; then

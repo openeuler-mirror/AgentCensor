@@ -49,7 +49,10 @@ const model = createServer(async (request, response) => {
 function run(binary, args) {
   return execFileSync(join(repo, 'target/debug', binary), args, { encoding: 'utf8', timeout: 40000 });
 }
-function ctl(...args) { return JSON.parse(run('censorguardctl', ['--config', config, ...args])); }
+function ctl(...args) {
+  if (['status', 'doctor'].includes(args[0])) args.push('--json');
+  return JSON.parse(run('censorguardctl', ['--config', config, ...args]));
+}
 function launch(command, args, label, options = {}) {
   let log = '';
   const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true, ...options });

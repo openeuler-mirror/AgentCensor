@@ -114,7 +114,7 @@ wait "${victim_pid}"
 victim_pid=
 grep -q '^generation-safe$' "${runtime_dir}/victim.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.log"
+    status --json >"${runtime_dir}/status.log"
 grep -q '"tracked": 0' "${runtime_dir}/status.log"
 
 wait "${daemon_pid}"

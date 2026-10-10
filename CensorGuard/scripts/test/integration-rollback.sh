@@ -79,7 +79,7 @@ set -e
 grep -q 'maximum is 256' "${runtime_dir}/overflow.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/failure-status.log"
+    status --json >"${runtime_dir}/failure-status.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/failure-status.log"
 grep -q '"version": 1' "${runtime_dir}/failure-status.log"
 grep -q '"active_bank": 0' "${runtime_dir}/failure-status.log"
@@ -93,7 +93,7 @@ grep -q '"reload_gen": 0' "${runtime_dir}/dry-run.log"
 grep -q '"version": 1' "${runtime_dir}/dry-run.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.log"
+    status --json >"${runtime_dir}/status.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/status.log"
 
 set +e

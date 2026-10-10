@@ -79,7 +79,7 @@ done
 [[ $(grep -c '^\[READY\]' "${runtime_dir}/daemon.log") -ge 2 ]]
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/status.log"
+    status --json >"${runtime_dir}/status.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1
 

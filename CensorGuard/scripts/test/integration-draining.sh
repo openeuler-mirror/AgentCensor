@@ -76,7 +76,7 @@ kill -0 "${child_pid}"
 
 for _ in $(seq 1 160); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/draining.log"
+        status --json >"${runtime_dir}/draining.log"
     if grep -q '"draining": true' "${runtime_dir}/draining.log"; then
         break
     fi
@@ -86,12 +86,12 @@ grep -q '"roots": 0' "${runtime_dir}/draining.log"
 grep -q '"draining": true' "${runtime_dir}/draining.log"
 grep -q '"tracked": 1' "${runtime_dir}/draining.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    status >"${runtime_dir}/tree.log"
+    status --json >"${runtime_dir}/tree.log"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.log"
 
 for _ in $(seq 1 320); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/final.log"
+        status --json >"${runtime_dir}/final.log"
     if grep -q '"tracked": 0' "${runtime_dir}/final.log" && \
         ! grep -q '"name": "lab-agent"' "${runtime_dir}/final.log"; then
         break

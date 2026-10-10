@@ -131,9 +131,9 @@ wait_dns_state() {
     local prefix=$5
     for _ in $(seq 1 120); do
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-            status >"${runtime_dir}/${prefix}-policy.log"
+            status --json >"${runtime_dir}/${prefix}-policy.log"
         "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-            status >"${runtime_dir}/${prefix}-status.log"
+            status --json >"${runtime_dir}/${prefix}-status.log"
         if grep -q "\"${address}\"" "${runtime_dir}/${prefix}-policy.log" && \
             [[ $(status_value version "${runtime_dir}/${prefix}-status.log") == "${version}" ]] && \
             [[ $(status_value active_bank "${runtime_dir}/${prefix}-status.log") == "${bank}" ]]; then

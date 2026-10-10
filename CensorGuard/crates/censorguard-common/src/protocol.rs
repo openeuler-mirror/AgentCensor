@@ -338,6 +338,9 @@ pub struct Response {
     pub dns: Vec<DnsDomainInfo>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub daemon_boot_id: String,
+    /// Canonical startup configuration path reported by the running daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_healthy: Option<bool>,
 }

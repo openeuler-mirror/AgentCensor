@@ -15,18 +15,52 @@ ARCH ?= $(shell uname -m)
 BPF_ARCH ?= $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 INSTALL ?= install
+WITH_DSH ?= 1
+PNPM ?= pnpm
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all check test bpf vmlinux build install install-files uninstall package startup-test clean
+.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output
 
-all: check bpf build
+all: check bpf build $(if $(filter 1,$(WITH_DSH)),plugin)
+
+help:
+	@printf '%s\n' \
+	  'make deps          Download locked build dependencies (first run)' \
+	  'make all           Check and build Rust, BPF and the DSH plugin package' \
+	  'make setup         Build, install and restart the systemd service; run doctor' \
+	  'make plugin-install DSH_REPO=/path/to/deepseek-harness [DSH_PROFILE=web]' \
+	  'make build / bpf / plugin    Build individual components' \
+	  'make test / plugin-test     Run component tests' \
+	  'WITH_DSH=0         Build/setup the daemon without Node or DSH tooling'
+
+deps:
+	cargo fetch --locked
+ifeq ($(WITH_DSH),1)
+	cd plugins/dsh-censorguard && $(PNPM) install --frozen-lockfile
+endif
+
+plugin:
+	PNPM="$(PNPM)" bash scripts/build-dsh-plugin.sh
+
+plugin-test: plugin
+	cd plugins/dsh-censorguard && $(PNPM) test
+	node scripts/test/verify-dsh-package.mjs
+
+DSH_PROFILE ?= web
+plugin-install:
+	bash scripts/install-dsh-censorguard.sh "$(DSH_REPO)" "$(DSH_PROFILE)"
+
+setup: all
+	@if [ -n "$(DESTDIR)" ] || [ "$(PREFIX)" != /usr ] || [ "$(SYSCONFDIR)" != /etc/censorguard ] || [ "$(SBINDIR)" != /usr/sbin ] || [ "$(BINDIR)" != /usr/bin ] || [ "$(SYSTEMDUNITDIR)" != /usr/lib/systemd/system ] || [ "$(SYSUSERSDIR)" != /usr/lib/sysusers.d ] || [ "$(TMPFILESDIR)" != /usr/lib/tmpfiles.d ] || [ "$(AGENTLIBDIR)" != /usr/lib/censorguard ]; then \
+	  printf '%s\n' 'make setup uses the standard /usr and /etc layout; use make install for custom/staged layouts.' >&2; exit 2; \
+	fi
+	bash scripts/setup-system.sh
 
 check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --offline -- -D warnings
-	bash -n scripts/*.sh
-	@for script in scripts/test/*.sh; do bash -n "$$script" || exit; done
+	@for script in scripts/*.sh scripts/test/*.sh; do bash -n "$$script" || exit; done
 	@for source in tools/*.c; do \
 		$(CC) -O2 -Wall -Wextra -Werror -fsyntax-only "$$source"; \
 	done
@@ -96,6 +130,9 @@ package: build bpf
 
 startup-test: build bpf
 	bash ./scripts/test/startup-test.sh
+
+integration-ctl-output: build
+	python3 scripts/test/integration-ctl-output.py
 
 integration-install: build bpf
 	bash ./scripts/test/integration-install.sh

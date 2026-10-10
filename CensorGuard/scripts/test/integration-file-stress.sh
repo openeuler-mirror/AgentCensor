@@ -113,7 +113,7 @@ for _ in $(seq 1 500); do
         "/proc/${probe_pid}/status" 2>/dev/null || true)
     [[ -z ${state} || ${state} == Z ]] && break
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/status-live.log"
+        status --json >"${runtime_dir}/status-live.log"
     responsive=$((responsive + 1))
     /usr/bin/sleep 0.02
 done
@@ -138,7 +138,7 @@ grep -q "denied_ok=${expected_denied} allowed_ok=${expected_allowed} errors=0" \
 
 for _ in $(seq 1 1200); do
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-        status >"${runtime_dir}/status-final.log"
+        status --json >"${runtime_dir}/status-final.log"
     grep -q '"tracked": 0' "${runtime_dir}/status-final.log" && break
     /usr/bin/sleep 0.01
 done

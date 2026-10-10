@@ -31,7 +31,7 @@ rules:
 `enable_*` / `audit_*` 放在启动配置的 `daemon` 段，默认 enable 全开、audit 全开。
 基线和 daemon 设置运行中不可热改，修改后用 `censorguardd reload` 完整重启。
 附加组可热更新；domain 支持多个组，任一层 deny 即拒绝。`remove` 移除域内一个组，
-`policy remove` 删除未被引用的组。`status` 包含 PID 进程树，`doctor` 检查组件。
+`policy remove` 删除未被引用的组。`status` 显示简洁摘要，`status --json` 包含 PID 进程树，`doctor` 检查组件。
 
 一个动态链接程序可能产生多个 `FILE ALLOW`（动态加载器、`libc`、locale 和配置文件的
 读取），这表示文件打开检查点，不表示执行了多个可执行文件。只看执行事件可使用
@@ -51,17 +51,12 @@ execve/execveat 入口暂存 argv；当当前策略存在参数规则而采集�
 
 ```bash
 ./scripts/check-env.sh
-make bpf
-cargo build --workspace --offline
-cargo test --workspace --offline
+make deps
+make all
 ```
 
-启动 daemon 需要 root、BTF、BPF LSM 和 libbpf：
-
-```bash
-sudo target/debug/censorguardd launch --config config/base.yaml
-# launch 加载基线与配置策略；已有 state 时恢复当前策略 revision。
-```
+`make all` 构建 Rust release、BPF 与 0.5.0 DSH 插件安装包。仅构建核心组件可加
+`WITH_DSH=0`。一键系统安装使用 `make setup`，详见 [构建指南](docs/构建指南.md)。
 
 常用控制命令：
 
@@ -101,11 +96,7 @@ IPv4/IPv6 静态网络与 A/AAAA DNS、reload/bind/SIGHUP/回滚、inner-map 共
 
 ```bash
 make all
-sudo make install-files
-sudo systemd-sysusers /usr/lib/sysusers.d/censorguard.conf
-sudo systemd-tmpfiles --create /usr/lib/tmpfiles.d/censorguard.conf
-sudo systemctl daemon-reload
-sudo systemctl enable --now censorguardd.service
+make setup
 ```
 
 `make package` 可生成确定性 tar.gz 和 SHA-256。策略文件由 ctl 按需发布；socket 为
@@ -127,7 +118,7 @@ launcher argv 前插）升级为**整树包裹**：DSH 主进程启动时由最�
 - 自助面：Bootstrap → `dsh.sock`（0666）`attach_self`/`status_self`/`tree_self`，
   5s 心跳比对 boot_id，daemon 重启即重 attach；
 - 委托面：Host 插件 → `censorguard-grpc`（127.0.0.1:50051，非特权，daemon 永不
-  监听网络）→ `ui.sock`（0666）白名单组策略读写与运行时开关切换。systemd 部署下
+  监听网络）→ `ui.sock`（0666）白名单组策略读写。systemd 部署下
   daemon 按配置文件中的 `daemon.spawn_grpc` 自动派生并守护该适配器（崩溃 1s 后重启、daemon 退出时
   TERM→KILL 回收），无需单独的 grpc unit；手动部署也可单独运行
   `sudo censorguard-grpc --config /etc/censorguard/base.yaml`；
