@@ -113,13 +113,13 @@ O5_OK=1
 for line in censorguard-bootstrap censorguard-host censorguard-ui; do
     grep -q "$line" "$PATCH" || { fail "patch 缺插件行 $line"; O5_OK=0; }
 done
-for target in webserver web-runtime api-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+for target in webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
     grep -A1 "^- id: $target\$" "$PATCH" | grep -q 'censorguardReady' \
         || { fail "patch 缺 inject 闸门 $target"; O5_OK=0; }
 done
 # dump-config.mjs 的 REQUIRED 列表与 patch 文件一致 (防两处漂移)
 for line in censorguard-bootstrap censorguard-host censorguard-ui \
-            webserver web-runtime api-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+            webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
     grep -q "'$line'" "$DUMP" || { fail "dump-config.mjs REQUIRED 缺 $line"; O5_OK=0; }
 done
 # 官方 subprocess 不得被 disable (整树包裹模式保留官方 entry); 匹配 yaml 键,

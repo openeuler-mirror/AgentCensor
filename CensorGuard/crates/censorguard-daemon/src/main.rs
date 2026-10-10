@@ -1,4 +1,5 @@
 mod event;
+mod lifecycle;
 mod procfs;
 mod runtime;
 mod server;
@@ -14,11 +15,10 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
-use std::io::BufReader;
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, BufReader};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
@@ -29,6 +29,7 @@ use std::time::Duration;
 struct Args {
     config: PathBuf,
     reload: bool,
+    stop: bool,
     bpf_object: PathBuf,
     control_socket: PathBuf,
     event_socket: PathBuf,
@@ -44,26 +45,27 @@ struct Args {
     dsh_self_groups: Vec<String>,
     spawn_grpc: bool,
     grpc_bin: Option<PathBuf>,
+    grpc_listen: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("censorguardd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let args = parse_args(env::args().skip(1))?;
-    if args.reload {
-        load(&args.config)?;
-        let mut stream = UnixStream::connect(&args.control_socket)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        censorguard_common::protocol::write_json_line(
-            &mut stream,
-            &serde_json::json!({
-                "v": censorguard_common::protocol::VERSION, "op": "daemon_reload"
-            }),
-        )?;
-        let reply: censorguard_common::protocol::Response =
-            censorguard_common::protocol::read_json_line(&mut BufReader::new(stream))?;
-        if !reply.ok {
-            return Err(invalid_input(reply.error.unwrap_or_default()).into());
+    if args.reload || args.stop {
+        if args.reload {
+            load(&args.config)?;
         }
-        println!("daemon restart requested; wait for READY and reattach agents");
+        lifecycle::control(
+            &args.control_socket,
+            &fs::canonicalize(&args.config)?,
+            args.stop,
+        )?;
         return Ok(());
     }
     let mut signals = SigSet::empty();
@@ -88,6 +90,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
     let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
+    let _instance = lifecycle::acquire_instance(
+        &args.state_dir,
+        &[
+            &args.control_socket,
+            &args.event_socket,
+            &args.launch_socket,
+            &args.dsh_socket,
+            &args.ui_socket,
+        ],
+    )?;
+    if args.spawn_grpc {
+        lifecycle::check_grpc_port(args.grpc_listen.as_deref())?;
+    }
+    let mut cleanup = lifecycle::SocketCleanup::default();
 
     // All policy dimensions stay attached so a later atomic reload can enable a dimension that
     // was disabled at startup. The filter_config map keeps disabled hooks fail-open and cheap.
@@ -136,10 +152,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&hub),
         gateway_uid,
     )?;
+    cleanup.record(&args.control_socket)?;
     let _events = server::start_events(&args.event_socket, socket_group, Arc::clone(&hub))?;
+    cleanup.record(&args.event_socket)?;
     let _launch = server::start_launch(&args.launch_socket, socket_group, Arc::clone(&runtime))?;
+    cleanup.record(&args.launch_socket)?;
     let _dsh = server::start_dsh(&args.dsh_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+    cleanup.record(&args.dsh_socket)?;
     let _ui = server::start_ui(&args.ui_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+    cleanup.record(&args.ui_socket)?;
     let _reconciler = start_reconciler(Arc::clone(&runtime))?;
     let _dns = start_dns_refresher(
         Arc::clone(&runtime),
@@ -159,6 +180,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         None
     };
 
+    runtime.mark_ready();
     println!(
         "[READY] {} required hooks attached; control={} events={} launch={} dsh={} ui={}",
         manifest.required().len(),
@@ -172,14 +194,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     wait_for_shutdown(args.duration_seconds, &shutdown_receiver, &runtime)?;
     grpc_shutdown.store(true, Ordering::SeqCst);
 
-    let _ = fs::remove_file(&args.control_socket);
-    let _ = fs::remove_file(&args.event_socket);
-    let _ = fs::remove_file(&args.launch_socket);
-    let _ = fs::remove_file(&args.dsh_socket);
-    let _ = fs::remove_file(&args.ui_socket);
-    if let Some(supervisor) = _grpc {
-        let _ = supervisor.join();
-    }
+    drop(cleanup);
+    drop(_grpc);
     eprintln!("censorguardd shutdown complete");
     if runtime.restart_requested() {
         eprintln!("restarting daemon with {}", args.config.display());
@@ -233,6 +249,7 @@ fn start_signal_handler(
                     }
                     Ok(Signal::SIGINT | Signal::SIGTERM) => {
                         eprintln!("shutdown requested by signal");
+                        let _ = runtime.request_stop();
                         let _ = shutdown.send(());
                         return;
                     }
@@ -255,72 +272,139 @@ fn start_signal_handler(
 /// (TERM, then KILL after a 2s grace period) when the daemon shuts down. The
 /// adapter keeps its own process boundary, so tonic panics never take down the
 /// eBPF enforcement plane.
+struct GrpcSupervisor {
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for GrpcSupervisor {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(supervisor) = self.thread.take() {
+            let _ = supervisor.join();
+        }
+    }
+}
+
+fn spawn_ready_grpc(command: &mut Command) -> Result<Child, io::Error> {
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("gRPC stdout unavailable"))?;
+    let (sender, receiver) = sync_channel(1);
+    let reader = thread::Builder::new()
+        .name("censorguard-grpc-log".into())
+        .spawn(move || {
+            let mut notified = false;
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                println!("{line}");
+                if !notified && line.starts_with("[READY] censorguard-grpc listening on ") {
+                    let _ = sender.send(());
+                    notified = true;
+                }
+            }
+        });
+    let ready = reader.and_then(|_| {
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "gRPC did not become ready: {error}; verify port and adapter version"
+                ))
+            })
+    });
+    if let Err(error) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    if let Some(status) = child.try_wait()? {
+        return Err(io::Error::other(format!(
+            "gRPC exited during startup: {status}"
+        )));
+    }
+    eprintln!("gRPC adapter ready: pid={}", child.id());
+    Ok(child)
+}
+
 fn start_grpc_supervisor(
     grpc_bin: Option<PathBuf>,
     config_path: PathBuf,
     shutdown: Arc<AtomicBool>,
-) -> Result<thread::JoinHandle<()>, io::Error> {
+) -> Result<GrpcSupervisor, io::Error> {
     let bin = grpc_bin.unwrap_or_else(|| {
-        let exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/sbin/censorguardd"));
-        exe.parent()
-            .unwrap_or_else(|| Path::new("/usr/sbin"))
-            .join("censorguard-grpc")
+        env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("/usr/sbin/censorguardd"))
+            .with_file_name("censorguard-grpc")
     });
-    if !bin.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "gRPC adapter not found at {}; build it or set daemon.grpc_bin in the config",
-                bin.display()
-            ),
-        ));
-    }
     let mut command = Command::new(&bin);
-    // The adapter reads the same config as the daemon.
     command.arg("--config").arg(config_path);
-    thread::Builder::new()
+    // A failed initial bind is a startup error, not an endless restart loop.
+    let first_child = spawn_ready_grpc(&mut command)?;
+    let thread_shutdown = Arc::clone(&shutdown);
+    // Share ownership until spawning succeeds so a thread creation failure also reaps the child.
+    let initial = Arc::new(std::sync::Mutex::new(Some(first_child)));
+    let for_thread = Arc::clone(&initial);
+    let supervisor = thread::Builder::new()
         .name("censorguard-grpc".into())
         .spawn(move || {
+            let mut child = match for_thread.lock() {
+                Ok(mut guard) => match guard.take() {
+                    Some(child) => child,
+                    None => return,
+                },
+                Err(_) => return,
+            };
             loop {
-                if shutdown.load(Ordering::SeqCst) {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    let child_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+                    let _ = nix::sys::signal::kill(child_pid, Signal::SIGTERM);
+                    for _ in 0..10 {
+                        if shutdown_reaped(&mut child) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return;
                 }
-                let mut child = match command.spawn() {
-                    Ok(child) => child,
-                    Err(error) => {
-                        eprintln!("gRPC adapter spawn failed: {error}; retrying in 5s");
-                        thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                eprintln!("gRPC adapter spawned: pid={}", child.id());
-                let child_pid = nix::unistd::Pid::from_raw(child.id() as i32);
-                // Poll the shutdown flag and child liveness with short timeouts.
-                loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        let _ = nix::sys::signal::kill(child_pid, Signal::SIGTERM);
-                        for _ in 0..10 {
-                            if shutdown_reaped(&mut child) {
-                                eprintln!("gRPC adapter terminated by signal");
-                                return;
-                            }
-                            thread::sleep(Duration::from_millis(200));
-                        }
-                        let _ = nix::sys::signal::kill(child_pid, Signal::SIGKILL);
-                        let _ = child.wait();
-                        eprintln!("gRPC adapter killed after grace period");
-                        return;
-                    }
-                    if shutdown_reaped(&mut child) {
-                        eprintln!("gRPC adapter exited; restarting in 1s");
+                if shutdown_reaped(&mut child) {
+                    eprintln!("gRPC adapter exited; retrying in 1s");
+                    loop {
                         thread::sleep(Duration::from_secs(1));
-                        break;
+                        if thread_shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match spawn_ready_grpc(&mut command) {
+                            Ok(next) => {
+                                child = next;
+                                break;
+                            }
+                            Err(error) => eprintln!("gRPC restart failed: {error}"),
+                        }
                     }
-                    thread::sleep(Duration::from_millis(200));
                 }
+                thread::sleep(Duration::from_millis(200));
             }
-        })
+        });
+    match supervisor {
+        Ok(thread) => Ok(GrpcSupervisor {
+            shutdown,
+            thread: Some(thread),
+        }),
+        Err(error) => {
+            if let Ok(mut guard) = initial.lock()
+                && let Some(mut child) = guard.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Try to reap the adapter child without blocking; true when it has exited.
@@ -357,6 +441,7 @@ fn wait_for_shutdown(
         duration_seconds.map(|seconds| std::time::Instant::now() + Duration::from_secs(seconds));
     loop {
         if runtime.restart_requested()
+            || runtime.stop_requested()
             || deadline.is_some_and(|time| std::time::Instant::now() >= time)
         {
             return Ok(());
@@ -374,9 +459,10 @@ fn wait_for_shutdown(
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
     let mut values: Vec<String> = args.collect();
     let reload = values.first().is_some_and(|value| value == "reload");
+    let stop = values.first().is_some_and(|value| value == "stop");
     if values
         .first()
-        .is_some_and(|value| matches!(value.as_str(), "launch" | "reload"))
+        .is_some_and(|value| matches!(value.as_str(), "launch" | "reload" | "stop"))
     {
         values.remove(0);
     } else if !values
@@ -384,14 +470,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
         .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
     {
         return Err(invalid_input(
-            "expected launch or reload; usage: censorguardd launch|reload [--config PATH]",
+            "expected launch, reload or stop; usage: censorguardd launch|reload|stop [--config PATH]",
         ));
     }
     let parsed = parse_args_with_values(values.into_iter())?;
-    if reload && (parsed.check_config || parsed.duration_seconds.is_some()) {
-        return Err(invalid_input("reload accepts only --config PATH"));
+    if (reload || stop) && (parsed.check_config || parsed.duration_seconds.is_some()) {
+        return Err(invalid_input("reload/stop accept only --config PATH"));
     }
-    Ok(Args { reload, ..parsed })
+    Ok(Args {
+        reload,
+        stop,
+        ..parsed
+    })
 }
 
 fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
@@ -415,6 +505,8 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
                     "usage: censorguardd launch [--config PATH] [--check-config]\n\
                      [--duration SECONDS]\n\
                      censorguardd reload [--config PATH]\n\
+                     censorguardd stop [--config PATH]\n\
+                     censorguardd --version\n\
                      all daemon paths and runtime settings are read from the config file"
                 );
                 std::process::exit(0);
@@ -445,6 +537,7 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
     Ok(Args {
         config,
         reload: false,
+        stop: false,
         bpf_object,
         control_socket,
         event_socket,
@@ -460,6 +553,7 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
         dsh_self_groups,
         spawn_grpc,
         grpc_bin,
+        grpc_listen: daemon.grpc_listen,
     })
 }
 

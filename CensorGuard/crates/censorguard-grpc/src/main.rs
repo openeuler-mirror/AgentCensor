@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Code, Request, Response, Status, transport::Server};
 
 #[allow(clippy::all)]
@@ -472,6 +472,13 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("censorguard-grpc {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut explicit_config = false;
     let mut args = std::env::args().skip(1);
@@ -510,6 +517,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client: Arc::new(DaemonClient::new(sock.clone())),
         ev_sock: ev_sock.clone(),
     };
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot listen on {addr}: {error}; check for an existing gRPC adapter"),
+        )
+    })?;
     println!(
         "[READY] censorguard-grpc listening on {addr} (ui={}, events={})",
         sock.display(),
@@ -517,7 +530,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Server::builder()
         .add_service(pb::censorguard_server::CensorguardServer::new(adapter))
-        .serve(addr)
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
 }

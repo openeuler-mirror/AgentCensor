@@ -148,6 +148,8 @@ pub struct Runtime {
     boot_id: String,
     hooks_healthy: bool,
     restart_requested: AtomicBool,
+    stop_requested: AtomicBool,
+    ready: AtomicBool,
     dsh_self_groups: BTreeSet<String>,
 }
 
@@ -262,6 +264,8 @@ impl Runtime {
             boot_id,
             hooks_healthy,
             restart_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
             dsh_self_groups,
         };
         runtime.persist_revision_snapshot(initial_revision, &policy)?;
@@ -356,6 +360,14 @@ impl Runtime {
 
     pub fn hooks_healthy(&self) -> bool {
         self.hooks_healthy
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && !self.stop_requested() && !self.restart_requested()
     }
 
     pub fn is_dsh_group_allowed(&self, group: &str) -> bool {
@@ -606,6 +618,9 @@ impl Runtime {
             .reload_lock
             .lock()
             .map_err(|_| RuntimeError::Poisoned)?;
+        if self.stop_requested() {
+            return Err(RuntimeError::RevisionStore("daemon is stopping".into()));
+        }
         crate::validate_restart_config(&self.config_path)?;
         self.restart_requested.store(true, Ordering::SeqCst);
         Ok(())
@@ -613,6 +628,32 @@ impl Runtime {
 
     pub fn restart_requested(&self) -> bool {
         self.restart_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn validate_config_path(&self, requested: Option<&str>) -> Result<(), RuntimeError> {
+        if let Some(path) = requested
+            && fs::canonicalize(path)? != self.config_path
+        {
+            return Err(RuntimeError::RevisionStore(format!(
+                "running daemon uses {}; reload must use that startup config",
+                self.config_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn request_stop(&self) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        self.restart_requested.store(false, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
     }
 
     pub fn untrack(&self, pid: u32, peer_uid: u32) -> Result<(), RuntimeError> {
@@ -1165,9 +1206,9 @@ impl Runtime {
         next_policy: CompiledPolicy,
         dry_run: bool,
     ) -> Result<ReloadResult, RuntimeError> {
-        if self.restart_requested() {
+        if self.restart_requested() || self.stop_requested() {
             return Err(RuntimeError::RevisionStore(
-                "daemon restart is pending".into(),
+                "daemon shutdown is pending".into(),
             ));
         }
         let (

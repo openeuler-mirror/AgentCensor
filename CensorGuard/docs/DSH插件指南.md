@@ -29,7 +29,7 @@ attach 失败则 DSH 启动失败)。
         5s 心跳比对 boot_id, daemon 重启即自动重 attach
 
 委托面: DSH Host 插件 → censorguard-grpc (127.0.0.1:50051, 非特权)
-        → ui.sock (0666) 白名单组策略读写 + 运行时开关切换
+        → ui.sock (0666) 白名单组策略读写
         (daemon 永不监听网络; systemd 下 daemon 按 `daemon.spawn_grpc` 配置自动派生守护)
 
 事件面: eBPF ringbuf → daemon events.sock → gRPC 流
@@ -101,10 +101,11 @@ sudo usermod -aG censorguard <用户名>
 普通用户执行（以源码仓库形态调用 dsh 为例）:
 
 ```bash
-cd ~/deepseek-harness-master
+cd ~/deepseek-harness
 pnpm dsh plugin --profile web add /path/to/CensorGuard/plugins/dsh-censorguard
 ```
 
+0.5.0 已适配本机 DSH 0.1.5-rc.2 的 `typert-gateway` entry 与浏览器 slot。
 插件是**单包**:包的 `dsh.bundle` 声明让它在 `dsh plugin add` 后自动进入
 profile 的层列表,`cordis.patch.yml` 随之叠加进组合树。插件装进 **profile
 数据目录**(`$DSH_HOME/profiles/<name>`,默认 `~/.dsh`)里的依赖是指回插件
@@ -114,8 +115,8 @@ profile 的层列表,`cordis.patch.yml` 随之叠加进组合树。插件装进 
 
 ```bash
 pnpm dsh --profile web --dump-config     # 输出应含 censorguard-bootstrap/host/ui 三行
-# 或插件自带的校验脚本(四级探测链定位 dsh: --dsh / $DSH_BIN / PATH / npx 兜底)
-node /path/to/plugins/dsh-censorguard/bin/dump-config.mjs --dsh ~/deepseek-harness-master
+# 或插件自带的校验脚本(--dsh / $DSH_BIN / PATH; 不自动下载另一版本)
+node /path/to/plugins/dsh-censorguard/bin/dump-config.mjs --dsh ~/deepseek-harness
 ```
 
 > 从旧四包形态迁移:`pnpm dsh plugin --profile web remove @censorguard/dsh-bundle
@@ -156,12 +157,18 @@ WebUI 只读——写请求在 RPC 通道层就被拒绝(403)。
 
 会话视图的第三个页签"安全拦截审计"(对话、轨迹之后):
 
+这三个页签属于已打开的会话；初始首页没有会话时不会显示。当前 DSH 首次启动
+还会显示内测声明，需要点"继续"，再选择工作区并打开或创建会话。
+侧边栏的会话树与文件预览由 DSH 自身提供，插件追加安全设置和审计页签。
+
 - 实时滚动被拦截/被审计的事件(FILE/EXEC/NET/GUARD),可按类型、
   允许/拒绝过滤,点击条目看完整详情(pid/comm/目标/参数/规则版本)。
 - 顶部状态条:流状态(live/reconnecting)、已丢失事件数、缓存淘汰数、
   daemon boot ID。
 - 缺口诚实展示:daemon 侧丢失(`dropped_before`)、断线期间丢失
   (sequence 跳变)、daemon 重启,都以 gap 标记条目出现在列表里。
+- 切换到对话/轨迹时取消审计长轮询，再次进入审计会恢复。daemon 重启后按新
+  boot ID 重置实时缓存与序号，并显示重启缺口，避免新事件被旧序号过滤。
 
 ### 4.3 域生命周期
 
@@ -192,14 +199,35 @@ cd plugins/dsh-censorguard && pnpm build
 # 重启 DSH(pnpm dsh web)
 ```
 
-### 5.3 升级 daemon / gRPC 适配器
+以 tarball 安装的 profile 需要重新安装生成的包，重建源码不会更新已复制的旧包：
 
 ```bash
-sudo systemctl stop censorguardd
-sudo cp target/release/censorguardd /usr/sbin/ && sudo cp target/release/censorguard-grpc /usr/bin/
-sudo systemctl start censorguardd
-# DSH 心跳检测到 boot_id 变化后自动重 attach,无需重启 DSH
+bash scripts/install-dsh-censorguard.sh ~/deepseek-harness web
 ```
+
+安装器会移除旧四包依赖，再安装 `@censorguard/dsh`。已有浏览器需刷新以加载
+新 bundle；包版本相同的重建也会生成新的资源 revision。
+
+本机验证入口：
+
+```bash
+cd plugins/dsh-censorguard
+pnpm build
+pnpm test
+node bin/dump-config.mjs --dsh ~/deepseek-harness
+cd ../..
+# 需要 BPF LSM、构建好的 debug workspace/BPF、DSH Web dist 和 Playwright Chromium
+sudo node scripts/test/integration-dsh-web.mjs ~/deepseek-harness
+```
+
+Web 验收使用临时 profile/state/端口及本地模型桩，覆盖对话、轨迹、侧边栏预览、
+实际文件拒绝审计及 reload 自动重新接入；不修改用户 profile 或已运行的服务。
+
+### 5.3 升级 daemon / gRPC 适配器
+
+按 [构建指南](构建指南.md) 的 0.5.0 升级步骤安装同版本 daemon、ctl、grpc、
+BPF 和 systemd unit，再 `daemon-reload` 并重启服务。仅构建源码不会替换旧进程。
+DSH 心跳检测到 boot ID 变化后自动重新 attach，无需为 daemon reload 重启 DSH。
 
 ## 6. 常见问题
 

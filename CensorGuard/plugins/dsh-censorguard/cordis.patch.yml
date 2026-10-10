@@ -47,7 +47,7 @@
   inject: [webStartup, censorguardReady]
 
 # 以下各行原无 inject (dsh-base / dsh-web-app 层)
-- id: api-gateway
+- id: typert-gateway
   inject: [censorguardReady]
 
 - id: cordis-host-runner

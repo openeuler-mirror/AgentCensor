@@ -133,8 +133,8 @@ export function apply(ctx: CordisContext, config?: HostPluginConfig): void {
       const unregisterRead = webCtx.webServer.register({
         kind: 'prefix',
         path: '/censorguard-read',
-        handler: serveRpc(webCtx, '/censorguard-read', false, (endpoint, payload) =>
-          routeRead(host, audit, boundGroup, endpoint, payload)),
+        handler: serveRpc(webCtx, '/censorguard-read', false, (endpoint, payload, signal) =>
+          routeRead(host, audit, boundGroup, endpoint, payload, signal)),
       });
       const unregisterAdmin = webCtx.webServer.register({
         kind: 'prefix',
@@ -303,6 +303,7 @@ async function routeRead(
   boundGroup: string,
   endpoint: string,
   payload: unknown,
+  signal: AbortSignal,
 ): Promise<RpcResult> {
   try {
     switch (endpoint) {
@@ -317,13 +318,13 @@ async function routeRead(
         return ok(audit.status());
       case 'audit/snapshot': {
         const p = (payload ?? {}) as SnapshotPayload;
-        return ok(audit.snapshot(p.afterSequence ?? 0, capLimit(p.limit), p.filter));
+        return ok(audit.snapshot(p.afterSequence ?? 0, capLimit(p.limit), p.filter, p.afterBootId));
       }
       case 'audit/wait': {
         const p = (payload ?? {}) as SnapshotPayload & { timeoutMs?: number };
         // 长轮询不超过 25 秒 (AuditStream.wait 内建上限)
         return ok(
-          await audit.wait(p.afterSequence ?? 0, capLimit(p.limit), p.timeoutMs ?? MAX_WAIT_MS, p.filter),
+          await audit.wait(p.afterSequence ?? 0, capLimit(p.limit), p.timeoutMs ?? MAX_WAIT_MS, p.filter, signal, p.afterBootId),
         );
       }
       default:
@@ -398,6 +399,7 @@ async function routeAdmin(
 
 interface SnapshotPayload {
   afterSequence?: number;
+  afterBootId?: string;
   limit?: number;
   filter?: AuditFilter;
 }

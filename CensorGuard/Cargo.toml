@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # MSRV 由语言特性决定: edition 2024 (1.85+) 与 let-chains (1.88+);
 # 依赖最高 MSRV 为 indexmap 2.13 的 1.82, 均低于 1.88

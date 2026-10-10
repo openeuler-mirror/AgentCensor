@@ -217,9 +217,21 @@ integration-policy-sharing: bpf
 	sudo bash ./scripts/test/integration-policy-sharing.sh
 
 # Requires the DSH plugin's gRPC dependencies (pnpm install in its package).
+# Isolated daemon lifecycle and gRPC startup conflict acceptance.
+integration-lifecycle: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-lifecycle.py
+
 integration-policy-entry: bpf
 	cargo build --workspace --offline
 	sudo python3 scripts/test/integration-policy-entry.py
+
+# Optional: needs a built DSH checkout and its Playwright Chromium installation.
+DSH_REPO ?= $(HOME)/deepseek-harness
+integration-dsh-web: bpf
+	cargo build --workspace --offline
+	cd plugins/dsh-censorguard && pnpm build
+	sudo node ./scripts/test/integration-dsh-web.mjs "$(DSH_REPO)"
 
 integration-dns: bpf
 	cargo build --workspace --offline
@@ -229,7 +241,7 @@ integration-dns-refresh: bpf
 	cargo build --workspace --offline
 	sudo bash ./scripts/test/integration-dns-refresh.sh
 
-integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh
+integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle
 
 clean:
 	cargo clean

@@ -909,6 +909,7 @@ fn dispatch(
                 let events = hub.stats();
                 Response {
                     ok: true,
+                    daemon_ready: runtime.ready(),
                     roots: status.roots,
                     trees,
                     groups,
@@ -1036,8 +1037,21 @@ fn dispatch(
             },
             None => failure("remove requires policy group"),
         },
-        Operation::DaemonReload => match runtime.request_restart() {
-            Ok(()) => success(),
+        Operation::DaemonReload => match runtime
+            .validate_config_path(request.policy_file.as_deref())
+            .and_then(|()| runtime.request_restart())
+        {
+            Ok(()) => Response {
+                daemon_boot_id: runtime.boot_id().to_owned(),
+                ..success()
+            },
+            Err(error) => failure(error.to_string()),
+        },
+        Operation::DaemonStop => match runtime.request_stop() {
+            Ok(()) => Response {
+                daemon_boot_id: runtime.boot_id().to_owned(),
+                ..success()
+            },
             Err(error) => failure(error.to_string()),
         },
         Operation::Tree => match runtime.trees() {
@@ -1077,7 +1091,10 @@ fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListe
     fs::create_dir_all(parent)?;
     validate_socket_parent(parent)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            crate::lifecycle::ensure_socket_unused(path)?;
+            fs::remove_file(path)?;
+        }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -1101,7 +1118,7 @@ fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListe
     Ok(listener)
 }
 
-fn validate_socket_parent(parent: &Path) -> Result<(), io::Error> {
+pub(crate) fn validate_socket_parent(parent: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(parent)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(

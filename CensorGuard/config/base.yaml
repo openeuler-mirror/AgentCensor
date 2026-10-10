@@ -14,9 +14,9 @@ daemon:
   enable_file: true
   enable_exec: true
   enable_net: true
-  audit_file: false
-  audit_exec: false
-  audit_net: false
+  audit_file: true
+  audit_exec: true
+  audit_net: true
   dns_refresh_seconds: 60
   spawn_grpc: true
   grpc_bin: /usr/bin/censorguard-grpc

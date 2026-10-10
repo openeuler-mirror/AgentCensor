@@ -38,8 +38,8 @@ function unwrap(r: RpcResult): unknown {
 }
 
 /** callRead /censorguard-read (trusted-host, 任何 caller 可读) */
-export async function callRead<T>(conn: ClientConnection, endpoint: string, payload?: unknown): Promise<T> {
-  return (await unwrap(await conn.rpc.call('/censorguard-read', endpoint, payload ?? {}))) as T;
+export async function callRead<T>(conn: ClientConnection, endpoint: string, payload?: unknown, signal?: AbortSignal): Promise<T> {
+  return (await unwrap(await conn.rpc.call('/censorguard-read', endpoint, payload ?? {}, signal))) as T;
 }
 
 /** callAdmin /censorguard-admin (loopback only; 远程浏览器在 Connection

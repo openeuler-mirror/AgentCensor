@@ -35,6 +35,15 @@ profile_dir="${DSH_HOME:-${HOME}/.dsh}/profiles/${profile}"
 if [[ -f "${profile_dir}/package.json" ]] && grep -q '"dsh-censorguard"' "${profile_dir}/package.json"; then
     (cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" remove dsh-censorguard)
 fi
+legacy_packages=()
+for legacy in @censorguard/dsh-bundle @censorguard/dsh-bootstrap @censorguard/dsh-host @censorguard/dsh-client; do
+    if [[ -f "${profile_dir}/package.json" ]] && grep -Fq "\"${legacy}\"" "${profile_dir}/package.json"; then
+        legacy_packages+=("${legacy}")
+    fi
+done
+if (( ${#legacy_packages[@]} )); then
+    (cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" remove "${legacy_packages[@]}")
+fi
 (cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" add "${tarball}")
 
-printf 'dsh-censorguard installed in profile %s\n' "${profile}"
+printf '@censorguard/dsh installed in profile %s\n' "${profile}"

@@ -16,10 +16,10 @@
 //   1. --dsh <repo>            源码仓库, 经 pnpm dsh 调用
 //   2. $DSH_BIN                源码仓库目录或 dsh 可执行文件 (自动判别)
 //   3. PATH 上的 dsh           全局安装
-//   4. npx 联网调用            @deepseek-ai/dsh (会有下载提醒)
+// 缺少 DSH 时提示指定源码仓库, 不隐式下载另一个版本。
 // 退出码: 0 = 验证通过; 1 = dump 失败或关键行缺失
 
-import { parseArgs, resolveDsh, runDsh } from './lib/dsh.mjs';
+import { parseArgs, resolveDsh, runDsh } from './dsh.mjs';
 
 // 必须出现在 dump 里的行: 三个插件行 + inject 闸门 (bundle patch 的
 // cordis.patch.yml 声明, 见 bundle/cordis.patch.yml)
@@ -31,7 +31,7 @@ const REQUIRED_LINES = [
 const REQUIRED_INJECT_TARGETS = [
   'webserver',
   'web-runtime',
-  'api-gateway',
+  'typert-gateway',
   'cordis-host-runner',
   'code-runtime',
   'subprocess',
@@ -54,7 +54,8 @@ function main() {
   const output = dump.output;
 
   console.log('=== Censorguard 验证 ===');
-  let ok = true;
+  let ok = !/patch: entry .+ not found/.test(output);
+  if (!ok) console.error('  ✗ patch 目标不存在, 检查 DSH 与插件版本');
 
   for (const line of REQUIRED_LINES) {
     const found = output.includes(line);
@@ -77,4 +78,7 @@ function main() {
   process.exit(ok ? 0 : 1);
 }
 
-main();
+try { main(); } catch (error) {
+  console.error(`[dump-config] ${error.message}`);
+  process.exitCode = 1;
+}

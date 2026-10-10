@@ -258,7 +258,7 @@ export const AuditView: FC<AuditViewProps> = (props) => {
   const filtered = s.items.filter((it) => it.type === 'row').length;
 
   return (
-    <div style={styles.root}>
+    <div style={styles.root} data-censorguard-audit data-stream-state={s.bar.connected ? 'live' : 'reconnecting'} data-daemon-boot-id={s.bar.daemonBootId}>
       {/* 顶部状态条: 实时/断线/重连中 + boot ID + 最后 sequence + 丢失/淘汰 */}
       <div style={styles.bar}>
         <span style={styles.chip}>
@@ -389,6 +389,8 @@ const RowView: FC<{
   const args = row.args.length > 0 ? `[${row.args.join(' ')}]` : '';
   return (
     <div
+      data-audit-sequence={row.sequence}
+      data-audit-result={row.result}
       style={{
         ...styles.row,
         background: selected ? C.accentDim : hover ? C.surface : undefined,

@@ -78,10 +78,13 @@ export const MAX_WAIT_MS = 25_000;
 
 interface Waiter {
   afterSequence: number;
+  afterBootId: string;
   filter?: AuditFilter;
   limit: number;
   resolve: (r: SnapshotResult) => void;
   timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort: () => void;
 }
 
 export class AuditStream {
@@ -145,9 +148,9 @@ export class AuditStream {
   }
 
   /** snapshot 一次性拉取 afterSequence 之后的条目 */
-  snapshot(afterSequence: number, limit: number, filter?: AuditFilter): SnapshotResult {
+  snapshot(afterSequence: number, limit: number, filter?: AuditFilter, afterBootId = this.lastBootId): SnapshotResult {
     return {
-      entries: this.collect(afterSequence, limit, filter),
+      entries: this.collect(afterSequence, limit, filter, afterBootId),
       lastSequence: this.lastSequence,
       status: this.status(),
     };
@@ -160,9 +163,11 @@ export class AuditStream {
     limit: number,
     timeoutMs: number,
     filter?: AuditFilter,
+    signal?: AbortSignal,
+    afterBootId = this.lastBootId,
   ): Promise<SnapshotResult> {
-    const immediate = this.collect(afterSequence, limit, filter);
-    if (immediate.length > 0 || this.disposed) {
+    const immediate = this.collect(afterSequence, limit, filter, afterBootId);
+    if (immediate.length > 0 || this.disposed || signal?.aborted) {
       return Promise.resolve({
         entries: immediate,
         lastSequence: this.lastSequence,
@@ -173,15 +178,25 @@ export class AuditStream {
     return new Promise<SnapshotResult>((resolve) => {
       const waiter: Waiter = {
         afterSequence,
+        afterBootId,
         filter,
         limit,
         resolve,
         timer: setTimeout(() => {
           this.waiters = this.waiters.filter((w) => w !== waiter);
-          resolve(this.snapshot(afterSequence, limit, filter));
+          signal?.removeEventListener('abort', waiter.onAbort);
+          resolve(this.snapshot(afterSequence, limit, filter, afterBootId));
         }, capped),
+        signal,
+        onAbort: () => {
+          clearTimeout(waiter.timer);
+          this.waiters = this.waiters.filter((w) => w !== waiter);
+          signal?.removeEventListener('abort', waiter.onAbort);
+          resolve(this.snapshot(afterSequence, limit, filter, afterBootId));
+        },
       };
       this.waiters.push(waiter);
+      signal?.addEventListener('abort', waiter.onAbort, { once: true });
     });
   }
 
@@ -199,6 +214,7 @@ export class AuditStream {
     this.waiters = [];
     for (const w of pending) {
       clearTimeout(w.timer);
+      w.signal?.removeEventListener('abort', w.onAbort);
       w.resolve({ entries: [], lastSequence: this.lastSequence, status: this.status() });
     }
   }
@@ -293,6 +309,9 @@ export class AuditStream {
   private onEvent(ev: AuditEvent): void {
     // daemon 重启: boot ID 变化, 此前缓存的 sequence 不再可比
     if (this.lastBootId && ev.daemonBootId && ev.daemonBootId !== this.lastBootId) {
+      this.entries = [];
+      this.entriesBytes = 0;
+      this.lastSequence = 0;
       this.push({
         type: 'gap',
         count: 0,
@@ -346,11 +365,12 @@ export class AuditStream {
     }
   }
 
-  private collect(afterSequence: number, limit: number, filter?: AuditFilter): AuditEntry[] {
+  private collect(afterSequence: number, limit: number, filter?: AuditFilter, afterBootId = this.lastBootId): AuditEntry[] {
+    const cursor = afterBootId && this.lastBootId && afterBootId !== this.lastBootId ? 0 : afterSequence;
     const out: AuditEntry[] = [];
     for (const e of this.entries) {
       const seq = e.type === 'event' ? e.event.sequence : e.atSequence;
-      if (seq <= afterSequence) continue;
+      if (seq <= cursor) continue;
       if (e.type === 'event' && filter) {
         if (filter.kinds && filter.kinds.length > 0 && !filter.kinds.includes(e.event.kind)) {
           continue;
@@ -368,12 +388,13 @@ export class AuditStream {
     const pending = this.waiters;
     this.waiters = [];
     for (const w of pending) {
-      const entries = this.collect(w.afterSequence, w.limit, w.filter);
+      const entries = this.collect(w.afterSequence, w.limit, w.filter, w.afterBootId);
       if (entries.length === 0 && !this.disposed) {
         this.waiters.push(w); // 仍无匹配条目, 继续等
         continue;
       }
       clearTimeout(w.timer);
+      w.signal?.removeEventListener('abort', w.onAbort);
       w.resolve({ entries, lastSequence: this.lastSequence, status: this.status() });
     }
   }

@@ -73,7 +73,7 @@ censorguardctl --config config/base.yaml attach --pid PID --domain lab-agent
 censorguardctl --config config/base.yaml audit
 ```
 
-0.4.0 最小启动验证：
+0.5.0 最小启动验证：
 
 ```bash
 cargo build --workspace --release --offline

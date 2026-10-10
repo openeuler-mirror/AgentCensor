@@ -31,7 +31,7 @@ on_err() {
 }
 trap 'on_err "${LINENO}"' ERR
 
-# Minimal 0.4.0 smoke test. Run as root on a host with BPF LSM enabled.
+# Minimal 0.5.0 smoke test. Run as root on a host with BPF LSM enabled.
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=$(mktemp -d /tmp/censorguard-smoke.XXXXXX)
 cleanup() { kill "${daemon_pid:-}" "${audit_pid:-}" 2>/dev/null || true; rm -rf -- "${runtime_dir}"; }
@@ -79,4 +79,4 @@ for _ in $(seq 1 40); do
   sleep 0.05
 done
 grep -q 'DENY' "${runtime_dir}/audit.log"
-echo "Censorguard 0.4.0 startup smoke test passed"
+echo "Censorguard 0.5.0 startup smoke test passed"

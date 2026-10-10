@@ -39,6 +39,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     if env::var_os(SPAWN_HELPER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
         return spawn_helper(&env::args().skip(1).collect::<Vec<_>>());
     }
+    if env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("censorguardctl {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
         println!(
             "usage: censorguardctl [--config PATH] <status|doctor|policy|attach|unattach|bind|remove|spawn|audit> ..."
@@ -87,7 +94,7 @@ fn doctor(config: &config::DaemonConfig) -> Result<(), Box<dyn Error>> {
         Ok(response) => {
             check(
                 "daemon",
-                response.ok,
+                response.ok && response.daemon_ready,
                 response
                     .error
                     .unwrap_or_else(|| response.daemon_boot_id.clone()),

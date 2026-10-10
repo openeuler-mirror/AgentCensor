@@ -221,7 +221,7 @@ const EMPTY_STATUS: RpcAuditStatus = {
 export class AuditController extends Store<AuditState> {
   private readonly buffer = new AuditBuffer();
   private rpcStatus: RpcAuditStatus = EMPTY_STATUS;
-  private disposed = false;
+  private polling: AbortController | null = null;
 
   constructor(private readonly conn: ClientConnection) {
     super({ items: [], bar: statusBar(EMPTY_STATUS, 0, 0), filter: {}, selected: null });
@@ -229,11 +229,14 @@ export class AuditController extends Store<AuditState> {
 
   /** start 长轮询循环: snapshot 起步 → wait 续推 */
   start(): void {
-    void this.loop();
+    if (this.polling) return;
+    this.polling = new AbortController();
+    void this.loop(this.polling.signal);
   }
 
   dispose(): void {
-    this.disposed = true;
+    this.polling?.abort();
+    this.polling = null;
   }
 
   setFilter(filter: AuditFilterView): void {
@@ -252,32 +255,42 @@ export class AuditController extends Store<AuditState> {
     return null;
   }
 
-  private async loop(): Promise<void> {
+  private async loop(signal: AbortSignal): Promise<void> {
     // 起步: 全量 snapshot
     try {
       const snap = await callRead<AuditSnapshot>(this.conn, 'audit/snapshot', {
         afterSequence: 0,
         limit: 200,
-      });
-      this.ingest(snap);
+      }, signal);
+      if (!signal.aborted) this.ingest(snap);
     } catch {
       // 首拉失败也进入 wait 循环, 由状态条显示断线
     }
-    while (!this.disposed) {
+    while (!signal.aborted) {
       try {
         const r = await callRead<AuditSnapshot>(this.conn, 'audit/wait', {
           afterSequence: this.buffer.lastSequence(),
+          afterBootId: this.rpcStatus.daemonBootId,
           limit: 200,
           timeoutMs: 25000,
-        });
-        this.ingest(r);
-      } catch {
-        if (!this.disposed) await sleep(1000); // 传输失败退避后重试
+        }, signal);
+        if (!signal.aborted) this.ingest(r);
+      } catch (error) {
+        if (!signal.aborted) {
+          this.rpcStatus = { ...this.rpcStatus, state: 'reconnecting', lastError: errText(error) };
+          this.set({ ...this.snapshot, bar: statusBar(this.rpcStatus, this.buffer.evictedCount(), this.snapshot.items.length) });
+          await sleep(1000, signal);
+        }
       }
     }
   }
 
   private ingest(snap: AuditSnapshot): void {
+    if (this.rpcStatus.daemonBootId && snap.status.daemonBootId &&
+        this.rpcStatus.daemonBootId !== snap.status.daemonBootId) {
+      this.buffer.clear();
+      this.set({ ...this.snapshot, selected: null });
+    }
     this.buffer.ingest(snap.entries);
     this.rpcStatus = snap.status;
     const items = this.visibleItems(this.snapshot.filter);
@@ -297,8 +310,17 @@ export class AuditController extends Store<AuditState> {
 
 const editor0 = new PolicyEditor();
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener('abort', finish, { once: true });
+    if (signal.aborted) finish();
+  });
 }
 
 function errText(e: unknown): string {

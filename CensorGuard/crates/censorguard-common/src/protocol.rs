@@ -22,6 +22,7 @@ pub enum Operation {
     Unattach,
     Remove,
     DaemonReload,
+    DaemonStop,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,7 +198,12 @@ impl Operation {
     pub const fn requires_root(&self) -> bool {
         matches!(
             self,
-            Self::Reload | Self::Bind | Self::SetSwitches | Self::Remove | Self::DaemonReload
+            Self::Reload
+                | Self::Bind
+                | Self::SetSwitches
+                | Self::Remove
+                | Self::DaemonReload
+                | Self::DaemonStop
         )
     }
 }
@@ -256,6 +262,8 @@ pub struct DomainInfo {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Response {
     pub ok: bool,
+    #[serde(default)]
+    pub daemon_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,6 +513,8 @@ mod tests {
     fn privileged_operations_are_explicit() {
         assert!(Operation::Reload.requires_root());
         assert!(Operation::Bind.requires_root());
+        assert!(Operation::DaemonStop.requires_root());
+        assert!(Operation::DaemonReload.requires_root());
         assert!(!Operation::Track.requires_root());
     }
 
