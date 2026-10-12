@@ -43,7 +43,7 @@ make plugin-install DSH_REPO=/path/to/deepseek-harness
 ```bash
 node plugins/dsh-censorguard/bin/dump-config.mjs --dsh /path/to/deepseek-harness
 cd /path/to/deepseek-harness
-pnpm dsh --profile web web
+pnpm dsh --profile web
 ```
 
 配置检查应显示三个插件入口和八个依赖闸门全部通过。打开终端显示的 Web 地址，
@@ -179,9 +179,26 @@ Bootstrap 每 5 秒核对 daemon boot ID；重启后重新接入。保护在 dae
 安全策略设置展示当前保护状态和绑定组规则。校验只编译，保存会立即发布组规则；
 版本检查发现冲突时，重新读取后再编辑。写接口只允许本机 loopback 浏览器，远程访问只读。
 
-“安全拦截审计”位于已打开会话的页签区。可按事件类型、允许/拒绝筛选，选中条目查看
-进程、目标和规则详情。切走取消长轮询，回来恢复；daemon boot ID 变化后切换到新事件序号。
-断线、重启和事件丢失会显示 gap；Host 的缓存上限为 5000 条 / 10 MiB，适合实时查看。
+“安全拦截审计”位于已打开会话的页签区，范围是**当前 DSH 实例及其子孙进程**，
+包含各会话工具、启动加载和页面文件访问。页签放在会话中，不代表事件只属于这一段对话。
+可按事件类型、允许/拒绝、进程和目标筛选，选中条目查看详情。
+切走取消浏览器长轮询，Host 继续接收；回来恢复缓存。daemon 重启后切换到新事件编号。
+
+| 字段 | 含义 |
+| --- | --- |
+| 事件序号（旧版 `seq`） | daemon 当前启动期间分配的全局事件编号，放行也有编号；其他域和显示过滤会造成跳号，不能当作命令数、拒绝数或丢失数 |
+| 传输丢失 | daemon 显式报告的本订阅传输丢失；断线期间数量未知，内核丢失另用 `censorguardctl status --json` 的事件计数诊断 |
+| 缓存移除（旧版“淘汰”） | `Host / 浏览器` 两个缓存各自移除的旧记录数；两者可能重叠，不相加，也不代表保护失效 |
+
+Host 上限为 **5000 条 / 10 MiB**，浏览器上限为 **5000 条**。这是实时观察窗，
+没有审计日志持久化；缓存满后移除旧记录，因此尽量在测试前打开页签。
+登录后 DSH 会加载资源、访问工作区；开启全局放行审计时即使未开始对话也会产生事件。
+
+为避免“接收审计 → 产生网络审计 → 再接收”的循环，插件订阅会过滤 **DSH Host 本进程
+未命中规则的 ALLOW 网络 send/recv 包事件**。该进程的网络连接事件、命中规则事件、
+所有 DENY、文件/执行事件以及子进程事件仍保留。内核检查与 daemon 原始事件不变；
+需要观察完整网络包事件时使用独立终端的 `sudo censorguardctl audit --kind net`。
+此修复需要**同时更新 censorguard-grpc 和插件**；只换浏览器资源不足以修复旧适配器的循环。
 
 对话、轨迹、会话树和文件预览由 DSH 提供。初始首页没有打开会话时，不会出现会话页签。
 实际文件访问受策略检查，因此被拒绝文件可能在预览时提示权限错误，并产生对应审计记录。
@@ -197,8 +214,11 @@ make integration-dsh-web DSH_REPO=/path/to/deepseek-harness
 ```
 
 Web 验收需要上游 Web 已构建、Playwright Chromium 和浏览器运行库，以及 root/BPF LSM。
-测试使用临时 profile、state、端口及本地模型桩，覆盖对话、轨迹、侧边栏、实际拒绝审计和
-reload 后自动重新接入。结果见 [策略管理验收](策略管理验收.md)。
+测试使用临时 profile、state、端口及本地模型桩，覆盖对话、轨迹、侧边栏、
+真实对话工具 `read` / `bash cat` / `bash rm` 的 BPF 拒绝及 Web 审计、
+开启全部放行审计后的空闲事件循环检查，以及 reload 后自动重新接入。
+测试只在临时会话中切换 DSH 权限模式，让命令到达 BPF 检查，不改变用户 profile。
+结果见 [策略管理验收](策略管理验收.md)。
 
 在 DSH 根目录卸载：
 
@@ -209,6 +229,29 @@ pnpm dsh plugin --profile web remove @censorguard/dsh
 随后重启 DSH，插件的补丁和 Web 扩展会移除。系统 daemon 及已发布组独立保留。
 
 </details>
+
+## 查看已安装插件与清理旧版本
+
+在 DSH 仓库目录执行，`--profile` 与启动时保持一致：
+
+```bash
+pnpm dsh plugin --profile web list --depth 0
+```
+
+命令列出插件包名和实际版本。profile 位于 `${DSH_HOME:-$HOME/.dsh}/profiles/web/`，
+其 `package.json` 中 `dependencies` 表示安装来源，`dsh.profile.bundles` 表示启用的补丁层。
+同一包名在一个 profile 中通常只有一个直接依赖版本；pnpm 缓存里的旧版本不等于被加载。
+其他用户或其他 profile 的插件需要分别检查。
+
+旧包名可能是 `dsh-censorguard`、`@censorguard/dsh-bundle`、`@censorguard/dsh-bootstrap`、
+`@censorguard/dsh-host`、`@censorguard/dsh-client`。从列表中找到实际安装的旧包后移除，例如：
+
+```bash
+pnpm dsh plugin --profile web remove --ignore-scripts @censorguard/dsh-bundle
+```
+
+替换成实际旧包名，可一次传入多个包。保留新版 `@censorguard/dsh`，随后重启 DSH 并刷新浏览器。
+一键安装器 `make plugin-install DSH_REPO=...` 已会清理上述旧包，通常不需要手动操作。
 
 ## 常见问题
 
@@ -222,6 +265,15 @@ pnpm dsh plugin --profile web remove @censorguard/dsh
 | 缺失 `lib/client.js` | 执行 `make plugin-install`，完整重建并安装插件 |
 | Web 保存失败或版本冲突 | 使用 loopback 地址；重新读取组；检查 daemon 与 grpc 是否同版本 |
 | 审计为空 | 确认 protected，再产生受控进程的文件/执行/网络事件；核对 daemon 审计开关与规则 |
+| 对话操作没有出现 DENY | 看轨迹中的真实工具结果：若 DSH 权限/沙箱在执行前拒绝，操作未到内核；若命令成功，核对实际域绑定组和目标规则；若 EPERM 且 ctl 有 DENY，则检查插件与 grpc 更新及页面过滤 |
+| 登录后事件暴涨、拒绝记录消失 | 同时更新 grpc 和插件；旧版审计网络收发可能形成循环，将记录挤出缓存 |
 | 重启后暂时 degraded / 审计出现 gap | 等待自动接入；持续失败时查看 daemon 和 DSH 日志 |
 
 详细 CLI 语义见 [命令手册](命令手册.md)，系统部署问题见 [构建指南](构建指南.md)。
+
+对话执行本地 `cat`/`rm` 时，放行程序启动可以是 `EXEC ALLOW`，
+目标文件读取/删除被拒绝则是 `FILE DENY`。查文件拦截时选择 `FILE` 或“全部类型”，
+不能只看 `EXEC`。原生 `read` 工具由 Node 读文件，线程名可能是 `node` 或 `libuv-worker`，
+详情中的 `tgid` 对应 DSH 主进程；不是所有工具都通过独立命令执行。
+默认真实 DSH 域绑定 `censorguard-dsh-default`；手工测试的 `dsh-web → web` 是另一个域，
+仅把规则发布到 `web` 不会更改当前 DSH 保护规则。用 `sudo censorguardctl status` 核对实际绑定。

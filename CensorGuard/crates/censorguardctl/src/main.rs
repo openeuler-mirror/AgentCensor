@@ -1,6 +1,6 @@
 use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_common::protocol::{
-    Event, Operation, ProtocolError, Request, Response, VERSION, read_json_line, write_json_line,
+    Operation, PolicySource, Request, Response, VERSION, read_json_line, write_json_line,
 };
 use rustix::process::{
     Pid, PidfdFlags, Signal, WaitOptions, getpid, kill_process, pidfd_open, pidfd_send_signal,
@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+mod audit;
 mod output;
 
 // The stopped child is an internal process mode, not a public CLI command.
@@ -23,7 +24,10 @@ const SPAWN_HELPER_ENV: &str = "_CENSORGUARD_SPAWN_HELPER";
 
 #[derive(Debug, Eq, PartialEq)]
 enum Action {
-    Request(Request),
+    Request {
+        request: Request,
+        json: bool,
+    },
     Status {
         json: bool,
     },
@@ -34,8 +38,7 @@ enum Action {
     },
     Audit {
         socket: PathBuf,
-        kind: Option<u32>,
-        pid: Option<u32>,
+        filter: audit::Filter,
     },
     Spawn {
         domain: Option<String>,
@@ -64,13 +67,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
         println!(
-            "CensorGuard control\n\n  status           Show protection and managed processes\n  doctor           Check installation and runtime health\n  policy           Inspect or publish policy groups\n  attach / unattach / bind / remove / spawn / audit\n\nUse status --json or doctor --json for scripts.\nUse doctor --verbose for individual checks.\nCustom configuration: --config PATH before the command."
+            "CensorGuard control\n\n  status           Show protection, domains, policies and source paths\n  doctor           Check installation and runtime health\n  policy apply     Publish a group: --policy NAME --file PATH (or --stdin)\n                   Add --dry-run to validate without applying\n  policy remove    Delete an unbound group: --policy NAME\n  bind / remove    Add/remove a domain policy: --domain NAME --policy NAME\n  attach           Manage a process tree: --pid PID [--domain NAME]\n  unattach         Release a registered process tree: --pid PID\n  spawn            Run a managed command: [--domain NAME] -- COMMAND [ARGS...]\n  audit            Follow hook decisions: [--kind file|exec|net|guard]\n                   [--domain NAME] [--result allow|deny] [--pid PID]\n                   Numeric kinds 1|2|3|4 are also accepted\n\nUse --json with status, doctor, policy, bind, remove, attach or unattach for scripts.\nUse doctor --verbose for individual checks.\nCustom configuration: --config PATH before the command."
         );
         return Ok(());
     }
     let (socket, action) = parse_args(env::args().skip(1))?;
     match action {
-        Action::Audit { socket, kind, pid } => return audit(&socket, kind, pid),
+        Action::Audit { socket, filter } => return audit::follow(&socket, &filter),
         Action::Doctor {
             config,
             json,
@@ -94,9 +97,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             ensure_success(response)?;
         }
-        Action::Request(request) => {
-            let response = call(&socket, &request)?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+        Action::Request { request, json } => {
+            let response = call(&socket, &request).map_err(|error| {
+                io::Error::other(format!("Cannot reach CensorGuard: {error}. Check systemctl status censorguardd.service; use --config PATH for a custom instance."))
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print!("{}", output::operation(&request, &response));
+                if !response.ok {
+                    std::process::exit(1);
+                }
+            }
             ensure_success(response)?;
         }
         Action::Spawn {
@@ -234,16 +246,27 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
             }
         }
         "audit" => {
-            validate_options(&values[1..], &["--kind", "--pid"], &[])?;
-            let kind = optional_u32_option(&values[1..], "--kind")?;
-            if kind.is_some_and(|kind| !(1..=4).contains(&kind)) {
-                return Err(invalid_input("--kind expects 1|2|3|4"));
-            }
-            let pid = optional_u32_option(&values[1..], "--pid")?;
+            let options = &values[1..];
+            validate_options(options, &["--kind", "--pid", "--domain", "--result"], &[])?;
+            let kind = string_option(options, "--kind")?
+                .map(|value| audit::parse_kind(&value))
+                .transpose()?;
+            let pid = optional_u32_option(options, "--pid")?;
+            let allowed = string_option(options, "--result")?
+                .map(|value| match value.as_str() {
+                    "allow" => Ok(true),
+                    "deny" => Ok(false),
+                    _ => Err(invalid_input("--result expects allow|deny")),
+                })
+                .transpose()?;
             Action::Audit {
                 socket: daemon.event_socket,
-                kind,
-                pid,
+                filter: audit::Filter {
+                    kind,
+                    pid,
+                    domain: string_option(options, "--domain")?,
+                    allowed,
+                },
             }
         }
         "doctor" => {
@@ -262,40 +285,48 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
         "policy" => parse_policy(&values[1..])?,
         "attach" => {
             let options = &values[1..];
-            validate_options(options, &["--pid", "--domain"], &[])?;
+            validate_options(options, &["--pid", "--domain"], &["--json"])?;
             let pid = required_u32_option(options, "--pid")?;
             let domain = string_option(options, "--domain")?;
-            Action::Request(Request {
-                pid: Some(pid),
-                domain,
-                seed: true,
-                ..request(Operation::Track)
-            })
+            request_action(
+                Request {
+                    pid: Some(pid),
+                    domain,
+                    seed: true,
+                    ..request(Operation::Track)
+                },
+                options,
+            )
         }
         "unattach" => {
-            validate_options(&values[1..], &["--pid"], &[])?;
-            Action::Request(Request {
-                pid: Some(required_u32_option(&values[1..], "--pid")?),
-                ..request(Operation::Unattach)
-            })
+            validate_options(&values[1..], &["--pid"], &["--json"])?;
+            request_action(
+                Request {
+                    pid: Some(required_u32_option(&values[1..], "--pid")?),
+                    ..request(Operation::Unattach)
+                },
+                &values[1..],
+            )
         }
         "bind" | "remove" => {
             let options = &values[1..];
-            validate_options(options, &["--domain", "--policy"], &[])?;
+            validate_options(options, &["--domain", "--policy"], &["--json"])?;
             let domain = string_option(options, "--domain")?
-                .ok_or_else(|| invalid_input("bind requires --domain DOMAIN"))?;
-            Action::Request(Request {
-                domain: Some(domain),
-                group: Some(
-                    string_option(options, "--policy")?
-                        .ok_or_else(|| invalid_input("bind requires --policy GROUP"))?,
-                ),
-                ..request(if command == "bind" {
-                    Operation::Bind
-                } else {
-                    Operation::Remove
-                })
-            })
+                .ok_or_else(|| invalid_input(format!("{command} requires --domain DOMAIN")))?;
+            request_action(
+                Request {
+                    domain: Some(domain),
+                    group: Some(string_option(options, "--policy")?.ok_or_else(|| {
+                        invalid_input(format!("{command} requires --policy GROUP"))
+                    })?),
+                    ..request(if command == "bind" {
+                        Operation::Bind
+                    } else {
+                        Operation::Remove
+                    })
+                },
+                options,
+            )
         }
         _ => {
             return Err(invalid_input(format!(
@@ -314,40 +345,64 @@ fn parse_policy(values: &[String]) -> Result<Action, io::Error> {
     };
     match subcommand {
         "remove" => {
-            validate_options(&values[1..], &["--policy"], &[])?;
-            Ok(Action::Request(Request {
-                group: Some(required_string_option(&values[1..], "--policy")?),
-                ..request(Operation::Remove)
-            }))
+            validate_options(&values[1..], &["--policy"], &["--json"])?;
+            Ok(request_action(
+                Request {
+                    group: Some(required_string_option(&values[1..], "--policy")?),
+                    ..request(Operation::Remove)
+                },
+                &values[1..],
+            ))
         }
         "apply" => {
             let options = &values[1..];
-            validate_options(options, &["--policy", "--file"], &["--stdin", "--dry-run"])?;
+            validate_options(
+                options,
+                &["--policy", "--file"],
+                &["--stdin", "--dry-run", "--json"],
+            )?;
             let group = required_string_option(options, "--policy")?;
             let file = string_option(options, "--file")?;
             let use_stdin = options.iter().any(|value| value == "--stdin");
             if file.is_some() && use_stdin {
                 return Err(invalid_input("--file and --stdin are mutually exclusive"));
             }
-            let policy_yaml = if use_stdin {
+            let (policy_yaml, source) = if use_stdin {
                 let mut yaml = String::new();
                 io::Read::read_to_string(&mut io::stdin().lock(), &mut yaml)?;
-                yaml
+                (yaml, PolicySource::Stdin)
             } else if let Some(file) = file {
-                std::fs::read_to_string(file)?
+                let path = std::fs::canonicalize(file)?;
+                (
+                    std::fs::read_to_string(&path)?,
+                    PolicySource::File {
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                )
             } else {
                 return Err(invalid_input("policy apply requires --file or --stdin"));
             };
-            Ok(Action::Request(Request {
-                group: Some(group),
-                policy_yaml: Some(policy_yaml),
-                dry_run: options.iter().any(|value| value == "--dry-run"),
-                ..request(Operation::Reload)
-            }))
+            Ok(request_action(
+                Request {
+                    group: Some(group),
+                    policy_yaml: Some(policy_yaml),
+                    policy_source: Some(source),
+                    dry_run: options.iter().any(|value| value == "--dry-run"),
+                    ..request(Operation::Reload)
+                },
+                options,
+            ))
         }
         _ => Err(invalid_input(format!(
-            "invalid policy command {subcommand:?}; expected apply"
+            "invalid policy command {subcommand:?}; expected apply or remove"
         ))),
+    }
+}
+
+fn request_action(request: Request, options: &[String]) -> Action {
+    Action::Request {
+        request,
+        json: options.iter().any(|value| value == "--json"),
     }
 }
 
@@ -425,8 +480,9 @@ fn spawn(
     }
     if let Some(domain) = response.domain {
         println!(
-            "tracking pid={pid} domain={} slot={} group={}",
-            domain.name, domain.slot, domain.group
+            "tracking pid={pid} domain={} policies={}",
+            domain.name,
+            output::policy_names(&domain.policies, &domain.group)
         );
     }
 
@@ -509,6 +565,7 @@ fn request(op: Operation) -> Request {
         seed: false,
         policy_file: None,
         policy_yaml: None,
+        policy_source: None,
         group: None,
         dry_run: false,
         enable_file: None,
@@ -569,87 +626,6 @@ fn call(path: &Path, request: &Request) -> Result<Response, Box<dyn Error>> {
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
     write_json_line(&mut stream, request)?;
     Ok(read_json_line(&mut BufReader::new(stream))?)
-}
-
-fn audit(path: &Path, kind: Option<u32>, pid: Option<u32>) -> Result<(), Box<dyn Error>> {
-    let stream = UnixStream::connect(path)?;
-    let mut reader = BufReader::new(stream);
-    println!("KIND   OP             PID      RESULT DOMAIN           COMM             DETAIL");
-    loop {
-        let event: Event = match read_json_line(&mut reader) {
-            Ok(event) => event,
-            Err(ProtocolError::EndOfStream) => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        if kind.is_some_and(|value| value != event.kind)
-            || pid.is_some_and(|value| value != event.tgid)
-        {
-            continue;
-        }
-        let result = if event.allowed { "ALLOW" } else { "DENY" };
-        let detail = if event.args.is_empty() {
-            event.detail
-        } else {
-            format!("{} args={}", event.detail, event.args.join(" "))
-        };
-        println!(
-            "{:<6} {:<14} {:<8} {:<6} {:<16} {:<16} {}",
-            event_kind_name(event.kind),
-            event_operation_name(event.kind, event.op),
-            event.tgid,
-            result,
-            event.domain,
-            event.comm,
-            detail
-        );
-    }
-}
-
-fn event_kind_name(kind: u32) -> &'static str {
-    match kind {
-        1 => "FILE",
-        2 => "EXEC",
-        3 => "NET",
-        4 => "GUARD",
-        _ => "OTHER",
-    }
-}
-
-fn event_operation_name(kind: u32, op: u32) -> &'static str {
-    match (kind, op) {
-        (1, 0) => "file",
-        (1, 1) => "open_read",
-        (1, 2) => "open_write",
-        (1, 3) => "truncate",
-        (1, 4) => "unlink",
-        (1, 5) => "rmdir",
-        (1, 6) => "rename",
-        (1, 7) => "ftruncate",
-        (1, 8) => "link",
-        (1, 9) => "symlink",
-        (1, 10) => "mkdir",
-        (1, 11) => "chmod",
-        (1, 12) => "chown",
-        (1, 13) => "setxattr",
-        (1, 14) => "mmap_write",
-        (1, 15) => "removexattr",
-        (1, 16) => "setacl",
-        (1, 17) => "mknod",
-        (1, 18) => "mprotect",
-        (1, 19) => "fd_read",
-        (1, 20) => "fd_write",
-        (2, _) => "exec",
-        (3, 0) => "connect",
-        (3, 1) => "bind",
-        (3, 2) => "sendmsg",
-        (3, 3) => "accept",
-        (3, 4) => "recvmsg",
-        (4, 1) => "kill",
-        (4, 2) => "ptrace",
-        (4, 3) => "traceme",
-        (4, 4) => "bpf",
-        _ => "unknown",
-    }
 }
 
 fn ensure_success(response: Response) -> Result<(), io::Error> {
@@ -732,6 +708,10 @@ mod tests {
             vec!["status", "extra"],
             vec!["audit", "--socket", "/tmp/events.sock"],
             vec!["audit", "--kind", "5"],
+            vec!["audit", "--kind", "0"],
+            vec!["audit", "--kind", "other"],
+            vec!["audit", "--result", "failed"],
+            vec!["audit", "--domain"],
             vec!["attach", "--pid", "12", "--name", "worker"],
             vec!["untrack", "--pid", "12", "--extra"],
             vec!["bind", "worker", "--policy", "g"],
@@ -769,12 +749,33 @@ mod tests {
         )?;
         assert_eq!(
             action,
-            Action::Request(Request {
-                domain: Some("worker".into()),
-                group: Some("restricted".into()),
-                ..request(Operation::Bind)
-            })
+            Action::Request {
+                request: Request {
+                    domain: Some("worker".into()),
+                    group: Some("restricted".into()),
+                    ..request(Operation::Bind)
+                },
+                json: false
+            }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_kind_names_and_numbers_apply_the_same_combined_filter() -> Result<(), io::Error> {
+        for (name, number) in [("file", "1"), ("exec", "2"), ("net", "3"), ("guard", "4")] {
+            let args = |kind: &str| {
+                [
+                    "audit", "--kind", kind, "--domain", "dsh-web", "--result", "deny", "--pid",
+                    "123",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+                .into_iter()
+            };
+            assert_eq!(parse_args(args(name))?, parse_args(args(number))?);
+        }
         Ok(())
     }
 }

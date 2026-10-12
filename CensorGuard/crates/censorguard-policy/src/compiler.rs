@@ -210,6 +210,7 @@ impl CompiledPolicy {
         if root.groups.remove(group).is_none() {
             return Err(PolicyError::InvalidGroupName(group.to_owned()));
         }
+        root.group_sources.remove(group);
         compile(root)
     }
 
@@ -236,6 +237,7 @@ impl CompiledPolicy {
                 .as_ref()
                 .map_or_else(Vec::new, |baseline| baseline.rules.clone()),
             groups: self.group_definitions.clone(),
+            group_sources: self.group_sources.clone(),
             domains: self
                 .domains
                 .iter()
@@ -249,6 +251,15 @@ impl CompiledPolicy {
     }
 
     pub fn replace_group_yaml(&self, name: &str, bytes: &[u8]) -> Result<Self, PolicyError> {
+        self.replace_group_yaml_from(name, bytes, censorguard_common::protocol::PolicySource::Api)
+    }
+
+    pub fn replace_group_yaml_from(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        source: censorguard_common::protocol::PolicySource,
+    ) -> Result<Self, PolicyError> {
         if name.is_empty() {
             return Err(PolicyError::InvalidGroupName(name.to_owned()));
         }
@@ -260,6 +271,7 @@ impl CompiledPolicy {
         let group: GroupPolicy = serde_yaml::from_slice(bytes)?;
         let mut root = self.to_root();
         root.groups.insert(name.to_owned(), group);
+        root.group_sources.insert(name.to_owned(), source);
         compile(root)
     }
 }
@@ -273,6 +285,7 @@ pub struct CompiledPolicy {
     pub warnings: Vec<CompileWarning>,
     pub baseline_definition: Option<GroupPolicy>,
     pub group_definitions: BTreeMap<String, GroupPolicy>,
+    pub group_sources: BTreeMap<String, censorguard_common::protocol::PolicySource>,
     pub daemon: censorguard_common::config::DaemonConfig,
 }
 
@@ -345,6 +358,7 @@ pub fn compile(root: PolicyRoot) -> Result<CompiledPolicy, PolicyError> {
         warnings,
         baseline_definition: Some(baseline_group),
         group_definitions,
+        group_sources: root.group_sources,
         daemon,
     };
     policy.rebuild_combinations();
@@ -799,6 +813,43 @@ impl Fnv64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_sources_survive_snapshots_and_are_replaced_with_content()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use censorguard_common::protocol::PolicySource;
+        let legacy = compile_yaml(b"groups:\n  old:\n    rules: []\n")?;
+        assert!(legacy.group_sources.is_empty());
+        let file = PolicySource::File {
+            path: "/policies/worker.yaml".into(),
+        };
+        let applied = legacy
+            .replace_group_yaml_from("worker", b"rules: []", file.clone())?
+            .bind_domain("agent", "worker", &[])?;
+        let restored = compile_yaml(serde_yaml::to_string(&applied.to_root())?.as_bytes())?;
+        assert_eq!(restored.group_sources["worker"], file);
+        // Provenance must not leak into the public, editable group fragment.
+        assert_eq!(
+            serde_yaml::to_string(&restored.group_definitions["worker"])?,
+            "rules: []\n"
+        );
+        assert!(
+            restored
+                .replace_group_yaml("worker", b"source: /fake.yaml\nrules: []")
+                .is_err()
+        );
+        let stdin =
+            restored.replace_group_yaml_from("worker", b"rules: []", PolicySource::Stdin)?;
+        assert_eq!(stdin.group_sources["worker"], PolicySource::Stdin);
+        let api = stdin.replace_group_yaml("worker", b"rules: []")?;
+        assert_eq!(api.group_sources["worker"], PolicySource::Api);
+        let removed = api
+            .remove_binding("agent", "worker")?
+            .remove_group("worker")?;
+        assert!(!removed.group_sources.contains_key("worker"));
+        assert_eq!(removed.domains["agent"], "");
+        Ok(())
+    }
 
     #[test]
     fn root_rules_are_compiled_as_global_baseline() -> Result<(), PolicyError> {

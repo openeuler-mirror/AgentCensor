@@ -20,7 +20,7 @@ PNPM ?= pnpm
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-exec-arguments integration-grpc integration-network-ops
+.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-audit-filter integration-exec-arguments integration-grpc integration-network-ops
 
 all: check bpf build $(if $(filter 1,$(WITH_DSH)),plugin)
 
@@ -265,6 +265,9 @@ integration-lifecycle: bpf
 integration-audit-config: build bpf
 	sudo python3 scripts/test/integration-audit-config.py
 
+integration-audit-filter: build bpf
+	sudo python3 scripts/test/integration-audit-filter.py
+
 integration-exec-arguments: build bpf
 	sudo python3 scripts/test/integration-exec-arguments.py
 
@@ -295,7 +298,7 @@ integration-dns-refresh: bpf
 	cargo build --workspace --offline
 	sudo bash ./scripts/test/integration-dns-refresh.sh
 
-integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle integration-audit-config integration-network-ops
+integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle integration-audit-config integration-audit-filter integration-network-ops
 
 clean:
 	cargo clean

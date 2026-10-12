@@ -101,6 +101,7 @@ export interface EventsRequest {
   kinds?: number[];
   allowed?: boolean;
   context?: RequestContext;
+  observerTgid?: number; // omit the UI host's unruled ALLOW send/recv packets
 }
 
 // AuditEvent 审计事件 (proto Event 的 TS 形态, uint64 已转 number)
@@ -318,6 +319,7 @@ export class GrpcClient {
       kinds: req.kinds ?? [],
       allowed: req.allowed,
       context: req.context,
+      observerTgid: req.observerTgid ?? 0,
     }, meta);
   }
 

@@ -1,8 +1,8 @@
 use crate::procfs;
 use censorguard_common::abi::{SocketOwner, TrackValue};
 use censorguard_common::protocol::{
-    DnsDomainInfo, DomainInfo, DomainTree, GroupDump, IntentDecision, PolicyDefinition,
-    SecurityIntent, TreeNode,
+    DnsDomainInfo, DomainBinding, DomainInfo, DomainTree, GroupDump, IntentDecision,
+    PolicyDefinition, PolicySource, SecurityIntent, TreeNode,
 };
 use censorguard_kernel::{InstalledPolicy, KernelError, NativeKernel};
 use censorguard_policy::{
@@ -196,6 +196,8 @@ pub struct RuntimeStatus {
     pub scopes: usize,
     pub scope_capacity: usize,
     pub domains: Vec<DomainInfo>,
+    pub bindings: Vec<DomainBinding>,
+    pub policy_snapshot_path: String,
     pub reload_generation: u64,
     pub version: u32,
     pub active_bank: u32,
@@ -722,6 +724,23 @@ impl Runtime {
             scopes: pid.scopes,
             scope_capacity: pid.scope_capacity,
             domains,
+            bindings: policy
+                .policy
+                .domains
+                .iter()
+                .map(|(name, group)| DomainBinding {
+                    name: name.clone(),
+                    policies: group
+                        .split('+')
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                })
+                .collect(),
+            policy_snapshot_path: self
+                .revision_path(u64::from(policy.version))
+                .display()
+                .to_string(),
             reload_generation: policy.reload_generation,
             version: policy.version,
             active_bank: policy.active_bank,
@@ -749,8 +768,8 @@ impl Runtime {
     }
 
     /// Single-group read (ui.sock delegation): the group's editable YAML fragment, the
-    /// current policy version (optimistic-lock token) and the active domains bound to it.
-    pub fn group_policy(&self, group: &str) -> Result<(String, u32, Vec<String>), RuntimeError> {
+    /// current revision, publication source and configured/runtime domain bindings.
+    pub fn group_policy(&self, group: &str) -> Result<(String, GroupDump), RuntimeError> {
         let policy = self.read_policy()?;
         let definition = if group == "__base__" {
             policy.policy.baseline_definition.as_ref()
@@ -763,14 +782,40 @@ impl Runtime {
         })?;
         let yaml = serde_yaml::to_string(definition)
             .map_err(|error| RuntimeError::RevisionStore(error.to_string()))?;
-        let domains = self
-            .lock_state()?
+        let domains: BTreeSet<_> = policy
+            .policy
             .domains
-            .values()
-            .filter(|domain| domain.group.split('+').any(|name| name == group))
-            .map(|domain| domain.name.clone())
+            .iter()
+            .filter(|(_, binding)| {
+                group == "__base__" || binding.split('+').any(|name| name == group)
+            })
+            .map(|(name, _)| name.clone())
+            .chain(
+                self.lock_state()?
+                    .domains
+                    .values()
+                    .filter(|domain| {
+                        group == "__base__" || domain.group.split('+').any(|name| name == group)
+                    })
+                    .map(|domain| domain.name.clone()),
+            )
             .collect();
-        Ok((yaml, policy.version, domains))
+        Ok((
+            yaml,
+            GroupDump {
+                name: group.to_owned(),
+                version: policy.version,
+                domains: domains.into_iter().collect(),
+                definition: policy_definition(definition),
+                source: if group == "__base__" {
+                    Some(PolicySource::File {
+                        path: self.config_path.display().to_string(),
+                    })
+                } else {
+                    policy.policy.group_sources.get(group).cloned()
+                },
+            },
+        ))
     }
 
     pub fn evaluate_intents(
@@ -849,7 +894,27 @@ impl Runtime {
             });
         }
         self.ensure_revision(expected_revision)?;
-        let canonical = compile_yaml(yaml.as_bytes())?;
+        let mut canonical = compile_yaml(yaml.as_bytes())?;
+        // Full API submissions may contain provenance copied from GetPolicy.
+        // Preserve it only for unchanged definitions; edited content comes from API.
+        let current = self.read_policy()?;
+        canonical.group_sources = canonical
+            .group_definitions
+            .iter()
+            .filter_map(|(name, definition)| {
+                if current.policy.group_definitions.get(name) == Some(definition) {
+                    current
+                        .policy
+                        .group_sources
+                        .get(name)
+                        .cloned()
+                        .map(|source| (name.clone(), source))
+                } else {
+                    Some((name.clone(), PolicySource::Api))
+                }
+            })
+            .collect();
+        drop(current);
         let (next_policy, cache, status) = self.resolve_dns(canonical)?;
         let result = self.apply_policy_locked(next_policy, false)?;
         {
@@ -999,8 +1064,19 @@ impl Runtime {
             groups.push(GroupDump {
                 name: "__base__".into(),
                 version: policy.version,
-                domains: state.domains.keys().cloned().collect(),
+                domains: policy
+                    .policy
+                    .domains
+                    .keys()
+                    .chain(state.domains.keys())
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
                 definition: policy_definition(definition),
+                source: Some(PolicySource::File {
+                    path: self.config_path.display().to_string(),
+                }),
             });
         }
         for (name, definition) in &policy.policy.group_definitions {
@@ -1023,6 +1099,7 @@ impl Runtime {
                 version: policy.version,
                 domains: domains.into_iter().collect(),
                 definition: policy_definition(definition),
+                source: policy.policy.group_sources.get(name).cloned(),
             });
         }
         let dns = self
@@ -1091,11 +1168,19 @@ impl Runtime {
         &self,
         policy_file: Option<&str>,
         policy_yaml: Option<&str>,
+        policy_source: Option<&PolicySource>,
         group: Option<&str>,
         dry_run: bool,
         expected_revision: Option<u64>,
     ) -> Result<ReloadResult, RuntimeError> {
-        let result = self.reload_inner(policy_file, policy_yaml, group, dry_run, expected_revision);
+        let result = self.reload_inner(
+            policy_file,
+            policy_yaml,
+            policy_source,
+            group,
+            dry_run,
+            expected_revision,
+        );
         self.observe_reload(&result);
         result
     }
@@ -1104,6 +1189,7 @@ impl Runtime {
         &self,
         policy_file: Option<&str>,
         policy_yaml: Option<&str>,
+        policy_source: Option<&PolicySource>,
         group: Option<&str>,
         dry_run: bool,
         expected_revision: Option<u64>,
@@ -1124,10 +1210,11 @@ impl Runtime {
             return Err(RuntimeError::MissingGroupYaml);
         }
         let yaml = policy_yaml.ok_or(RuntimeError::MissingGroupYaml)?;
-        let canonical = self
-            .read_policy()?
-            .policy
-            .replace_group_yaml(group, yaml.as_bytes())?;
+        let canonical = self.read_policy()?.policy.replace_group_yaml_from(
+            group,
+            yaml.as_bytes(),
+            policy_source.cloned().unwrap_or(PolicySource::Api),
+        )?;
 
         let (next_policy, cache, status) = self.resolve_dns(canonical)?;
         let result = self.apply_policy_locked(next_policy, dry_run)?;

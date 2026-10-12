@@ -50,7 +50,8 @@ export interface AuditStatusBar {
   daemonBootId: string;
   lastSequence: number;
   droppedCount: number; // 已知丢失事件数
-  evictedCount: number; // Host 缓存淘汰数 + 本地缓冲淘汰数
+  hostEvictedCount: number; // Host 缓存移除；与浏览器可能重叠，不能相加
+  localEvictedCount: number;
   empty: boolean; // 空状态 (没有事件时显示空状态文案)
 }
 
@@ -145,7 +146,8 @@ export function statusBar(
     daemonBootId: status.daemonBootId,
     lastSequence: status.lastSequence,
     droppedCount: status.droppedCount,
-    evictedCount: status.evictedCount + localEvicted,
+    hostEvictedCount: status.evictedCount,
+    localEvictedCount: localEvicted,
     empty: listLength === 0,
   };
 }

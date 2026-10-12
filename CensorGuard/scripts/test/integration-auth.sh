@@ -126,7 +126,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    attach --pid "${nobody_pid}" --domain auth-domain >"${runtime_dir}/own-attach.log"
+    attach --pid "${nobody_pid}" --domain auth-domain --json >"${runtime_dir}/own-attach.log"
 grep -q '"ok": true' "${runtime_dir}/own-attach.log"
 
 set +e

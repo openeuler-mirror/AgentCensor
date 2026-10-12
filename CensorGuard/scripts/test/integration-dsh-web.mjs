@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createServer as createPortProbe } from 'node:net';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,12 +37,33 @@ console.log(`Artifacts: ${directory}`);
 const children = [];
 let browser;
 let modelRequests = 0;
+let toolResults = [];
+const readSecret = join(workspace, 'chat-read.txt');
+const deleteSecret = join(workspace, 'chat-delete.txt');
 const model = createServer(async (request, response) => {
   if (!request.url.endsWith('/chat/completions')) { response.writeHead(404).end(); return; }
-  for await (const _chunk of request) { /* Drain the local test request without retaining prompts. */ }
+  const chunks = [];
+  for await (const data of request) chunks.push(data);
+  const body = JSON.parse(Buffer.concat(chunks).toString());
   modelRequests++;
   response.writeHead(200, { 'content-type': 'text/event-stream' });
   const chunk = (delta, finish_reason = null) => `data: ${JSON.stringify({id: 'cg-web-test', object: 'chat.completion.chunk', created: 1, model: 'deepseek-flash', choices: [{index: 0, delta, finish_reason}]})}\n\n`;
+  if (body.messages.some(message => message.role === 'user' && JSON.stringify(message.content).includes('CensorGuard conversation tool audit'))) {
+    toolResults = body.messages.filter(message => message.role === 'tool');
+    const probes = [
+      { name: 'read', args: { file_path: readSecret } },
+      { name: 'bash', args: { command: `cat '${readSecret}'`, description: 'Read protected test file', workdir: workspace } },
+      { name: 'bash', args: { command: `rm -f '${deleteSecret}'`, description: 'Delete protected test file', workdir: workspace } },
+    ];
+    const probe = probes[toolResults.length];
+    if (probe) {
+      assert(body.tools.some(tool => tool.function.name === probe.name), `missing real tool ${probe.name}`);
+      response.end(chunk({ role: 'assistant', tool_calls: [{ index: 0, id: `cg-probe-${toolResults.length}`, type: 'function', function: { name: probe.name, arguments: JSON.stringify(probe.args) } }] }) + chunk({}, 'tool_calls') + 'data: [DONE]\n\n');
+      return;
+    }
+    response.end(chunk({ role: 'assistant', content: 'CensorGuard conversation tool audit complete.' }) + chunk({}, 'stop') + 'data: [DONE]\n\n');
+    return;
+  }
   response.end(chunk({ role: 'assistant', content: 'CensorGuard Web test reply.' }) + chunk({}, 'stop') + 'data: [DONE]\n\n');
 });
 
@@ -50,7 +71,7 @@ function run(binary, args) {
   return execFileSync(join(repo, 'target/debug', binary), args, { encoding: 'utf8', timeout: 40000 });
 }
 function ctl(...args) {
-  if (['status', 'doctor'].includes(args[0])) args.push('--json');
+  if (!args.includes('--json')) args.push('--json');
   return JSON.parse(run('censorguardctl', ['--config', config, ...args]));
 }
 function launch(command, args, label, options = {}) {
@@ -79,6 +100,8 @@ try {
   const grpcPort = await freePort();
   const secret = join(workspace, 'guarded.txt');
   writeFileSync(secret, 'protected test content\n');
+  writeFileSync(readSecret, 'protected conversation read content\n');
+  writeFileSync(deleteSecret, 'protected conversation delete content\n');
   writeFileSync(join(workspace, 'public.txt'), 'public test content\n');
   writeFileSync(config, `daemon:
   bpf_object: ${repo}/bpf/enforce.bpf.o
@@ -91,8 +114,13 @@ try {
   spawn_grpc: true
   grpc_bin: ${repo}/target/debug/censorguard-grpc
   grpc_listen: 127.0.0.1:${grpcPort}
+  audit_file: true
+  audit_exec: true
+  audit_net: true
 rules:
   - file deny+audit ${secret}
+  - file deny+audit ${readSecret} [read]
+  - file deny+audit ${deleteSecret} [delete]
 `);
   const daemon = launch(join(repo, 'target/debug/censorguardd'), ['launch', '--config', config], 'daemon');
   await waitFor(() => {
@@ -168,6 +196,33 @@ rules:
   await page.getByRole('tab', { name: '安全拦截审计', exact: true }).click();
   await page.locator('[data-censorguard-audit][data-stream-state="live"]').waitFor();
   console.log('PASS conversation/trajectory/audit tab switching and audit re-entry');
+  await page.getByRole('tab', { name: '对话', exact: true }).click();
+  // Only this isolated fixture: let real local commands reach the BPF checks.
+  // DSH's independent sandbox can otherwise refuse a command before it runs.
+  await input.fill('/permission danger-full-access');
+  await input.press('Enter');
+  await page.getByRole('button', { name: /访问模式，当前：.*(完全|无限)/ }).waitFor();
+  await input.fill('CensorGuard conversation tool audit');
+  await input.press('Enter');
+  await page.getByText('CensorGuard conversation tool audit complete.', { exact: true }).waitFor({ timeout: 60000 });
+  writeFileSync(join(directory, 'tool-results.json'), JSON.stringify(toolResults, null, 2));
+  assert.equal(toolResults.length, 3, 'read and both bash calls must run through the real conversation');
+  assert(toolResults.every(result => /EPERM|Operation not permitted/.test(JSON.stringify(result))), 'all three operations must be denied by BPF');
+  assert(existsSync(deleteSecret), 'denied deletion must preserve the actual file');
+  await page.getByRole('tab', { name: '安全拦截审计', exact: true }).click();
+  const toolAudit = page.locator('[data-censorguard-audit]');
+  const deniedReads = toolAudit.locator('[data-audit-result="DENY"]').filter({ hasText: 'chat-read.txt' });
+  await toolAudit.locator(`[data-audit-result="DENY"][data-audit-tgid="${web.child.pid}"]`).filter({ hasText: 'chat-read.txt' }).first().waitFor();
+  await deniedReads.filter({ hasText: 'cat(' }).first().waitFor();
+  await toolAudit.locator('[data-audit-result="DENY"]').filter({ hasText: 'chat-delete.txt' }).filter({ hasText: 'rm(' }).first().waitFor();
+  console.log('PASS real conversation read, bash cat and bash rm: BPF denies operations and browser displays audit');
+  const beforeIdle = Number(await toolAudit.getAttribute('data-last-sequence'));
+  await sleep(2000);
+  const afterIdle = Number(await toolAudit.getAttribute('data-last-sequence'));
+  assert(afterIdle - beforeIdle < 200, `idle audit feedback loop: ${beforeIdle} -> ${afterIdle}`);
+  assert((await toolAudit.innerText()).includes('缓存移除: 0 / 0'), 'idle observation must not flood either cache');
+  writeFileSync(join(directory, 'tool-audit.txt'), await toolAudit.ariaSnapshot());
+  console.log(`PASS idle observation has no recursive event flood (${beforeIdle} -> ${afterIdle})`);
   await page.getByRole('button', { name: '打开右侧边栏', exact: true }).click();
   const files = page.locator('[data-files-state="tree"]');
   await files.waitFor();

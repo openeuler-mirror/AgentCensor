@@ -106,7 +106,7 @@ rules: []
 
         for args in [('policy', 'apply', '--policy', 'web', '--file', str(group)),
                      ('bind', '--domain', 'arg-test', '--policy', 'web')]:
-            result = ctl(*args)
+            result = ctl(*args, '--json')
             assert result.returncode == 0, result.stderr
             check(' '.join(args[:2]) + ' reports actual readiness',
                   json.loads(result.stdout)['daemon_ready'])

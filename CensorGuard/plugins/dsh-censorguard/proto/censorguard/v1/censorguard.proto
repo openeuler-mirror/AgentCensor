@@ -203,6 +203,10 @@ message EventsReq {
   repeated uint32 kinds = 2;          // 只订阅这些 kind (1=FILE 2=EXEC 3=NET 4=GUARD; 空 = 全部)
   optional bool allowed = 3;          // 只订阅 allow=true / allow=false 的事件 (不填 = 全部)
   RequestContext context = 4;
+  // Optional UI observer: omit its unruled ALLOW send/recv packet events to
+  // prevent the audit transport from recursively auditing itself. Connection
+  // events, rule matches, DENY and other processes remain visible. 0 disables.
+  uint32 observer_tgid = 5;
 }
 
 // Event 事件面消息 (ringbuf enforceEvent 的纯数据形态)。

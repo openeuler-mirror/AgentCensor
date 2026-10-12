@@ -3,6 +3,8 @@ import { EventEmitter } from 'node:events';
 import { test } from 'node:test';
 import { build } from 'esbuild';
 import { AuditStream } from '../dist/host/auditStream.js';
+import { AuditBuffer } from '../dist/ui/auditTab.js';
+import { statusBar } from '../dist/ui/auditView.js';
 
 const compiled = await build({ entryPoints: [new URL('../src/client/controllers.ts', import.meta.url).pathname], bundle: true, write: false, format: 'esm', platform: 'node' });
 const { AuditController } = await import(`data:text/javascript;base64,${Buffer.from(compiled.outputFiles[0].text).toString('base64')}`);
@@ -91,4 +93,87 @@ test('host releases a long-poll waiter immediately when the browser disconnects'
     const result = await Promise.race([pending, new Promise(resolve => setTimeout(() => resolve(null), 50))]);
     assert.notEqual(result, null, 'disconnect must not retain the waiter for 25 seconds');
   } finally { audit.dispose(); }
+});
+
+function fakeStream() {
+  const stream = new EventEmitter();
+  stream.cancel = () => stream.emit('error', new Error('cancelled'));
+  return stream;
+}
+
+test('filtered global sequence gaps are normal; explicit loss is counted once', async () => {
+  const stream = fakeStream();
+  const audit = new AuditStream({ subscribeEvents: async () => stream }, { domainIds: [1] });
+  audit.start();
+  await tick();
+  try {
+    stream.emit('data', event(10));
+    stream.emit('data', { ...event(100), droppedBefore: 3 });
+    assert.equal(audit.status().droppedCount, 3);
+    assert.deepEqual(audit.snapshot(0, 200).entries.filter(e => e.type === 'gap').map(e => e.reason), ['dropped']);
+    const page = audit.snapshot(10, 1);
+    assert.equal(page.entries.length, 2, 'loss marker and real event share an atomic page');
+    assert.equal(page.entries[1].event.sequence, 100);
+  } finally { audit.dispose(); }
+});
+
+test('disconnect never advances the browser past the first recovered event', async () => {
+  const streams = [fakeStream(), fakeStream()];
+  let count = 0;
+  const audit = new AuditStream({ subscribeEvents: async () => streams[count++] }, { domainIds: [1] }, { reconnectInitialMs: 1 });
+  audit.start();
+  await tick();
+  try {
+    streams[0].emit('data', event(10));
+    const pending = audit.wait(10, 1, 1000);
+    streams[0].emit('error', new Error('connection lost'));
+    const offline = await pending;
+    assert.equal(offline.status.state, 'reconnecting');
+    assert.equal(offline.entries.length, 0);
+    assert.equal(offline.lastSequence, 10);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    streams[1].emit('data', event(11));
+    const recovered = audit.snapshot(10, 1);
+    assert.equal(recovered.entries[0].reason, 'stream_reconnect');
+    assert.equal(recovered.entries[1].event.sequence, 11);
+    assert.equal(audit.status().droppedCount, 0, 'disconnect loss count is unknown');
+  } finally { audit.dispose(); }
+});
+
+test('domain changes cancel a stale pending subscription; equal updates keep the stream', async () => {
+  let finish;
+  const stale = fakeStream();
+  let cancelled = 0;
+  stale.cancel = () => { cancelled++; };
+  const current = fakeStream();
+  const requests = [];
+  const audit = new AuditStream({ subscribeEvents: async request => {
+    requests.push(request);
+    return requests.length === 1 ? new Promise(resolve => { finish = resolve; }) : current;
+  } }, { domainIds: [0], observerTgid: 123 });
+  audit.start();
+  audit.setDomainIds([7]);
+  finish(stale);
+  await tick();
+  try {
+    assert.equal(cancelled, 1);
+    assert.deepEqual(requests.map(r => r.domainIds), [[0], [7]]);
+    assert.equal(requests[1].observerTgid, 123);
+    audit.setDomainIds([7]);
+    await tick();
+    assert.equal(requests.length, 2);
+    current.emit('data', event(20));
+    assert.equal(audit.status().lastSequence, 20);
+  } finally { audit.dispose(); }
+});
+
+test('cache removal counters belong to separate caches and reset on clear', () => {
+  const buffer = new AuditBuffer(1);
+  buffer.ingest([ { type: 'event', event: event(1) }, { type: 'event', event: event(2) } ]);
+  assert.equal(buffer.evictedCount(), 1);
+  const bar = statusBar({ ...snapshot().status, evictedCount: 1 }, buffer.evictedCount(), 1);
+  assert.equal(bar.hostEvictedCount, 1);
+  assert.equal(bar.localEvictedCount, 1);
+  buffer.clear();
+  assert.equal(buffer.evictedCount(), 0);
 });

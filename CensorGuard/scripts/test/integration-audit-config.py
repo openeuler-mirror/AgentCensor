@@ -116,6 +116,8 @@ rules:
         temporary.replace(config)
 
     def ctl(*args):
+        if '--json' not in args:
+            args = (*args, '--json')
         result = subprocess.run([str(BIN / 'censorguardctl'), '--config', str(config), *args],
                                 text=True, capture_output=True, timeout=12)
         assert result.returncode == 0, (args, result.stdout, result.stderr)

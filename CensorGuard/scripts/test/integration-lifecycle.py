@@ -50,7 +50,7 @@ rules:
         return result
 
     def ctl(*args, ok=True):
-        if args and args[0] in ('status', 'doctor'):
+        if args and args[0] in ('status', 'doctor', 'policy', 'bind', 'remove', 'attach', 'unattach') and '--json' not in args:
             args = (*args, '--json')
         result = subprocess.run([str(BIN / 'censorguardctl'), '--config', str(config), *args],
                                 capture_output=True, text=True, timeout=10)
@@ -143,12 +143,26 @@ rules:
         group = directory / 'worker.yaml'
         group.write_text('rules:\n  - exec deny /usr/bin/id\n')
         ctl('policy', 'apply', '--policy', 'worker', '--file', str(group))
+        preview = directory / 'preview.yaml'
+        preview.write_text('rules: []\n')
+        ctl('policy', 'apply', '--policy', 'worker', '--file', str(preview), '--dry-run')
         ctl('bind', '--domain', 'probe', '--policy', 'worker')
         before = ctl('status')
+        worker = next(group for group in before['groups'] if group['name'] == 'worker')
+        assert worker['source'] == {'kind': 'file', 'path': str(group.resolve())}, worker
+        assert {'name': 'probe', 'policies': ['worker']} in before['bindings'], before
+        assert Path(before['policy_snapshot_path']).is_file(), before
+        group.write_text('rules: []\n')  # Saved groups are snapshots, not watched source files.
         config.write_text(yaml.replace('  spawn_grpc: true', '  audit_exec: true\n  spawn_grpc: true')
                           .replace(f'  - file deny {secret}', '  - exec deny /usr/bin/whoami'))
         reloaded = daemon_cmd('reload')
         after = ctl('status')
+        assert after['bindings'] == before['bindings'], after
+        assert next(group for group in after['groups'] if group['name'] == 'worker')['source'] == worker['source']
+        human = subprocess.run([str(BIN / 'censorguardctl'), '--config', str(config), 'status'],
+                               capture_output=True, text=True, timeout=10)
+        assert human.returncode == 0 and 'probe [configured; no processes]' in human.stdout, human
+        assert str(group) in human.stdout and 'saved copies' in human.stdout, human
         assert 'daemon restarted' in reloaded.stdout, reloaded.stdout
         assert after['daemon_boot_id'] != before['daemon_boot_id'] and after['daemon_ready']
         assert daemon.poll() is None and after['audit_exec'] and after['version'] == before['version'] + 1

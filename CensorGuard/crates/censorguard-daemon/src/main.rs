@@ -704,7 +704,13 @@ mod tests {
         fs::create_dir_all(state.join("revisions"))?;
         fs::write(&config, "rules:\n  - exec deny /bin/false\n")?;
         let saved = load(&config)?
-            .replace_group_yaml("a", b"rules:\n  - exec deny /bin/true\n")?
+            .replace_group_yaml_from(
+                "a",
+                b"rules:\n  - exec deny /bin/true\n",
+                censorguard_common::protocol::PolicySource::File {
+                    path: "/policies/a.yaml".into(),
+                },
+            )?
             .replace_group_yaml("b", b"rules: []")?
             .bind_domain("agent", "a", &[])?
             .bind_domain("agent", "b", &[])?;
@@ -723,6 +729,7 @@ mod tests {
         assert_eq!(restored.to_root().rules, vec!["exec deny /bin/echo"]);
         assert_eq!(restored.domains["agent"], "a+b");
         assert_eq!(restored.group_definitions, saved.group_definitions);
+        assert_eq!(restored.group_sources, saved.group_sources);
         assert!(restored.daemon.audit_exec);
         assert!(!restored.daemon.enable_net);
         assert!(restored.groups.contains_key("a+b"));

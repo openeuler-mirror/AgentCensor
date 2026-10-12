@@ -1,4 +1,5 @@
-use censorguard_common::protocol::Response;
+use censorguard_common::protocol::{DomainInfo, Operation, PolicySource, Request, Response};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct Check {
@@ -36,10 +37,9 @@ pub(crate) fn status(response: &Response) -> String {
         on_off(response.audit_net),
     ));
     text.push_str(&format!(
-        "  Managed       {} / {} / {}\n  Policy        revision {} / {}\n  BPF hooks     {}\n",
+        "  Managed       {} / {}\n  Policy        revision {} / {}\n  BPF hooks     {}\n",
         count(response.tracked, "process", "processes"),
         count(response.roots.len(), "root", "roots"),
-        count(response.domains.len(), "domain", "domains"),
         response.version,
         count(
             response
@@ -63,16 +63,8 @@ pub(crate) fn status(response: &Response) -> String {
             .as_deref()
             .unwrap_or("Not reported (update daemon)")
     ));
-    let groups: Vec<_> = response
-        .groups
-        .iter()
-        .filter(|group| group.name != "__base__")
-        .map(|group| group.name.as_str())
-        .collect();
-    if !groups.is_empty() {
-        text.push_str(&format!("  Groups        {}\n", groups.join(", ")));
-    }
-    if response.roots.is_empty() && response.daemon_ready {
+    append_domains(&mut text, response);
+    if response.roots.is_empty() && response.tracked == 0 && response.daemon_ready {
         text.push_str("\n  No processes attached yet.\n");
     }
     if let Some(error) = &response.error {
@@ -106,6 +98,219 @@ pub(crate) fn status(response: &Response) -> String {
         .any(|domain| domain.stale || domain.error.is_some())
     {
         text.push_str("\n  ! DNS policy resolution needs attention; inspect status --json.\n");
+    }
+    text
+}
+
+fn append_domains(text: &mut String, response: &Response) {
+    // Keep published bindings distinct from runtime scopes: an idle binding is
+    // useful to operators, but must not imply any process is protected.
+    let mut domains: BTreeMap<&str, (BTreeSet<&str>, Option<&DomainInfo>)> = BTreeMap::new();
+    for binding in &response.bindings {
+        domains.insert(
+            &binding.name,
+            (binding.policies.iter().map(String::as_str).collect(), None),
+        );
+    }
+    // Also understand older daemons which report bindings only through group dumps.
+    for group in &response.groups {
+        for name in &group.domains {
+            let entry = domains.entry(name).or_default();
+            if group.name != "__base__" {
+                entry.0.insert(&group.name);
+            }
+        }
+    }
+    for domain in &response.domains {
+        let policies = if domain.policies.is_empty() {
+            domain
+                .group
+                .split('+')
+                .filter(|name| !name.is_empty())
+                .collect()
+        } else {
+            domain.policies.iter().map(String::as_str).collect()
+        };
+        domains.insert(&domain.name, (policies, Some(domain)));
+    }
+    if !domains.is_empty() {
+        for (name, (policies, live)) in &domains {
+            let state = match live {
+                Some(domain) if domain.draining => "draining; no registered roots".to_owned(),
+                Some(domain) => {
+                    let roots: Vec<_> = response
+                        .trees
+                        .iter()
+                        .filter(|tree| tree.domain == **name)
+                        .flat_map(|tree| &tree.nodes)
+                        .filter(|node| node.root)
+                        .map(|node| node.pid.to_string())
+                        .collect();
+                    if roots.is_empty() {
+                        count(domain.roots, "registered root", "registered roots")
+                    } else {
+                        format!(
+                            "{}; PID {}",
+                            count(domain.roots, "root", "roots"),
+                            roots.join(", ")
+                        )
+                    }
+                }
+                None => "configured; no processes".to_owned(),
+            };
+            text.push_str(&format!("\n  {name} [{state}]\n"));
+            text.push_str(&format!(
+                "  {} base  {} (inherited)\n",
+                if policies.is_empty() {
+                    "└─"
+                } else {
+                    "├─"
+                },
+                response
+                    .config_path
+                    .as_deref()
+                    .unwrap_or("Not reported (update daemon)")
+            ));
+            for (index, name) in policies.iter().enumerate() {
+                let group = response.groups.iter().find(|group| group.name == *name);
+                text.push_str(&format!(
+                    "  {} {name}  {}\n",
+                    if index + 1 == policies.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    },
+                    source(
+                        group.and_then(|group| group.source.as_ref()),
+                        response.policy_snapshot_path.as_deref()
+                    )
+                ));
+            }
+        }
+    }
+    let bound: BTreeSet<_> = domains
+        .values()
+        .flat_map(|(policies, _)| policies.iter().copied())
+        .collect();
+    let unbound: Vec<_> = response
+        .groups
+        .iter()
+        .filter(|group| group.name != "__base__" && !bound.contains(group.name.as_str()))
+        .collect();
+    if !unbound.is_empty() {
+        text.push_str("\n  Unbound policies\n");
+        for (index, group) in unbound.iter().enumerate() {
+            text.push_str(&format!(
+                "  {} {}  {}\n",
+                if index + 1 == unbound.len() {
+                    "└─"
+                } else {
+                    "├─"
+                },
+                group.name,
+                source(
+                    group.source.as_ref(),
+                    response.policy_snapshot_path.as_deref()
+                )
+            ));
+        }
+    }
+    if response.groups.iter().any(|group| group.name != "__base__") {
+        if let Some(path) = &response.policy_snapshot_path {
+            text.push_str(&format!("\n  Group snapshot  {path}\n"));
+        }
+        text.push_str("  Group policies are saved copies; reapply after editing their source.\n");
+    }
+}
+
+fn source(value: Option<&PolicySource>, snapshot: Option<&str>) -> String {
+    match value {
+        Some(PolicySource::File { path }) => path.clone(),
+        Some(PolicySource::Stdin) => {
+            format!("{} (from stdin)", snapshot.unwrap_or("Inline policy"))
+        }
+        Some(PolicySource::Api) => {
+            format!("{} (from API/Web)", snapshot.unwrap_or("Inline policy"))
+        }
+        None => format!(
+            "{} (original source unknown)",
+            snapshot.unwrap_or("Saved policy")
+        ),
+    }
+}
+
+pub(crate) fn policy_names(policies: &[String], group: &str) -> String {
+    let names = if policies.is_empty() {
+        group.replace('+', " + ")
+    } else {
+        policies.join(" + ")
+    };
+    if names.is_empty() {
+        "base only".into()
+    } else {
+        format!("base + {names}")
+    }
+}
+
+pub(crate) fn operation(request: &Request, response: &Response) -> String {
+    let state = if !response.ok {
+        "Operation failed"
+    } else {
+        match request.op {
+            Operation::Reload if request.dry_run => "Policy valid (no changes applied)",
+            Operation::Reload => "Policy applied",
+            Operation::Bind => "Policy bound",
+            Operation::Remove if request.domain.is_some() => "Policy unbound",
+            Operation::Remove => "Policy removed",
+            Operation::Track => "Process tree attached",
+            Operation::Unattach => "Process tree released",
+            _ => "Operation completed",
+        }
+    };
+    let mut text = format!("CensorGuard | {state}\n\n");
+    if let Some(group) = &request.group {
+        text.push_str(&format!("  Policy        {group}\n"));
+    }
+    if request.op == Operation::Reload {
+        text.push_str(&format!(
+            "  Source        {}\n",
+            source(request.policy_source.as_ref(), None)
+        ));
+    }
+    if let Some(domain) = response
+        .domain
+        .as_ref()
+        .map(|domain| &domain.name)
+        .or(request.domain.as_ref())
+    {
+        text.push_str(&format!("  Domain        {domain}\n"));
+    }
+    if let Some(pid) = request.pid {
+        text.push_str(&format!("  Root PID      {pid}\n"));
+    }
+    if !response.ok {
+        text.push_str(&format!(
+            "\n  ! {}\n",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("Daemon rejected the operation")
+        ));
+        return text;
+    }
+    if let Some(domain) = &response.domain {
+        text.push_str(&format!(
+            "  Policies      {}\n",
+            policy_names(&domain.policies, &domain.group)
+        ));
+    }
+    if request.dry_run {
+        text.push_str("  Changes       None; validation only\n");
+    } else if response.version > 0 {
+        text.push_str(&format!("  Revision      {}\n", response.version));
+    }
+    if !response.daemon_ready {
+        text.push_str("\n  ! Daemon is not ready; check status or doctor.\n");
     }
     text
 }
@@ -222,6 +427,23 @@ mod tests {
         assert!(text.contains("Needs attention"));
         assert!(text.contains("invalid policy"));
         assert!(text.contains("kernel 3"));
+    }
+
+    #[test]
+    fn tracked_descendants_do_not_look_like_an_empty_daemon() {
+        let text = status(&Response {
+            ok: true,
+            daemon_ready: true,
+            tracked: 2,
+            domains: vec![DomainInfo {
+                name: "agent".into(),
+                draining: true,
+                ..DomainInfo::default()
+            }],
+            ..Response::default()
+        });
+        assert!(text.contains("draining; no registered roots"));
+        assert!(!text.contains("No processes attached yet"));
     }
 
     #[test]

@@ -31,7 +31,10 @@ function run(binary, ...args) {
     encoding: 'utf8', timeout: 40000, stdio: 'pipe',
   });
 }
-function ctl(...args) { return JSON.parse(run('censorguardctl', ...args)); }
+function ctl(...args) {
+  if (!args.includes('--json')) args.push('--json');
+  return JSON.parse(run('censorguardctl', ...args));
+}
 function unary(method, request = {}) {
   return new Promise((resolveReply, reject) => client[method](request, {
     deadline: Date.now() + 10000,
@@ -59,14 +62,13 @@ function subscribe(request) {
   return { stream, items };
 }
 
-function rawApply(expectedRevision, policyYaml, index) {
+function rawRequest(method, params = {}, requestId = 'metadata-test') {
   return new Promise((resolveReply, reject) => {
     const socket = createConnection(join(directory, 'ctl.sock'));
     socket.setTimeout(10000, () => socket.destroy(new Error('raw RPC timeout')));
     socket.on('error', reject);
     socket.on('connect', () => socket.write(JSON.stringify({
-      v: 2, request_id: `race-${index}`, method: 'apply_policy',
-      params: { group: 'censorguard-dsh-default', expected_revision: expectedRevision, policy_yaml: policyYaml },
+      v: 2, request_id: requestId, method, params,
     }) + '\n'));
     let buffer = '';
     socket.on('data', data => {
@@ -74,6 +76,12 @@ function rawApply(expectedRevision, policyYaml, index) {
       if (buffer.includes('\n')) { socket.destroy(); resolveReply(JSON.parse(buffer.split('\n')[0])); }
     });
   });
+}
+
+function rawApply(expectedRevision, policyYaml, index) {
+  return rawRequest('apply_policy', {
+    group: 'censorguard-dsh-default', expected_revision: expectedRevision, policy_yaml: policyYaml,
+  }, `race-${index}`);
 }
 
 try {
@@ -146,6 +154,26 @@ rules:
   console.log('PASS six live switches, read endpoints, admin/baseline/whitelist denials and error mapping');
 
   ctl('policy', 'apply', '--policy', 'censorguard-dsh-default', '--file', group);
+  const originalSource = { kind: 'file', path: group };
+  const policySource = () => status().groups.find(group => group.name === 'censorguard-dsh-default').source;
+  assert.deepEqual(policySource(), originalSource);
+  const exported = await rawRequest('get_policy');
+  assert(exported.ok);
+  const unchanged = await rawRequest('apply_policy', {
+    policy_yaml: exported.result.policy_yaml, expected_revision: exported.result.revision,
+  });
+  assert(unchanged.ok);
+  assert.deepEqual(policySource(), originalSource, 'unchanged full API submissions preserve the file source');
+  const edited = exported.result.policy_yaml.replace('    rules: []', '    rules:\n      - exec deny /usr/bin/false');
+  assert.notEqual(edited, exported.result.policy_yaml);
+  const updated = await rawRequest('apply_policy', {
+    policy_yaml: edited, expected_revision: unchanged.result.revision,
+  });
+  assert(updated.ok, JSON.stringify(updated));
+  assert.deepEqual(policySource(), { kind: 'api' }, 'full API edits must discard copied file metadata');
+  ctl('policy', 'apply', '--policy', 'censorguard-dsh-default', '--file', group);
+  assert.deepEqual(policySource(), originalSource);
+  console.log('PASS full API provenance follows changed content and preserves unchanged definitions');
   ctl('bind', '--domain', 'grpc-test', '--policy', 'censorguard-dsh-default');
   trackedRoot = spawn('/usr/bin/sleep', ['120']);
   ctl('attach', '--pid', String(trackedRoot.pid), '--domain', 'grpc-test');
@@ -160,9 +188,11 @@ rules:
   const preview = await unary('ApplyPolicy', { name: 'censorguard-dsh-default', policyYaml: yaml, dryRun: true });
   assert.deepEqual(preview.affected, ['grpc-test']);
   assert.equal(status().version, revision);
+  assert.deepEqual(policySource(), originalSource, 'validation must preserve the published source');
   const applied = await unary('ApplyPolicy', { name: 'censorguard-dsh-default', policyYaml: yaml });
   assert.deepEqual(applied.affected, ['grpc-test']);
   assert.equal(applied.version, revision + 1);
+  assert.deepEqual(policySource(), { kind: 'api' }, 'Web/API edits must clear the old file source');
   assert.equal((await unary('GetPolicy', { name: 'censorguard-dsh-default' })).version, applied.version);
   assert.throws(() => run('censorguardctl', 'spawn', '--domain', 'grpc-test', '--', '/usr/bin/true'));
   console.log('PASS invalid/valid validation, dry-run immutability, affected domains and actual group enforcement');

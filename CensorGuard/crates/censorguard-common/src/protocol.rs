@@ -223,6 +223,9 @@ pub struct Request {
     pub policy_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_yaml: Option<String>,
+    /// Informational provenance; the daemon applies policy_yaml, never reads this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<PolicySource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default)]
@@ -257,6 +260,21 @@ pub struct DomainInfo {
     pub version: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub draining: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PolicySource {
+    File { path: String },
+    Stdin,
+    Api,
+}
+
+/// Published bindings, including domains with no running processes.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DomainBinding {
+    pub name: String,
+    pub policies: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -298,6 +316,8 @@ pub struct Response {
     pub scope_capacity: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<DomainInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<DomainBinding>,
     #[serde(default)]
     pub reload_gen: u64,
     #[serde(default)]
@@ -341,6 +361,9 @@ pub struct Response {
     /// Canonical startup configuration path reported by the running daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_path: Option<String>,
+    /// Persistent snapshot used to restore published groups and bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_snapshot_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_healthy: Option<bool>,
 }
@@ -369,6 +392,9 @@ pub struct GroupDump {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
     pub definition: PolicyDefinition,
+    /// Missing for snapshots created before source tracking was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PolicySource>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -496,6 +522,7 @@ mod tests {
             seed: true,
             policy_file: None,
             policy_yaml: None,
+            policy_source: None,
             group: None,
             dry_run: false,
             enable_file: None,

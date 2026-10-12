@@ -78,7 +78,7 @@ set -e
 [[ ${before_rc} -ne 0 ]]
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    bind --domain lab-agent --policy allow-policy >"${runtime_dir}/bind.log"
+    bind --domain lab-agent --policy allow-policy --json >"${runtime_dir}/bind.log"
 
 # Additive bind keeps the old deny until that group is explicitly removed.
 set +e
@@ -100,4 +100,3 @@ grep -q '(root)' "${runtime_dir}/after.log"
 wait "${daemon_pid}"
 daemon_pid=
 echo "domain bind integration passed: additive bind and explicit removal preserve independent denies"
-

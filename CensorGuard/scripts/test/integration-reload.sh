@@ -89,7 +89,7 @@ fi
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    policy apply --policy lab-policy --stdin >"${runtime_dir}/reload.log"
+    policy apply --policy lab-policy --stdin --json >"${runtime_dir}/reload.log"
 
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     spawn --domain lab-agent -- /usr/bin/id >"${runtime_dir}/after.log" 2>&1

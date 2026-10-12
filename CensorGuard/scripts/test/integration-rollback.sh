@@ -88,7 +88,7 @@ grep -q '"last_reload_error": ".*maximum is 256' "${runtime_dir}/failure-status.
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    policy apply --policy lab-policy --stdin --dry-run >"${runtime_dir}/dry-run.log"
+    policy apply --policy lab-policy --stdin --dry-run --json >"${runtime_dir}/dry-run.log"
 grep -q '"reload_gen": 0' "${runtime_dir}/dry-run.log"
 grep -q '"version": 1' "${runtime_dir}/dry-run.log"
 
@@ -105,7 +105,7 @@ set -e
 
 printf 'rules: []\n' | \
     "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
-    policy apply --policy lab-policy --stdin >"${runtime_dir}/commit.log"
+    policy apply --policy lab-policy --stdin --json >"${runtime_dir}/commit.log"
 grep -q '"reload_gen": 1' "${runtime_dir}/commit.log"
 grep -q '"version": 2' "${runtime_dir}/commit.log"
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \

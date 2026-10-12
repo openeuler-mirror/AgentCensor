@@ -111,6 +111,17 @@ struct EventSubscription {
     connection: UnixStream,
 }
 
+/// Display filter only: enforcement and the daemon event stream are unchanged.
+/// Preserve explicit rule audit and all denials, including the observer itself.
+fn observer_packet(event: &Event, observer_tgid: u32) -> bool {
+    observer_tgid != 0
+        && event.tgid == observer_tgid
+        && event.kind == 3
+        && matches!(event.op, 2 | 4)
+        && event.allowed
+        && event.rule_version == 0
+}
+
 impl tokio_stream::Stream for EventSubscription {
     type Item = Result<pb::Event, Status>;
 
@@ -468,6 +479,7 @@ impl pb::censorguard_server::Censorguard for Adapter {
         let domain_ids: HashSet<u64> = req.domain_ids.into_iter().collect();
         let kinds: HashSet<u32> = req.kinds.into_iter().collect();
         let allowed = req.allowed;
+        let observer_tgid = req.observer_tgid;
         let ev_sock = self.ev_sock.clone();
         let stream = UnixStream::connect(&ev_sock).map_err(|error| {
             Status::unavailable(format!("event socket is unreachable: {error}"))
@@ -482,9 +494,13 @@ impl pb::censorguard_server::Censorguard for Adapter {
             .name("censorguard-grpc-events".into())
             .spawn(move || {
                 let mut reader = BufReader::new(&stream);
+                let mut pending_dropped: u64 = 0;
                 loop {
                     match read_json_line::<Event>(&mut reader) {
-                        Ok(event) => {
+                        Ok(mut event) => {
+                            // A loss report can arrive on a filtered frame; carry
+                            // it to the next delivered event rather than erase it.
+                            pending_dropped = pending_dropped.saturating_add(event.dropped_before);
                             if !domain_ids.is_empty() && !domain_ids.contains(&event.domain_id) {
                                 continue;
                             }
@@ -494,6 +510,11 @@ impl pb::censorguard_server::Censorguard for Adapter {
                             if allowed.is_some_and(|allowed| allowed != event.allowed) {
                                 continue;
                             }
+                            if observer_packet(&event, observer_tgid) {
+                                continue;
+                            }
+                            event.dropped_before = pending_dropped;
+                            pending_dropped = 0;
                             if sender.blocking_send(Ok(pb_event(&event))).is_err() {
                                 return; // client disconnected
                             }
@@ -590,3 +611,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Silence unused-import lint when the path is only used in doc comments.
 #[allow(dead_code)]
 fn doc_path_anchor(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observer_filter_preserves_denials_rules_children_and_connections() {
+        let mut event = Event {
+            ts: String::new(),
+            kind: 3,
+            op: 4,
+            pid: 102,
+            tgid: 100,
+            allowed: true,
+            policy_version: 1,
+            rule_version: 0,
+            comm: "node".into(),
+            detail: "127.000.000.001:50051".into(),
+            args: vec![],
+            domain_id: 1,
+            domain: "test".into(),
+            sequence: 1,
+            daemon_boot_id: "boot".into(),
+            dropped_before: 0,
+        };
+        assert!(observer_packet(&event, 100));
+        assert!(!observer_packet(&event, 0));
+        assert!(!observer_packet(&event, 101)); // descendant remains visible
+        event.allowed = false;
+        assert!(!observer_packet(&event, 100));
+        event.allowed = true;
+        event.rule_version = 1;
+        assert!(!observer_packet(&event, 100)); // explicit rule audit remains visible
+        event.rule_version = 0;
+        event.op = 0;
+        assert!(!observer_packet(&event, 100)); // connect remains visible
+        event.kind = 1;
+        event.op = 2;
+        assert!(!observer_packet(&event, 100)); // native read/write remains visible
+    }
+}

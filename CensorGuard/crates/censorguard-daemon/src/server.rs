@@ -542,20 +542,14 @@ fn dispatch_rpc(
             if let Some(group) = params.group.as_deref().filter(|group| !group.is_empty()) {
                 // Single-group read (any group incl. __base__ is readable; writes are restricted).
                 match runtime.group_policy(group) {
-                    Ok((yaml, version, domains)) => rpc_success(
+                    Ok((yaml, group)) => rpc_success(
                         request_id,
                         RpcResult {
-                            revision: Some(u64::from(version)),
+                            revision: Some(u64::from(group.version)),
                             policy_yaml: Some(yaml),
                             response: Some(Response {
                                 ok: true,
-                                groups: vec![censorguard_common::protocol::GroupDump {
-                                    name: group.to_owned(),
-                                    version,
-                                    domains,
-                                    definition:
-                                        censorguard_common::protocol::PolicyDefinition::default(),
-                                }],
+                                groups: vec![group],
                                 ..Response::default()
                             }),
                             ..RpcResult::default()
@@ -646,6 +640,7 @@ fn dispatch_rpc(
                 match runtime.reload(
                     None,
                     Some(yaml),
+                    None,
                     Some(group),
                     true,
                     params.expected_revision,
@@ -694,6 +689,7 @@ fn dispatch_rpc(
                 return match runtime.reload(
                     None,
                     Some(yaml),
+                    None,
                     Some(group),
                     false,
                     params.expected_revision,
@@ -807,6 +803,7 @@ fn legacy_request(op: Operation) -> Request {
         seed: false,
         policy_file: None,
         policy_yaml: None,
+        policy_source: None,
         group: None,
         dry_run: false,
         enable_file: None,
@@ -977,6 +974,8 @@ fn dispatch_inner(
                     scopes: status.scopes,
                     scope_capacity: status.scope_capacity,
                     domains: status.domains,
+                    bindings: status.bindings,
+                    policy_snapshot_path: Some(status.policy_snapshot_path),
                     reload_gen: status.reload_generation,
                     version: status.version,
                     active_bank: status.active_bank,
@@ -1005,6 +1004,7 @@ fn dispatch_inner(
         Operation::Reload => match runtime.reload(
             request.policy_file.as_deref(),
             request.policy_yaml.as_deref(),
+            request.policy_source.as_ref(),
             request.group.as_deref(),
             request.dry_run,
             None,
