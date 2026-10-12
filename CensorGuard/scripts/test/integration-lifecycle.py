@@ -72,7 +72,7 @@ rules:
         processes.append(process)
         for _ in range(300):
             assert process.poll() is None, log.read_text()[-6000:]
-            if '[READY] 32 required hooks attached' in log.read_text():
+            if '[READY] 36 required hooks attached' in log.read_text():
                 status = ctl('status')
                 assert status['daemon_ready'], status
                 return process, log

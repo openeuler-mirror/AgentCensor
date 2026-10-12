@@ -126,7 +126,15 @@ export class HostCore {
     }
 
     // 3. Apply (origin=DSH_WEB_UI 标记, 透传到 daemon 审计)
-    return this.grpc.applyPolicy(req.group, req.policyYaml, false, this.buildAdminContext());
+    try {
+      return await this.grpc.applyPolicy(req.group, req.policyYaml, req.dryRun ?? false,
+        this.buildAdminContext(), req.expectedVersion);
+    } catch (error) {
+      if ((error as { code?: number }).code === 9) {
+        throw new HostError('version_conflict', '策略已被其他请求修改，请重新读取后再保存', 409);
+      }
+      throw error;
+    }
   }
 
   /** Legacy endpoint: daemon settings are read-only through DSH. */

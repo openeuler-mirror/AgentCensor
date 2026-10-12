@@ -22,6 +22,9 @@ for (const target of ['dist/bootstrap/index.js', 'dist/host/index.js', 'dist/ui/
   assert.equal(typeof module.apply, 'function');
 }
 assert(existsSync(join(pkg, 'proto/censorguard/v1/censorguard.proto')));
+assert.equal(readFileSync(join(pkg, 'proto/censorguard/v1/censorguard.proto'), 'utf8'),
+  readFileSync(join(repo, 'api/censorguard/v1/censorguard.proto'), 'utf8'),
+  'shipped plugin schema must match the daemon adapter contract');
 await import(pathToFileURL(join(pkg, 'bin/dsh.mjs')));
 let registration;
 runInNewContext(readFileSync(join(pkg, 'lib/client.js'), 'utf8'), {

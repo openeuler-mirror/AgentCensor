@@ -733,7 +733,17 @@ mod tests {
 
     #[test]
     fn dns_refresh_defaults_to_sixty_seconds() -> Result<(), io::Error> {
-        let args = parse_args(["launch".to_owned()].into_iter())?;
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(&config, "rules: []\n")?;
+        let args = parse_args(
+            [
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
+            ]
+            .into_iter(),
+        )?;
         assert_eq!(args.dns_refresh_seconds, 60);
         Ok(())
     }
@@ -750,9 +760,41 @@ mod tests {
 
     #[test]
     fn spawn_grpc_defaults_to_off() -> Result<(), io::Error> {
-        let args = parse_args(["launch".to_owned()].into_iter())?;
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(&config, "rules: []\n")?;
+        let args = parse_args(
+            [
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
+            ]
+            .into_iter(),
+        )?;
         assert!(!args.spawn_grpc);
         assert_eq!(args.grpc_bin, None);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_config_overrides_daemon_defaults() -> Result<(), io::Error> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(
+            &config,
+            "daemon:\n  spawn_grpc: true\n  dns_refresh_seconds: 7\n  grpc_bin: /test/grpc\nrules: []\n",
+        )?;
+        let args = parse_args(
+            [
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
+            ]
+            .into_iter(),
+        )?;
+        assert!(args.spawn_grpc);
+        assert_eq!(args.grpc_bin, Some(PathBuf::from("/test/grpc")));
+        assert_eq!(args.dns_refresh_seconds, 7);
         Ok(())
     }
 

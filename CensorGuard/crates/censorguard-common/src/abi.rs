@@ -3,12 +3,13 @@
 //! These structures deliberately contain no pointers. Keep field order, widths, padding and
 //! constants synchronized with the C source. Layout tests make accidental drift visible.
 
-/// Maximum bytes in a path or executable map key (NAME_MAX + NUL).
+/// Project limit for a path or executable map key, including NUL.
+/// This is not the Linux limit for a complete path or exec argument.
 pub const PATH_KEY_LEN: usize = 256;
 /// Number of captured exec tokens.
 pub const ARG_TOKEN_COUNT: usize = 4;
-/// Bytes per exec token, including the trailing NUL.
-pub const ARG_TOKEN_LEN: usize = 32;
+/// Bytes per exec token, including NUL: 255 UTF-8 bytes of rule content.
+pub const ARG_TOKEN_LEN: usize = PATH_KEY_LEN;
 /// Marker stored in argument token zero when the executable is identified by inode.
 pub const ARG_INODE_MARKER: u8 = 0xff;
 /// Byte offset of the encoded `(dev, ino)` pair inside argument token zero.
@@ -84,7 +85,8 @@ pub struct InodeKey {
     pub ino: u64,
 }
 
-/// Fixed exec argument prefix key.
+/// Fixed exec argument prefix key. A key with only tokens[0] populated is
+/// executable-subject metadata, not an allow/deny rule.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(C)]
 pub struct ArgKey {
@@ -167,6 +169,16 @@ pub struct NetRuleValue {
 #[repr(C)]
 pub struct TrackValue {
     pub scope_id: u64,
+}
+
+/// Socket inode owner used to attribute inbound requests outside process context.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct SocketOwner {
+    pub scope_id: u64,
+    pub tgid: u32,
+    pub pad: u32,
+    pub comm: [u8; 16],
 }
 
 /// Generation-safe fallback identity used when the primary PID tracking pair cannot be written.
@@ -260,7 +272,7 @@ mod tests {
         assert_eq!(size_of::<FilterConfig>(), 40);
         assert_eq!(size_of::<PathKey>(), 256);
         assert_eq!(size_of::<InodeKey>(), 16);
-        assert_eq!(size_of::<ArgKey>(), 128);
+        assert_eq!(size_of::<ArgKey>(), 1024);
         assert_eq!(size_of::<NetLpmKey>(), 12);
         assert_eq!(size_of::<NetPortLpmKey>(), 12);
         assert_eq!(size_of::<Net6LpmKey>(), 20);
@@ -268,11 +280,12 @@ mod tests {
         assert_eq!(size_of::<InodeRuleValue>(), 8);
         assert_eq!(size_of::<NetRuleValue>(), 12);
         assert_eq!(size_of::<TrackValue>(), 8);
+        assert_eq!(size_of::<SocketOwner>(), 32);
         assert_eq!(size_of::<PendingProcessOp>(), 16);
         assert_eq!(size_of::<ScopePolicyValue>(), 8);
         assert_eq!(size_of::<PidTrackingStats>(), 40);
         assert_eq!(size_of::<SlotMeta>(), 24);
-        assert_eq!(size_of::<RawEvent>(), 360);
+        assert_eq!(size_of::<RawEvent>(), 1256);
         assert_eq!(align_of::<RawEvent>(), 8);
     }
 

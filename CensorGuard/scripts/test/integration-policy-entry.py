@@ -132,7 +132,7 @@ def assert_layers(result, group=True, extra=False, base=True):
 
 def acceptance():
     assert os.geteuid() == 0, 'run as root on a BPF LSM host'
-    # Exec rule tokens are limited to 31 bytes; keep the fallback executable path short.
+    # Exec rule tokens are limited to 255 bytes; keep the fallback executable path short.
     directory = Path(tempfile.mkdtemp(prefix='cg-e-'))
     print(f'Artifacts: {directory}', flush=True)
     processes = []

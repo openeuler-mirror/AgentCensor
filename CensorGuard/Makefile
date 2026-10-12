@@ -20,7 +20,7 @@ PNPM ?= pnpm
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output
+.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-exec-arguments integration-grpc integration-network-ops
 
 all: check bpf build $(if $(filter 1,$(WITH_DSH)),plugin)
 
@@ -116,6 +116,9 @@ uninstall:
 	$(RM) "$(DESTDIR)$(SYSUSERSDIR)/censorguard.conf"
 	$(RM) "$(DESTDIR)$(TMPFILESDIR)/censorguard.conf"
 	$(RM) "$(DESTDIR)$(DOCDIR)/README.md" "$(DESTDIR)$(DOCDIR)/NOTICE"
+	@for doc in docs/*.md; do \
+		$(RM) "$(DESTDIR)$(DOCDIR)/$${doc##*/}"; \
+	done
 	$(RM) "$(DESTDIR)$(DOCDIR)/architecture.md" "$(DESTDIR)$(DOCDIR)/migration-matrix.md"
 	$(RM) "$(DESTDIR)$(DOCDIR)/deployment.md" "$(DESTDIR)$(DOCDIR)/refactor-plan.md"
 	$(RM) "$(DESTDIR)$(DOCDIR)/verification.md" "$(DESTDIR)$(DOCDIR)/current-runbook.md"
@@ -259,6 +262,20 @@ integration-lifecycle: bpf
 	cargo build --workspace --offline
 	sudo python3 scripts/test/integration-lifecycle.py
 
+integration-audit-config: build bpf
+	sudo python3 scripts/test/integration-audit-config.py
+
+integration-exec-arguments: build bpf
+	sudo python3 scripts/test/integration-exec-arguments.py
+
+integration-network-ops: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-network-ops.py
+
+integration-grpc: bpf
+	cargo build --workspace --offline
+	sudo node scripts/test/integration-grpc.mjs
+
 integration-policy-entry: bpf
 	cargo build --workspace --offline
 	sudo python3 scripts/test/integration-policy-entry.py
@@ -278,7 +295,7 @@ integration-dns-refresh: bpf
 	cargo build --workspace --offline
 	sudo bash ./scripts/test/integration-dns-refresh.sh
 
-integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle
+integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle integration-audit-config integration-network-ops
 
 clean:
 	cargo clean

@@ -6,7 +6,7 @@ use censorguard_common::abi::{
     ArgKey, FilterConfig, InodeKey, InodeRuleValue, Net6LpmKey, Net6PortLpmKey, NetLpmKey,
     NetPortLpmKey, NetRuleValue, PID_PENDING_CAPACITY, PID_TRACKED_CAPACITY, PathKey,
     PendingProcessOp, PidTrackingStats, RawEvent, SCOPE_POLICY_CAPACITY, ScopePolicyValue,
-    SlotMeta, StringRuleValue, TrackValue,
+    SlotMeta, SocketOwner, StringRuleValue, TrackValue,
 };
 use censorguard_policy::{CompiledPolicy, CompiledRules, RuleValue};
 use std::collections::BTreeMap;
@@ -402,6 +402,10 @@ impl NativeKernel {
         self.delete_map("scope_policies", &scope_id)
     }
 
+    pub fn track_socket(&self, inode: u64, owner: SocketOwner) -> Result<(), KernelError> {
+        self.update_map("socket_owners", &inode, &owner)
+    }
+
     pub fn track_pid(
         &self,
         pid: u32,
@@ -515,7 +519,12 @@ impl NativeKernel {
         let mut error = [0 as c_char; 4096];
         // SAFETY: the kernel handle is valid and retained by the Arc stored in EventReader.
         let handle = unsafe {
-            ffi::as_event_reader_new(self.handle.as_ptr(), error.as_mut_ptr(), error.len())
+            ffi::as_event_reader_new(
+                self.handle.as_ptr(),
+                size_of::<RawEvent>(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
         };
         let handle = NonNull::new(handle).ok_or_else(|| native_error(&error))?;
         Ok(EventReader {
@@ -859,6 +868,7 @@ impl_kernel_pod!(
     InodeRuleValue,
     NetRuleValue,
     TrackValue,
+    SocketOwner,
     PendingProcessOp,
     ScopePolicyValue,
     PidTrackingStats,
@@ -1033,6 +1043,26 @@ const EXEC: &[ProgramSpec] = &[
 ];
 
 const NETWORK: &[ProgramSpec] = &[
+    ProgramSpec {
+        name: "track_socket_listen",
+        section: "lsm/socket_listen",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "enforce_inet_conn_request",
+        section: "lsm/inet_conn_request",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "enforce_socket_recvmsg",
+        section: "lsm/socket_recvmsg",
+        feature: Feature::Network,
+    },
+    ProgramSpec {
+        name: "forget_socket_inode",
+        section: "lsm/inode_free_security",
+        feature: Feature::Network,
+    },
     ProgramSpec {
         name: "enforce_socket_connect",
         section: "lsm/socket_connect",

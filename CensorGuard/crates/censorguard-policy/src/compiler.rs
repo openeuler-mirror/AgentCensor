@@ -427,6 +427,10 @@ fn add_argument_rule(
         audit,
         version: 0,
     });
+    // A zero-argument key indexes the executable identities with argv rules.
+    // It is metadata, never a matching allow/deny rule. BPF can therefore
+    // distinguish unrelated commands even when their argv capture fails.
+    add_argument_subject(key, rules);
     match executable_inode(executable) {
         Ok(inode) => {
             encode_argument_inode(&mut key, inode);
@@ -436,6 +440,7 @@ fn add_argument_rule(
                 audit,
                 version: 0,
             });
+            add_argument_subject(key, rules);
         }
         Err(error) => warnings.push(CompileWarning::MissingCommandFallback {
             path: executable.to_owned(),
@@ -443,6 +448,11 @@ fn add_argument_rule(
         }),
     }
     Ok(())
+}
+
+fn add_argument_subject(mut key: ArgKey, rules: &mut CompiledRules) {
+    key.tokens[1..].fill([0; ARG_TOKEN_LEN]);
+    rules.arguments.entry(key).or_default();
 }
 
 fn executable_inode(value: &str) -> Result<InodeKey, std::io::Error> {
@@ -938,6 +948,36 @@ mod tests {
     }
 
     #[test]
+    fn argument_tokens_accept_255_bytes_and_reject_256_bytes() -> Result<(), PolicyError> {
+        for length in [31, 32, 254, 255] {
+            let token = "x".repeat(length);
+            let executable = format!("/{}", "p".repeat(length - 1));
+            let key = pack_arguments(&format!("{executable} {token}"))?;
+            assert_eq!(&key.tokens[0][..length], executable.as_bytes());
+            assert_eq!(&key.tokens[1][..length], token.as_bytes());
+            assert_eq!(key.tokens[0][length], 0);
+            assert_eq!(key.tokens[1][length], 0);
+        }
+        for rule in [
+            format!("/usr/bin/echo {}", "x".repeat(256)),
+            format!("/{} blocked", "p".repeat(255)),
+            // Length is UTF-8 bytes, not character count.
+            format!("/usr/bin/echo {}", "界".repeat(86)),
+        ] {
+            assert!(matches!(
+                pack_arguments(&rule),
+                Err(PolicyError::ArgTokenTooLong { maximum: 255, .. })
+            ));
+        }
+        let utf8 = "界".repeat(85);
+        assert_eq!(
+            pack_arguments(&format!("/usr/bin/echo {utf8}"))?.tokens[1][255],
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn whole_command_rules_do_not_require_argument_capture()
     -> Result<(), Box<dyn std::error::Error>> {
         let command = format!("/tmp/{}", "x".repeat(80));
@@ -1006,7 +1046,18 @@ mod tests {
         let rules = &compiled.groups["lab"];
         assert_eq!(rules.command_inodes.len(), 1);
         assert_eq!(rules.commands.len(), 1);
-        assert_eq!(rules.arguments.len(), 2);
+        assert_eq!(rules.arguments.len(), 4);
+        let subjects: Vec<_> = rules
+            .arguments
+            .iter()
+            .filter(|(key, _)| key.tokens[1..].iter().flatten().all(|byte| *byte == 0))
+            .collect();
+        assert_eq!(subjects.len(), 2);
+        assert!(
+            subjects
+                .iter()
+                .all(|(_, value)| **value == RuleValue::default())
+        );
         let arguments: Vec<_> = rules.arguments.iter().collect();
         assert!(
             arguments

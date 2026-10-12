@@ -643,6 +643,7 @@ fn event_operation_name(kind: u32, op: u32) -> &'static str {
         (3, 1) => "bind",
         (3, 2) => "sendmsg",
         (3, 3) => "accept",
+        (3, 4) => "recvmsg",
         (4, 1) => "kill",
         (4, 2) => "ptrace",
         (4, 3) => "traceme",

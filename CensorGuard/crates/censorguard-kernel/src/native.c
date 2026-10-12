@@ -32,8 +32,10 @@ struct as_event_reader {
     int drop_map_fd;
     struct {
         size_t size;
-        unsigned char data[512];
     } samples[256];
+    unsigned char *sample_data;
+    size_t sample_capacity;
+    size_t abi_mismatch_size;
     size_t head;
     size_t count;
     unsigned long dropped;
@@ -42,13 +44,17 @@ struct as_event_reader {
 static int copy_event(void *context, void *data, size_t size)
 {
     struct as_event_reader *reader = context;
-    if (size > sizeof(reader->samples[0].data) || reader->count == 256) {
+    if (size != reader->sample_capacity) {
+        reader->abi_mismatch_size = size;
+        return -EMSGSIZE;
+    }
+    if (reader->count == 256) {
         reader->dropped++;
         return 0;
     }
     size_t tail = (reader->head + reader->count) % 256;
     reader->samples[tail].size = size;
-    memcpy(reader->samples[tail].data, data, size);
+    memcpy(reader->sample_data + tail * reader->sample_capacity, data, size);
     reader->count++;
     return 0;
 }
@@ -538,6 +544,7 @@ long as_kernel_list_scope(const struct as_kernel *kernel,
 }
 
 struct as_event_reader *as_event_reader_new(const struct as_kernel *kernel,
+                                             size_t sample_capacity,
                                              char *error,
                                              size_t error_size)
 {
@@ -551,16 +558,28 @@ struct as_event_reader *as_event_reader_new(const struct as_kernel *kernel,
         set_error(error, error_size, "event_drops map does not exist");
         return NULL;
     }
+    if (sample_capacity == 0) {
+        set_error(error, error_size, "event size must be nonzero");
+        return NULL;
+    }
     struct as_event_reader *reader = calloc(1, sizeof(*reader));
     if (reader == NULL) {
         set_error(error, error_size, "allocate event reader: %s", strerror(errno));
         return NULL;
     }
+    reader->sample_data = calloc(256, sample_capacity);
+    if (reader->sample_data == NULL) {
+        set_error(error, error_size, "allocate event samples: %s", strerror(errno));
+        free(reader);
+        return NULL;
+    }
+    reader->sample_capacity = sample_capacity;
     reader->ring = ring_buffer__new(map_fd, copy_event, reader, NULL);
     long ring_error = libbpf_get_error(reader->ring);
     if (ring_error != 0) {
         set_error(error, error_size, "open events ring buffer: %s",
                   strerror((int)-ring_error));
+        free(reader->sample_data);
         free(reader);
         return NULL;
     }
@@ -573,6 +592,7 @@ void as_event_reader_free(struct as_event_reader *reader)
     if (reader == NULL)
         return;
     ring_buffer__free(reader->ring);
+    free(reader->sample_data);
     free(reader);
 }
 
@@ -588,7 +608,11 @@ int as_event_reader_next(struct as_event_reader *reader,
     if (reader->count == 0) {
         int result = ring_buffer__poll(reader->ring, timeout_ms);
         if (result < 0) {
-            set_error(error, error_size, "poll events ring buffer: %s", strerror(-result));
+            if (reader->abi_mismatch_size != 0)
+                set_error(error, error_size, "event ABI mismatch: kernel %zu / Rust %zu",
+                          reader->abi_mismatch_size, reader->sample_capacity);
+            else
+                set_error(error, error_size, "poll events ring buffer: %s", strerror(-result));
             return result;
         }
     }
@@ -600,7 +624,7 @@ int as_event_reader_next(struct as_event_reader *reader,
                   sample_size, output_size);
         return -EMSGSIZE;
     }
-    memcpy(output, reader->samples[reader->head].data, sample_size);
+    memcpy(output, reader->sample_data + reader->head * reader->sample_capacity, sample_size);
     reader->head = (reader->head + 1) % 256;
     reader->count--;
     return 1;

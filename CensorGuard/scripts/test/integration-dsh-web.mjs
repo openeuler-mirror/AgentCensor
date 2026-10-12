@@ -191,6 +191,8 @@ rules:
   const newBoot = ctl('status').daemon_boot_id;
   assert.notEqual(oldBoot, newBoot);
   await waitFor(() => (ctl('status').roots ?? []).includes(web.child.pid), 'DSH did not automatically reattach after reload');
+  // Real-time streams have no replay: generate the probe after the Host has resubscribed.
+  await waitFor(() => ctl('status').event_subscribers > 0, 'DSH audit did not resubscribe after reload');
   await page.request.post(deniedRequest.url, { data: deniedRequest.body });
   await waitFor(async () => (await audit.getAttribute('data-daemon-boot-id')) === newBoot, 'audit did not recover after daemon reload');
   await audit.locator('[data-audit-result="DENY"]').filter({ hasText: 'guarded.txt' }).first().waitFor();

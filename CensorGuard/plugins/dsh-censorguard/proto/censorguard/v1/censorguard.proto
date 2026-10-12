@@ -1,7 +1,7 @@
 // Censorguard gRPC 契约 —— 面向 DSH 插件的委托控制面 + 事件面
 //
 // 结构逐条对照 ohmyguard-link/api/ohmyguard/v1/ohmyguard.proto 复刻。
-// gRPC 适配器进程 (crates/censorguard-grpc, 非特权服务用户) 对外讲本协议,
+// gRPC 适配器进程 (crates/censorguard-grpc, 委托角色) 对外讲本协议,
 // 对内是 daemon ui.sock / events.sock 的客户端 (JSON-lines 透传)。
 // daemon 自身永不直接监听网络。
 //
@@ -35,7 +35,7 @@ service Censorguard {
   rpc ApplyPolicy(ApplyPolicyReq)  returns (ApplyPolicyReply);    // 整组替换 (限定白名单组)
   rpc RemovePolicy(RemovePolicyReq) returns (RemovePolicyReply);  // 删组 (gRPC 角色无权限, ACL 拒)
   rpc GetConfig(GetConfigReq)      returns (GetConfigReply);
-  // 运行时开关读写 (enable_*/audit_* 六开关; ui.sock 委托面允许):
+  // 兼容旧客户端的开关写接口；0.5.0 返回 PermissionDenied。
   rpc SetSwitches(SetSwitchesReq)  returns (SetSwitchesReply);
 
   // 事件面:
@@ -71,7 +71,7 @@ message StatusReply {
   uint64 reload_gen = 4;              // 策略变更代数 (单调; dry_run 不增)
   string last_reload_time = 5;        // RFC3339, 空 = 从未变更
   string last_reload_error = 6;       // 上次失败原因, 空 = 上次成功
-  map<string, bool> config = 7;       // 全局开关 (enable_* × file/exec/net)
+  map<string, bool> config = 7;       // 当前已加载的 enable_* / audit_* 六开关
   // daemon boot ID 与 hook 健康度: UI 用于显示 daemon 是否存活/重启过,
   // 以及策略 enforcement 是否就绪。
   string daemon_boot_id = 10;
@@ -138,6 +138,7 @@ message ApplyPolicyReq {
   string policy_yaml = 2;             // 单组规则片段 (GroupPolicy YAML)
   bool dry_run = 3;                   // 只编译校验 + 报告影响面, 不动数据面
   RequestContext context = 4;
+  optional uint64 expected_revision = 5; // 可选并发写保护；在 daemon 更新锁内检查
 }
 message ApplyPolicyReply {
   uint64 reload_gen = 1;              // 策略变更代数
@@ -168,8 +169,8 @@ message GetConfigReply {
   map<string, bool> config = 1;
 }
 
-// SetSwitches 运行时开关: 只传要改的字段 (proto3 optional), 未传字段保持不变。
-// 开关不持久化, daemon 重启恢复默认 (enable 全开, audit 全关)。
+// SetSwitches 保留原协议字段以兼容旧客户端，0.5.0 拒绝此写操作。
+// 开关统一由启动 YAML 的 daemon 段配置，修改后 reload/restart 生效。
 message SetSwitchesReq {
   optional bool enable_file = 1;
   optional bool enable_exec = 2;

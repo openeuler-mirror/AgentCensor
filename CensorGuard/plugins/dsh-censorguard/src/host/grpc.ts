@@ -262,12 +262,14 @@ export class GrpcClient {
     policyYaml: string,
     dryRun: boolean,
     ctx?: RequestContext,
+    expectedRevision?: number,
   ): Promise<ApplyPolicyReply> {
     const r = await this.call<Record<string, unknown>>('ApplyPolicy', {
       name,
       policyYaml,
       dryRun,
       context: ctx,
+      expectedRevision: expectedRevision == null ? undefined : String(expectedRevision),
     });
     return {
       reloadGen: Number(r.reloadGen ?? 0),

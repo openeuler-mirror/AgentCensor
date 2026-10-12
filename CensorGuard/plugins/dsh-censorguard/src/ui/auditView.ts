@@ -68,7 +68,7 @@ export function kindLabel(kind: number, op: number): string {
 }
 
 function netOpLabel(op: number): string {
-  return ({ 1: 'NET-BIND', 2: 'NET-SEND', 3: 'NET-ACCEPT' } as Record<number, string>)[op] ?? 'NET';
+  return ({ 1: 'NET-BIND', 2: 'NET-SEND', 3: 'NET-ACCEPT', 4: 'NET-RECV' } as Record<number, string>)[op] ?? 'NET';
 }
 
 // eventToRow 单条事件 → 列表行

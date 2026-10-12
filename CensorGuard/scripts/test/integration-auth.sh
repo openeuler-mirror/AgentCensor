@@ -92,6 +92,38 @@ for _ in $(seq 1 1200); do
 done
 [[ ${nobody_uid:-} == 65534 ]]
 
+# Missing cross-UID fd access must fail clearly and roll back process registration.
+set +e
+setpriv --reuid=65534 --regid=65534 --clear-groups \
+    "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    attach --pid "${nobody_pid}" --domain auth-domain >"${runtime_dir}/missing-cap.log" 2>&1
+missing_cap_rc=$?
+set -e
+[[ ${missing_cap_rc} -ne 0 ]]
+grep -q 'CAP_SYS_PTRACE' "${runtime_dir}/missing-cap.log"
+"${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/rolled-back.log"
+python3 - "${runtime_dir}/rolled-back.log" <<'PY'
+import json, sys
+status = json.load(open(sys.argv[1]))
+assert status['tracked'] == 0 and not status.get('roots') and not status.get('domains'), status
+PY
+"${repo_dir}/target/debug/censorguardd" stop --config "${runtime_dir}/config.yaml"
+wait "${daemon_pid}"
+
+# Match the shipped systemd capability boundary; this does not grant callers admin access.
+setpriv --no-new-privs \
+    --bounding-set=-all,+chown,+dac_read_search,+sys_admin,+sys_resource,+perfmon,+bpf,+sys_ptrace \
+    "${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
+    --duration 8 >"${runtime_dir}/daemon.log" 2>&1 &
+daemon_pid=$!
+for _ in $(seq 1 1200); do
+    grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break
+    /usr/bin/sleep 0.05
+done
+grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
+
 setpriv --reuid=65534 --regid=65534 --clear-groups \
     "${runtime_dir}/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${nobody_pid}" --domain auth-domain >"${runtime_dir}/own-attach.log"

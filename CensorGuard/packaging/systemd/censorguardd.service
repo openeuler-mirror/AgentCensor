@@ -25,7 +25,8 @@ LimitMEMLOCK=infinity
 LimitNOFILE=65536
 OOMScoreAdjust=-500
 
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN
+# CAP_SYS_PTRACE permits /proc/<pid>/fd inspection for socket ownership across UIDs.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_DAC_READ_SEARCH CAP_SYS_RESOURCE CAP_CHOWN CAP_SYS_PTRACE
 NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateMounts=yes

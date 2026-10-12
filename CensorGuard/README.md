@@ -28,7 +28,8 @@ rules:
   - exec deny /usr/bin/nc
 ```
 
-`enable_*` / `audit_*` 放在启动配置的 `daemon` 段，默认 enable 全开、audit 全开。
+`enable_*` / `audit_*` 放在启动配置的 `daemon` 段，省略时 enable 全开、audit 全关；
+仓库 `config/base.yaml` 显式开启三个 audit。
 基线和 daemon 设置运行中不可热改，修改后用 `censorguardd reload` 完整重启。
 附加组可热更新；domain 支持多个组，任一层 deny 即拒绝。`remove` 移除域内一个组，
 `policy remove` 删除未被引用的组。`status` 显示简洁摘要，`status --json` 包含 PID 进程树，`doctor` 检查组件。
@@ -39,11 +40,16 @@ rules:
 
 文件规则同时编译为 inode 身份和同一规则的规范化路径身份：内核先查 inode，inode
 未命中时才使用路径兜底，以覆盖文件重建或新建后的短期窗口。当前 exec 参数规则依赖
-execve/execveat 入口暂存 argv；当当前策略存在参数规则而采集失败、scratch 不可用或
-暂存更新失败时，`bprm_check_security` 按 fail-closed 拒绝该次执行。网络策略覆盖
-`socket_connect`、`socket_bind`、带目标地址的 `socket_sendmsg` 和已建立入站连接的
-`socket_accept`；无法从 sendmsg 取得目标地址的已连接发送由 connect 检查负责，仍不
-等价于包级防火墙。
+execve/execveat 入口暂存 argv；仅当前可执行文件配置了参数规则且采集/暂存失败时，
+`bprm_check_security` 按 fail-closed 拒绝该次执行（匹配 scratch 不可用仍拒绝）。
+规则 token 最长 255 字节；运行时长参数不会匹配较短的完整 token，也不会绕过已命中的拒绝前缀。
+参数规则最多 4 个 token（程序路径 + 前 3 个参数）；255 按 UTF-8 字节计算，
+是项目限制，不是 Linux 完整路径或参数的系统上限。
+脚本的参数缓存保留到解释器检查完成。网络策略覆盖
+`socket_connect`、`socket_bind`、显式目标及已连接 socket 的 `socket_sendmsg`/`socket_recvmsg`。
+TCP 入站由 `inet_conn_request` 在握手阶段检查：拒绝请求会丢弃，客户端通常超时。
+监听 socket 由 listen/accept 和 attach 时的 fd 回填建立 scope 身份；reload 后须重新接入。
+这仍不等价于包级防火墙。
 文件 `allow` 不构成白名单；网络规则按带端口优先、同层级 deny 优先的顺序判定。
 启动和 hook 的微秒级延迟尚未由现有启动 smoke test 证明。
 
@@ -77,6 +83,8 @@ sudo ./scripts/test/startup-test.sh
 ```
 
 ## 验证
+
+快速手动验收见 [手动测试指南](docs/手动测试指南.md)，覆盖长参数、脚本、文件读取和策略热更新。
 
 完整 root 集成：
 
@@ -117,8 +125,9 @@ launcher argv 前插）升级为**整树包裹**：DSH 主进程启动时由最�
 
 - 自助面：Bootstrap → `dsh.sock`（0666）`attach_self`/`status_self`/`tree_self`，
   5s 心跳比对 boot_id，daemon 重启即重 attach；
-- 委托面：Host 插件 → `censorguard-grpc`（127.0.0.1:50051，非特权，daemon 永不
-  监听网络）→ `ui.sock`（0666）白名单组策略读写。systemd 部署下
+- 委托面：Host 插件 → `censorguard-grpc`（127.0.0.1:50051，委托角色，daemon 永不
+  监听网络）→ `ui.sock`（0666）白名单组策略读写。适配器由 root daemon 派生时继承
+  root UID，接口权限由 adapter 与 ui.sock 角色限制，当前没有单独降权。systemd 部署下
   daemon 按配置文件中的 `daemon.spawn_grpc` 自动派生并守护该适配器（崩溃 1s 后重启、daemon 退出时
   TERM→KILL 回收），无需单独的 grpc unit；手动部署也可单独运行
   `sudo censorguard-grpc --config /etc/censorguard/base.yaml`；
@@ -154,7 +163,7 @@ crates/censorguard-policy  YAML、文件、exec、IPv4/IPv6、A/AAAA DNS 编译
 crates/censorguard-kernel  唯一 unsafe/libbpf 边界
 crates/censorguard-daemon  特权 daemon、PID 域、热更新、角色 socket ACL
 crates/censorguardctl      控制客户端
-crates/censorguard-grpc    非特权 gRPC 适配器（127.0.0.1:50051 → ui.sock/events.sock）
+crates/censorguard-grpc    委托 gRPC 适配器（127.0.0.1:50051 → ui.sock/events.sock）
 api/                         gRPC 契约 censorguard.v1
 plugins/dsh-censorguard    DSH 整树包裹插件（runtime/bootstrap/host/client + bundle）
 scripts/                     构建/打包/DSH 运维脚本
@@ -165,9 +174,12 @@ docs/                        架构、迁移、验证文档
 
 ## 文档
 
+- [全流程摸底测试报告](docs/全流程摸底测试报告.md)：验收范围、实机证据、缺陷与修复
+- [代码库结构与系统原理](docs/代码库结构与系统原理.md)：结构图、系统架构及模块实现分析
 - [命令手册](docs/命令手册.md)：当前 CLI、命名与策略管理规范
 - [构建指南](docs/构建指南.md)：从源码构建全部组件与离线打包
 - [使用手册](docs/使用手册.md)：核心概念、策略编写、运行时开关、观测与故障排查
+- [策略编写与保护范围](docs/策略编写与保护范围.md)：目录保护、exec 参数匹配与通配符边界
 - [DSH 插件指南](docs/DSH插件指南.md)：DSH 整树包裹插件的架构、安装与使用
 
 IPv6 规则示例：

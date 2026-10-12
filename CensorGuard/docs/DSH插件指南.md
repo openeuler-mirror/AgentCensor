@@ -15,6 +15,8 @@ sudo censorguardctl policy apply --policy censorguard-dsh-default --file config/
 ```
 
 策略组会持久保存。升级插件通常无需再次发布；重发会用文件内容更新该组，可能覆盖 Web 中的编辑。
+示例 exec 黑名单只覆盖指定程序/参数写法；保护重要目录需补充 `file` 规则。
+匹配范围和通配符限制见 [策略编写与保护范围](策略编写与保护范围.md)。
 
 ### 2. 给使用 DSH 的用户访问权限
 

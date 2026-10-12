@@ -13,13 +13,13 @@
  * 每条规则 value 与 slot_meta 携带策略版本, 事件上报版本供审计对账。
  *
  * 三个策略：文件 / 命令(含参数级) / 网络
- * 29 个 program: lsm/file_open (按 f_flags 区分读/写),
+ * 必需 programs: lsm/file_open (按 f_flags 区分读/写),
  *              lsm/file_permission (预打开 fd 实际读写时重新授权),
  *              lsm/path_truncate (写), lsm/path_unlink (删),
  *              lsm/path_rmdir (删目录), lsm/path_rename (改名/移动),
  *              等 18 个文件钩子 + lsm/bprm_check_security,
  *              tracepoint/syscalls/sys_enter_execve/execveat (取 argv 暂存),
- *              lsm/socket_connect/bind/sendmsg/accept + 守护四钩 + 进程树追踪三钩
+ *              网络八钩（含监听身份/入站请求/收发/释放）+ 守护四钩 + 进程树追踪三钩
  *
  * 注意: path_truncate/unlink/rmdir/rename 不在内核 sleepable LSM
  * 钩子名单里 (inode 锁上下文), 只能用非 sleepable lsm/ 挂载;
@@ -144,9 +144,9 @@ struct ino_key {
     __u64 ino;
 };
 
-/* exec 参数 token: 最多 4 个定长槽, 每槽 32 字节 (31 字符 + NUL) */
+/* exec 参数 token: 最多 4 个定长槽, 每槽 256 字节 (255 字节 + NUL) */
 #define ARG_TOKEN_N    4
-#define ARG_TOKEN_LEN  32
+#define ARG_TOKEN_LEN  256
 #define ARG_INODE_MARKER 0xff
 #define ARG_INODE_OFFSET 8
 
@@ -160,7 +160,8 @@ struct arg_key {
 struct exec_args {
     char tok[ARG_TOKEN_N][ARG_TOKEN_LEN];
     __u8 capture_status;
-    __u8 pad[3];
+    __u8 overlong_mask; /* truncated display tokens cannot be exact rule matches */
+    __u8 pad[2];
 };
 #define EXEC_ARGS_CAPTURED 0
 #define EXEC_ARGS_FAILED   1
@@ -273,6 +274,7 @@ struct net_rule_val {
 #define NET_OP_BIND 1
 #define NET_OP_SENDMSG 2
 #define NET_OP_ACCEPT 3
+#define NET_OP_RECVMSG 4
 
 /* ============ 运行时可热更的过滤配置 (array map) ============
  *
@@ -417,6 +419,21 @@ struct {
     __type(key, __u64);
     __type(value, struct scope_policy_val);
 } scope_policies SEC(".maps");
+
+/* Socket inode identity survives fork/inheritance; scope binding is resolved at each
+ * handshake. inode_free_security removes entries before socket inode reuse. */
+struct socket_owner {
+    __u64 scope_id;
+    __u32 tgid;
+    __u32 pad;
+    char comm[16];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);
+    __type(value, struct socket_owner);
+} socket_owners SEC(".maps");
 
 struct pid_tracking_stats {
     __u64 start_update_failures;
@@ -693,7 +710,7 @@ struct slot_meta {
     __u32 version;       /* 当前槽位生效的策略版本 */
     __u32 policy_group;  /* 绑定的策略组 id */
     __u32 file_str_count; /* 该槽 file_str 规则条数: 0 = 路径兜底判定整体跳过 */
-    __u32 arg_count;     /* 该槽 exec 参数规则条数 */
+    __u32 arg_count;     /* exec 参数规则及可执行身份索引条数 */
     __u64 switch_ts;     /* 换槽时间戳 (控制面写入, UnixNano), 审计用 */
 };
 struct {
@@ -880,8 +897,8 @@ static __always_inline bool should_report_allow(void)
     return counter->count % cfg->allow_sample_rate == 0;
 }
 
-/* argv 暂存: sys_enter_execve 写入, bprm_check_security 读出后即删。
- * LRU 自动驱逐残留项 (exec 中途失败走不到 LSM hook 的情况) */
+/* argv 暂存: syscall 入口写入，脚本及解释器的 bprm 检查复用；
+ * exec 成功/线程退出时清理，下次入口替换失败 exec 的缓存，LRU 驱逐残留。 */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 1024);
@@ -889,8 +906,17 @@ struct {
     __type(value, struct exec_args);
 } exec_args_map SEC(".maps");
 
+/* 1028-byte argv capture cannot live on the 512-byte BPF stack. The
+ * non-sleepable syscall tracepoints use one scratch value per CPU. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct exec_args);
+} exec_capture_scratch SEC(".maps");
+
 /* is_args_in_blacklist 的 scratch key 缓冲。
- * BPF 栈只有 512B, arg_key(128B) 内联进 bprm hook 会超限,
+ * BPF 栈只有 512B, arg_key(1024B) 不能放在 bprm hook 栈上,
  * 按 clang 建议放 per-cpu array (单 CPU 独占, 无需锁)。
  * 与域无关 (查询 key 的构造不碰策略表), 全组共享一个。 */
 struct {
@@ -1126,7 +1152,7 @@ static __always_inline __u8 ino_mask_lookup(struct bpf_map *base,
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
-            *rule_ver = rv->version;
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
         }
@@ -1136,7 +1162,7 @@ static __always_inline __u8 ino_mask_lookup(struct bpf_map *base,
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
-            *rule_ver = rv->version;
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
         }
@@ -1210,7 +1236,7 @@ static long dir_walk_step(__u32 index, void *ctx)
         if (rv) {
             if (rv->action == 0)
                 st->mask |= rv->mask;
-            st->rule_ver = rv->version;
+            st->rule_ver = rv->version | (st->rule_ver & 0x80000000u);
             if (rv->audit)
                 st->rule_ver |= 0x80000000u;
         }
@@ -1222,7 +1248,7 @@ static long dir_walk_step(__u32 index, void *ctx)
         if (rv) {
             if (rv->action == 0)
                 st->mask |= rv->mask;
-            st->rule_ver = rv->version;
+            st->rule_ver = rv->version | (st->rule_ver & 0x80000000u);
             if (rv->audit)
                 st->rule_ver |= 0x80000000u;
         }
@@ -1243,7 +1269,7 @@ static __always_inline __u8 dir_ancestor_mask(struct dentry *dentry,
         .cur = dentry,
         .base_slot = base_slot,
         .dom_slot = dom_slot,
-        .rule_ver = 0,
+        .rule_ver = *rule_ver,
         .mask = 0,
         .stop = false,
         .invalid = false,
@@ -1359,7 +1385,7 @@ static __always_inline __u8 file_str_key_lookup(const struct path_key *key,
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
-            *rule_ver = rv->version;
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
         }
@@ -1369,7 +1395,7 @@ static __always_inline __u8 file_str_key_lookup(const struct path_key *key,
         if (rv) {
             if (rv->action == 0)
                 mask |= rv->mask;
-            *rule_ver = rv->version;
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
         }
@@ -1465,20 +1491,22 @@ static __always_inline bool is_cmd_in_blacklist(const char *cmd,
     struct str_rule_val *rv;
     if (base) {
         rv = bpf_map_lookup_elem(base, key);
-        if (rv && rv->action == 0) {
-            *rule_ver = rv->version;
+        if (rv) {
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
-            return true;
+            if (rv->action == 0)
+                return true;
         }
     }
     if (dom) {
         rv = bpf_map_lookup_elem(dom, key);
-        if (rv && rv->action == 0) {
-            *rule_ver = rv->version;
+        if (rv) {
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u);
             if (rv->audit)
                 *rule_ver |= 0x80000000u;
-            return true;
+            if (rv->action == 0)
+                return true;
         }
     }
     return false;
@@ -1501,7 +1529,8 @@ static __always_inline bool is_cmd_inode_in_blacklist(struct file *file,
     return ino_mask_lookup(base, dom, &key, rule_ver) != 0;
 }
 
-/* 对一个已构造的 argument key 做 4→1 token 前缀回退。 */
+/* 对一个已构造的 argument key 做 4→2 token 前缀回退。
+ * tok[0] alone is executable-subject metadata, not an executable-wide rule. */
 static __always_inline bool arg_key_in_blacklist(struct arg_key *k,
                                                  struct bpf_map *base,
                                                  struct bpf_map *dom,
@@ -1509,20 +1538,21 @@ static __always_inline bool arg_key_in_blacklist(struct arg_key *k,
 {
     struct str_rule_val *rv;
 
-#define ARG_HIT()                                                     \
-    ({                                                                \
-        bool hit = false;                                             \
-        if (base) {                                                   \
-            rv = bpf_map_lookup_elem(base, k);                        \
-            if (rv && rv->action == 0) { *rule_ver = rv->version | (rv->audit ? 0x80000000u : 0); hit = true; }          \
-        }                                                             \
-        if (!hit) {                                                   \
-            if (dom) {                                                \
-                rv = bpf_map_lookup_elem(dom, k);                     \
-                if (rv && rv->action == 0) { *rule_ver = rv->version | (rv->audit ? 0x80000000u : 0); hit = true; }      \
-            }                                                         \
-        }                                                             \
-        hit;                                                          \
+#define ARG_RULE(map)                                                   \
+    if (map) {                                                         \
+        rv = bpf_map_lookup_elem(map, k);                               \
+        if (rv) {                                                      \
+            *rule_ver = rv->version | (*rule_ver & 0x80000000u) |       \
+                        (rv->audit ? 0x80000000u : 0);                  \
+            if (rv->action == 0) hit = true;                            \
+        }                                                              \
+    }
+#define ARG_HIT()                                                      \
+    ({                                                                 \
+        bool hit = false;                                              \
+        ARG_RULE(base);                                                \
+        if (!hit) { ARG_RULE(dom); }                                    \
+        hit;                                                           \
     })
 
     if (ARG_HIT())
@@ -1533,11 +1563,40 @@ static __always_inline bool arg_key_in_blacklist(struct arg_key *k,
     __builtin_memset(k->tok[2], 0, ARG_TOKEN_LEN);
     if (ARG_HIT())
         return true;
-    __builtin_memset(k->tok[1], 0, ARG_TOKEN_LEN);
-    if (ARG_HIT())
-        return true;
     return false;
 #undef ARG_HIT
+#undef ARG_RULE
+}
+
+static __always_inline bool has_argument_subject(struct arg_key *k,
+                                                  struct bpf_map *base,
+                                                  struct bpf_map *dom)
+{
+    return (base && bpf_map_lookup_elem(base, k)) ||
+           (dom && bpf_map_lookup_elem(dom, k));
+}
+
+static __always_inline void clear_argument_tokens(void *tokens)
+{
+    /* Volatile stores prevent LLVM from emitting an unsupported 1 KiB
+     * libc memset call. Both buffers are aligned BPF map values. */
+    volatile __u64 *words = tokens;
+#pragma unroll
+    for (int i = 0; i < ARG_TOKEN_N * ARG_TOKEN_LEN / sizeof(__u64); i++)
+        words[i] = 0;
+}
+
+static __always_inline void copy_argument_tokens(struct arg_key *k,
+                                                  const struct exec_args *ea)
+{
+    __builtin_memcpy(k, ea->tok, sizeof(*k));
+#pragma unroll
+    for (int i = 1; i < ARG_TOKEN_N; i++) {
+        /* Rules are valid UTF-8 and <=255 bytes. An overlong runtime token
+         * cannot equal one; retain its display prefix only in the event. */
+        if (ea->overlong_mask & (1u << i))
+            k->tok[i][0] = ARG_INODE_MARKER;
+    }
 }
 
 /* 参数级黑名单并查: token 逐级回退匹配。
@@ -1565,20 +1624,34 @@ static __always_inline int is_args_in_blacklist(const struct exec_args *ea,
         if (inode) {
             struct ino_key ik = {};
             ino_key_from_inode(inode, &ik);
-            __builtin_memcpy(k, ea->tok, sizeof(*k));
-            __builtin_memset(k->tok[0], 0, ARG_TOKEN_LEN);
+            clear_argument_tokens(k);
             k->tok[0][0] = ARG_INODE_MARKER;
             __builtin_memcpy(k->tok[0] + ARG_INODE_OFFSET, &ik, sizeof(ik));
-            if (arg_key_in_blacklist(k, base, dom, rule_ver))
-                return ARG_CHECK_MATCH;
+            if (has_argument_subject(k, base, dom)) {
+                if (!ea || ea->capture_status != EXEC_ARGS_CAPTURED)
+                    return ARG_CHECK_UNAVAILABLE;
+                copy_argument_tokens(k, ea);
+                __builtin_memset(k->tok[0], 0, ARG_TOKEN_LEN);
+                k->tok[0][0] = ARG_INODE_MARKER;
+                __builtin_memcpy(k->tok[0] + ARG_INODE_OFFSET, &ik, sizeof(ik));
+                if (arg_key_in_blacklist(k, base, dom, rule_ver))
+                    return ARG_CHECK_MATCH;
+            }
         }
     }
 
     if (filename) {
-        __builtin_memcpy(k, ea->tok, sizeof(*k));
+        clear_argument_tokens(k);
         bpf_probe_read_kernel_str(k->tok[0], ARG_TOKEN_LEN, filename);
-        if (arg_key_in_blacklist(k, base, dom, rule_ver))
-            return ARG_CHECK_MATCH;
+        if (has_argument_subject(k, base, dom)) {
+            if (!ea || ea->capture_status != EXEC_ARGS_CAPTURED)
+                return ARG_CHECK_UNAVAILABLE;
+            copy_argument_tokens(k, ea);
+            __builtin_memset(k->tok[0], 0, ARG_TOKEN_LEN);
+            bpf_probe_read_kernel_str(k->tok[0], ARG_TOKEN_LEN, filename);
+            if (arg_key_in_blacklist(k, base, dom, rule_ver))
+                return ARG_CHECK_MATCH;
+        }
     }
     return ARG_CHECK_NO_MATCH;
 }
@@ -1644,9 +1717,11 @@ static __always_inline void fmt_dec7(char *dst, __u32 v)
  * 前会清除该位，因此用户态仍收到原始 u32 规则版本；命中 allow+audit 时
  * 即使全局 ALLOW 采样关闭，也会强制生成事件。
  */
-static __always_inline void report(__u32 kind, __u32 op, __u32 allowed,
+static __always_inline void report_scoped(__u32 kind, __u32 op, __u32 allowed,
                                    const char *detail,
-                                   __u32 policy_ver, __u32 rule_ver)
+                                   __u32 policy_ver, __u32 rule_ver,
+                                   const struct scope_info *scope,
+                                   const struct socket_owner *owner)
 {
     bool rule_audit = (rule_ver & 0x80000000u) != 0;
     rule_ver &= 0x7fffffffu;
@@ -1678,8 +1753,16 @@ static __always_inline void report(__u32 kind, __u32 op, __u32 allowed,
     e->rule_version = rule_ver;
     /* 与判定复用统一 scope，容量降级到 pending 时事件仍保留域归属。 */
     struct scope_info si = {};
-    e->domain_id = current_scope_info(&si) ? si.scope_id : 0;
-    bpf_get_current_comm(e->comm, sizeof(e->comm));
+    e->domain_id = scope ? scope->scope_id :
+        (current_scope_info(&si) ? si.scope_id : 0);
+    if (owner) {
+        e->tgid = owner->tgid;
+        e->pid = owner->tgid;
+        e->cgroup_id = 0; /* No current-task cgroup attribution in softirq. */
+        __builtin_memcpy(e->comm, owner->comm, sizeof(e->comm));
+    } else {
+        bpf_get_current_comm(e->comm, sizeof(e->comm));
+    }
 
     /* ringbuf_reserve 不清零内存: args 只对 EXEC 参数级事件有意义,
      * 其余事件必须显式清零, 否则用户态会把槽位里上一个事件的
@@ -1690,6 +1773,13 @@ static __always_inline void report(__u32 kind, __u32 op, __u32 allowed,
     e->detail[159] = '\0';
 
     bpf_ringbuf_submit(e, 0);
+}
+
+static __always_inline void report(__u32 kind, __u32 op, __u32 allowed,
+                                   const char *detail,
+                                   __u32 policy_ver, __u32 rule_ver)
+{
+    report_scoped(kind, op, allowed, detail, policy_ver, rule_ver, NULL, NULL);
 }
 
 /* 固定宽度 hex (16 字符, 全常量偏移) —— 事件 detail 里展示 ino 用 */
@@ -1796,8 +1886,9 @@ int BPF_PROG(enforce_file_open, struct file *file)
         return -1;
     }
 
+    /* An allow+audit rule has no deny mask; retain its audit marker on ALLOW. */
     report_file_op(0, 1, dentry, fb_path, fp.policy_ver,
-                   mask ? rule_ver : 0);  /* OK (含命中名单但操作允许) */
+                   rule_ver);  /* OK (含命中名单但操作允许) */
     return 0;
 }
 
@@ -2311,8 +2402,11 @@ static __always_inline void report_exec(__u32 allowed, const char *fn,
 {
     bool rule_audit = (rule_ver & 0x80000000u) != 0;
     rule_ver &= 0x7fffffffu;
-    if (allowed && !rule_audit && !should_report_allow())
-        return;
+    if (allowed && !rule_audit) {
+        const struct filter_config *cfg = get_cfg();
+        if (!cfg || !cfg->audit_exec || !should_report_allow())
+            return;
+    }
 
     struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
@@ -2372,6 +2466,13 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
     char fn[256] = {};   /* 与 cmd_key 等长: 命令规则上限已扩到 NAME_MAX */
     long fn_ret = filename ?
         bpf_probe_read_kernel_str(fn, sizeof(fn), filename) : -1;
+    bool fn_complete = fn_ret > 0;
+    if (fn_ret == sizeof(fn)) {
+        char boundary = 0;
+        if (bpf_probe_read_kernel(&boundary, sizeof(boundary),
+                                  filename + sizeof(fn) - 1) < 0 || boundary)
+            fn_complete = false;
+    }
     if (fn_ret <= 0)
         __builtin_memcpy(fn, "<exec-path-unavailable>", 24);
 
@@ -2380,7 +2481,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
 
     bool command_denied = is_cmd_inode_in_blacklist(
         executable, base_cmd_ino, dom_cmd_ino_m, &rule_ver);
-    if (!command_denied && fn_ret > 0)
+    if (!command_denied && fn_complete)
         command_denied = is_cmd_in_blacklist(fn, base_cmd, dom_cmd_m, &rule_ver);
     if (command_denied) {
         report_exec(0, fn, ea, policy_ver, rule_ver, si.scope_id);   /* DENY (整命令) */
@@ -2389,7 +2490,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
         return -1;
     }
 
-    /* 参数级黑名单: 从 capture_exec_args 暂存的 argv 匹配, 取出后即删。
+    /* 参数级黑名单: 从 capture_exec_args 暂存的 argv 匹配。
      * 注意 bprm->p 路线已证伪 (见 docs/archive/命令参数拦截调研.md §2.1):
      * bprm->p 是新 mm 的用户地址, 本 hook 触发时新 mm 未安装, 读不到,
      * 所以参数只能从 sys_enter_execve 提前暂存。
@@ -2397,18 +2498,13 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
     {
         int arg_result = ARG_CHECK_NO_MATCH;
         if ((sm && sm->arg_count) || (bm && bm->arg_count)) {
-            if (!ea || ea->capture_status != EXEC_ARGS_CAPTURED) {
-                report_exec(0, fn, ea, policy_ver, 0, si.scope_id);
-                if (ea)
-                    bpf_map_delete_elem(&exec_args_map, &tid);
-                return -1;
-            }
             arg_result = is_args_in_blacklist(ea, executable,
-                                              fn_ret > 0 ? fn : NULL,
+                                              fn_complete ? fn : NULL,
                                               base_arg, dom_arg_m, &rule_ver);
             if (arg_result == ARG_CHECK_UNAVAILABLE) {
                 report_exec(0, fn, ea, policy_ver, 0, si.scope_id);
-                bpf_map_delete_elem(&exec_args_map, &tid);
+                if (ea)
+                    bpf_map_delete_elem(&exec_args_map, &tid);
                 return -1;
             }
         }
@@ -2423,8 +2519,9 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
          * file_open(exec 时要打开二进制) 的形式出现在 FILE 事件里。
          * 在判决点上报, allowed 状态必然准确; 参数从暂存里带上展示。 */
         report_exec(1, fn, ea, policy_ver, rule_ver, si.scope_id);      /* OK */
-        if (ea)
-            bpf_map_delete_elem(&exec_args_map, &tid);
+        /* A shebang causes further bprm checks for its interpreters. Keep
+         * this syscall's original argv until exec succeeds or the task exits.
+         * The next syscall capture replaces it after any failed exec. */
     }
 
     return 0;
@@ -2461,9 +2558,18 @@ static __always_inline int capture_exec_argv(const char *const *argv)
     if (!in_scope_exec(&si))
         return 0;
 
-    struct exec_args ea = {};
-    ea.capture_status = EXEC_ARGS_FAILED;
     __u64 id = bpf_get_current_pid_tgid();
+    // Never reuse prior syscall argv, including when scratch allocation fails.
+    bpf_map_delete_elem(&exec_args_map, &id);
+    __u32 zero = 0;
+    struct exec_args *ea = bpf_map_lookup_elem(&exec_capture_scratch, &zero);
+    if (!ea)
+        return 0;
+    clear_argument_tokens(ea->tok);
+    ea->capture_status = EXEC_ARGS_FAILED;
+    ea->overlong_mask = 0;
+    ea->pad[0] = 0;
+    ea->pad[1] = 0;
     if (!argv)
         goto store;
 
@@ -2479,21 +2585,29 @@ static __always_inline int capture_exec_argv(const char *const *argv)
                 stop = true;
             } else {
                 /* 定长槽, verifier 友好; 拼接展示在 Rust audit 做 */
-                long str_ret = bpf_probe_read_user_str(ea.tok[i], ARG_TOKEN_LEN, p);
-                if (str_ret < 0 || str_ret >= ARG_TOKEN_LEN)
+                long str_ret = bpf_probe_read_user_str(ea->tok[i], ARG_TOKEN_LEN, p);
+                if (str_ret <= 0)
                     goto store;
+                if (str_ret == ARG_TOKEN_LEN) {
+                    /* The helper returns 256 both for an exact 255-byte token
+                     * and for truncation. Check the boundary byte itself. */
+                    char boundary = 0;
+                    if (bpf_probe_read_user(&boundary, sizeof(boundary),
+                                            p + ARG_TOKEN_LEN - 1) < 0)
+                        goto store;
+                    if (boundary)
+                        ea->overlong_mask |= 1u << i;
+                }
             }
         }
     }
-    ea.capture_status = EXEC_ARGS_CAPTURED;
+    ea->capture_status = EXEC_ARGS_CAPTURED;
 
     /* DEBUG: 排障时取消注释 */
-    // bpf_printk("[execve] tok1=%s tok2=%s", ea.tok[1], ea.tok[2]);
+    // bpf_printk("[execve] tok1=%s tok2=%s", ea->tok[1], ea->tok[2]);
 
 store:
-    /* Remove a prior exec entry first so an update failure cannot reuse stale argv. */
-    bpf_map_delete_elem(&exec_args_map, &id);
-    bpf_map_update_elem(&exec_args_map, &id, &ea, BPF_ANY);
+    bpf_map_update_elem(&exec_args_map, &id, ea, BPF_ANY);
     return 0;
 }
 
@@ -2515,11 +2629,9 @@ int capture_execveat_args(struct trace_event_raw_sys_enter *ctx)
  * allow/deny 名单模式, 两级判定 (P2 map-in-map):
  *   相位 1 端口规则 (dom_net_port): 域 inner → 基线 inner
  *   相位 2 无端口规则 (dom_net):    域 inner → 基线 inner
- * 每相位内 "域优先于基线" (域是更具体的作用域, 可覆盖基线结论);
- * 相位顺序保持旧版 "带端口规则优先于无端口规则 (先精确后通配)"。
+ * 基线/组分别执行端口优先、地址最长前缀查询，然后合并；任一层 deny 即拒绝。
  * 命中条目的 action 决定放行/拒绝; 都未命中 = 默认允许。
- * 白名单模式 = 基线配一条 "deny 0.0.0.0/0" (prefixlen 0 匹配一切)
- * 兜底, 域里逐条 allow 放行。
+ * 默认拒绝应在同一层配置 deny CIDR 和更具体的端口 allow；组不能覆盖基线 deny。
  * IPv4/IPv6 分别使用独立 LPM 维度，优先级与默认动作完全一致。
  * loopback 也走规则检查 (白名单模式下需自行 allow)。
  * =================================================================== */
@@ -2527,7 +2639,8 @@ static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
                                                 const struct scope_info *si,
                                                 struct sockaddr *addr,
                                                 int addrlen,
-                                                __u32 op)
+                                                __u32 op,
+                                                const struct socket_owner *owner)
 {
     /* sockaddr_in6: family(2), port(2), flowinfo(4), addr(16), scope(4)。
      * 只读取到 address 末尾，因此 24 字节是本程序需要的最小可信长度。 */
@@ -2575,44 +2688,26 @@ static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
     if (dom_v && dom_v->action == 0) { rule_ver = dom_v->version | (dom_v->audit ? 0x80000000u : 0); goto deny6; }
     v = dom_v ? dom_v : base_v;
     if (v)
-        rule_ver = v->version | (v->audit ? 0x80000000u : 0);
+        rule_ver = v->version;
+    if (base_v && base_v->audit)
+        rule_ver |= 0x80000000u;
+    if (dom_v && dom_v->audit)
+        rule_ver |= 0x80000000u;
 
-    report(3, op, 1, detail, policy_ver, rule_ver);
+    report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
     return 0;
 
 deny6:
-    report(3, op, 0, detail, policy_ver, rule_ver);
+    report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);
     return -1;
 }
 
-static __always_inline int enforce_socket_addr(struct socket *sock,
+static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
+                                               const struct scope_info *si,
                                                struct sockaddr *addr,
-                                               int addrlen,
-                                               __u32 op)
+                                               int addrlen, __u32 op,
+                                               const struct socket_owner *owner)
 {
-    const struct filter_config *cfg = get_cfg();
-    if (!cfg)
-        return 0;
-    if (!cfg->enable_net)
-        return 0;
-
-    struct scope_info si = {};
-    if (!current_scope_info(&si))
-        return 0;
-
-    struct sock *skp = BPF_CORE_READ(sock, sk);
-    if (!skp)
-        return 0;
-    short family = BPF_CORE_READ(skp, __sk_common.skc_family);
-
-    /* DEBUG: 排障时取消注释。打印每次 connect 的 family / addrlen */
-    // bpf_printk("[net] ENTER family=%d addrlen=%d", family, addrlen);
-
-    if (family == 10)
-        return enforce_ipv6_connect(cfg, &si, addr, addrlen, op);
-    if (family != 2)
-        return 0;
-
     /* addrlen 防御性检查: LSM socket_connect 在协议层地址长度校验
      * 之前触发, AF_INET 但 addrlen 过短时 sockaddr_storage 里残余
      * 的是栈上旧数据, 读出的 daddr/dport 不可信, 直接放行
@@ -2622,7 +2717,7 @@ static __always_inline int enforce_socket_addr(struct socket *sock,
 
     /* 两维 outer: 基线 slot + 域 slot 各查一次, 拿到 inner 指针 */
     __u32 base = physical_slot(cfg, BASE_SLOT);
-    __u32 domain = physical_slot(cfg, si.policy_slot);
+    __u32 domain = physical_slot(cfg, si->policy_slot);
     struct bpf_map *base_port = bpf_map_lookup_elem(&dom_net_port, &base);
     struct bpf_map *dom_port  = bpf_map_lookup_elem(&dom_net_port, &domain);
     struct bpf_map *base_addr = bpf_map_lookup_elem(&dom_net, &base);
@@ -2683,14 +2778,66 @@ static __always_inline int enforce_socket_addr(struct socket *sock,
     if (dom_v4 && dom_v4->action == 0) { rule_ver = dom_v4->version | (dom_v4->audit ? 0x80000000u : 0); goto deny; }
     v = dom_v4 ? dom_v4 : base_v4;
     if (v)
-        rule_ver = v->version | (v->audit ? 0x80000000u : 0);
+        rule_ver = v->version;
+    if (base_v4 && base_v4->audit)
+        rule_ver |= 0x80000000u;
+    if (dom_v4 && dom_v4->audit)
+        rule_ver |= 0x80000000u;
 
-    report(3, op, 1, detail, policy_ver, rule_ver);  /* OK */
+    report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);  /* OK */
     return 0;
 
 deny:
-    report(3, op, 0, detail, policy_ver, rule_ver);  /* DENY */
+    report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);  /* DENY */
     return -1;
+}
+
+static __always_inline int enforce_socket_addr(struct socket *sock,
+                                               struct sockaddr *addr,
+                                               int addrlen, __u32 op)
+{
+    const struct filter_config *cfg = get_cfg();
+    if (!cfg || !cfg->enable_net || !sock || !addr)
+        return 0;
+    struct scope_info si = {};
+    if (!current_scope_info(&si))
+        return 0;
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk)
+        return 0;
+    short family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family == 10)
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, op, NULL);
+    if (family == 2)
+        return enforce_ipv4_addr(cfg, &si, addr, addrlen, op, NULL);
+    return 0;
+}
+
+static __always_inline int enforce_connected_peer(struct socket *sock, __u32 op)
+{
+    const struct filter_config *cfg = get_cfg();
+    struct scope_info si = {};
+    if (!cfg || !cfg->enable_net || !sock || !current_scope_info(&si))
+        return 0;
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk || !BPF_CORE_READ(sk, __sk_common.skc_dport))
+        return 0;
+    short family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family == 2) {
+        struct sockaddr_in sin = {};
+        sin.sin_family = 2;
+        sin.sin_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+        sin.sin_addr.s_addr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+        return enforce_ipv4_addr(cfg, &si, (struct sockaddr *)&sin, sizeof(sin), op, NULL);
+    }
+    if (family == 10) {
+        struct sockaddr_in6 sin6 = {};
+        sin6.sin6_family = 10;
+        sin6.sin6_port = BPF_CORE_READ(sk, __sk_common.skc_dport);
+        BPF_CORE_READ_INTO(&sin6.sin6_addr, sk, __sk_common.skc_v6_daddr);
+        return enforce_ipv6_connect(cfg, &si, (struct sockaddr *)&sin6, sizeof(sin6), op, NULL);
+    }
+    return 0;
 }
 
 SEC("lsm/socket_connect")
@@ -2714,14 +2861,13 @@ int BPF_PROG(enforce_socket_bind, struct socket *sock, struct sockaddr *addr, in
         return 0;
     short family = BPF_CORE_READ(skp, __sk_common.skc_family);
     if (family == 10)
-        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_BIND);
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_BIND, NULL);
     if (family == 2)
         return enforce_socket_addr(sock, addr, addrlen, NET_OP_BIND);
     return 0;
 }
 
-/* sendmsg 能提供明确目标时检查该目标。已连接 socket 的 msg_name 通常为空，
- * 其连接阶段已经由 socket_connect 检查，避免在这里重复阻断合法 TCP 发送。 */
+/* Check explicit send targets and connected peers against the current policy. */
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, int size)
 {
@@ -2732,7 +2878,7 @@ int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, in
     struct sockaddr *addr = BPF_CORE_READ(msg, msg_name);
     int addrlen = BPF_CORE_READ(msg, msg_namelen);
     if (!addr || addrlen <= 0)
-        return 0;
+        return enforce_connected_peer(sock, NET_OP_SENDMSG);
     struct scope_info si = {};
     if (!current_scope_info(&si))
         return 0;
@@ -2741,39 +2887,106 @@ int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, in
         return 0;
     short family = BPF_CORE_READ(skp, __sk_common.skc_family);
     if (family == 10)
-        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_SENDMSG);
+        return enforce_ipv6_connect(cfg, &si, addr, addrlen, NET_OP_SENDMSG, NULL);
     if (family == 2)
         return enforce_socket_addr(sock, addr, addrlen, NET_OP_SENDMSG);
     return 0;
 }
 
-/* accept 没有 sockaddr 参数，从新 socket 的远端地址构造内核地址，复用查表。 */
+static __always_inline int remember_socket_scope(struct socket *sock)
+{
+    struct scope_info si = {};
+    if (!sock || !current_scope_info(&si))
+        return 0;
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk)
+        return 0;
+    short family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family != 2 && family != 10)
+        return 0;
+    __u64 inode = BPF_CORE_READ(sock, file, f_inode, i_ino);
+    if (!inode)
+        return -12;
+    struct socket_owner owner = { .scope_id = si.scope_id,
+        .tgid = bpf_get_current_pid_tgid() >> 32 };
+    bpf_get_current_comm(owner.comm, sizeof(owner.comm));
+    if (bpf_map_update_elem(&socket_owners, &inode, &owner, BPF_ANY)) {
+        const struct filter_config *cfg = get_cfg();
+        if (cfg && cfg->enable_net)
+            return -12;
+    }
+    return 0;
+}
+
+SEC("lsm/socket_listen")
+int BPF_PROG(track_socket_listen, struct socket *sock, int backlog)
+{
+    (void)backlog;
+    return remember_socket_scope(sock);
+}
+
+/* socket_accept runs BEFORE newsock->sk is populated. Register the listening
+ * socket here; peer enforcement runs when a TCP request is created instead. */
 SEC("lsm/socket_accept")
 int BPF_PROG(enforce_socket_accept, struct socket *sock, struct socket *newsock)
 {
+    (void)newsock;
+    return remember_socket_scope(sock);
+}
+
+SEC("lsm/inet_conn_request")
+int BPF_PROG(enforce_inet_conn_request, struct sock *sk, struct sk_buff *skb,
+             struct request_sock *req)
+{
+    (void)skb;
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_net || !newsock)
+    if (!cfg || !cfg->enable_net || !sk || !req)
         return 0;
-    struct scope_info si = {};
-    if (!current_scope_info(&si))
+    struct socket *sock = BPF_CORE_READ(sk, sk_socket);
+    if (!sock)
         return 0;
-    struct sock *skp = BPF_CORE_READ(newsock, sk);
-    if (!skp)
+    __u64 inode = BPF_CORE_READ(sock, file, f_inode, i_ino);
+    struct socket_owner *owner = bpf_map_lookup_elem(&socket_owners, &inode);
+    if (!owner)
         return 0;
-    short family = BPF_CORE_READ(skp, __sk_common.skc_family);
+    struct scope_policy_val *binding = bpf_map_lookup_elem(&scope_policies, &owner->scope_id);
+    if (!binding)
+        return 0;
+    struct scope_info si = { .scope_id = owner->scope_id, .policy_slot = binding->policy_slot };
+    short family = BPF_CORE_READ(sk, __sk_common.skc_family);
     if (family == 2) {
         struct sockaddr_in sin = {};
         sin.sin_family = 2;
-        sin.sin_port = BPF_CORE_READ(skp, __sk_common.skc_dport);
-        sin.sin_addr.s_addr = BPF_CORE_READ(skp, __sk_common.skc_daddr);
-        return enforce_socket_addr(newsock, (struct sockaddr *)&sin, sizeof(sin), NET_OP_ACCEPT);
+        sin.sin_port = BPF_CORE_READ(req, __req_common.skc_dport);
+        sin.sin_addr.s_addr = BPF_CORE_READ(req, __req_common.skc_daddr);
+        return enforce_ipv4_addr(cfg, &si, (struct sockaddr *)&sin, sizeof(sin), NET_OP_ACCEPT, owner);
     }
     if (family == 10) {
         struct sockaddr_in6 sin6 = {};
         sin6.sin6_family = 10;
-        sin6.sin6_port = BPF_CORE_READ(skp, __sk_common.skc_dport);
-        BPF_CORE_READ_INTO(&sin6.sin6_addr, skp, __sk_common.skc_v6_daddr);
-        return enforce_ipv6_connect(cfg, &si, (struct sockaddr *)&sin6, sizeof(sin6), NET_OP_ACCEPT);
+        sin6.sin6_port = BPF_CORE_READ(req, __req_common.skc_dport);
+        BPF_CORE_READ_INTO(&sin6.sin6_addr, req, __req_common.skc_v6_daddr);
+        return enforce_ipv6_connect(cfg, &si, (struct sockaddr *)&sin6, sizeof(sin6), NET_OP_ACCEPT, owner);
+    }
+    return 0;
+}
+
+SEC("lsm/socket_recvmsg")
+int BPF_PROG(enforce_socket_recvmsg, struct socket *sock, struct msghdr *msg,
+             int size, int flags)
+{
+    (void)msg;
+    (void)size;
+    (void)flags;
+    return enforce_connected_peer(sock, NET_OP_RECVMSG);
+}
+
+SEC("lsm/inode_free_security")
+int BPF_PROG(forget_socket_inode, struct inode *inode)
+{
+    if ((BPF_CORE_READ(inode, i_mode) & 0170000) == 0140000) {
+        __u64 number = BPF_CORE_READ(inode, i_ino);
+        bpf_map_delete_elem(&socket_owners, &number);
     }
     return 0;
 }
@@ -2953,10 +3166,14 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
  * sched_process_exec 在 exec 成功的进程上下文跑,
  * 当前 tgid 即 fork 时暂存的 child_tgid。 */
 SEC("tracepoint/sched/sched_process_exec")
-int handle_sched_process_exec(void *ctx)
+int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
-    (void)ctx;
-    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tgid = pid_tgid >> 32;
+    bpf_map_delete_elem(&exec_args_map, &pid_tgid);
+    /* A non-leader exec changes its TID to the TGID before this tracepoint. */
+    __u64 old_id = ((__u64)tgid << 32) | (__u32)BPF_CORE_READ(ctx, old_pid);
+    bpf_map_delete_elem(&exec_args_map, &old_id);
     struct pending_proc_op *op =
         bpf_map_lookup_elem(&pending_child_proc_ops, &tgid);
     if (!op)
@@ -2987,6 +3204,7 @@ int handle_sched_process_exit(void *ctx)
 {
     (void)ctx;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_delete_elem(&exec_args_map, &pid_tgid);
     __u32 tgid = pid_tgid >> 32;
     bpf_map_delete_elem(&pending_child_proc_ops, &tgid);
     if ((__u32)pid_tgid != tgid)

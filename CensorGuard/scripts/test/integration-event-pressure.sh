@@ -133,7 +133,9 @@ if [[ ${kernel_dropped} -eq 0 || ${reader_dropped} -eq 0 || \
     cat "${runtime_dir}/pressure.log" >&2
     exit 1
 fi
-[[ $(status_value event_subscribers "${runtime_dir}/pressure.log") == 2 ]]
+# A non-reading consumer may be disconnected by the daemon's bounded write timeout.
+# The healthy consumer must remain; the sentinel below verifies delivery after pressure.
+[[ $(status_value event_subscribers "${runtime_dir}/pressure.log") -ge 1 ]]
 
 # Let the healthy subscriber drain its bounded queue, then send several sentinel DENY events.
 /usr/bin/sleep 1

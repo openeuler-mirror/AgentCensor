@@ -88,10 +88,10 @@ write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${r
 daemon_pid=$!
 
 for _ in $(seq 1 1200); do
-    grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log" && break
+    grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
-grep -q '^\[READY\] 32 required hooks attached' "${runtime_dir}/daemon.log"
+grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log"
 
 run_denied() {
     local name=$1

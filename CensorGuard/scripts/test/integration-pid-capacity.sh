@@ -179,7 +179,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
-assert not any(item["name"] == "capacity-domain" for item in status["domains"]), status
+assert not any(item["name"] == "capacity-domain" for item in status.get("domains", [])), status
 assert status["pid_pending"] == 0, status
 PY
 
@@ -194,7 +194,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
 assert status["tracked"] == 0, status
 assert status["pid_pending"] == 0, status
-assert not any(item["name"] == "capacity-domain" for item in status["domains"]), status
+assert not any(item["name"] == "capacity-domain" for item in status.get("domains", [])), status
 PY
 
 touch "${runtime_dir}/release"

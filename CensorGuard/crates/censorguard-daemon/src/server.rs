@@ -4,14 +4,16 @@ use censorguard_common::protocol::{
     Operation, Request, Response, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse,
     RpcResult, VERSION, read_json_line, validate_version, write_json_line,
 };
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::sys::socket::{MsgFlags, getsockopt, recv, sockopt::PeerCredentials};
 use nix::unistd::{Gid, chown, geteuid};
 use std::fs;
 use std::io::{self, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -166,9 +168,31 @@ pub fn start_events(
                             .name("censorguard-event-client".into())
                             .spawn(move || {
                                 let mut stream = stream;
-                                while let Ok(event) = receiver.recv() {
-                                    if write_json_line(&mut stream, &event).is_err() {
-                                        return;
+                                if stream
+                                    .set_write_timeout(Some(Duration::from_secs(2)))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                loop {
+                                    // Detect idle disconnects without waiting for the next audit event.
+                                    match recv(
+                                        stream.as_raw_fd(),
+                                        &mut [0u8; 1],
+                                        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+                                    ) {
+                                        Err(nix::errno::Errno::EAGAIN) => {}
+                                        Err(nix::errno::Errno::EINTR) => continue,
+                                        _ => return, // EOF, error, or input on this receive-only socket
+                                    }
+                                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                                        Ok(event) => {
+                                            if write_json_line(&mut stream, &event).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(RecvTimeoutError::Timeout) => {}
+                                        Err(RecvTimeoutError::Disconnected) => return,
                                     }
                                 }
                             });
@@ -619,13 +643,19 @@ fn dispatch_rpc(
                         None,
                     );
                 }
-                match runtime.reload(None, Some(yaml), Some(group), true) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                match runtime.reload(
+                    None,
+                    Some(yaml),
+                    Some(group),
+                    true,
+                    params.expected_revision,
+                ) {
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 }
             } else {
                 match runtime.validate_policy_yaml(yaml) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 }
             }
@@ -661,13 +691,14 @@ fn dispatch_rpc(
                         None,
                     );
                 };
-                if let Some(expected) = params.expected_revision
-                    && let Err(error) = runtime.check_revision(expected)
-                {
-                    return runtime_rpc_failure(request_id, error);
-                }
-                return match runtime.reload(None, Some(yaml), Some(group), false) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                return match runtime.reload(
+                    None,
+                    Some(yaml),
+                    Some(group),
+                    false,
+                    params.expected_revision,
+                ) {
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 };
             }
@@ -691,7 +722,7 @@ fn dispatch_rpc(
                 );
             };
             match runtime.apply_policy_yaml(yaml, expected, params.idempotency_key.as_deref()) {
-                Ok(result) => reload_rpc_success(request_id, result),
+                Ok(result) => reload_rpc_success(runtime, request_id, result),
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
@@ -714,7 +745,7 @@ fn dispatch_rpc(
                 );
             };
             match runtime.rollback_policy(revision, expected, params.idempotency_key.as_deref()) {
-                Ok(result) => reload_rpc_success(request_id, result),
+                Ok(result) => reload_rpc_success(runtime, request_id, result),
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
@@ -787,13 +818,18 @@ fn legacy_request(op: Operation) -> Request {
     }
 }
 
-fn reload_rpc_success(request_id: String, result: crate::runtime::ReloadResult) -> RpcResponse {
+fn reload_rpc_success(
+    runtime: &Runtime,
+    request_id: String,
+    result: crate::runtime::ReloadResult,
+) -> RpcResponse {
     rpc_success(
         request_id,
         RpcResult {
             revision: Some(u64::from(result.version)),
             response: Some(Response {
                 ok: true,
+                daemon_ready: runtime.ready(),
                 reload_gen: result.generation,
                 version: result.version,
                 active_bank: result.active_bank,
@@ -863,6 +899,20 @@ fn rpc_failure(
 }
 
 fn dispatch(
+    runtime: &Runtime,
+    hub: &EventHub,
+    request: Request,
+    peer_uid: u32,
+    gateway_uid: Option<u32>,
+) -> Response {
+    let mut response = dispatch_inner(runtime, hub, request, peer_uid, gateway_uid);
+    // Readiness is independent of operation success. A mutation reply must not
+    // expose Response::default()'s false as if it were a live health check.
+    response.daemon_ready = runtime.ready();
+    response
+}
+
+fn dispatch_inner(
     runtime: &Runtime,
     hub: &EventHub,
     request: Request,
@@ -957,6 +1007,7 @@ fn dispatch(
             request.policy_yaml.as_deref(),
             request.group.as_deref(),
             request.dry_run,
+            None,
         ) {
             Ok(result) => Response {
                 ok: true,

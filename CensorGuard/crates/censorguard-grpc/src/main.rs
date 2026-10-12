@@ -19,8 +19,10 @@ use std::collections::HashSet;
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -104,7 +106,50 @@ struct Adapter {
     ev_sock: PathBuf,
 }
 
+struct EventSubscription {
+    receiver: ReceiverStream<Result<pb::Event, Status>>,
+    connection: UnixStream,
+}
+
+impl tokio_stream::Stream for EventSubscription {
+    type Item = Result<pb::Event, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(context)
+    }
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        // Wake a blocked reader even when the daemon has no events to publish.
+        let _ = self.connection.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Adapter {
+    async fn affected_domains(&self, group: &str) -> Result<Vec<String>, Status> {
+        match self
+            .call(
+                RpcMethod::GetPolicy,
+                RpcParams {
+                    group: Some(group.to_owned()),
+                    ..RpcParams::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => Ok(result
+                .response
+                .into_iter()
+                .flat_map(|response| response.groups)
+                .filter(|info| info.name == group)
+                .flat_map(|info| info.domains)
+                .collect()),
+            Err(error) if error.code() == Code::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn call(
         &self,
         method: RpcMethod,
@@ -168,6 +213,9 @@ fn pb_status(result: &censorguard_common::protocol::RpcResult) -> Result<pb::Sta
             ("enable_file".to_owned(), response.enable_file),
             ("enable_exec".to_owned(), response.enable_exec),
             ("enable_net".to_owned(), response.enable_net),
+            ("audit_file".to_owned(), response.audit_file),
+            ("audit_exec".to_owned(), response.audit_exec),
+            ("audit_net".to_owned(), response.audit_net),
         ]),
         daemon_boot_id: response.daemon_boot_id,
         hooks_healthy: response.hooks_healthy.unwrap_or(false),
@@ -343,7 +391,7 @@ impl pb::censorguard_server::Censorguard for Adapter {
             Ok(_) => Ok(Response::new(pb::ValidatePolicyReply {
                 ok: true,
                 errors: Vec::new(),
-                affected: Vec::new(),
+                affected: self.affected_domains(&req.name).await?,
             })),
             Err(status) if status.code() == Code::InvalidArgument => {
                 Ok(Response::new(pb::ValidatePolicyReply {
@@ -368,30 +416,34 @@ impl pb::censorguard_server::Censorguard for Adapter {
             ));
         }
         if req.dry_run {
-            let reply = self
-                .validate_policy(Request::new(pb::ValidatePolicyReq {
-                    name: req.name.clone(),
-                    policy_yaml: req.policy_yaml,
-                    context: None,
-                }))
-                .await?
-                .into_inner();
-            if !reply.ok {
-                return Err(Status::invalid_argument(reply.errors.join("\n")));
-            }
+            let result = self
+                .call(
+                    RpcMethod::ValidatePolicy,
+                    RpcParams {
+                        group: Some(req.name.clone()),
+                        policy_yaml: Some(req.policy_yaml),
+                        expected_revision: req.expected_revision,
+                        ..RpcParams::default()
+                    },
+                )
+                .await?;
+            let response = result.response.unwrap_or_default();
+            let affected = self.affected_domains(&req.name).await?;
             return Ok(Response::new(pb::ApplyPolicyReply {
-                reload_gen: 0,
+                reload_gen: response.reload_gen,
                 name: req.name,
-                version: 0,
-                affected: Vec::new(),
+                version: response.version,
+                affected,
             }));
         }
+        let affected = self.affected_domains(&req.name).await?;
         let result = self
             .call(
                 RpcMethod::ApplyPolicy,
                 RpcParams {
                     group: Some(req.name.clone()),
                     policy_yaml: Some(req.policy_yaml),
+                    expected_revision: req.expected_revision,
                     ..RpcParams::default()
                 },
             )
@@ -401,7 +453,7 @@ impl pb::censorguard_server::Censorguard for Adapter {
             reload_gen: response.reload_gen,
             name: req.name,
             version: response.version,
-            affected: Vec::new(),
+            affected,
         }))
     }
 
@@ -417,21 +469,18 @@ impl pb::censorguard_server::Censorguard for Adapter {
         let kinds: HashSet<u32> = req.kinds.into_iter().collect();
         let allowed = req.allowed;
         let ev_sock = self.ev_sock.clone();
+        let stream = UnixStream::connect(&ev_sock).map_err(|error| {
+            Status::unavailable(format!("event socket is unreachable: {error}"))
+        })?;
+        let connection = stream
+            .try_clone()
+            .map_err(|error| Status::internal(format!("cannot clone event socket: {error}")))?;
         // Each stream owns an independent events.sock subscription; the daemon-side
         // per-subscriber dropped_before counter therefore reflects this consumer.
         let (sender, receiver) = mpsc::channel::<Result<pb::Event, Status>>(256);
         std::thread::Builder::new()
             .name("censorguard-grpc-events".into())
             .spawn(move || {
-                let stream = match UnixStream::connect(&ev_sock) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        let _ = sender.blocking_send(Err(Status::unavailable(format!(
-                            "event socket is unreachable: {error}"
-                        ))));
-                        return;
-                    }
-                };
                 let mut reader = BufReader::new(&stream);
                 loop {
                     match read_json_line::<Event>(&mut reader) {
@@ -461,7 +510,10 @@ impl pb::censorguard_server::Censorguard for Adapter {
                 }
             })
             .map_err(|error| Status::internal(format!("cannot spawn event pump: {error}")))?;
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        Ok(Response::new(Box::pin(EventSubscription {
+            receiver: ReceiverStream::new(receiver),
+            connection,
+        })))
     }
 }
 

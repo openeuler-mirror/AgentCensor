@@ -138,6 +138,7 @@ make --no-print-directory -C "${repo_dir}" uninstall DESTDIR="${stage}"
 [[ ! -e ${stage}/usr/bin/censorguardctl ]]
 [[ ! -e ${stage}/usr/bin/censorguard-grpc ]]
 [[ ! -e ${stage}/usr/lib/systemd/system/censorguardd.service ]]
+[[ ! -e ${stage}/usr/share/doc/censorguard ]]
 grep -q '^rules:' "${stage}/etc/censorguard/base.yaml"
 
 echo "deployment integration passed: layout, preservation, unit, package and uninstall"

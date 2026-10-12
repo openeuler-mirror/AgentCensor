@@ -1,5 +1,5 @@
 use crate::procfs;
-use censorguard_common::abi::TrackValue;
+use censorguard_common::abi::{SocketOwner, TrackValue};
 use censorguard_common::protocol::{
     DnsDomainInfo, DomainInfo, DomainTree, GroupDump, IntentDecision, PolicyDefinition,
     SecurityIntent, TreeNode,
@@ -493,6 +493,16 @@ impl Runtime {
                 }
                 return Err(error.into());
             }
+            if let Err(error) = self.seed_sockets(pid, scope_id) {
+                self.kernel.untrack_pid(pid)?;
+                if existing_scope_id.is_none() {
+                    for member in self.kernel.scoped_pids_scope(scope_id)? {
+                        self.kernel.untrack_pid(member)?;
+                    }
+                    self.kernel.remove_scope_policy(scope_id)?;
+                }
+                return Err(error);
+            }
             let committed_scope_id =
                 ensure_domain(&mut state, scope_name, group, slot, policy_managed);
             debug_assert_eq!(committed_scope_id, scope_id);
@@ -761,10 +771,6 @@ impl Runtime {
             .map(|domain| domain.name.clone())
             .collect();
         Ok((yaml, policy.version, domains))
-    }
-
-    pub fn check_revision(&self, expected: u64) -> Result<(), RuntimeError> {
-        self.ensure_revision(expected)
     }
 
     pub fn evaluate_intents(
@@ -1087,8 +1093,9 @@ impl Runtime {
         policy_yaml: Option<&str>,
         group: Option<&str>,
         dry_run: bool,
+        expected_revision: Option<u64>,
     ) -> Result<ReloadResult, RuntimeError> {
-        let result = self.reload_inner(policy_file, policy_yaml, group, dry_run);
+        let result = self.reload_inner(policy_file, policy_yaml, group, dry_run, expected_revision);
         self.observe_reload(&result);
         result
     }
@@ -1099,11 +1106,15 @@ impl Runtime {
         policy_yaml: Option<&str>,
         group: Option<&str>,
         dry_run: bool,
+        expected_revision: Option<u64>,
     ) -> Result<ReloadResult, RuntimeError> {
         let _reload = self
             .reload_lock
             .lock()
             .map_err(|_| RuntimeError::Poisoned)?;
+        if let Some(expected) = expected_revision {
+            self.ensure_revision(expected)?;
+        }
         let group = group.filter(|name| !name.is_empty()).ok_or_else(|| {
             RuntimeError::RevisionStore(
                 "baseline is immutable; use censorguardd reload to restart".into(),
@@ -1359,6 +1370,7 @@ impl Runtime {
                 ensure_domain(&mut state, &domain_name, &group, slot, policy_managed)
             };
             self.kernel.set_scope_policy(scope_id, slot, version)?;
+            self.seed_sockets(pid, scope_id)?;
             let _ = self.seed_descendants(pid, scope_id)?;
         }
         self.finalize_draining()?;
@@ -1478,9 +1490,33 @@ impl Runtime {
             };
             self.kernel
                 .track_descendant(pid, TrackValue { scope_id }, start_time)?;
+            self.seed_sockets(pid, scope_id)?;
             seeded += 1;
         }
         Ok(seeded)
+    }
+
+    fn seed_sockets(&self, pid: u32, scope_id: u64) -> Result<(), RuntimeError> {
+        let inodes = procfs::socket_inodes(pid)?;
+        if inodes.is_empty() {
+            return Ok(());
+        }
+        let info = match procfs::process_info(pid) {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut owner = SocketOwner {
+            scope_id,
+            tgid: pid,
+            ..SocketOwner::default()
+        };
+        let count = info.comm.len().min(owner.comm.len() - 1);
+        owner.comm[..count].copy_from_slice(&info.comm.as_bytes()[..count]);
+        for inode in inodes {
+            self.kernel.track_socket(inode, owner)?;
+        }
+        Ok(())
     }
 
     fn remove_dead_root(&self, pid: u32) -> Result<(), RuntimeError> {

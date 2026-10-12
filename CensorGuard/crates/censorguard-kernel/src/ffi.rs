@@ -89,6 +89,7 @@ unsafe extern "C" {
 
     pub fn as_event_reader_new(
         kernel: *const KernelHandle,
+        sample_capacity: usize,
         error: *mut c_char,
         error_size: usize,
     ) -> *mut EventReaderHandle;

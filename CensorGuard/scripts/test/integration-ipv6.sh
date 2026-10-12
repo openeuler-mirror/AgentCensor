@@ -112,7 +112,7 @@ audit_pid=$!
 status_value() {
     local field=$1
     local file=$2
-    sed -n "s/.*\"${field}\": \([0-9][0-9]*\).*/\1/p" "${file}"
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[2]))[sys.argv[1]])' "${field}" "${file}"
 }
 
 probe_denied() {

@@ -4,7 +4,8 @@
 #
 # 用法:
 #   sudo bash scripts/test/run-all.sh              # 全部 (不含 DSH)
-#   sudo bash scripts/test/run-all.sh --dsh        # 含 DSH 插件测试
+#   sudo bash scripts/test/run-all.sh --dsh        # 含 gRPC、DSH 自注册/安装/发布包测试
+#   sudo bash scripts/test/run-all.sh --web        # 另加真实 DSH 浏览器测试
 #   sudo bash scripts/test/run-all.sh file exec    # 只跑名字含 file/exec 的
 #
 # 判定以脚本退出码为准: [FAIL] 字样可能是 ERR trap 在 set +e 区间的
@@ -17,14 +18,18 @@ export LC_ALL=C
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 test_dir=${repo_dir}/scripts/test
-log_dir=${RUN_ALL_LOG_DIR:-/tmp/censorguard-run-all}
+log_dir=${RUN_ALL_LOG_DIR:-$(mktemp -d /tmp/censorguard-run-all.XXXXXX)}
 per_case_timeout=${RUN_ALL_TIMEOUT:-300}
 
 with_dsh=0
+with_web=0
 patterns=()
 for arg in "$@"; do
     if [[ ${arg} == "--dsh" ]]; then
         with_dsh=1
+    elif [[ ${arg} == "--web" ]]; then
+        with_dsh=1
+        with_web=1
     else
         patterns+=("${arg}")
     fi
@@ -35,13 +40,20 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-# 收集用例: startup-test 先行冒烟, 之后按字母序全部 integration-*.sh
+# Collect both shell and Python regressions; new tests must not disappear from this entrypoint.
 cases=("${test_dir}/startup-test.sh")
-while IFS= read -r f; do
+for f in "${test_dir}"/integration-*.sh "${test_dir}"/integration-*.py; do
+    [[ ${f} == */integration-dsh-install.py ]] && continue
     cases+=("${f}")
-done < <(find "${test_dir}" -maxdepth 1 -name 'integration-*.sh' | sort)
+done
 if [[ ${with_dsh} -eq 1 ]]; then
-    cases+=("${test_dir}/censorguard-dsh-attach-self.sh")
+    cases+=("${test_dir}/censorguard-dsh-attach-self.sh"
+            "${test_dir}/integration-grpc.mjs"
+            "${test_dir}/integration-dsh-install.py"
+            "${test_dir}/verify-dsh-package.mjs")
+fi
+if [[ ${with_web} -eq 1 ]]; then
+    cases+=("${test_dir}/integration-dsh-web.mjs")
 fi
 
 if [[ ${#patterns[@]} -gt 0 ]]; then
@@ -63,6 +75,7 @@ if [[ ${#cases[@]} -eq 0 ]]; then
 fi
 
 install -d -m 0700 "${log_dir}"
+: >"${log_dir}/results.jsonl"
 
 pass_list=()
 fail_list=()
@@ -72,12 +85,20 @@ printf '%-38s %8s %8s\n' "CASE" "RESULT" "TIME"
 printf '%-38s %8s %8s\n' "----" "------" "----"
 
 for c in "${cases[@]}"; do
-    name=$(basename "${c}" .sh)
+    name=$(basename "${c}")
+    name=${name%.*}
     log="${log_dir}/${name}.log"
     start=${SECONDS}
-    timeout "${per_case_timeout}" bash "${c}" >"${log}" 2>&1
+    case ${c} in
+        *.py) interpreter=python3 ;;
+        *.mjs) interpreter=node ;;
+        *) interpreter=bash ;;
+    esac
+    timeout "${per_case_timeout}" "${interpreter}" "${c}" >"${log}" 2>&1
     rc=$?
     elapsed=$((SECONDS - start))
+    python3 -c 'import json, sys; print(json.dumps(dict(name=sys.argv[1], exit_code=int(sys.argv[2]), seconds=int(sys.argv[3]), log=sys.argv[4])))' \
+        "${name}" "${rc}" "${elapsed}" "${log}" >>"${log_dir}/results.jsonl"
     if [[ ${rc} -eq 0 ]]; then
         printf '%-38s %8s %7ds\n' "${name}" "PASS" "${elapsed}"
         pass_list+=("${name}")
