@@ -85,6 +85,11 @@ impl StorageBackend for SqliteStorage {
             .map_err(|error| storage_error("append_payloads_batch", error))
     }
 
+    fn reset_spool_checkpoint(&mut self) -> Result<(), StorageError> {
+        SqliteStorage::reset_spool_checkpoint(self)
+            .map_err(|error| storage_error("reset_spool_checkpoint", error))
+    }
+
     fn apply_ingest_batch(
         &mut self,
         sequence: u64,

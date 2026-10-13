@@ -60,6 +60,22 @@ sudo ./target/release/censorscoped start --level L3      # 指定等级（run/st
 sudo ./target/release/censorscoped stop
 ```
 
+与 CensorGuard 同时运行时，`censorscoped` 必须在 Guard 受管进程树外启动；受管树内的
+`bpf()`、跨进程 ptrace 检查均会被拒绝，root 或加入 `censorguard` 组也不会豁免。
+DSH host 插件 0.1.2 会显式传递自身 PID namespace，避免 ctl 子进程读取宿主
+`/proc/PID/ns/pid` 时触发 ptrace 限制，需要同步重建安装 `censorscopectl`。
+
+手动从受管 shell 观测自身时，可传入确切坐标：
+
+```bash
+pid_namespace=$(readlink /proc/self/ns/pid)
+./target/release/censorscopectl track-add \
+  --root-pid "$$" --root-pid-namespace "$pid_namespace"
+```
+
+显式 namespace 时，`--root-pid` 是该 namespace 中的 PID，客户端不读取目标 procfs。
+Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权；此参数不授予额外权限。
+
 ## 配置
 
 默认 operator 配置：`/etc/censorscope/censorscoped.conf`（`censorscoped init` 生成），TOML 段：

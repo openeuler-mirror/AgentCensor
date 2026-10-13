@@ -72,6 +72,7 @@ import { installModelSelection } from '@deepseek-ai/dsh-agent'
 
 export const name = 'agentcensor-worker'
 export const inject = ['agentDefaultModel', 'agents', 'sessions']
+const hostSyncedSequences = new Set()
 
 export function apply(ctx) {
   const exit = ctx.get('appExit')
@@ -141,6 +142,10 @@ async function run(ctx) {
   // stays registered for the whole process life (multi-turn).
   ctx.on('session/event', (session, event) => {
     if (session.id !== sessionId) return
+    if (hostSyncedSequences.delete(event.seq)) {
+      process.stdout.write(`ACSYNC\t${JSON.stringify({ seq: event.seq })}\n`)
+      return
+    }
     // Preserve the complete Session V3 event envelope across the wire.
     const line = JSON.stringify(event)
     process.stdout.write(`ACEVT\t${line}\n`)
@@ -222,6 +227,20 @@ async function controlLoop(agent, sessions, asks) {
       frame = JSON.parse(raw)
     } catch (error) {
       process.stderr.write(`agentcensor-worker: unparsable stdin frame: ${String(error)}\n`)
+      continue
+    }
+    if (frame?.type === 'host-session-event') {
+      const event = frame.event
+      if (!event || !['permission/preset', 'sandbox/mode', 'approval/policy', 'model/selection'].includes(event.type)) {
+        throw new Error('invalid host session configuration event')
+      }
+      // Use the native event fold: shell and approval read these exact knobs.
+      // Echoed events are already present on the host and are skipped there.
+      hostSyncedSequences.add(agent.session.seq)
+      agent.session.append(event.type, event.data, {
+        ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
+        ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
+      })
       continue
     }
     if (frame?.type === 'message') {

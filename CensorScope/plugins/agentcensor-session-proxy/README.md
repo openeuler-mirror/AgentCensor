@@ -9,7 +9,8 @@ worker 是完整的 dsh 进程、跑正常的原生 agent 流程,宿主只做 UI
 的全部配置(`settings.yaml` / `.credentials.yaml` / 机器级 `cordis.patch.yml` / env 分层,
 与原生 dsh 读同一文件,不存在任何 key/模型 env 注入);worker 只把**可写数据根**(会话
 持久化、storage、attachment)重定向到私有临时目录,共享会话日志的唯一写者仍是宿主 ——
-宿主对 worker 的事件流做 1:1 透明回放(不合成、不篡改)。
+宿主保留 worker 的对话、工具、审批事件内容并写入共享日志。浏览器修改权限、沙箱、审批
+或模型时，宿主将原生配置事件同步到常驻 worker，两端各自维护连续的事件序号。
 
 ## 要求
 
@@ -21,10 +22,10 @@ worker 是完整的 dsh 进程、跑正常的原生 agent 流程,宿主只做 UI
 # 安装
 dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.4.tgz
 # 启动
-dsh web
+dsh --profile web
 ```
 
-没有全局 `dsh`、直接从源码运行时，在 DeepSeek Harness 根目录执行 `pnpm dsh web`；插件会
+没有全局 `dsh`、直接从源码运行时，在 DeepSeek Harness 根目录执行 `pnpm dsh --profile web`；插件会
 自动用同一源码入口启动 headless worker。也可在启动 Web 时设置 `DSH_ROOT`，或用
 `AGENTCENSOR_DSH_BIN` 指向独立的 `dsh` 可执行文件。
 
@@ -41,6 +42,8 @@ dsh plugin --profile web remove agentcensor-session-proxy
   会话 → 浏览器 follow 流 / 投影 / JSONL 实时更新(共享日志始终连续、宿主唯一写者)。
 - 模型选择:默认选型读宿主 `settings.yaml` 的 `agent-default-model`(worker 每次
   boot 从自身持久化重放推导会话最近一次选型,仅在进程重建时发生)。
+- 常驻 worker 的权限、沙箱、审批及模型切换通过 `host-session-event` 同步；worker
+  用原生 session fold 应用，发 `ACSYNC` 确认，不把同一配置事件再次写回宿主。
 - goal / schedule / subagent / jobs 等工具在常驻 worker 内与原生语义一致地跨消息存活
   (后台任务不会因单轮结束被杀)。
 - **审批 / 提问（ask_user_question）桥**:浏览器是 dsh 里唯一的交互应答端,但它只挂在**宿主**的
