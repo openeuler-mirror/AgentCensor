@@ -103,9 +103,9 @@ export function apply(ctx: CordisContext, config?: HostPluginConfig): void {
 
   const grpc = new GrpcClient(addr, protoPath);
   const host = new HostCore(grpc, boundGroup);
-  // 事件订阅过滤先为空 (attach 未完成时收不到本 Domain 事件, 但不会误订全机:
-  // 回填 domainIds 前的窗口内按不过滤订阅, Domain 归属在 Client 展示层标注)
-  const audit = new AuditStream(grpc, {});
+  // domain 0 不属于受控进程，接入前保持空观察窗，避免订阅全机。
+  // 不转发本 Host 的普通 ALLOW 网络收发，否则观察连接会产生递归事件。
+  const audit = new AuditStream(grpc, { domainIds: [0], observerTgid: process.pid });
 
   // Bootstrap 状态 → HostCore.domainId + AuditStream 订阅过滤
   const ready = ctx.censorguardReady;
@@ -113,6 +113,9 @@ export function apply(ctx: CordisContext, config?: HostPluginConfig): void {
     if (s.kind === 'protected') {
       host.setDomainId(s.domainId);
       audit.setDomainIds([s.domainId]);
+    } else {
+      host.setDomainId(0);
+      audit.setDomainIds([0]);
     }
   };
   applyState(ready.state);
@@ -133,8 +136,8 @@ export function apply(ctx: CordisContext, config?: HostPluginConfig): void {
       const unregisterRead = webCtx.webServer.register({
         kind: 'prefix',
         path: '/censorguard-read',
-        handler: serveRpc(webCtx, '/censorguard-read', false, (endpoint, payload) =>
-          routeRead(host, audit, boundGroup, endpoint, payload)),
+        handler: serveRpc(webCtx, '/censorguard-read', false, (endpoint, payload, signal) =>
+          routeRead(host, audit, boundGroup, endpoint, payload, signal)),
       });
       const unregisterAdmin = webCtx.webServer.register({
         kind: 'prefix',
@@ -303,6 +306,7 @@ async function routeRead(
   boundGroup: string,
   endpoint: string,
   payload: unknown,
+  signal: AbortSignal,
 ): Promise<RpcResult> {
   try {
     switch (endpoint) {
@@ -317,13 +321,13 @@ async function routeRead(
         return ok(audit.status());
       case 'audit/snapshot': {
         const p = (payload ?? {}) as SnapshotPayload;
-        return ok(audit.snapshot(p.afterSequence ?? 0, capLimit(p.limit), p.filter));
+        return ok(audit.snapshot(p.afterSequence ?? 0, capLimit(p.limit), p.filter, p.afterBootId));
       }
       case 'audit/wait': {
         const p = (payload ?? {}) as SnapshotPayload & { timeoutMs?: number };
         // 长轮询不超过 25 秒 (AuditStream.wait 内建上限)
         return ok(
-          await audit.wait(p.afterSequence ?? 0, capLimit(p.limit), p.timeoutMs ?? MAX_WAIT_MS, p.filter),
+          await audit.wait(p.afterSequence ?? 0, capLimit(p.limit), p.timeoutMs ?? MAX_WAIT_MS, p.filter, signal, p.afterBootId),
         );
       }
       default:
@@ -398,6 +402,7 @@ async function routeAdmin(
 
 interface SnapshotPayload {
   afterSequence?: number;
+  afterBootId?: string;
   limit?: number;
   filter?: AuditFilter;
 }

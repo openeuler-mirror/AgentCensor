@@ -50,7 +50,8 @@ export interface AuditStatusBar {
   daemonBootId: string;
   lastSequence: number;
   droppedCount: number; // 已知丢失事件数
-  evictedCount: number; // Host 缓存淘汰数 + 本地缓冲淘汰数
+  hostEvictedCount: number; // Host 缓存移除；与浏览器可能重叠，不能相加
+  localEvictedCount: number;
   empty: boolean; // 空状态 (没有事件时显示空状态文案)
 }
 
@@ -59,11 +60,16 @@ export const AUDIT_DISCONNECTED_HINT =
   '事件流已断开, 列表保留已缓存事件; 断线期间的事件可能丢失 (见缺口标记)';
 
 // kindLabel 把 kind/op 翻译成类型标签 (与 bpf/enforce.bpf.c 的
-// FILE_OP_* / GUARD_OP_* 常量一致)
+// FILE_OP_* / NET_OP_* / GUARD_OP_* 常量一致)
 export function kindLabel(kind: number, op: number): string {
   if (kind === 1 && op !== 0) return fileOpLabel(op);
+  if (kind === 3 && op !== 0) return netOpLabel(op);
   if (kind === 4 && op !== 0) return guardOpLabel(op);
   return { 1: 'FILE', 2: 'EXEC', 3: 'NET', 4: 'GUARD' }[kind] ?? '?';
+}
+
+function netOpLabel(op: number): string {
+  return ({ 1: 'NET-BIND', 2: 'NET-SEND', 3: 'NET-ACCEPT', 4: 'NET-RECV' } as Record<number, string>)[op] ?? 'NET';
 }
 
 // eventToRow 单条事件 → 列表行
@@ -140,7 +146,8 @@ export function statusBar(
     daemonBootId: status.daemonBootId,
     lastSequence: status.lastSequence,
     droppedCount: status.droppedCount,
-    evictedCount: status.evictedCount + localEvicted,
+    hostEvictedCount: status.evictedCount,
+    localEvictedCount: localEvicted,
     empty: listLength === 0,
   };
 }

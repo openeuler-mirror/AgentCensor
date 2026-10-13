@@ -61,6 +61,7 @@ impl CompiledPolicy {
         for rules in resolved.groups.values_mut() {
             apply_cache(rules, &cache);
         }
+        resolved.rebuild_combinations();
         (resolved, cache, status)
     }
 }
@@ -88,66 +89,70 @@ fn apply_cache(rules: &mut CompiledRules, cache: &DnsCache) {
         for address in addresses {
             match (address, rule.port) {
                 (IpAddr::V4(address), Some(port)) => {
-                    rules.network_ports.insert(
-                        NetPortLpmKey {
+                    rules
+                        .network_ports
+                        .entry(NetPortLpmKey {
                             prefix_len: 48,
                             port,
                             addr: address.octets(),
                             pad: 0,
-                        },
-                        RuleValue {
+                        })
+                        .or_default()
+                        .merge(RuleValue {
                             mask: 0,
                             action: rule.action as u8,
                             audit: rule.audit,
                             version: 0,
-                        },
-                    );
+                        });
                 }
                 (IpAddr::V4(address), None) => {
-                    rules.network.insert(
-                        NetLpmKey {
+                    rules
+                        .network
+                        .entry(NetLpmKey {
                             prefix_len: 32,
                             addr: u32::from_le_bytes(address.octets()),
                             port: 0,
                             pad: 0,
-                        },
-                        RuleValue {
+                        })
+                        .or_default()
+                        .merge(RuleValue {
                             mask: 0,
                             action: rule.action as u8,
                             audit: rule.audit,
                             version: 0,
-                        },
-                    );
+                        });
                 }
                 (IpAddr::V6(address), Some(port)) => {
-                    rules.network6_ports.insert(
-                        Net6PortLpmKey {
+                    rules
+                        .network6_ports
+                        .entry(Net6PortLpmKey {
                             prefix_len: 144,
                             port,
                             addr: address.octets(),
                             pad: 0,
-                        },
-                        RuleValue {
+                        })
+                        .or_default()
+                        .merge(RuleValue {
                             mask: 0,
                             action: rule.action as u8,
                             audit: rule.audit,
                             version: 0,
-                        },
-                    );
+                        });
                 }
                 (IpAddr::V6(address), None) => {
-                    rules.network6.insert(
-                        Net6LpmKey {
+                    rules
+                        .network6
+                        .entry(Net6LpmKey {
                             prefix_len: 128,
                             addr: address.octets(),
-                        },
-                        RuleValue {
+                        })
+                        .or_default()
+                        .merge(RuleValue {
                             mask: 0,
                             action: rule.action as u8,
                             audit: rule.audit,
                             version: 0,
-                        },
-                    );
+                        });
                 }
             }
         }
@@ -159,6 +164,43 @@ mod tests {
     use super::*;
     use crate::compile_yaml;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn dns_refresh_preserves_static_rules_and_merges_conflicting_denies()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = compile_yaml(
+            b"rules:\n  - net deny 127.0.0.1\n  - net deny 127.0.0.1:443\n  - net deny ::1\n  - net deny [::1]:443\n  - net allow+audit example.test\n  - net allow+audit example.test:443\n",
+        )?;
+        let mut rules = policy.baseline.clone().ok_or("missing baseline")?;
+        let cache = DnsCache::from([(
+            "example.test".into(),
+            vec![
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ],
+        )]);
+        apply_cache(&mut rules, &cache);
+        for values in [
+            rules.network.values().collect::<Vec<_>>(),
+            rules.network_ports.values().collect(),
+            rules.network6.values().collect(),
+            rules.network6_ports.values().collect(),
+        ] {
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].action, 0);
+            assert!(values[0].audit);
+        }
+        // Removing DNS addresses on a later refresh must still leave static denies.
+        apply_cache(&mut rules, &DnsCache::new());
+        assert_eq!(rules.network, rules.network_static);
+        assert_eq!(rules.network_ports, rules.network_ports_static);
+        assert_eq!(rules.network6, rules.network6_static);
+        assert_eq!(rules.network6_ports, rules.network6_ports_static);
+        let static_only = compile_yaml(b"rules:\n  - net deny 10.0.0.0/8\n")?;
+        let (resolved, _, _) = static_only.resolve_dns(&DnsCache::new());
+        assert_eq!(resolved.baseline, static_only.baseline);
+        Ok(())
+    }
 
     #[test]
     fn failed_resolution_keeps_previous_addresses() -> Result<(), crate::PolicyError> {

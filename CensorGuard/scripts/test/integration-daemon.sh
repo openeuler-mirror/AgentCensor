@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-runtime
@@ -35,15 +66,13 @@ for file in daemon.log audit.log ctl.log status.log error.log output.log rc star
 done
 unlink "${runtime_dir}/start"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 6 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     if grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
         break
     fi
@@ -54,8 +83,7 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
     exit 1
 fi
 
-"${repo_dir}/target/debug/censorguard-audit" \
-    --socket "${runtime_dir}/events.sock" >"${runtime_dir}/audit.log" 2>&1 &
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 
 /bin/bash -c '
@@ -69,15 +97,15 @@ printf "%s\n" "$?" >/tmp/censorguard-runtime/rc
 victim_pid=$!
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" \
-    attach --pid "${victim_pid}" --domain lab-agent --seed >"${runtime_dir}/ctl.log"
+    --config "${runtime_dir}/config.yaml" \
+    attach --pid "${victim_pid}" --domain lab-agent >"${runtime_dir}/ctl.log"
 
 touch "${runtime_dir}/start"
 wait "${victim_pid}"
 victim_pid=
 
 "${repo_dir}/target/debug/censorguardctl" \
-    --socket "${runtime_dir}/ctl.sock" status >"${runtime_dir}/status.log"
+    --config "${runtime_dir}/config.yaml" status --json >"${runtime_dir}/status.log"
 
 rc=$(<"${runtime_dir}/rc")
 if [[ ${rc} -eq 0 || -s "${runtime_dir}/output.log" ]]; then

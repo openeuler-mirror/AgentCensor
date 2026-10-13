@@ -4,14 +4,16 @@ use censorguard_common::protocol::{
     Operation, Request, Response, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse,
     RpcResult, VERSION, read_json_line, validate_version, write_json_line,
 };
-use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::sys::socket::{MsgFlags, getsockopt, recv, sockopt::PeerCredentials};
 use nix::unistd::{Gid, chown, geteuid};
 use std::fs;
 use std::io::{self, BufReader};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -166,9 +168,31 @@ pub fn start_events(
                             .name("censorguard-event-client".into())
                             .spawn(move || {
                                 let mut stream = stream;
-                                while let Ok(event) = receiver.recv() {
-                                    if write_json_line(&mut stream, &event).is_err() {
-                                        return;
+                                if stream
+                                    .set_write_timeout(Some(Duration::from_secs(2)))
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                loop {
+                                    // Detect idle disconnects without waiting for the next audit event.
+                                    match recv(
+                                        stream.as_raw_fd(),
+                                        &mut [0u8; 1],
+                                        MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+                                    ) {
+                                        Err(nix::errno::Errno::EAGAIN) => {}
+                                        Err(nix::errno::Errno::EINTR) => continue,
+                                        _ => return, // EOF, error, or input on this receive-only socket
+                                    }
+                                    match receiver.recv_timeout(Duration::from_millis(100)) {
+                                        Ok(event) => {
+                                            if write_json_line(&mut stream, &event).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(RecvTimeoutError::Timeout) => {}
+                                        Err(RecvTimeoutError::Disconnected) => return,
                                     }
                                 }
                             });
@@ -518,20 +542,14 @@ fn dispatch_rpc(
             if let Some(group) = params.group.as_deref().filter(|group| !group.is_empty()) {
                 // Single-group read (any group incl. __base__ is readable; writes are restricted).
                 match runtime.group_policy(group) {
-                    Ok((yaml, version, domains)) => rpc_success(
+                    Ok((yaml, group)) => rpc_success(
                         request_id,
                         RpcResult {
-                            revision: Some(u64::from(version)),
+                            revision: Some(u64::from(group.version)),
                             policy_yaml: Some(yaml),
                             response: Some(Response {
                                 ok: true,
-                                groups: vec![censorguard_common::protocol::GroupDump {
-                                    name: group.to_owned(),
-                                    version,
-                                    domains,
-                                    definition:
-                                        censorguard_common::protocol::PolicyDefinition::default(),
-                                }],
+                                groups: vec![group],
                                 ..Response::default()
                             }),
                             ..RpcResult::default()
@@ -619,13 +637,20 @@ fn dispatch_rpc(
                         None,
                     );
                 }
-                match runtime.reload(None, Some(yaml), Some(group), true) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                match runtime.reload(
+                    None,
+                    Some(yaml),
+                    None,
+                    Some(group),
+                    true,
+                    params.expected_revision,
+                ) {
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 }
             } else {
                 match runtime.validate_policy_yaml(yaml) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 }
             }
@@ -661,13 +686,15 @@ fn dispatch_rpc(
                         None,
                     );
                 };
-                if let Some(expected) = params.expected_revision
-                    && let Err(error) = runtime.check_revision(expected)
-                {
-                    return runtime_rpc_failure(request_id, error);
-                }
-                return match runtime.reload(None, Some(yaml), Some(group), false) {
-                    Ok(result) => reload_rpc_success(request_id, result),
+                return match runtime.reload(
+                    None,
+                    Some(yaml),
+                    None,
+                    Some(group),
+                    false,
+                    params.expected_revision,
+                ) {
+                    Ok(result) => reload_rpc_success(runtime, request_id, result),
                     Err(error) => runtime_rpc_failure(request_id, error),
                 };
             }
@@ -691,7 +718,7 @@ fn dispatch_rpc(
                 );
             };
             match runtime.apply_policy_yaml(yaml, expected, params.idempotency_key.as_deref()) {
-                Ok(result) => reload_rpc_success(request_id, result),
+                Ok(result) => reload_rpc_success(runtime, request_id, result),
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
@@ -714,7 +741,7 @@ fn dispatch_rpc(
                 );
             };
             match runtime.rollback_policy(revision, expected, params.idempotency_key.as_deref()) {
-                Ok(result) => reload_rpc_success(request_id, result),
+                Ok(result) => reload_rpc_success(runtime, request_id, result),
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
@@ -752,59 +779,12 @@ fn dispatch_rpc(
                 Err(error) => runtime_rpc_failure(request_id, error),
             }
         }
-        RpcMethod::SetSwitches => {
-            // Root/gateway on ctl.sock or any peer on the delegated ui.sock surface.
-            if !is_privileged(peer_uid, gateway_uid) && role != SocketRole::Ui {
-                return rpc_failure(
-                    request_id,
-                    RpcErrorCode::PermissionDenied,
-                    "set_switches requires root",
-                    None,
-                );
-            }
-            let updates = [
-                params.enable_file,
-                params.enable_exec,
-                params.enable_net,
-                params.audit_file,
-                params.audit_exec,
-                params.audit_net,
-            ];
-            if updates.iter().all(Option::is_none) {
-                return rpc_failure(
-                    request_id,
-                    RpcErrorCode::InvalidRequest,
-                    "set_switches requires at least one switch field",
-                    None,
-                );
-            }
-            let [
-                enable_file,
-                enable_exec,
-                enable_net,
-                audit_file,
-                audit_exec,
-                audit_net,
-            ] = updates;
-            match runtime.set_switches(
-                enable_file,
-                enable_exec,
-                enable_net,
-                audit_file,
-                audit_exec,
-                audit_net,
-            ) {
-                Ok(switches) => rpc_success(
-                    request_id,
-                    RpcResult {
-                        response: Some(switch_response(switches)),
-                        revision: runtime.current_revision().ok(),
-                        ..RpcResult::default()
-                    },
-                ),
-                Err(error) => runtime_rpc_failure(request_id, error),
-            }
-        }
+        RpcMethod::SetSwitches => rpc_failure(
+            request_id,
+            RpcErrorCode::PermissionDenied,
+            "switches are configured in base.yaml daemon; restart daemon to apply",
+            None,
+        ),
         RpcMethod::CloseScope => rpc_failure(
             request_id,
             RpcErrorCode::InvalidRequest,
@@ -823,6 +803,7 @@ fn legacy_request(op: Operation) -> Request {
         seed: false,
         policy_file: None,
         policy_yaml: None,
+        policy_source: None,
         group: None,
         dry_run: false,
         enable_file: None,
@@ -834,26 +815,18 @@ fn legacy_request(op: Operation) -> Request {
     }
 }
 
-fn switch_response(switches: crate::runtime::SwitchState) -> Response {
-    Response {
-        ok: true,
-        enable_file: switches.enables[0],
-        enable_exec: switches.enables[1],
-        enable_net: switches.enables[2],
-        audit_file: switches.audits[0],
-        audit_exec: switches.audits[1],
-        audit_net: switches.audits[2],
-        ..Response::default()
-    }
-}
-
-fn reload_rpc_success(request_id: String, result: crate::runtime::ReloadResult) -> RpcResponse {
+fn reload_rpc_success(
+    runtime: &Runtime,
+    request_id: String,
+    result: crate::runtime::ReloadResult,
+) -> RpcResponse {
     rpc_success(
         request_id,
         RpcResult {
             revision: Some(u64::from(result.version)),
             response: Some(Response {
                 ok: true,
+                daemon_ready: runtime.ready(),
                 reload_gen: result.generation,
                 version: result.version,
                 active_bank: result.active_bank,
@@ -882,7 +855,9 @@ fn runtime_rpc_failure(request_id: String, error: RuntimeError) -> RpcResponse {
         }
         RuntimeError::MissingGroup { .. } => (RpcErrorCode::UnknownGroup, None),
         RuntimeError::UnknownDomain(_) => (RpcErrorCode::UnknownScope, None),
-        RuntimeError::DuplicateRoot(_) => (RpcErrorCode::ScopeAlreadyRegistered, None),
+        RuntimeError::DuplicateRoot(_) | RuntimeError::DomainBindingConflict(_) => {
+            (RpcErrorCode::ScopeAlreadyRegistered, None)
+        }
         RuntimeError::UnauthorizedPid { .. }
         | RuntimeError::UnauthorizedRoot { .. }
         | RuntimeError::GroupNotAllowed(_) => (RpcErrorCode::PermissionDenied, None),
@@ -927,6 +902,20 @@ fn dispatch(
     peer_uid: u32,
     gateway_uid: Option<u32>,
 ) -> Response {
+    let mut response = dispatch_inner(runtime, hub, request, peer_uid, gateway_uid);
+    // Readiness is independent of operation success. A mutation reply must not
+    // expose Response::default()'s false as if it were a live health check.
+    response.daemon_ready = runtime.ready();
+    response
+}
+
+fn dispatch_inner(
+    runtime: &Runtime,
+    hub: &EventHub,
+    request: Request,
+    peer_uid: u32,
+    gateway_uid: Option<u32>,
+) -> Response {
     if request.op.requires_root() && !is_privileged(peer_uid, gateway_uid) {
         return failure(format!(
             "operation {:?} requires root; peer uid={peer_uid}",
@@ -962,12 +951,16 @@ fn dispatch(
                 Err(error) => failure(error.to_string()),
             }
         }
-        Operation::Status => match runtime.status() {
-            Ok(status) => {
+        Operation::Status => match (runtime.status(), runtime.trees(), runtime.policy_dump()) {
+            (Ok(status), Ok(trees), Ok((_, groups, dns))) => {
                 let events = hub.stats();
                 Response {
                     ok: true,
+                    daemon_ready: runtime.ready(),
                     roots: status.roots,
+                    trees,
+                    groups,
+                    dns,
                     tracked: status.tracked,
                     pid_pending: status.pid_pending,
                     pid_generations: status.pid_generations,
@@ -981,6 +974,8 @@ fn dispatch(
                     scopes: status.scopes,
                     scope_capacity: status.scope_capacity,
                     domains: status.domains,
+                    bindings: status.bindings,
+                    policy_snapshot_path: Some(status.policy_snapshot_path),
                     reload_gen: status.reload_generation,
                     version: status.version,
                     active_bank: status.active_bank,
@@ -997,17 +992,22 @@ fn dispatch(
                     event_subscriber_dropped: events.subscriber_dropped,
                     event_subscribers: events.subscribers,
                     daemon_boot_id: runtime.boot_id().to_owned(),
+                    config_path: Some(runtime.config_path().display().to_string()),
                     hooks_healthy: Some(runtime.hooks_healthy()),
                     ..Response::default()
                 }
             }
-            Err(error) => failure(error.to_string()),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                failure(error.to_string())
+            }
         },
         Operation::Reload => match runtime.reload(
             request.policy_file.as_deref(),
             request.policy_yaml.as_deref(),
+            request.policy_source.as_ref(),
             request.group.as_deref(),
             request.dry_run,
+            None,
         ) {
             Ok(result) => Response {
                 ok: true,
@@ -1066,18 +1066,46 @@ fn dispatch(
             Err(error) => failure(error.to_string()),
         },
         Operation::SetSwitches => {
-            match runtime.set_switches(
-                request.enable_file,
-                request.enable_exec,
-                request.enable_net,
-                request.audit_file,
-                request.audit_exec,
-                request.audit_net,
-            ) {
-                Ok(switches) => switch_response(switches),
-                Err(error) => failure(error.to_string()),
-            }
+            failure("switches are configured in base.yaml daemon; restart daemon to apply")
         }
+        Operation::Unattach => match request.pid {
+            Some(pid) => match runtime.unattach(pid, peer_uid) {
+                Ok(()) => success(),
+                Err(error) => failure(error.to_string()),
+            },
+            None => failure("unattach requires pid"),
+        },
+        Operation::Remove => match request.group.as_deref() {
+            Some(group) => match runtime.remove_policy(request.domain.as_deref(), group) {
+                Ok(result) => Response {
+                    ok: true,
+                    version: result.version,
+                    reload_gen: result.generation,
+                    active_bank: result.active_bank,
+                    changed: result.changed,
+                    ..Response::default()
+                },
+                Err(error) => failure(error.to_string()),
+            },
+            None => failure("remove requires policy group"),
+        },
+        Operation::DaemonReload => match runtime
+            .validate_config_path(request.policy_file.as_deref())
+            .and_then(|()| runtime.request_restart())
+        {
+            Ok(()) => Response {
+                daemon_boot_id: runtime.boot_id().to_owned(),
+                ..success()
+            },
+            Err(error) => failure(error.to_string()),
+        },
+        Operation::DaemonStop => match runtime.request_stop() {
+            Ok(()) => Response {
+                daemon_boot_id: runtime.boot_id().to_owned(),
+                ..success()
+            },
+            Err(error) => failure(error.to_string()),
+        },
         Operation::Tree => match runtime.trees() {
             Ok(trees) => Response {
                 ok: true,
@@ -1115,7 +1143,10 @@ fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListe
     fs::create_dir_all(parent)?;
     validate_socket_parent(parent)?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => fs::remove_file(path)?,
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            crate::lifecycle::ensure_socket_unused(path)?;
+            fs::remove_file(path)?;
+        }
         Ok(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -1139,7 +1170,7 @@ fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListe
     Ok(listener)
 }
 
-fn validate_socket_parent(parent: &Path) -> Result<(), io::Error> {
+pub(crate) fn validate_socket_parent(parent: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(parent)?;
     if !metadata.is_dir() {
         return Err(io::Error::new(

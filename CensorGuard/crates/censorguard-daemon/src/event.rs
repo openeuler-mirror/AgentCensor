@@ -2,7 +2,7 @@ use crate::runtime::Runtime;
 use censorguard_common::abi::RawEvent;
 use censorguard_common::protocol::Event;
 use censorguard_kernel::NativeKernel;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,6 +11,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 struct Subscriber {
     sender: SyncSender<Event>,
     dropped: u64,
+    alive: Arc<AtomicBool>,
+}
+
+pub struct Subscription {
+    receiver: Receiver<Event>,
+    alive: Arc<AtomicBool>,
+}
+
+impl std::ops::Deref for Subscription {
+    type Target = Receiver<Event>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 pub struct EventHub {
@@ -42,12 +62,18 @@ impl EventHub {
         }
     }
 
-    pub fn subscribe(&self) -> Receiver<Event> {
+    pub fn subscribe(&self) -> Subscription {
         let (sender, receiver) = sync_channel(256);
+        let alive = Arc::new(AtomicBool::new(true));
         if let Ok(mut subscribers) = self.subscribers.lock() {
-            subscribers.push(Subscriber { sender, dropped: 0 });
+            subscribers.retain(|subscriber| subscriber.alive.load(Ordering::Acquire));
+            subscribers.push(Subscriber {
+                sender,
+                dropped: 0,
+                alive: Arc::clone(&alive),
+            });
         }
-        receiver
+        Subscription { receiver, alive }
     }
 
     fn broadcast(&self, mut event: Event) {
@@ -58,6 +84,9 @@ impl EventHub {
             return;
         };
         subscribers.retain_mut(|subscriber| {
+            if !subscriber.alive.load(Ordering::Acquire) {
+                return false;
+            }
             let mut frame = event.clone();
             frame.dropped_before = subscriber.dropped;
             match subscriber.sender.try_send(frame) {
@@ -88,10 +117,10 @@ impl EventHub {
             kernel_dropped: self.kernel_dropped.load(Ordering::Relaxed),
             reader_dropped: self.reader_dropped.load(Ordering::Relaxed),
             subscriber_dropped: self.subscriber_dropped.load(Ordering::Relaxed),
-            subscribers: self
-                .subscribers
-                .lock()
-                .map_or(0, |subscribers| subscribers.len()),
+            subscribers: self.subscribers.lock().map_or(0, |mut subscribers| {
+                subscribers.retain(|subscriber| subscriber.alive.load(Ordering::Acquire));
+                subscribers.len()
+            }),
         }
     }
 }
@@ -194,6 +223,15 @@ mod tests {
     fn unix_epoch_calendar_conversion_is_stable() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_691), (2026, 8, 26));
+    }
+
+    #[test]
+    fn dropped_idle_subscription_is_removed_without_an_event() {
+        let hub = EventHub::new("boot-test".into());
+        let receiver = hub.subscribe();
+        assert_eq!(hub.stats().subscribers, 1);
+        drop(receiver);
+        assert_eq!(hub.stats().subscribers, 0);
     }
 
     #[test]

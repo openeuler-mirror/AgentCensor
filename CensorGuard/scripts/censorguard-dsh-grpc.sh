@@ -53,6 +53,7 @@ GRPC_LOG=$TDIR/grpc.log
 GRPC_PORT=50098
 GRPC_ADDR=127.0.0.1:$GRPC_PORT
 GRPC_CALL="$NODE_BIN $ROOT/scripts/censorguard-grpc-call.mjs $GRPC_ADDR"
+CONFIG=$TDIR/base.yaml
 
 cleanup() {
     [ -n "${GRPC_PID:-}" ] && kill "$GRPC_PID" 2>/dev/null
@@ -61,7 +62,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$DAEMON" --ctl-sock "$CTL_SOCK" --event-sock "$EV_SOCK" --state-dir "$TDIR/state" \
+cat >"$CONFIG" <<EOF
+daemon:
+  bpf_object: $ROOT/bpf/enforce.bpf.o
+  control_socket: $CTL_SOCK
+  event_socket: $EV_SOCK
+  launch_socket: $TDIR/launch.sock
+  dsh_socket: $TDIR/dsh.sock
+  ui_socket: $UI_SOCK
+  state_dir: $TDIR/state
+  spawn_grpc: false
+  grpc_listen: $GRPC_ADDR
+rules: []
+EOF
+
+"$DAEMON" launch --config "$CONFIG" \
     >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 100); do
@@ -73,7 +88,7 @@ grep -q 'required hooks attached' "$DAEMON_LOG" || { echo "daemon 未 READY:"; c
 
 # 非特权运行适配器 (生产姿态), ui.sock/events.sock 是 0666 可连
 setpriv --reuid 65534 --regid 65534 --clear-groups \
-    "$GRPC" --sock "$UI_SOCK" --ev-sock "$EV_SOCK" --listen "$GRPC_ADDR" \
+    "$GRPC" --config "$CONFIG" \
     >"$GRPC_LOG" 2>&1 &
 GRPC_PID=$!
 for _ in $(seq 1 50); do
@@ -82,7 +97,7 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-"$CTL" --sock "$CTL_SOCK" policy apply --name censorguard-dsh-default \
+"$CTL" --config "$CONFIG" policy apply --policy censorguard-dsh-default \
     --file config/policy.dsh-default.yaml >/dev/null 2>&1 \
     && pass "准备: 下发 censorguard-dsh-default" || fail "准备: 策略下发失败"
 
@@ -149,7 +164,7 @@ OUT=$($GRPC_CALL ApplyPolicy "{\"name\":\"censorguard-dsh-default\",\"policyYaml
 if echo "$OUT" | grep -q '"name": *"censorguard-dsh-default"'; then
     pass "ApplyPolicy 成功"
     # 恢复仓库里的完整策略 (B8 把它整组替换成单条规则了)
-    "$CTL" --sock "$CTL_SOCK" policy apply --name censorguard-dsh-default \
+    "$CTL" --config "$CONFIG" policy apply --policy censorguard-dsh-default \
         --file config/policy.dsh-default.yaml >/dev/null 2>&1
 else
     fail "ApplyPolicy 异常: $OUT"

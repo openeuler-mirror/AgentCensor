@@ -54,7 +54,7 @@ export type RpcAuditEntry =
   | {
       type: 'gap';
       count: number;
-      reason: 'dropped' | 'sequence_jump' | 'daemon_restart' | 'stream_reconnect';
+      reason: 'dropped' | 'daemon_restart' | 'stream_reconnect';
       atSequence: number;
       message: string;
     };
@@ -139,5 +139,6 @@ export class AuditBuffer {
     this.entries = [];
     this.seenEvents.clear();
     this.seenGaps.clear();
+    this.evicted = 0;
   }
 }

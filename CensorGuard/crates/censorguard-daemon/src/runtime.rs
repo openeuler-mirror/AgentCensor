@@ -1,18 +1,19 @@
 use crate::procfs;
-use censorguard_common::abi::TrackValue;
+use censorguard_common::abi::{SocketOwner, TrackValue};
 use censorguard_common::protocol::{
-    DnsDomainInfo, DomainInfo, DomainTree, GroupDump, IntentDecision, PolicyDefinition,
-    SecurityIntent, TreeNode,
+    DnsDomainInfo, DomainBinding, DomainInfo, DomainTree, GroupDump, IntentDecision,
+    PolicyDefinition, PolicySource, SecurityIntent, TreeNode,
 };
 use censorguard_kernel::{InstalledPolicy, KernelError, NativeKernel};
 use censorguard_policy::{
-    CompiledPolicy, DnsCache, DnsResolution, GroupPolicy, PolicyError, compile, compile_yaml, load,
+    CompiledPolicy, DnsCache, DnsResolution, GroupPolicy, PolicyError, compile, compile_yaml,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -31,6 +32,8 @@ pub enum RuntimeError {
     MissingGroup { domain: String, group: String },
     #[error("pid {0} is already a registered root")]
     DuplicateRoot(u32),
+    #[error("domain {0:?} is already bound to a different policy group")]
+    DomainBindingConflict(String),
     #[error("pid {0} is not a registered root")]
     UnknownRoot(u32),
     #[error("runtime state lock is poisoned")]
@@ -133,7 +136,6 @@ impl Default for SwitchState {
 
 pub struct Runtime {
     kernel: Arc<NativeKernel>,
-    config_path: PathBuf,
     policy_state: RwLock<PolicyState>,
     switches: Mutex<SwitchState>,
     reload_lock: Mutex<()>,
@@ -141,20 +143,24 @@ pub struct Runtime {
     dns_state: Mutex<DnsState>,
     revisions: Mutex<RevisionState>,
     revision_dir: PathBuf,
+    config_path: PathBuf,
     state: Mutex<State>,
     boot_id: String,
     hooks_healthy: bool,
+    restart_requested: AtomicBool,
+    stop_requested: AtomicBool,
+    ready: AtomicBool,
     dsh_self_groups: BTreeSet<String>,
 }
 
 pub struct RuntimeInit {
     pub kernel: Arc<NativeKernel>,
-    pub config_path: PathBuf,
     pub policy: Arc<CompiledPolicy>,
     pub installed: InstalledPolicy,
     pub dns_cache: DnsCache,
     pub dns_status: Vec<DnsResolution>,
     pub revision_dir: PathBuf,
+    pub config_path: PathBuf,
     pub initial_revision: u32,
     pub boot_id: String,
     pub hooks_healthy: bool,
@@ -190,6 +196,8 @@ pub struct RuntimeStatus {
     pub scopes: usize,
     pub scope_capacity: usize,
     pub domains: Vec<DomainInfo>,
+    pub bindings: Vec<DomainBinding>,
+    pub policy_snapshot_path: String,
     pub reload_generation: u64,
     pub version: u32,
     pub active_bank: u32,
@@ -205,12 +213,12 @@ impl Runtime {
     pub fn new(init: RuntimeInit) -> Result<Self, RuntimeError> {
         let RuntimeInit {
             kernel,
-            config_path,
             policy,
             installed,
             dns_cache,
             dns_status,
             revision_dir,
+            config_path,
             initial_revision,
             boot_id,
             hooks_healthy,
@@ -218,7 +226,6 @@ impl Runtime {
         } = init;
         let runtime = Self {
             kernel,
-            config_path,
             policy_state: RwLock::new(PolicyState {
                 policy: Arc::clone(&policy),
                 installed,
@@ -226,7 +233,18 @@ impl Runtime {
                 version: initial_revision,
                 reload_generation: u64::from(initial_revision.saturating_sub(1)),
             }),
-            switches: Mutex::new(SwitchState::default()),
+            switches: Mutex::new(SwitchState {
+                enables: [
+                    policy.daemon.enable_file,
+                    policy.daemon.enable_exec,
+                    policy.daemon.enable_net,
+                ],
+                audits: [
+                    policy.daemon.audit_file,
+                    policy.daemon.audit_exec,
+                    policy.daemon.audit_net,
+                ],
+            }),
             reload_lock: Mutex::new(()),
             reload_observation: Mutex::new(ReloadObservation::default()),
             dns_state: Mutex::new(DnsState {
@@ -238,6 +256,7 @@ impl Runtime {
                 idempotency: BTreeMap::new(),
             }),
             revision_dir,
+            config_path,
             state: Mutex::new(State {
                 next_domain_id: 1,
                 roots: BTreeMap::new(),
@@ -246,6 +265,9 @@ impl Runtime {
             }),
             boot_id,
             hooks_healthy,
+            restart_requested: AtomicBool::new(false),
+            stop_requested: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
             dsh_self_groups,
         };
         runtime.persist_revision_snapshot(initial_revision, &policy)?;
@@ -260,6 +282,10 @@ impl Runtime {
         seed: bool,
         peer_uid: u32,
     ) -> Result<TrackResult, RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
         let start_time = procfs::start_time(pid)?;
         let owner_uid = procfs::owner_uid(pid)?;
         if peer_uid != 0 && peer_uid != owner_uid {
@@ -271,6 +297,7 @@ impl Runtime {
         }
         let domain_name = if domain.is_empty() { "default" } else { domain };
         let (group, slot, version) = self.resolve_domain(domain_name)?;
+        validate_registration_binding(&self.read_policy()?.policy, domain_name, "")?;
         self.track_resolved_with_start(
             pid,
             domain_name,
@@ -291,6 +318,10 @@ impl Runtime {
         group: &str,
         peer_uid: u32,
     ) -> Result<TrackResult, RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
         let start_time = procfs::start_time(pid)?;
         let owner_uid = procfs::owner_uid(pid)?;
         if owner_uid != peer_uid {
@@ -301,9 +332,27 @@ impl Runtime {
             });
         }
         let scope_name = if scope.is_empty() { "default" } else { scope };
-        let (slot, version) = self.resolve_group(group)?;
+        let group = if group == "__base__" { "" } else { group };
+        let policy_managed = {
+            let policy = self.read_policy()?;
+            validate_registration_binding(&policy.policy, scope_name, group)?
+        };
+        let (group, slot, version) = if policy_managed {
+            self.resolve_domain(scope_name)?
+        } else {
+            let (slot, version) = self.resolve_group(group)?;
+            (group.to_owned(), slot, version)
+        };
         self.track_resolved_with_start(
-            pid, scope_name, group, slot, version, false, owner_uid, start_time, false,
+            pid,
+            scope_name,
+            &group,
+            slot,
+            version,
+            true,
+            owner_uid,
+            start_time,
+            policy_managed,
         )
     }
 
@@ -311,8 +360,20 @@ impl Runtime {
         &self.boot_id
     }
 
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
     pub fn hooks_healthy(&self) -> bool {
         self.hooks_healthy
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    pub fn ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && !self.stop_requested() && !self.restart_requested()
     }
 
     pub fn is_dsh_group_allowed(&self, group: &str) -> bool {
@@ -329,6 +390,10 @@ impl Runtime {
         seed: bool,
         peer_uid: u32,
     ) -> Result<TrackResult, RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
         if policy_group.is_empty() || !self.dsh_self_groups.contains(policy_group) {
             return Err(RuntimeError::GroupNotAllowed(policy_group.to_owned()));
         }
@@ -342,24 +407,33 @@ impl Runtime {
             });
         }
         let domain_name = dsh_domain_name(owner_uid, pid, start_time, instance_hint)?;
-        let (slot, version) = self.resolve_group(policy_group)?;
+        let policy_managed = {
+            let policy = self.read_policy()?;
+            validate_registration_binding(&policy.policy, &domain_name, policy_group)?
+        };
+        let (group, slot, version) = if policy_managed {
+            self.resolve_domain(&domain_name)?
+        } else {
+            let (slot, version) = self.resolve_group(policy_group)?;
+            (policy_group.to_owned(), slot, version)
+        };
         self.track_resolved_with_start(
             pid,
             &domain_name,
-            policy_group,
+            &group,
             slot,
             version,
             seed,
             owner_uid,
             start_time,
-            false,
+            policy_managed,
         )
     }
 
     /// Heartbeat query: the domain the peer pid roots, if any.
     pub fn status_self(&self, pid: u32) -> Result<Option<DomainInfo>, RuntimeError> {
-        let state = self.lock_state()?;
         let version = self.read_policy()?.version;
+        let state = self.lock_state()?;
         let Some(root) = state.roots.get(&pid) else {
             return Ok(None);
         };
@@ -402,6 +476,13 @@ impl Runtime {
             if state.roots.contains_key(&pid) {
                 return Err(RuntimeError::DuplicateRoot(pid));
             }
+            if state
+                .domains
+                .get(scope_name)
+                .is_some_and(|domain| domain.group != group)
+            {
+                return Err(RuntimeError::DomainBindingConflict(scope_name.to_owned()));
+            }
             let existing_scope_id = state.domains.get(scope_name).map(|scope| scope.id);
             let scope_id = existing_scope_id.unwrap_or(state.next_domain_id);
             self.kernel.set_scope_policy(scope_id, slot, version)?;
@@ -413,6 +494,16 @@ impl Runtime {
                     let _ = self.kernel.remove_scope_policy(scope_id);
                 }
                 return Err(error.into());
+            }
+            if let Err(error) = self.seed_sockets(pid, scope_id) {
+                self.kernel.untrack_pid(pid)?;
+                if existing_scope_id.is_none() {
+                    for member in self.kernel.scoped_pids_scope(scope_id)? {
+                        self.kernel.untrack_pid(member)?;
+                    }
+                    self.kernel.remove_scope_policy(scope_id)?;
+                }
+                return Err(error);
             }
             let committed_scope_id =
                 ensure_domain(&mut state, scope_name, group, slot, policy_managed);
@@ -443,6 +534,142 @@ impl Runtime {
             domain: info,
             seeded,
         })
+    }
+
+    pub fn remove_policy(
+        &self,
+        domain: Option<&str>,
+        group: &str,
+    ) -> Result<ReloadResult, RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        let mut root = self.read_policy()?.policy.to_root();
+        for active in self.lock_state()?.domains.values() {
+            if !root
+                .domains
+                .iter()
+                .any(|binding| binding.name == active.name)
+            {
+                root.domains.push(censorguard_policy::DomainRef {
+                    name: active.name.clone(),
+                    group: active.group.clone(),
+                });
+            }
+        }
+        let current = compile(root)?;
+        let canonical = if let Some(domain) = domain {
+            current.remove_binding(domain, group)?
+        } else {
+            current.remove_group(group)?
+        };
+        let (next, cache, status) = self.resolve_dns(canonical)?;
+        let result = self.apply_policy_locked(next, false)?;
+        let mut dns = self.dns_state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        dns.cache = cache;
+        dns.status = status;
+        Ok(result)
+    }
+
+    pub fn unattach(&self, pid: u32, peer_uid: u32) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        let mut state = self.lock_state()?;
+        let root = state
+            .roots
+            .get(&pid)
+            .ok_or(RuntimeError::UnknownRoot(pid))?;
+        if peer_uid != 0 && peer_uid != root.owner_uid {
+            return Err(RuntimeError::UnauthorizedRoot { peer_uid, pid });
+        }
+        let name = root.domain.clone();
+        let domain = state
+            .domains
+            .get(&name)
+            .ok_or_else(|| RuntimeError::UnknownDomain(name.clone()))?;
+        let id = domain.id;
+        let last_root = domain.roots.len() == 1;
+        let mut pids = BTreeSet::from([pid]);
+        pids.extend(procfs::descendants(pid)?);
+        // Keep independently registered roots and their subtrees attached.
+        for other in state.roots.keys().filter(|root| **root != pid) {
+            pids.remove(other);
+            for child in procfs::descendants(*other)? {
+                pids.remove(&child);
+            }
+        }
+        if last_root {
+            pids.extend(self.kernel.scoped_pids_scope(id)?);
+        }
+        // A nested root may belong to another domain; only detach members of this scope.
+        let scoped: BTreeSet<_> = self.kernel.scoped_pids_scope(id)?.into_iter().collect();
+        pids.retain(|child| scoped.contains(child));
+        // Untrack ancestor before children to prevent fresh inheritance from that ancestor.
+        self.kernel.untrack_pid(pid)?;
+        for child in pids.into_iter().filter(|child| *child != pid) {
+            self.kernel.untrack_pid(child)?;
+        }
+        state.roots.remove(&pid);
+        if let Some(domain) = state.domains.get_mut(&name) {
+            domain.roots.remove(&pid);
+            domain.draining = domain.roots.is_empty();
+        }
+        if last_root {
+            // Catch children forked just before their parent was detached.
+            for child in self.kernel.scoped_pids_scope(id)? {
+                self.kernel.untrack_pid(child)?;
+            }
+            self.kernel.remove_scope_policy(id)?;
+            state.domains.remove(&name);
+            state.names_by_id.remove(&id);
+        }
+        Ok(())
+    }
+
+    pub fn request_restart(&self) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        if self.stop_requested() {
+            return Err(RuntimeError::RevisionStore("daemon is stopping".into()));
+        }
+        crate::validate_restart_config(&self.config_path)?;
+        self.restart_requested.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn restart_requested(&self) -> bool {
+        self.restart_requested.load(Ordering::SeqCst)
+    }
+
+    pub fn validate_config_path(&self, requested: Option<&str>) -> Result<(), RuntimeError> {
+        if let Some(path) = requested
+            && fs::canonicalize(path)? != self.config_path
+        {
+            return Err(RuntimeError::RevisionStore(format!(
+                "running daemon uses {}; reload must use that startup config",
+                self.config_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn request_stop(&self) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        self.restart_requested.store(false, Ordering::SeqCst);
+        self.stop_requested.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
     }
 
     pub fn untrack(&self, pid: u32, peer_uid: u32) -> Result<(), RuntimeError> {
@@ -497,6 +724,23 @@ impl Runtime {
             scopes: pid.scopes,
             scope_capacity: pid.scope_capacity,
             domains,
+            bindings: policy
+                .policy
+                .domains
+                .iter()
+                .map(|(name, group)| DomainBinding {
+                    name: name.clone(),
+                    policies: group
+                        .split('+')
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                })
+                .collect(),
+            policy_snapshot_path: self
+                .revision_path(u64::from(policy.version))
+                .display()
+                .to_string(),
             reload_generation: policy.reload_generation,
             version: policy.version,
             active_bank: policy.active_bank,
@@ -524,8 +768,8 @@ impl Runtime {
     }
 
     /// Single-group read (ui.sock delegation): the group's editable YAML fragment, the
-    /// current policy version (optimistic-lock token) and the active domains bound to it.
-    pub fn group_policy(&self, group: &str) -> Result<(String, u32, Vec<String>), RuntimeError> {
+    /// current revision, publication source and configured/runtime domain bindings.
+    pub fn group_policy(&self, group: &str) -> Result<(String, GroupDump), RuntimeError> {
         let policy = self.read_policy()?;
         let definition = if group == "__base__" {
             policy.policy.baseline_definition.as_ref()
@@ -538,18 +782,40 @@ impl Runtime {
         })?;
         let yaml = serde_yaml::to_string(definition)
             .map_err(|error| RuntimeError::RevisionStore(error.to_string()))?;
-        let domains = self
-            .lock_state()?
+        let domains: BTreeSet<_> = policy
+            .policy
             .domains
-            .values()
-            .filter(|domain| domain.group == group)
-            .map(|domain| domain.name.clone())
+            .iter()
+            .filter(|(_, binding)| {
+                group == "__base__" || binding.split('+').any(|name| name == group)
+            })
+            .map(|(name, _)| name.clone())
+            .chain(
+                self.lock_state()?
+                    .domains
+                    .values()
+                    .filter(|domain| {
+                        group == "__base__" || domain.group.split('+').any(|name| name == group)
+                    })
+                    .map(|domain| domain.name.clone()),
+            )
             .collect();
-        Ok((yaml, policy.version, domains))
-    }
-
-    pub fn check_revision(&self, expected: u64) -> Result<(), RuntimeError> {
-        self.ensure_revision(expected)
+        Ok((
+            yaml,
+            GroupDump {
+                name: group.to_owned(),
+                version: policy.version,
+                domains: domains.into_iter().collect(),
+                definition: policy_definition(definition),
+                source: if group == "__base__" {
+                    Some(PolicySource::File {
+                        path: self.config_path.display().to_string(),
+                    })
+                } else {
+                    policy.policy.group_sources.get(group).cloned()
+                },
+            },
+        ))
     }
 
     pub fn evaluate_intents(
@@ -580,62 +846,14 @@ impl Runtime {
             .map_err(|_| RuntimeError::Poisoned)
     }
 
-    /// Update runtime switches and rewrite the kernel filter config in place. The active bank
-    /// and policy version are left untouched, so a switch change is not a policy reload.
-    #[allow(clippy::too_many_arguments)]
-    pub fn set_switches(
-        &self,
-        enable_file: Option<bool>,
-        enable_exec: Option<bool>,
-        enable_net: Option<bool>,
-        audit_file: Option<bool>,
-        audit_exec: Option<bool>,
-        audit_net: Option<bool>,
-    ) -> Result<SwitchState, RuntimeError> {
-        let _reload = self
-            .reload_lock
-            .lock()
-            .map_err(|_| RuntimeError::Poisoned)?;
-        let (bank, version) = {
-            let policy = self.read_policy()?;
-            (policy.active_bank, policy.version)
-        };
-        let mut switches = self.switches.lock().map_err(|_| RuntimeError::Poisoned)?;
-        let mut next = *switches;
-        if let Some(value) = enable_file {
-            next.enables[0] = value;
-        }
-        if let Some(value) = enable_exec {
-            next.enables[1] = value;
-        }
-        if let Some(value) = enable_net {
-            next.enables[2] = value;
-        }
-        if let Some(value) = audit_file {
-            next.audits[0] = value;
-        }
-        if let Some(value) = audit_exec {
-            next.audits[1] = value;
-        }
-        if let Some(value) = audit_net {
-            next.audits[2] = value;
-        }
-        self.kernel
-            .activate_policy(next.enables, next.audits, bank, version)?;
-        *switches = next;
-        Ok(next)
-    }
-
     pub fn rebind_scope(&self, scope: &str, group: &str) -> Result<DomainInfo, RuntimeError> {
-        let (slot, version) = self.resolve_group(group)?;
-        let mut state = self.lock_state()?;
+        self.bind_domain(scope, group, false)?;
+        let version = self.read_policy()?.version;
+        let state = self.lock_state()?;
         let runtime = state
             .domains
-            .get_mut(scope)
+            .get(scope)
             .ok_or_else(|| RuntimeError::UnknownDomain(scope.to_owned()))?;
-        self.kernel.set_scope_policy(runtime.id, slot, version)?;
-        runtime.group = group.to_owned();
-        runtime.slot = slot;
         Ok(domain_info(runtime, version))
     }
 
@@ -676,7 +894,27 @@ impl Runtime {
             });
         }
         self.ensure_revision(expected_revision)?;
-        let canonical = compile_yaml(yaml.as_bytes())?;
+        let mut canonical = compile_yaml(yaml.as_bytes())?;
+        // Full API submissions may contain provenance copied from GetPolicy.
+        // Preserve it only for unchanged definitions; edited content comes from API.
+        let current = self.read_policy()?;
+        canonical.group_sources = canonical
+            .group_definitions
+            .iter()
+            .filter_map(|(name, definition)| {
+                if current.policy.group_definitions.get(name) == Some(definition) {
+                    current
+                        .policy
+                        .group_sources
+                        .get(name)
+                        .cloned()
+                        .map(|source| (name.clone(), source))
+                } else {
+                    Some((name.clone(), PolicySource::Api))
+                }
+            })
+            .collect();
+        drop(current);
         let (next_policy, cache, status) = self.resolve_dns(canonical)?;
         let result = self.apply_policy_locked(next_policy, false)?;
         {
@@ -826,23 +1064,42 @@ impl Runtime {
             groups.push(GroupDump {
                 name: "__base__".into(),
                 version: policy.version,
-                domains: state.domains.keys().cloned().collect(),
+                domains: policy
+                    .policy
+                    .domains
+                    .keys()
+                    .chain(state.domains.keys())
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
                 definition: policy_definition(definition),
+                source: Some(PolicySource::File {
+                    path: self.config_path.display().to_string(),
+                }),
             });
         }
         for (name, definition) in &policy.policy.group_definitions {
-            let domains = policy
+            let domains: BTreeSet<_> = policy
                 .policy
                 .domains
                 .iter()
-                .filter(|(_, group)| *group == name)
+                .filter(|(_, group)| group.split('+').any(|item| item == name))
                 .map(|(domain, _)| domain.clone())
+                .chain(
+                    state
+                        .domains
+                        .values()
+                        .filter(|domain| domain.group.split('+').any(|item| item == name))
+                        .map(|domain| domain.name.clone()),
+                )
                 .collect();
             groups.push(GroupDump {
                 name: name.clone(),
                 version: policy.version,
-                domains,
+                domains: domains.into_iter().collect(),
                 definition: policy_definition(definition),
+                source: policy.policy.group_sources.get(name).cloned(),
             });
         }
         let dns = self
@@ -911,10 +1168,19 @@ impl Runtime {
         &self,
         policy_file: Option<&str>,
         policy_yaml: Option<&str>,
+        policy_source: Option<&PolicySource>,
         group: Option<&str>,
         dry_run: bool,
+        expected_revision: Option<u64>,
     ) -> Result<ReloadResult, RuntimeError> {
-        let result = self.reload_inner(policy_file, policy_yaml, group, dry_run);
+        let result = self.reload_inner(
+            policy_file,
+            policy_yaml,
+            policy_source,
+            group,
+            dry_run,
+            expected_revision,
+        );
         self.observe_reload(&result);
         result
     }
@@ -923,27 +1189,32 @@ impl Runtime {
         &self,
         policy_file: Option<&str>,
         policy_yaml: Option<&str>,
+        policy_source: Option<&PolicySource>,
         group: Option<&str>,
         dry_run: bool,
+        expected_revision: Option<u64>,
     ) -> Result<ReloadResult, RuntimeError> {
         let _reload = self
             .reload_lock
             .lock()
             .map_err(|_| RuntimeError::Poisoned)?;
-        let canonical = if let Some(group) = group.filter(|name| !name.is_empty()) {
-            let yaml = policy_yaml.ok_or(RuntimeError::MissingGroupYaml)?;
-            self.read_policy()?
-                .policy
-                .replace_group_yaml(group, yaml.as_bytes())?
-        } else if let Some(yaml) = policy_yaml.filter(|yaml| !yaml.is_empty()) {
-            compile_yaml(yaml.as_bytes())?
-        } else {
-            let path = policy_file
-                .filter(|path| !path.is_empty())
-                .map(Path::new)
-                .unwrap_or(&self.config_path);
-            load(path)?
-        };
+        if let Some(expected) = expected_revision {
+            self.ensure_revision(expected)?;
+        }
+        let group = group.filter(|name| !name.is_empty()).ok_or_else(|| {
+            RuntimeError::RevisionStore(
+                "baseline is immutable; use censorguardd reload to restart".into(),
+            )
+        })?;
+        if policy_file.is_some() {
+            return Err(RuntimeError::MissingGroupYaml);
+        }
+        let yaml = policy_yaml.ok_or(RuntimeError::MissingGroupYaml)?;
+        let canonical = self.read_policy()?.policy.replace_group_yaml_from(
+            group,
+            yaml.as_bytes(),
+            policy_source.cloned().unwrap_or(PolicySource::Api),
+        )?;
 
         let (next_policy, cache, status) = self.resolve_dns(canonical)?;
         let result = self.apply_policy_locked(next_policy, dry_run)?;
@@ -977,18 +1248,20 @@ impl Runtime {
             .lock()
             .map_err(|_| RuntimeError::Poisoned)?;
         let mut root = self.read_policy()?.policy.to_root();
-        if !group.is_empty() && !root.groups.contains_key(group) {
-            return Err(RuntimeError::MissingGroup {
-                domain: domain.to_owned(),
-                group: group.to_owned(),
-            });
+        for domain in self.lock_state()?.domains.values() {
+            if !root
+                .domains
+                .iter()
+                .any(|binding| binding.name == domain.name)
+            {
+                root.domains.push(censorguard_policy::DomainRef {
+                    name: domain.name.clone(),
+                    group: domain.group.clone(),
+                });
+            }
         }
-        if let Some(domain_ref) = root.domains.iter_mut().find(|item| item.name == domain) {
-            domain_ref.group = group.to_owned();
-        } else if root.rules.is_empty() {
-            return Err(RuntimeError::UnknownDomain(domain.to_owned()));
-        }
-        let (next_policy, cache, status) = self.resolve_dns(compile(root)?)?;
+        let canonical = compile(root)?.bind_domain(domain, group, &[])?;
+        let (next_policy, cache, status) = self.resolve_dns(canonical)?;
         let result = self.apply_policy_locked(next_policy, dry_run)?;
         if !dry_run {
             let mut dns = self.dns_state.lock().map_err(|_| RuntimeError::Poisoned)?;
@@ -1035,6 +1308,11 @@ impl Runtime {
         next_policy: CompiledPolicy,
         dry_run: bool,
     ) -> Result<ReloadResult, RuntimeError> {
+        if self.restart_requested() || self.stop_requested() {
+            return Err(RuntimeError::RevisionStore(
+                "daemon shutdown is pending".into(),
+            ));
+        }
         let (
             next_layout,
             next_bank,
@@ -1045,6 +1323,13 @@ impl Runtime {
             previous_version,
         ) = {
             let current = self.read_policy()?;
+            if current.policy.baseline_definition != next_policy.baseline_definition
+                || current.policy.daemon != next_policy.daemon
+            {
+                return Err(RuntimeError::RevisionStore(
+                    "base and daemon settings are immutable until restart".into(),
+                ));
+            }
             self.validate_reload(&current.policy, &next_policy)?;
             let layout = current.installed.evolve(&next_policy)?;
             let changed = changed_groups(&current.policy, &next_policy);
@@ -1126,6 +1411,10 @@ impl Runtime {
     }
 
     pub fn reconcile(&self) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
         let roots: Vec<_> = {
             let state = self.lock_state()?;
             state
@@ -1168,6 +1457,7 @@ impl Runtime {
                 ensure_domain(&mut state, &domain_name, &group, slot, policy_managed)
             };
             self.kernel.set_scope_policy(scope_id, slot, version)?;
+            self.seed_sockets(pid, scope_id)?;
             let _ = self.seed_descendants(pid, scope_id)?;
         }
         self.finalize_draining()?;
@@ -1210,16 +1500,14 @@ impl Runtime {
         let has_policy_roots = state
             .domains
             .values()
-            .any(|domain| domain.policy_managed && !domain.roots.is_empty());
-        if has_policy_roots && current.has_explicit_domains != next.has_explicit_domains {
+            .any(|domain| domain.policy_managed && (!domain.roots.is_empty() || domain.draining));
+        if has_policy_roots && current.has_explicit_domains && !next.has_explicit_domains {
             return Err(RuntimeError::ActiveDomainSchemaChange);
         }
         if next.has_explicit_domains {
-            for domain in state
-                .domains
-                .values()
-                .filter(|domain| domain.policy_managed && !domain.roots.is_empty())
-            {
+            for domain in state.domains.values().filter(|domain| {
+                domain.policy_managed && (!domain.roots.is_empty() || domain.draining)
+            }) {
                 if !next.domains.contains_key(&domain.name) {
                     return Err(RuntimeError::ActiveDomainRemoved(domain.name.clone()));
                 }
@@ -1228,9 +1516,12 @@ impl Runtime {
         for scope in state
             .domains
             .values()
-            .filter(|scope| !scope.policy_managed && !scope.roots.is_empty())
+            .filter(|scope| !scope.policy_managed && (!scope.roots.is_empty() || scope.draining))
         {
-            if !scope.group.is_empty() && !next.groups.contains_key(&scope.group) {
+            if !next.domains.contains_key(&scope.name)
+                && !scope.group.is_empty()
+                && !next.groups.contains_key(&scope.group)
+            {
                 return Err(RuntimeError::ActiveGroupRemoved {
                     scope: scope.name.clone(),
                     group: scope.group.clone(),
@@ -1257,15 +1548,11 @@ impl Runtime {
         let policy = self.read_policy()?;
         let mut state = self.lock_state()?;
         for domain in state.domains.values_mut() {
-            let group = if !domain.policy_managed {
+            let explicit_group = policy.policy.domains.get(&domain.name);
+            let group = if let Some(group) = explicit_group {
+                group.clone()
+            } else if !domain.policy_managed {
                 domain.group.clone()
-            } else if policy.policy.has_explicit_domains {
-                policy
-                    .policy
-                    .domains
-                    .get(&domain.name)
-                    .cloned()
-                    .unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1274,6 +1561,7 @@ impl Runtime {
                     .set_scope_policy(domain.id, slot, policy.version)?;
                 domain.group = group;
                 domain.slot = slot;
+                domain.policy_managed |= explicit_group.is_some();
             }
         }
         Ok(())
@@ -1289,9 +1577,33 @@ impl Runtime {
             };
             self.kernel
                 .track_descendant(pid, TrackValue { scope_id }, start_time)?;
+            self.seed_sockets(pid, scope_id)?;
             seeded += 1;
         }
         Ok(seeded)
+    }
+
+    fn seed_sockets(&self, pid: u32, scope_id: u64) -> Result<(), RuntimeError> {
+        let inodes = procfs::socket_inodes(pid)?;
+        if inodes.is_empty() {
+            return Ok(());
+        }
+        let info = match procfs::process_info(pid) {
+            Ok(info) => info,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut owner = SocketOwner {
+            scope_id,
+            tgid: pid,
+            ..SocketOwner::default()
+        };
+        let count = info.comm.len().min(owner.comm.len() - 1);
+        owner.comm[..count].copy_from_slice(&info.comm.as_bytes()[..count]);
+        for inode in inodes {
+            self.kernel.track_socket(inode, owner)?;
+        }
+        Ok(())
     }
 
     fn remove_dead_root(&self, pid: u32) -> Result<(), RuntimeError> {
@@ -1314,8 +1626,8 @@ impl Runtime {
                 .policy
                 .domains
                 .get(domain)
-                .ok_or_else(|| RuntimeError::UnknownDomain(domain.to_owned()))?
-                .clone()
+                .cloned()
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -1407,9 +1719,40 @@ fn domain_info(domain: &DomainState, version: u32) -> DomainInfo {
         id: domain.id,
         slot: domain.slot,
         group: domain.group.clone(),
+        policies: domain
+            .group
+            .split('+')
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect(),
         roots: domain.roots.len(),
         version,
         draining: domain.draining,
+    }
+}
+
+/// Self-registration may create a dynamic domain, but cannot override a published binding.
+fn validate_registration_binding(
+    policy: &CompiledPolicy,
+    domain: &str,
+    group: &str,
+) -> Result<bool, RuntimeError> {
+    // Reuse the compiler's name and group validation without publishing a policy revision.
+    let root = censorguard_policy::PolicyRoot {
+        domains: vec![censorguard_policy::DomainRef {
+            name: domain.to_owned(),
+            group: group.to_owned(),
+        }],
+        ..policy.to_root()
+    };
+    compile(root)?;
+    if let Some(configured) = policy.domains.get(domain) {
+        if !group.is_empty() && !configured.split('+').any(|name| name == group) {
+            return Err(RuntimeError::DomainBindingConflict(domain.to_owned()));
+        }
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -1432,6 +1775,9 @@ fn dsh_domain_name(
         }
         name.push('-');
         name.push_str(hint);
+        if name.len() > 63 {
+            return Err(RuntimeError::InvalidInstanceHint(hint.to_owned()));
+        }
     }
     Ok(name)
 }
@@ -1465,6 +1811,23 @@ fn policy_definition(group: &GroupPolicy) -> PolicyDefinition {
 #[cfg(test)]
 mod tests {
     use super::dsh_domain_name;
+
+    #[test]
+    fn registration_respects_published_domain_binding() -> Result<(), super::RuntimeError> {
+        let policy = censorguard_policy::compile_yaml(
+            b"groups:\n  strict:\n    rules: []\ndomains:\n  - name: agent\n    group: strict\n",
+        )?;
+        assert!(super::validate_registration_binding(
+            &policy, "agent", "strict"
+        )?);
+        assert!(!super::validate_registration_binding(
+            &policy, "dynamic", "strict"
+        )?);
+        assert!(super::validate_registration_binding(&policy, "agent", "")?);
+        assert!(super::validate_registration_binding(&policy, "invalid/domain", "strict").is_err());
+        assert!(super::validate_registration_binding(&policy, "dynamic", "missing").is_err());
+        Ok(())
+    }
 
     #[test]
     fn dsh_domain_name_embeds_start_time_and_optional_hint() -> Result<(), super::RuntimeError> {

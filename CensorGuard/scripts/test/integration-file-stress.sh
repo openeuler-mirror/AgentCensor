@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-file-stress
@@ -52,29 +83,27 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/probe.log"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 90 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
-for _ in $(seq 1 200); do
-    grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log" && break
+for _ in $(seq 1 1200); do
+    grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
-grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log"
+grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log"
 
 "${runtime_dir}/file-stress-probe" "${protected_file}" "${allowed_file}" \
     "${threads}" "${iterations}" >"${runtime_dir}/probe.log" 2>&1 &
 probe_pid=$!
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^State:[[:space:]]*T' "/proc/${probe_pid}/status" 2>/dev/null && break
     /usr/bin/sleep 0.01
 done
 grep -q '^State:[[:space:]]*T' "/proc/${probe_pid}/status"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain stress-domain >"${runtime_dir}/attach.log"
 kill -CONT "${probe_pid}"
 
@@ -83,8 +112,8 @@ for _ in $(seq 1 500); do
     state=$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' \
         "/proc/${probe_pid}/status" 2>/dev/null || true)
     [[ -z ${state} || ${state} == Z ]] && break
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-        status >"${runtime_dir}/status-live.log"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+        status --json >"${runtime_dir}/status-live.log"
     responsive=$((responsive + 1))
     /usr/bin/sleep 0.02
 done
@@ -107,9 +136,9 @@ grep -q "denied_ok=${expected_denied} allowed_ok=${expected_allowed} errors=0" \
 [[ ${responsive} -gt 0 ]]
 [[ $(sha256sum "${protected_file}" | awk '{ print $1 }') == "${protected_hash}" ]]
 
-for _ in $(seq 1 200); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-        status >"${runtime_dir}/status-final.log"
+for _ in $(seq 1 1200); do
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+        status --json >"${runtime_dir}/status-final.log"
     grep -q '"tracked": 0' "${runtime_dir}/status-final.log" && break
     /usr/bin/sleep 0.01
 done

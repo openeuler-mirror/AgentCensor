@@ -128,24 +128,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "censorguard-audit"
-version = "0.4.0"
-dependencies = [
- "censorguard-common",
-]
-
-[[package]]
 name = "censorguard-common"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror",
 ]
 
 [[package]]
 name = "censorguard-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "censorguard-common",
  "censorguard-kernel",
@@ -153,20 +147,13 @@ dependencies = [
  "nix",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror",
 ]
 
 [[package]]
-name = "censorguard-exec"
-version = "0.4.0"
-dependencies = [
- "censorguard-common",
- "serde_json",
-]
-
-[[package]]
 name = "censorguard-grpc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "censorguard-common",
  "censorguard-policy",
@@ -182,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "censorguard-kernel"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "censorguard-common",
  "censorguard-policy",
@@ -191,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "censorguard-policy"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "censorguard-common",
  "serde",
@@ -202,10 +189,11 @@ dependencies = [
 
 [[package]]
 name = "censorguardctl"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "censorguard-common",
  "rustix",
+ "serde",
  "serde_json",
 ]
 

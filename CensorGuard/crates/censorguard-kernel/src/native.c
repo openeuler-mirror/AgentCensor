@@ -32,8 +32,10 @@ struct as_event_reader {
     int drop_map_fd;
     struct {
         size_t size;
-        unsigned char data[512];
     } samples[256];
+    unsigned char *sample_data;
+    size_t sample_capacity;
+    size_t abi_mismatch_size;
     size_t head;
     size_t count;
     unsigned long dropped;
@@ -42,13 +44,17 @@ struct as_event_reader {
 static int copy_event(void *context, void *data, size_t size)
 {
     struct as_event_reader *reader = context;
-    if (size > sizeof(reader->samples[0].data) || reader->count == 256) {
+    if (size != reader->sample_capacity) {
+        reader->abi_mismatch_size = size;
+        return -EMSGSIZE;
+    }
+    if (reader->count == 256) {
         reader->dropped++;
         return 0;
     }
     size_t tail = (reader->head + reader->count) % 256;
     reader->samples[tail].size = size;
-    memcpy(reader->samples[tail].data, data, size);
+    memcpy(reader->sample_data + tail * reader->sample_capacity, data, size);
     reader->count++;
     return 0;
 }
@@ -86,6 +92,8 @@ static void cleanup(struct as_kernel *kernel)
 struct as_kernel *as_kernel_load(const char *path,
                                  const char *const *programs,
                                  size_t count,
+                                 const char *const *stage_programs,
+                                 size_t stage_count,
                                  char *error,
                                  size_t error_size)
 {
@@ -125,8 +133,12 @@ struct as_kernel *as_kernel_load(const char *path,
 
     struct bpf_program *program = NULL;
     bpf_object__for_each_program(program, kernel->object) {
-        int result = bpf_program__set_autoload(
-            program, required(bpf_program__name(program), programs, count));
+        const char *name = bpf_program__name(program);
+        /* manifest 程序: 加载 + attach; 尾调用阶段程序: 只加载不 attach
+         * (经 file_stage_calls 进入, attach 它们没有对应钩子可挂) */
+        bool load = required(name, programs, count) ||
+                    required(name, stage_programs, stage_count);
+        int result = bpf_program__set_autoload(program, load);
         if (result != 0) {
             set_error(error, error_size, "set autoload for %s: %s",
                       bpf_program__name(program), strerror(-result));
@@ -149,6 +161,38 @@ struct as_kernel *as_kernel_load(const char *path,
         set_error(error, error_size, "load BPF object: %s", strerror(-result));
         cleanup(kernel);
         return NULL;
+    }
+
+    /* 尾调用阶段表: 阶段程序已加载 (autoload) 但不 attach, 这里把它们的
+     * fd 灌入 file_stage_calls, 钩子内 bpf_tail_call 才能进入。
+     * 阶段程序未加载 (enable_file=false 时 autoload=false, fd<0) 则跳过
+     * —— 此时源侧钩子同样不在 attach 名单, 语义一致。
+     * 灌入失败 = READY 门禁失守, 拒绝启动。 */
+    static const struct {
+        const char *program;
+        unsigned int index;   /* 与 enforce.bpf.c 的 FILE_STAGE_* 对齐 */
+    } file_stages[] = {
+        { "enforce_path_rename_dst", 0 },   /* FILE_STAGE_RENAME_DST */
+    };
+    struct bpf_map *stages =
+        bpf_object__find_map_by_name(kernel->object, "file_stage_calls");
+    if (stages != NULL) {
+        for (size_t index = 0; index < sizeof(file_stages) / sizeof(file_stages[0]); index++) {
+            struct bpf_program *stage =
+                bpf_object__find_program_by_name(kernel->object, file_stages[index].program);
+            if (stage == NULL)
+                continue;
+            int program_fd = bpf_program__fd(stage);
+            if (program_fd < 0)
+                continue;
+            if (bpf_map_update_elem(bpf_map__fd(stages), &file_stages[index].index,
+                                    &program_fd, BPF_ANY) != 0) {
+                set_error(error, error_size, "install tail-call stage %s: %s",
+                          file_stages[index].program, strerror(errno));
+                cleanup(kernel);
+                return NULL;
+            }
+        }
     }
 
     kernel->links = calloc(count, sizeof(*kernel->links));
@@ -500,6 +544,7 @@ long as_kernel_list_scope(const struct as_kernel *kernel,
 }
 
 struct as_event_reader *as_event_reader_new(const struct as_kernel *kernel,
+                                             size_t sample_capacity,
                                              char *error,
                                              size_t error_size)
 {
@@ -513,16 +558,28 @@ struct as_event_reader *as_event_reader_new(const struct as_kernel *kernel,
         set_error(error, error_size, "event_drops map does not exist");
         return NULL;
     }
+    if (sample_capacity == 0) {
+        set_error(error, error_size, "event size must be nonzero");
+        return NULL;
+    }
     struct as_event_reader *reader = calloc(1, sizeof(*reader));
     if (reader == NULL) {
         set_error(error, error_size, "allocate event reader: %s", strerror(errno));
         return NULL;
     }
+    reader->sample_data = calloc(256, sample_capacity);
+    if (reader->sample_data == NULL) {
+        set_error(error, error_size, "allocate event samples: %s", strerror(errno));
+        free(reader);
+        return NULL;
+    }
+    reader->sample_capacity = sample_capacity;
     reader->ring = ring_buffer__new(map_fd, copy_event, reader, NULL);
     long ring_error = libbpf_get_error(reader->ring);
     if (ring_error != 0) {
         set_error(error, error_size, "open events ring buffer: %s",
                   strerror((int)-ring_error));
+        free(reader->sample_data);
         free(reader);
         return NULL;
     }
@@ -535,6 +592,7 @@ void as_event_reader_free(struct as_event_reader *reader)
     if (reader == NULL)
         return;
     ring_buffer__free(reader->ring);
+    free(reader->sample_data);
     free(reader);
 }
 
@@ -550,7 +608,11 @@ int as_event_reader_next(struct as_event_reader *reader,
     if (reader->count == 0) {
         int result = ring_buffer__poll(reader->ring, timeout_ms);
         if (result < 0) {
-            set_error(error, error_size, "poll events ring buffer: %s", strerror(-result));
+            if (reader->abi_mismatch_size != 0)
+                set_error(error, error_size, "event ABI mismatch: kernel %zu / Rust %zu",
+                          reader->abi_mismatch_size, reader->sample_capacity);
+            else
+                set_error(error, error_size, "poll events ring buffer: %s", strerror(-result));
             return result;
         }
     }
@@ -562,7 +624,7 @@ int as_event_reader_next(struct as_event_reader *reader,
                   sample_size, output_size);
         return -EMSGSIZE;
     }
-    memcpy(output, reader->samples[reader->head].data, sample_size);
+    memcpy(output, reader->sample_data + reader->head * reader->sample_capacity, sample_size);
     reader->head = (reader->head + 1) % 256;
     reader->count--;
     return 1;

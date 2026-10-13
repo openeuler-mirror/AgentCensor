@@ -1,4 +1,4 @@
-//! Versioned JSON-lines protocol shared by daemon, ctl and audit.
+//! Versioned JSON-lines protocol shared by daemon and control clients.
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Write};
@@ -6,11 +6,6 @@ use thiserror::Error;
 
 pub const VERSION: u16 = 3;
 pub const MIN_VERSION: u16 = 1;
-pub const DEFAULT_CONTROL_SOCKET: &str = "/run/censorguard/ctl.sock";
-pub const DEFAULT_EVENT_SOCKET: &str = "/run/censorguard/events.sock";
-pub const DEFAULT_LAUNCH_SOCKET: &str = "/run/censorguard/launch.sock";
-pub const DEFAULT_DSH_SOCKET: &str = "/run/censorguard/dsh.sock";
-pub const DEFAULT_UI_SOCKET: &str = "/run/censorguard/ui.sock";
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -24,6 +19,10 @@ pub enum Operation {
     PolicyDump,
     Tree,
     SetSwitches,
+    Unattach,
+    Remove,
+    DaemonReload,
+    DaemonStop,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -197,7 +196,15 @@ pub struct RpcResponse {
 impl Operation {
     #[must_use]
     pub const fn requires_root(&self) -> bool {
-        matches!(self, Self::Reload | Self::Bind | Self::SetSwitches)
+        matches!(
+            self,
+            Self::Reload
+                | Self::Bind
+                | Self::SetSwitches
+                | Self::Remove
+                | Self::DaemonReload
+                | Self::DaemonStop
+        )
     }
 }
 
@@ -216,6 +223,9 @@ pub struct Request {
     pub policy_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_yaml: Option<String>,
+    /// Informational provenance; the daemon applies policy_yaml, never reads this path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_source: Option<PolicySource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     #[serde(default)]
@@ -244,15 +254,34 @@ pub struct DomainInfo {
     pub id: u64,
     pub slot: u32,
     pub group: String,
+    #[serde(default)]
+    pub policies: Vec<String>,
     pub roots: usize,
     pub version: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub draining: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PolicySource {
+    File { path: String },
+    Stdin,
+    Api,
+}
+
+/// Published bindings, including domains with no running processes.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DomainBinding {
+    pub name: String,
+    pub policies: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Response {
     pub ok: bool,
+    #[serde(default)]
+    pub daemon_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,6 +316,8 @@ pub struct Response {
     pub scope_capacity: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<DomainInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<DomainBinding>,
     #[serde(default)]
     pub reload_gen: u64,
     #[serde(default)]
@@ -327,6 +358,12 @@ pub struct Response {
     pub dns: Vec<DnsDomainInfo>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub daemon_boot_id: String,
+    /// Canonical startup configuration path reported by the running daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    /// Persistent snapshot used to restore published groups and bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_snapshot_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hooks_healthy: Option<bool>,
 }
@@ -355,6 +392,9 @@ pub struct GroupDump {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
     pub definition: PolicyDefinition,
+    /// Missing for snapshots created before source tracking was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<PolicySource>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -482,6 +522,7 @@ mod tests {
             seed: true,
             policy_file: None,
             policy_yaml: None,
+            policy_source: None,
             group: None,
             dry_run: false,
             enable_file: None,
@@ -502,6 +543,8 @@ mod tests {
     fn privileged_operations_are_explicit() {
         assert!(Operation::Reload.requires_root());
         assert!(Operation::Bind.requires_root());
+        assert!(Operation::DaemonStop.requires_root());
+        assert!(Operation::DaemonReload.requires_root());
         assert!(!Operation::Track.requires_root());
     }
 

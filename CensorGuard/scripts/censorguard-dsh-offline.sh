@@ -25,11 +25,19 @@ GRPC_PORT=50099
 GRPC_ADDR=127.0.0.1:$GRPC_PORT
 TDIR=$(mktemp -d /tmp/censorguard_offline.XXXXXX)
 GRPC_LOG=$TDIR/grpc.log
+CONFIG=$TDIR/base.yaml
 cleanup() {
     [ -n "${GRPC_PID:-}" ] && kill "$GRPC_PID" 2>/dev/null
     rm -rf "$TDIR"
 }
 trap cleanup EXIT
+
+cat >"$CONFIG" <<EOF
+daemon:
+  ui_socket: $TDIR/nonexistent-ui.sock
+  event_socket: $TDIR/nonexistent-events.sock
+  grpc_listen: $GRPC_ADDR
+EOF
 
 echo "=== O1: 插件 workspace 构建 + 单测 ==="
 if ( cd plugins/dsh-censorguard && pnpm build >/dev/null 2>&1 && pnpm test >/dev/null 2>&1 ); then
@@ -51,8 +59,7 @@ if [ ! -x "$GRPC_BIN" ]; then
     cargo build -p censorguard-grpc >/dev/null 2>&1 || { fail "censorguard-grpc 构建失败"; }
 fi
 if [ -x "$GRPC_BIN" ]; then
-    "$GRPC_BIN" --sock "$TDIR/nonexistent-ui.sock" --ev-sock "$TDIR/nonexistent-events.sock" \
-        --listen "$GRPC_ADDR" >"$GRPC_LOG" 2>&1 &
+    "$GRPC_BIN" --config "$CONFIG" >"$GRPC_LOG" 2>&1 &
     GRPC_PID=$!
     for _ in $(seq 1 30); do
         grep -q 'READY' "$GRPC_LOG" 2>/dev/null && break
@@ -106,13 +113,13 @@ O5_OK=1
 for line in censorguard-bootstrap censorguard-host censorguard-ui; do
     grep -q "$line" "$PATCH" || { fail "patch 缺插件行 $line"; O5_OK=0; }
 done
-for target in webserver web-runtime api-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+for target in webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
     grep -A1 "^- id: $target\$" "$PATCH" | grep -q 'censorguardReady' \
         || { fail "patch 缺 inject 闸门 $target"; O5_OK=0; }
 done
 # dump-config.mjs 的 REQUIRED 列表与 patch 文件一致 (防两处漂移)
 for line in censorguard-bootstrap censorguard-host censorguard-ui \
-            webserver web-runtime api-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+            webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
     grep -q "'$line'" "$DUMP" || { fail "dump-config.mjs REQUIRED 缺 $line"; O5_OK=0; }
 done
 # 官方 subprocess 不得被 disable (整树包裹模式保留官方 entry); 匹配 yaml 键,

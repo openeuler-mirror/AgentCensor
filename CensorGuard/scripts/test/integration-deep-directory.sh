@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-deep-directory
@@ -50,25 +81,23 @@ domains:
 YAML
 : >"${runtime_dir}/daemon.log"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 30 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
-    grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log" && break
+for _ in $(seq 1 1200); do
+    grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
-grep -q '^\[READY\] 29 required hooks attached' "${runtime_dir}/daemon.log"
+grep -q '^\[READY\] 36 required hooks attached' "${runtime_dir}/daemon.log"
 
 run_denied() {
     local name=$1
     shift
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain deep-domain -- "$@" >"${runtime_dir}/${name}.log" 2>&1
     local result=$?
     set -e
@@ -83,7 +112,7 @@ run_denied() {
 run_allowed() {
     local name=$1
     shift
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain deep-domain -- "$@" >"${runtime_dir}/${name}.log" 2>&1
 }
 

@@ -10,19 +10,22 @@
 // tonic mandates `Result<_, Status>` handler signatures; Status is large by design.
 #![allow(clippy::result_large_err)]
 
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_common::protocol::{
-    DEFAULT_EVENT_SOCKET, DEFAULT_UI_SOCKET, Event, ProtocolError, RpcError, RpcErrorCode,
-    RpcMethod, RpcParams, RpcRequest, RpcResponse, VERSION, read_json_line, write_json_line,
+    Event, ProtocolError, RpcError, RpcErrorCode, RpcMethod, RpcParams, RpcRequest, RpcResponse,
+    VERSION, read_json_line, write_json_line,
 };
 use std::collections::HashSet;
 use std::io::BufReader;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Code, Request, Response, Status, transport::Server};
 
 #[allow(clippy::all)]
@@ -103,7 +106,61 @@ struct Adapter {
     ev_sock: PathBuf,
 }
 
+struct EventSubscription {
+    receiver: ReceiverStream<Result<pb::Event, Status>>,
+    connection: UnixStream,
+}
+
+/// Display filter only: enforcement and the daemon event stream are unchanged.
+/// Preserve explicit rule audit and all denials, including the observer itself.
+fn observer_packet(event: &Event, observer_tgid: u32) -> bool {
+    observer_tgid != 0
+        && event.tgid == observer_tgid
+        && event.kind == 3
+        && matches!(event.op, 2 | 4)
+        && event.allowed
+        && event.rule_version == 0
+}
+
+impl tokio_stream::Stream for EventSubscription {
+    type Item = Result<pb::Event, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(context)
+    }
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        // Wake a blocked reader even when the daemon has no events to publish.
+        let _ = self.connection.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 impl Adapter {
+    async fn affected_domains(&self, group: &str) -> Result<Vec<String>, Status> {
+        match self
+            .call(
+                RpcMethod::GetPolicy,
+                RpcParams {
+                    group: Some(group.to_owned()),
+                    ..RpcParams::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => Ok(result
+                .response
+                .into_iter()
+                .flat_map(|response| response.groups)
+                .filter(|info| info.name == group)
+                .flat_map(|info| info.domains)
+                .collect()),
+            Err(error) if error.code() == Code::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn call(
         &self,
         method: RpcMethod,
@@ -126,6 +183,7 @@ fn pb_domain(info: &censorguard_common::protocol::DomainInfo) -> pb::DomainInfo 
         roots: i32::try_from(info.roots).unwrap_or(i32::MAX),
         version: info.version,
         draining: info.draining,
+        policies: info.policies.clone(),
     }
 }
 
@@ -166,6 +224,9 @@ fn pb_status(result: &censorguard_common::protocol::RpcResult) -> Result<pb::Sta
             ("enable_file".to_owned(), response.enable_file),
             ("enable_exec".to_owned(), response.enable_exec),
             ("enable_net".to_owned(), response.enable_net),
+            ("audit_file".to_owned(), response.audit_file),
+            ("audit_exec".to_owned(), response.audit_exec),
+            ("audit_net".to_owned(), response.audit_net),
         ]),
         daemon_boot_id: response.daemon_boot_id,
         hooks_healthy: response.hooks_healthy.unwrap_or(false),
@@ -268,30 +329,10 @@ impl pb::censorguard_server::Censorguard for Adapter {
         &self,
         request: Request<pb::SetSwitchesReq>,
     ) -> Result<Response<pb::SetSwitchesReply>, Status> {
-        let req = request.into_inner();
-        let result = self
-            .call(
-                RpcMethod::SetSwitches,
-                RpcParams {
-                    enable_file: req.enable_file,
-                    enable_exec: req.enable_exec,
-                    enable_net: req.enable_net,
-                    audit_file: req.audit_file,
-                    audit_exec: req.audit_exec,
-                    audit_net: req.audit_net,
-                    ..RpcParams::default()
-                },
-            )
-            .await?;
-        let response = result.response.unwrap_or_default();
-        Ok(Response::new(pb::SetSwitchesReply {
-            enable_file: response.enable_file,
-            enable_exec: response.enable_exec,
-            enable_net: response.enable_net,
-            audit_file: response.audit_file,
-            audit_exec: response.audit_exec,
-            audit_net: response.audit_net,
-        }))
+        let _ = request;
+        Err(Status::permission_denied(
+            "switches are configured in base.yaml daemon; restart daemon to apply",
+        ))
     }
 
     async fn get_policy(
@@ -361,7 +402,7 @@ impl pb::censorguard_server::Censorguard for Adapter {
             Ok(_) => Ok(Response::new(pb::ValidatePolicyReply {
                 ok: true,
                 errors: Vec::new(),
-                affected: Vec::new(),
+                affected: self.affected_domains(&req.name).await?,
             })),
             Err(status) if status.code() == Code::InvalidArgument => {
                 Ok(Response::new(pb::ValidatePolicyReply {
@@ -386,30 +427,34 @@ impl pb::censorguard_server::Censorguard for Adapter {
             ));
         }
         if req.dry_run {
-            let reply = self
-                .validate_policy(Request::new(pb::ValidatePolicyReq {
-                    name: req.name.clone(),
-                    policy_yaml: req.policy_yaml,
-                    context: None,
-                }))
-                .await?
-                .into_inner();
-            if !reply.ok {
-                return Err(Status::invalid_argument(reply.errors.join("\n")));
-            }
+            let result = self
+                .call(
+                    RpcMethod::ValidatePolicy,
+                    RpcParams {
+                        group: Some(req.name.clone()),
+                        policy_yaml: Some(req.policy_yaml),
+                        expected_revision: req.expected_revision,
+                        ..RpcParams::default()
+                    },
+                )
+                .await?;
+            let response = result.response.unwrap_or_default();
+            let affected = self.affected_domains(&req.name).await?;
             return Ok(Response::new(pb::ApplyPolicyReply {
-                reload_gen: 0,
+                reload_gen: response.reload_gen,
                 name: req.name,
-                version: 0,
-                affected: Vec::new(),
+                version: response.version,
+                affected,
             }));
         }
+        let affected = self.affected_domains(&req.name).await?;
         let result = self
             .call(
                 RpcMethod::ApplyPolicy,
                 RpcParams {
                     group: Some(req.name.clone()),
                     policy_yaml: Some(req.policy_yaml),
+                    expected_revision: req.expected_revision,
                     ..RpcParams::default()
                 },
             )
@@ -419,7 +464,7 @@ impl pb::censorguard_server::Censorguard for Adapter {
             reload_gen: response.reload_gen,
             name: req.name,
             version: response.version,
-            affected: Vec::new(),
+            affected,
         }))
     }
 
@@ -434,26 +479,28 @@ impl pb::censorguard_server::Censorguard for Adapter {
         let domain_ids: HashSet<u64> = req.domain_ids.into_iter().collect();
         let kinds: HashSet<u32> = req.kinds.into_iter().collect();
         let allowed = req.allowed;
+        let observer_tgid = req.observer_tgid;
         let ev_sock = self.ev_sock.clone();
+        let stream = UnixStream::connect(&ev_sock).map_err(|error| {
+            Status::unavailable(format!("event socket is unreachable: {error}"))
+        })?;
+        let connection = stream
+            .try_clone()
+            .map_err(|error| Status::internal(format!("cannot clone event socket: {error}")))?;
         // Each stream owns an independent events.sock subscription; the daemon-side
         // per-subscriber dropped_before counter therefore reflects this consumer.
         let (sender, receiver) = mpsc::channel::<Result<pb::Event, Status>>(256);
         std::thread::Builder::new()
             .name("censorguard-grpc-events".into())
             .spawn(move || {
-                let stream = match UnixStream::connect(&ev_sock) {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        let _ = sender.blocking_send(Err(Status::unavailable(format!(
-                            "event socket is unreachable: {error}"
-                        ))));
-                        return;
-                    }
-                };
                 let mut reader = BufReader::new(&stream);
+                let mut pending_dropped: u64 = 0;
                 loop {
                     match read_json_line::<Event>(&mut reader) {
-                        Ok(event) => {
+                        Ok(mut event) => {
+                            // A loss report can arrive on a filtered frame; carry
+                            // it to the next delivered event rather than erase it.
+                            pending_dropped = pending_dropped.saturating_add(event.dropped_before);
                             if !domain_ids.is_empty() && !domain_ids.contains(&event.domain_id) {
                                 continue;
                             }
@@ -463,6 +510,11 @@ impl pb::censorguard_server::Censorguard for Adapter {
                             if allowed.is_some_and(|allowed| allowed != event.allowed) {
                                 continue;
                             }
+                            if observer_packet(&event, observer_tgid) {
+                                continue;
+                            }
+                            event.dropped_before = pending_dropped;
+                            pending_dropped = 0;
                             if sender.blocking_send(Ok(pb_event(&event))).is_err() {
                                 return; // client disconnected
                             }
@@ -479,7 +531,10 @@ impl pb::censorguard_server::Censorguard for Adapter {
                 }
             })
             .map_err(|error| Status::internal(format!("cannot spawn event pump: {error}")))?;
-        Ok(Response::new(Box::pin(ReceiverStream::new(receiver))))
+        Ok(Response::new(Box::pin(EventSubscription {
+            receiver: ReceiverStream::new(receiver),
+            connection,
+        })))
     }
 }
 
@@ -490,22 +545,27 @@ fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<Str
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut sock = PathBuf::from(DEFAULT_UI_SOCKET);
-    let mut ev_sock = PathBuf::from(DEFAULT_EVENT_SOCKET);
-    let mut listen = String::from("127.0.0.1:50051");
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("censorguard-grpc {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    let mut explicit_config = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--sock" => sock = PathBuf::from(next_value(&mut args, "--sock")?),
-            "--ev-sock" => ev_sock = PathBuf::from(next_value(&mut args, "--ev-sock")?),
-            "--listen" => listen = next_value(&mut args, "--listen")?,
+            "--config" => {
+                if explicit_config {
+                    return Err(Status::invalid_argument("duplicate --config option").into());
+                }
+                explicit_config = true;
+                config_path = PathBuf::from(next_value(&mut args, "--config")?);
+            }
             "-h" | "--help" => {
-                println!(
-                    "usage: censorguard-grpc [--sock PATH] [--ev-sock PATH] [--listen ADDR]\n\
-                     defaults: --sock {DEFAULT_UI_SOCKET} --ev-sock {DEFAULT_EVENT_SOCKET} \\\n\
-                     --listen 127.0.0.1:50051 (loopback only; add mTLS at the deployment layer \
-                     for cross-machine access)"
-                );
+                println!("usage: censorguard-grpc [--config PATH]");
                 return Ok(());
             }
             _ => {
@@ -515,11 +575,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let daemon = if explicit_config || config_path.exists() {
+        config::load(&config_path)?
+    } else {
+        config::DaemonConfig::default()
+    };
+    let sock = daemon.ui_socket;
+    let ev_sock = daemon.event_socket;
+    let listen = daemon
+        .grpc_listen
+        .unwrap_or_else(|| "127.0.0.1:50051".to_owned());
     let addr: std::net::SocketAddr = listen.parse()?;
     let adapter = Adapter {
         client: Arc::new(DaemonClient::new(sock.clone())),
         ev_sock: ev_sock.clone(),
     };
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot listen on {addr}: {error}; check for an existing gRPC adapter"),
+        )
+    })?;
     println!(
         "[READY] censorguard-grpc listening on {addr} (ui={}, events={})",
         sock.display(),
@@ -527,7 +603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Server::builder()
         .add_service(pb::censorguard_server::CensorguardServer::new(adapter))
-        .serve(addr)
+        .serve_with_incoming(TcpListenerStream::new(listener))
         .await?;
     Ok(())
 }
@@ -535,3 +611,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 // Silence unused-import lint when the path is only used in doc comments.
 #[allow(dead_code)]
 fn doc_path_anchor(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observer_filter_preserves_denials_rules_children_and_connections() {
+        let mut event = Event {
+            ts: String::new(),
+            kind: 3,
+            op: 4,
+            pid: 102,
+            tgid: 100,
+            allowed: true,
+            policy_version: 1,
+            rule_version: 0,
+            comm: "node".into(),
+            detail: "127.000.000.001:50051".into(),
+            args: vec![],
+            domain_id: 1,
+            domain: "test".into(),
+            sequence: 1,
+            daemon_boot_id: "boot".into(),
+            dropped_before: 0,
+        };
+        assert!(observer_packet(&event, 100));
+        assert!(!observer_packet(&event, 0));
+        assert!(!observer_packet(&event, 101)); // descendant remains visible
+        event.allowed = false;
+        assert!(!observer_packet(&event, 100));
+        event.allowed = true;
+        event.rule_version = 1;
+        assert!(!observer_packet(&event, 100)); // explicit rule audit remains visible
+        event.rule_version = 0;
+        event.op = 0;
+        assert!(!observer_packet(&event, 100)); // connect remains visible
+        event.kind = 1;
+        event.op = 2;
+        assert!(!observer_packet(&event, 100)); // native read/write remains visible
+    }
+}

@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
 const MAX_DESCENDANTS: usize = 4095;
 
@@ -54,6 +55,42 @@ pub fn owner_uid(pid: u32) -> Result<u32, io::Error> {
         .ok_or_else(|| invalid_data(format!("malformed {path}: missing real uid")))?
         .parse()
         .map_err(|_| invalid_data(format!("malformed {path}: invalid real uid")))
+}
+
+/// Include pre-existing and inherited sockets when a process is attached.
+pub fn socket_inodes(pid: u32) -> Result<Vec<u64>, io::Error> {
+    let entries = match fs::read_dir(format!("/proc/{pid}/fd")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return Err(socket_access_error(pid, error));
+        }
+        Err(error) => return Err(error),
+    };
+    let mut inodes = BTreeSet::new();
+    for entry in entries {
+        match fs::metadata(entry?.path()) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                inodes.insert(metadata.ino());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(socket_access_error(pid, error));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(inodes.into_iter().collect())
+}
+
+fn socket_access_error(pid: u32, error: io::Error) -> io::Error {
+    io::Error::new(
+        error.kind(),
+        format!(
+            "cannot inspect /proc/{pid}/fd; cross-UID socket registration requires CAP_SYS_PTRACE"
+        ),
+    )
 }
 
 pub fn process_info(pid: u32) -> Result<ProcessInfo, io::Error> {

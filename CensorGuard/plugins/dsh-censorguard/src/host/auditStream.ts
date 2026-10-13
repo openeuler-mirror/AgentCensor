@@ -1,12 +1,12 @@
 // AuditStream: Host 长期持有 gRPC SubscribeEvents 流, 为当前 DSH Domain 建
-// 有界事件缓存, 断线自动重连, sequence gap 可见。
+// 有界事件缓存, 断线自动重连, 明确报告断线和 daemon 丢失。
 //
 // 数据链路: eBPF ringbuf → daemon events.sock → censorguard-grpc
 //           → 本类 (有界缓存) → Client 长轮询 audit.snapshot/audit.wait
 //
 // 缺口语义: 不制造"日志完整"错觉。
 //   - daemon 侧丢失: Event.dropped_before > 0
-//   - 传输断线丢失: 重连后 sequence 跳变
+//   - 传输断线: 丢失数量未知 (过滤流的全局 sequence 跳变不能推断丢失)
 //   - daemon 重启: daemon_boot_id 变化
 // 以上都会在缓存里留下 gap 标记条目, UI 原样展示。全链路无持久化 (实时观察窗)。
 
@@ -29,7 +29,7 @@ export type AuditEntry =
   | {
       type: 'gap';
       count: number; // 已知丢失条数 (未知 = 0, 如断线标记)
-      reason: 'dropped' | 'sequence_jump' | 'daemon_restart' | 'stream_reconnect';
+      reason: 'dropped' | 'daemon_restart' | 'stream_reconnect';
       atSequence: number; // 缺口出现位置 (其后第一条事件的 sequence)
       message: string;
     };
@@ -42,7 +42,7 @@ export interface AuditStreamStatus {
   state: AuditStreamState;
   daemonBootId: string;
   lastSequence: number;
-  droppedCount: number; // 已知丢失事件总数 (dropped_before + sequence 跳变)
+  droppedCount: number; // daemon 显式报告的本订阅丢失数；过滤跳号不计入
   evictedCount: number; // 缓存淘汰数量
   cachedCount: number; // 当前缓存条数 (含 gap 标记)
   lastError: string; // 最近一次流错误, 空 = 无
@@ -67,7 +67,7 @@ export interface AuditStreamOptions {
 // SnapshotResult snapshot/wait 的返回
 export interface SnapshotResult {
   entries: AuditEntry[];
-  lastSequence: number; // 当前已见最大 sequence (下次轮询的 afterSequence)
+  lastSequence: number; // Host 已见最大 sequence；分页游标用已返回条目
   status: AuditStreamStatus;
 }
 
@@ -78,10 +78,13 @@ export const MAX_WAIT_MS = 25_000;
 
 interface Waiter {
   afterSequence: number;
+  afterBootId: string;
   filter?: AuditFilter;
   limit: number;
   resolve: (r: SnapshotResult) => void;
   timer: ReturnType<typeof setTimeout>;
+  signal?: AbortSignal;
+  onAbort: () => void;
 }
 
 export class AuditStream {
@@ -98,6 +101,8 @@ export class AuditStream {
   private reconnectDelay: number;
   private disposed = false;
   private waiters: Waiter[] = [];
+  private subscriptionGeneration = 0;
+  private reconnectMessage = '';
 
   private readonly maxEntries: number;
   private readonly maxBytes: number;
@@ -119,7 +124,9 @@ export class AuditStream {
 
   /** setDomainIds bootstrap attach 后回填当前 DSH Domain, 触发重订阅 */
   setDomainIds(domainIds: number[]): void {
+    if (JSON.stringify(this.request.domainIds) === JSON.stringify(domainIds)) return;
     this.request = { ...this.request, domainIds };
+    this.subscriptionGeneration++;
     if (this.state === 'live' || this.state === 'reconnecting') {
       this.cancelStream();
       void this.subscribe();
@@ -145,9 +152,9 @@ export class AuditStream {
   }
 
   /** snapshot 一次性拉取 afterSequence 之后的条目 */
-  snapshot(afterSequence: number, limit: number, filter?: AuditFilter): SnapshotResult {
+  snapshot(afterSequence: number, limit: number, filter?: AuditFilter, afterBootId = this.lastBootId): SnapshotResult {
     return {
-      entries: this.collect(afterSequence, limit, filter),
+      entries: this.collect(afterSequence, limit, filter, afterBootId),
       lastSequence: this.lastSequence,
       status: this.status(),
     };
@@ -160,9 +167,11 @@ export class AuditStream {
     limit: number,
     timeoutMs: number,
     filter?: AuditFilter,
+    signal?: AbortSignal,
+    afterBootId = this.lastBootId,
   ): Promise<SnapshotResult> {
-    const immediate = this.collect(afterSequence, limit, filter);
-    if (immediate.length > 0 || this.disposed) {
+    const immediate = this.collect(afterSequence, limit, filter, afterBootId);
+    if (immediate.length > 0 || this.disposed || signal?.aborted) {
       return Promise.resolve({
         entries: immediate,
         lastSequence: this.lastSequence,
@@ -173,15 +182,25 @@ export class AuditStream {
     return new Promise<SnapshotResult>((resolve) => {
       const waiter: Waiter = {
         afterSequence,
+        afterBootId,
         filter,
         limit,
         resolve,
         timer: setTimeout(() => {
           this.waiters = this.waiters.filter((w) => w !== waiter);
-          resolve(this.snapshot(afterSequence, limit, filter));
+          signal?.removeEventListener('abort', waiter.onAbort);
+          resolve(this.snapshot(afterSequence, limit, filter, afterBootId));
         }, capped),
+        signal,
+        onAbort: () => {
+          clearTimeout(waiter.timer);
+          this.waiters = this.waiters.filter((w) => w !== waiter);
+          signal?.removeEventListener('abort', waiter.onAbort);
+          resolve(this.snapshot(afterSequence, limit, filter, afterBootId));
+        },
       };
       this.waiters.push(waiter);
+      signal?.addEventListener('abort', waiter.onAbort, { once: true });
     });
   }
 
@@ -199,6 +218,7 @@ export class AuditStream {
     this.waiters = [];
     for (const w of pending) {
       clearTimeout(w.timer);
+      w.signal?.removeEventListener('abort', w.onAbort);
       w.resolve({ entries: [], lastSequence: this.lastSequence, status: this.status() });
     }
   }
@@ -208,20 +228,23 @@ export class AuditStream {
   private async subscribe(): Promise<void> {
     // 已有活跃流则不再订阅: 防止并发 subscribe 造成流增殖
     if (this.disposed || this.stream) return;
+    const generation = this.subscriptionGeneration;
     let stream: EventStream;
     try {
       stream = await this.source.subscribeEvents(this.request);
     } catch (e) {
-      this.onStreamFailure(e);
+      if (generation === this.subscriptionGeneration) this.onStreamFailure(e);
+      else if (!this.disposed && !this.stream) void this.subscribe();
       return;
     }
     // await 期间可能有并发订阅胜出 (如 setDomainIds), 丢弃本次结果
-    if (this.disposed || this.stream) {
+    if (this.disposed || this.stream || generation !== this.subscriptionGeneration) {
       try {
         stream.cancel();
       } catch {
         /* 已取消 */
       }
+      if (!this.disposed && !this.stream) void this.subscribe();
       return;
     }
     this.stream = stream;
@@ -255,15 +278,9 @@ export class AuditStream {
     this.cancelStream();
     this.state = 'reconnecting';
     this.lastError = e instanceof Error ? e.message : String(e);
-    // 断线标记: 让 UI 列表能看到断流位置 (丢失数待重连后由 sequence 跳变补记)
-    this.push({
-      type: 'gap',
-      count: 0,
-      reason: 'stream_reconnect',
-      atSequence: this.lastSequence + 1,
-      message: `事件流断线, 重连中: ${this.lastError}`,
-    });
-    this.notifyWaiters();
+    // 标记跟随下一条真实事件，不能凭空推进游标、跳过重连后的首条事件。
+    this.reconnectMessage = `事件流曾断线，期间事件数量未知: ${this.lastError}`;
+    this.notifyWaiters(true);
     // 关键: 先清旧定时器再排新的, 任何时刻至多一个重连调度。
     // 不清的话同一次断线的 error+end 双回调会各排一个定时器,
     // 适配器不可达期间每个定时器触发的失败再各排一个, 指数增殖直到 OOM。
@@ -279,12 +296,13 @@ export class AuditStream {
 
   private cancelStream(): void {
     if (this.stream) {
+      const stream = this.stream;
+      this.stream = null;
       try {
-        this.stream.cancel();
+        stream.cancel();
       } catch {
         /* 已取消 */
       }
-      this.stream = null;
     }
   }
 
@@ -293,6 +311,11 @@ export class AuditStream {
   private onEvent(ev: AuditEvent): void {
     // daemon 重启: boot ID 变化, 此前缓存的 sequence 不再可比
     if (this.lastBootId && ev.daemonBootId && ev.daemonBootId !== this.lastBootId) {
+      this.entries = [];
+      this.entriesBytes = 0;
+      this.lastSequence = 0;
+      this.droppedCount = 0;
+      this.evictedCount = 0;
       this.push({
         type: 'gap',
         count: 0,
@@ -300,6 +323,11 @@ export class AuditStream {
         atSequence: ev.sequence,
         message: `daemon 已重启 (boot ${this.lastBootId} → ${ev.daemonBootId}), 期间事件不可比`,
       });
+    }
+    if (this.reconnectMessage) {
+      this.push({ type: 'gap', count: 0, reason: 'stream_reconnect',
+        atSequence: ev.sequence, message: this.reconnectMessage });
+      this.reconnectMessage = '';
     }
     // daemon 侧广播丢失 (ringbuf 满 / 订阅者慢)
     if (ev.droppedBefore > 0) {
@@ -312,22 +340,7 @@ export class AuditStream {
         message: `daemon 报告丢失 ${ev.droppedBefore} 条事件`,
       });
     }
-    // 传输断线期间的丢失: sequence 跳变 (同 boot 才可比)
-    if (
-      this.lastSequence > 0 &&
-      ev.sequence > this.lastSequence + 1 &&
-      (!this.lastBootId || !ev.daemonBootId || ev.daemonBootId === this.lastBootId)
-    ) {
-      const missed = ev.sequence - this.lastSequence - 1;
-      this.droppedCount += missed;
-      this.push({
-        type: 'gap',
-        count: missed,
-        reason: 'sequence_jump',
-        atSequence: ev.sequence,
-        message: `事件序列跳变: ${this.lastSequence} → ${ev.sequence}, 丢失 ${missed} 条`,
-      });
-    }
+    // sequence 是全局编号：其他 Domain、显示过滤都会跳号，不能当成丢失。
     if (ev.daemonBootId) this.lastBootId = ev.daemonBootId;
     if (ev.sequence > this.lastSequence) this.lastSequence = ev.sequence;
     this.push({ type: 'event', event: ev });
@@ -346,11 +359,18 @@ export class AuditStream {
     }
   }
 
-  private collect(afterSequence: number, limit: number, filter?: AuditFilter): AuditEntry[] {
+  private collect(afterSequence: number, limit: number, filter?: AuditFilter, afterBootId = this.lastBootId): AuditEntry[] {
+    const cursor = afterBootId && this.lastBootId && afterBootId !== this.lastBootId ? 0 : afterSequence;
     const out: AuditEntry[] = [];
     for (const e of this.entries) {
       const seq = e.type === 'event' ? e.event.sequence : e.atSequence;
-      if (seq <= afterSequence) continue;
+      if (seq <= cursor) continue;
+      // gap 与同序号事件必须整批返回，不能让页尾 gap 吞掉对应的 DENY。
+      if (out.length >= Math.max(1, limit)) {
+        const last = out[out.length - 1];
+        const lastSeq = last.type === 'event' ? last.event.sequence : last.atSequence;
+        if (seq !== lastSeq) break;
+      }
       if (e.type === 'event' && filter) {
         if (filter.kinds && filter.kinds.length > 0 && !filter.kinds.includes(e.event.kind)) {
           continue;
@@ -358,22 +378,22 @@ export class AuditStream {
         if (filter.allowed != null && e.event.allowed !== filter.allowed) continue;
       }
       out.push(e);
-      if (out.length >= limit) break;
     }
     return out;
   }
 
-  private notifyWaiters(): void {
+  private notifyWaiters(statusChanged = false): void {
     if (this.waiters.length === 0) return;
     const pending = this.waiters;
     this.waiters = [];
     for (const w of pending) {
-      const entries = this.collect(w.afterSequence, w.limit, w.filter);
-      if (entries.length === 0 && !this.disposed) {
+      const entries = this.collect(w.afterSequence, w.limit, w.filter, w.afterBootId);
+      if (entries.length === 0 && !this.disposed && !statusChanged) {
         this.waiters.push(w); // 仍无匹配条目, 继续等
         continue;
       }
       clearTimeout(w.timer);
+      w.signal?.removeEventListener('abort', w.onAbort);
       w.resolve({ entries, lastSequence: this.lastSequence, status: this.status() });
     }
   }

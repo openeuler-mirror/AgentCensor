@@ -32,6 +32,7 @@ export interface ProtectionStatusView {
   domainName: string;
   domainId: number;
   boundGroup: string;
+  boundPolicies?: string[];
   policyVersion: number;
   ruleVersion: number;
   reloadGen: number;

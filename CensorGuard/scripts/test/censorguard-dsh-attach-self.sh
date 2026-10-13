@@ -1,21 +1,259 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化), 固定 C locale。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # Censorguard DSH attach 自助面验收 (对照 ohmyguard scripts/dsh_attach_self_test.sh A1-A9)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 验证点:
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A1  ctl.sock (root) 下发 censorguard-dsh-default 策略组
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A2  非 root 经 dsh.sock attach_self 成功, 回执带 daemonBootId + hooksHealthy
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A3  两个并发 attach (不同 uid) 得到不同 Domain
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A4  dsh.sock ACL: 非自助 op (health) 被拒 "not allowed on the Dsh socket"
-#   A5  attach_self 忽略伪造 pid (params.pid=1, 域名仍取 SO_PEERCRED 真实 tgid)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
+#   A5  attach_self 拒绝客户端 pid 字段，身份只取 SO_PEERCRED
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A6  status_self: 新进程不属于任何 Domain (ok=true, domains 空)
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A7  attach_self 在 ctl.sock (Admin 角色) 被 ACL 拒
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A8  白名单外组 (__base__) attach_self 被拒 "not in the DSH self-serve whitelist"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #   A9  Domain 名格式 dsh:<uid>:<tgid>-<starttime>
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 #
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 用法: sudo bash scripts/test/censorguard-dsh-attach-self.sh
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 # 前置: cargo build (target/debug/censorguardd, censorguardctl) + 插件 pnpm build
 
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
+
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -u
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 FAILS=0
@@ -54,7 +292,7 @@ cp "$SELFCHECK" "$TDIR/selfcheck.mjs"
 chmod -R 0755 "$RT_TMP"
 
 CTL_SOCK=$TDIR/ctl.sock
-DSH_SOCK=$TDIR/dsh.sock   # sibling 自动推导 (--ctl-sock 非 /run 时)
+DSH_SOCK=$TDIR/dsh.sock   # dsh socket from the shared test config
 EV_SOCK=$TDIR/events.sock
 DAEMON_LOG=$TDIR/daemon.log
 
@@ -68,7 +306,8 @@ trap cleanup EXIT
 sed -i "s|'../../plugins/dsh-censorguard/dist/runtime/index.js'|'./runtime-dist/index.js'|" \
     "$TDIR/selfcheck.mjs"
 
-"$DAEMON" --ctl-sock "$CTL_SOCK" --event-sock "$EV_SOCK" --state-dir "$TDIR/state" \
+write_test_config "$TDIR/config.yaml" "$ROOT/config/base.yaml" "$ROOT/bpf/enforce.bpf.o" "$TDIR" "$TDIR/state"
+"$DAEMON" launch --config "$TDIR/config.yaml" \
     >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for _ in $(seq 1 100); do
@@ -81,7 +320,7 @@ grep -q 'required hooks attached' "$DAEMON_LOG" || { echo "daemon 未 READY:"; c
 run_as_nobody() { setpriv --reuid 65534 --regid 65534 --clear-groups "$@"; }
 
 echo "=== A1: ctl.sock 下发 censorguard-dsh-default ==="
-if "$CTL" --sock "$CTL_SOCK" policy apply --name censorguard-dsh-default \
+if "$CTL" --config "$TDIR/config.yaml" policy apply --policy censorguard-dsh-default \
         --file config/policy.dsh-default.yaml >/dev/null 2>&1; then
     pass "策略组下发成功"
 else
@@ -116,26 +355,26 @@ else
 fi
 
 echo "=== A4: dsh.sock 拒绝非自助 op (health) ==="
-OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" health '{}' 2>&1)
+OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" health '{}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not allowed on the Dsh socket'; then
     pass "health 在 dsh.sock 被 ACL 拒"
 else
     fail "dsh.sock 未拒绝 health: $OUT"
 fi
 
-echo "=== A5: attach_self 忽略伪造 pid (params.pid=1) ==="
+echo "=== A5: attach_self 拒绝伪造 pid 字段 ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" attach_self \
-    '{"policy_group":"censorguard-dsh-default","pid":1,"seed":false}' 2>&1)
-# 域名必须是 dsh-65534-<真实tgid>-..., 不能含 pid 1 的 tgid
-if echo "$OUT" | grep -q '"ok": *true' && echo "$OUT" | grep -qP '"name": *"dsh-65534-\d+-\d+"'; then
-    pass "pid 取 SO_PEERCRED, 伪造 pid=1 无效 ($(echo "$OUT" | grep -oP '"name": *"\K[^"]+'))"
+    '{"policy_group":"censorguard-dsh-default","pid":1,"seed":false}' 2>&1 || true)
+# RpcParams 严格拒绝 pid 字段，正常 attach 的域名已在 A2/A9 检查。
+if echo "$OUT" | grep -q 'unknown field `pid`'; then
+    pass "伪造 pid 字段被拒，身份只取 SO_PEERCRED"
 else
-    fail "attach_self 伪造 pid 处理异常: $OUT"
+    fail "attach_self 未拒绝伪造 pid 字段: $OUT"
 fi
 
 echo "=== A6: status_self 新进程不属于任何 Domain ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" status_self '{}' 2>&1)
-if echo "$OUT" | grep -q '"ok": *true' && echo "$OUT" | grep -qP '"domains": *\[\]'; then
+if python3 -c 'import json,sys; r=json.load(sys.stdin); sys.exit(not (r["ok"] and not r["result"]["response"].get("domains", [])))' <<<"$OUT"; then
     pass "status_self 返回空域列表 (语义正确: 只有 attach 调用者自身在域内)"
 else
     fail "status_self 输出异常: $OUT"
@@ -143,7 +382,7 @@ fi
 
 echo "=== A7: attach_self 在 ctl.sock (Admin) 被拒 ==="
 OUT=$("$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$CTL_SOCK" attach_self \
-    '{"policy_group":"censorguard-dsh-default"}' 2>&1)
+    '{"policy_group":"censorguard-dsh-default"}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not allowed on the Admin socket'; then
     pass "Admin 角色拒绝 attach_self"
 else
@@ -152,7 +391,7 @@ fi
 
 echo "=== A8: 白名单外组 (__base__) attach_self 被拒 ==="
 OUT=$(run_as_nobody "$NODE_TMP" "$TDIR/selfcheck.mjs" raw "$DSH_SOCK" attach_self \
-    '{"policy_group":"__base__","seed":false}' 2>&1)
+    '{"policy_group":"__base__","seed":false}' 2>&1 || true)
 if echo "$OUT" | grep -q 'not in the DSH self-serve whitelist'; then
     pass "__base__ 被白名单拒"
 else

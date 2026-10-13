@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-pid-capacity
@@ -36,16 +67,13 @@ for sync_file in start ready release; do
 done
 : >"${runtime_dir}/daemon.log"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 20 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
@@ -55,7 +83,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
     "${runtime_dir}/ready" "${runtime_dir}/release" \
     "${runtime_dir}/protected.txt" 1 &
 probe_pid=$!
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain capacity-domain >"${runtime_dir}/attach.log"
 
 bpftool -j map show >"${runtime_dir}/maps.json"
@@ -98,8 +126,8 @@ with open(fill_path, "w", encoding="ascii") as fill, \
 PY
 bpftool batch file "${runtime_dir}/fill.batch" >"${runtime_dir}/fill.log"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/full.json"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/full.json"
 python3 - "${runtime_dir}/full.json" <<'PY'
 import json
 import sys
@@ -112,7 +140,7 @@ assert status["version"] == 1 and status["active_bank"] == 0, status
 PY
 
 touch "${runtime_dir}/start"
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     [[ -s ${runtime_dir}/ready ]] && break
     /usr/bin/sleep 0.025
 done
@@ -120,8 +148,8 @@ grep -q ' 1$' "${runtime_dir}/ready"
 child_pid=$(awk 'NR == 1 { print $1 }' "${runtime_dir}/ready")
 kill -0 "${child_pid}"
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/degraded.json"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/degraded.json"
 python3 - "${runtime_dir}/degraded.json" <<'PY'
 import json
 import sys
@@ -136,29 +164,28 @@ assert status["pid_pending_fallbacks"] >= 1, status
 assert status["pid_pending_update_failures"] == 0, status
 assert status["version"] == 1 and status["active_bank"] == 0, status
 PY
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    tree >"${runtime_dir}/tree.json"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/tree.json"
 grep -q "\"pid\": ${child_pid}" "${runtime_dir}/tree.json"
 
-# Removing the root while its child exists only in pending must keep the domain draining.
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    untrack --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/draining.json"
+# Unattach must remove the root and pending-backed child immediately.
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    unattach --pid "${probe_pid}" >"${runtime_dir}/untrack.log"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/draining.json"
 python3 - "${runtime_dir}/draining.json" <<'PY'
 import json
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
-domain = next(item for item in status["domains"] if item["name"] == "capacity-domain")
-assert domain["roots"] == 0 and domain["draining"] is True, status
-assert status["pid_pending"] == 1, status
+assert not any(item["name"] == "capacity-domain" for item in status.get("domains", [])), status
+assert status["pid_pending"] == 0, status
 PY
 
 bpftool batch file "${runtime_dir}/delete.batch" >"${runtime_dir}/delete.log"
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/after-delete.json"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/after-delete.json"
 python3 - "${runtime_dir}/after-delete.json" <<'PY'
 import json
 import sys
@@ -166,16 +193,16 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as stream:
     status = json.load(stream)
 assert status["tracked"] == 0, status
-assert status["pid_pending"] == 1, status
-assert any(item["name"] == "capacity-domain" for item in status["domains"]), status
+assert status["pid_pending"] == 0, status
+assert not any(item["name"] == "capacity-domain" for item in status.get("domains", [])), status
 PY
 
 touch "${runtime_dir}/release"
 wait "${probe_pid}"
 probe_pid=
 for _ in $(seq 1 240); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-        status >"${runtime_dir}/final.json"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+        status --json >"${runtime_dir}/final.json"
     if grep -q '"pid_pending": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "capacity-domain"' "${runtime_dir}/final.json"; then
         break

@@ -37,9 +37,13 @@ export class BootstrapCore implements CensorguardReady {
   private stateMachine = new ProtectionStateMachine();
   private reattaching = false;
   private disposed = false;
-  private waitResolvers = new Set<() => void>();
+  private readyWaits = new Set<(error?: Error) => void>();
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryDelay: number;
 
-  constructor(private cfg: Required<BootstrapConfig>) {}
+  constructor(private cfg: Required<BootstrapConfig>) {
+    this.retryDelay = cfg.initialRetryMs;
+  }
 
   get state(): ProtectionState {
     return this.stateMachine.get();
@@ -50,23 +54,27 @@ export class BootstrapCore implements CensorguardReady {
   }
 
   async waitForReady(timeoutMs = 10000): Promise<void> {
-    if (this.state.kind === 'protected') return;
+    if (this.disposed) throw new Error('censorguardReady 已 dispose');
+    const isReady = (state: ProtectionState): boolean => state.kind === 'protected'
+      || (state.kind === 'degraded' && !this.cfg.blockOnFailure);
+    if (isReady(this.state)) return;
     return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error(`censorguardReady 等待超时 ${timeoutMs}ms`));
-      }, timeoutMs);
-      const unsub = this.stateMachine.subscribe((s) => {
-        if (s.kind === 'protected') {
-          clearTimeout(timer);
-          unsub();
-          resolve();
-        } else if (s.kind === 'degraded' && !this.cfg.blockOnFailure) {
-          // 非阻塞模式 (默认): degraded 也算 ready (不阻塞 DSH)
-          clearTimeout(timer);
-          unsub();
-          resolve();
-        }
+      let settled = false;
+      let unsubscribe = (): void => {};
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        this.readyWaits.delete(finish);
+        if (error) reject(error); else resolve();
+      };
+      const timer = setTimeout(() => finish(new Error(`censorguardReady 等待超时 ${timeoutMs}ms`)), timeoutMs);
+      this.readyWaits.add(finish);
+      unsubscribe = this.stateMachine.subscribe((s) => {
+        if (isReady(s)) finish();
       });
+      if (settled) unsubscribe(); // subscribe immediately reports the current state
     });
   }
 
@@ -82,8 +90,7 @@ export class BootstrapCore implements CensorguardReady {
     try {
       const result = await this.tryAttach();
       this.scheduleHeartbeat();
-      this.waitResolvers.forEach((r) => r());
-      this.waitResolvers.clear();
+      this.resetRetry();
       return result;
     } catch (e) {
       const reason = e instanceof AttachError ? `${e.kind}: ${e.message}` : String(e);
@@ -121,8 +128,7 @@ export class BootstrapCore implements CensorguardReady {
         hooksHealthy: result.hooksHealthy,
       });
       this.scheduleHeartbeat();
-      this.waitResolvers.forEach((r) => r());
-      this.waitResolvers.clear();
+      this.resetRetry();
     } catch (e) {
       const reason = e instanceof AttachError ? `${e.kind}: ${e.message}` : String(e);
       this.stateMachine.toDegraded(`reattach 失败: ${reason}`);
@@ -137,6 +143,8 @@ export class BootstrapCore implements CensorguardReady {
     this.disposed = true;
     this.client?.dispose();
     this.client = null;
+    this.resetRetry();
+    this.readyWaits.forEach((finish) => finish(new Error('censorguardReady 已 dispose')));
   }
 
   private async tryAttach(): Promise<AttachResult> {
@@ -167,21 +175,18 @@ export class BootstrapCore implements CensorguardReady {
   }
 
   private scheduleRetry(): void {
-    if (this.disposed) return;
-    const initial = this.cfg.initialRetryMs;
-    const max = this.cfg.maxRetryMs;
-    let delay = initial;
-    const attempt = async (): Promise<void> => {
-      if (this.disposed) return;
-      try {
-        await this.reattach();
-      } catch {
-        // 退避重试
-        delay = Math.min(delay * 2, max);
-        setTimeout(() => void attempt(), delay);
-      }
-    };
-    setTimeout(() => void attempt(), delay);
+    if (this.disposed || this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.reattach();
+    }, this.retryDelay);
+    this.retryDelay = Math.min(this.retryDelay * 2, this.cfg.maxRetryMs);
+  }
+
+  private resetRetry(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.retryDelay = this.cfg.initialRetryMs;
   }
 }
 

@@ -9,32 +9,27 @@ if [[ ! -d "${harness_dir}" ]]; then
     printf 'Harness directory does not exist: %s\n' "${harness_dir}" >&2
     exit 2
 fi
-command -v npm >/dev/null || { printf 'npm is required\n' >&2; exit 2; }
 command -v pnpm >/dev/null || { printf 'pnpm is required\n' >&2; exit 2; }
 
-plugin_dir="${repo_dir}/plugins/dsh-censorguard"
-cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/Censorguard-plugin-cache.XXXXXX")
-trap 'rm -rf -- "${cache_dir}"' EXIT
-
-if [[ -x "${plugin_dir}/node_modules/.bin/tsc" && -x "${plugin_dir}/node_modules/.bin/esbuild" ]]; then
-    printf '[1/3] reusing existing plugin build dependencies\n'
-else
-    printf '[1/3] installing plugin build dependencies offline\n'
-    npm --prefix "${plugin_dir}" ci --ignore-scripts --offline
-fi
-printf '[2/3] building plugin package\n'
-npm --prefix "${plugin_dir}" run build
-output_dir="${repo_dir}/dist"
-mkdir -p "${output_dir}"
-tarball=$(cd "${plugin_dir}" && npm_config_cache="${cache_dir}" npm pack --pack-destination "${output_dir}" --silent | tail -n 1)
-tarball="${output_dir}/${tarball##*/}"
-printf '[3/3] adding %s to Harness %s profile\n' "${tarball}" "${profile}"
-# Remove an older direct file dependency first.  This also repairs profiles that still point
-# at a deleted temporary tarball from an interrupted or older installer run.
+printf '[1/2] Building the plugin package\n'
+bash "${repo_dir}/scripts/build-dsh-plugin.sh"
+plugin_version=$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version' "${repo_dir}/plugins/dsh-censorguard/package.json")
+tarball="${repo_dir}/dist/censorguard-dsh-${plugin_version}.tgz"
+printf '[2/2] Adding %s to Harness %s profile\n' "${tarball}" "${profile}"
+# Remove obsolete dependencies in one pass, including dangling old tarball paths.
 profile_dir="${DSH_HOME:-${HOME}/.dsh}/profiles/${profile}"
-if [[ -f "${profile_dir}/package.json" ]] && grep -q '"dsh-censorguard"' "${profile_dir}/package.json"; then
-    (cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" remove dsh-censorguard)
+legacy_packages=()
+for legacy in dsh-censorguard @censorguard/dsh-bundle @censorguard/dsh-bootstrap @censorguard/dsh-host @censorguard/dsh-client; do
+    if [[ -f "${profile_dir}/package.json" ]] && grep -Fq "\"${legacy}\"" "${profile_dir}/package.json"; then
+        legacy_packages+=("${legacy}")
+    fi
+done
+if (( ${#legacy_packages[@]} )); then
+    (cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" remove --ignore-scripts "${legacy_packages[@]}")
 fi
-(cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" add "${tarball}")
+# The tarball is fully built and its runtime dependencies are pure JavaScript.
+# A new profile has its own pnpm build policy; protobufjs's optional postinstall
+# must not turn an otherwise complete installation into ERR_PNPM_IGNORED_BUILDS.
+(cd "${harness_dir}" && pnpm dsh plugin --profile "${profile}" add --ignore-scripts "${tarball}")
 
-printf 'dsh-censorguard installed in profile %s\n' "${profile}"
+printf '@censorguard/dsh installed in profile %s\n' "${profile}"

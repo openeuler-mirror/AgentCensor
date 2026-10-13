@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-pid-churn
@@ -35,15 +66,13 @@ for sync_file in start ready release; do
 done
 : >"${runtime_dir}/daemon.log"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 18 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
@@ -53,7 +82,7 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
     "${runtime_dir}/ready" "${runtime_dir}/release" \
     "${runtime_dir}/protected.txt" "${child_count}" &
 probe_pid=$!
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
     attach --pid "${probe_pid}" --domain churn-domain >"${runtime_dir}/attach.log"
 touch "${runtime_dir}/start"
 
@@ -70,8 +99,8 @@ if grep -q ' 0$' "${runtime_dir}/ready"; then
     exit 1
 fi
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/status.json"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/status.json"
 python3 - "${runtime_dir}/status.json" "${child_count}" <<'PY'
 import json
 import sys
@@ -137,8 +166,8 @@ wait "${probe_pid}"
 probe_pid=
 
 for _ in $(seq 1 240); do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-        status >"${runtime_dir}/final.json"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+        status --json >"${runtime_dir}/final.json"
     if grep -q '"tracked": 0' "${runtime_dir}/final.json" && \
         ! grep -q '"name": "churn-domain"' "${runtime_dir}/final.json"; then
         break

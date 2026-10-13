@@ -17,7 +17,7 @@ prost = "0.13"
 serde_json.workspace = true
 serde_yaml.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-stream = { version = "0.1", features = ["sync", "net"] }
 tonic = "0.12"
 
 [build-dependencies]

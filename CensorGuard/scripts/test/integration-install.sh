@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=$(mktemp -d /tmp/censorguard-install.XXXXXX)
@@ -23,17 +54,16 @@ make --no-print-directory -C "${repo_dir}" install-files DESTDIR="${stage}"
 declare -A expected_modes=(
     [usr/sbin/censorguardd]=755
     [usr/bin/censorguardctl]=755
-    [usr/bin/censorguard-audit]=755
-    [usr/bin/censorguard-exec]=755
-    [usr/lib/Censorguard/enforce.bpf.o]=644
-    [etc/Censorguard/base.yaml]=640
-    [etc/Censorguard/standard-dev.yaml]=640
-    [etc/Censorguard/high-priv.yaml]=640
+    [usr/bin/censorguard-grpc]=755
+    [usr/lib/censorguard/enforce.bpf.o]=644
+    [etc/censorguard/base.yaml]=640
+    [etc/censorguard/standard-dev.yaml]=640
+    [etc/censorguard/high-priv.yaml]=640
     [usr/lib/systemd/system/censorguardd.service]=644
     [usr/lib/sysusers.d/censorguard.conf]=644
     [usr/lib/tmpfiles.d/censorguard.conf]=644
-    [usr/share/doc/Censorguard/README.md]=644
-    [usr/share/licenses/Censorguard/LICENSE]=644
+    [usr/share/doc/censorguard/README.md]=644
+    [usr/share/licenses/censorguard/LICENSE]=644
 )
 for path in "${!expected_modes[@]}"; do
     [[ -f ${stage}/${path} ]]
@@ -50,7 +80,7 @@ grep -q 'preserving existing' "${runtime_dir}/reinstall.log"
 systemd-sysusers --dry-run --root="${stage}" \
     "${stage}/usr/lib/sysusers.d/censorguard.conf" \
     >"${runtime_dir}/sysusers.log" 2>&1
-grep -q 'Censorguard' "${runtime_dir}/sysusers.log"
+grep -qi 'censorguard' "${runtime_dir}/sysusers.log"
 systemd-tmpfiles --create --graceful --root="${stage}" \
     "${stage}/usr/lib/tmpfiles.d/censorguard.conf"
 # The staged package intentionally does not contain the operating system's base units or /bin/kill.
@@ -66,23 +96,22 @@ systemd-analyze verify --root="${stage}" censorguardd.service
 # Restore a valid policy and execute the staged daemon's read-only configuration gate.
 install -m 0640 "${repo_dir}/config/base.yaml" \
     "${stage}/etc/censorguard/base.yaml"
-"${stage}/usr/sbin/censorguardd" \
-    --config "${stage}/etc/censorguard/base.yaml" --check-config \
+write_test_config "${runtime_dir}/config.yaml" "${stage}/etc/censorguard/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${stage}/usr/sbin/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" --check-config \
     >"${runtime_dir}/check-config.log"
 grep -q 'configuration is valid' "${runtime_dir}/check-config.log"
+write_test_config "${runtime_dir}/bad-config.yaml" "${stage}/etc/censorguard/base.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}/bad" "${runtime_dir}/bad-state" censorguard-group-that-does-not-exist
 set +e
-"${stage}/usr/sbin/censorguardd" \
-    --config "${stage}/etc/censorguard/base.yaml" \
-    --ctl-sock "${runtime_dir}/bad-ctl.sock" \
-    --event-sock "${runtime_dir}/bad-events.sock" \
-    --socket-group censorguard-group-that-does-not-exist --duration 1 \
+"${stage}/usr/sbin/censorguardd" launch \
+    --config "${runtime_dir}/bad-config.yaml" --duration 1 \
     >"${runtime_dir}/bad-group.log" 2>&1
 bad_group_rc=$?
 set -e
 [[ ${bad_group_rc} -ne 0 ]]
 grep -q '^Error:' "${runtime_dir}/bad-group.log"
-[[ ! -e ${runtime_dir}/bad-ctl.sock ]]
-[[ ! -e ${runtime_dir}/bad-events.sock ]]
+[[ ! -e ${runtime_dir}/bad/ctl.sock ]]
+[[ ! -e ${runtime_dir}/bad/events.sock ]]
 
 make --no-print-directory -C "${repo_dir}" package DISTDIR="${dist_dir}"
 archive=$(find "${dist_dir}" -maxdepth 1 -type f -name 'Censorguard-*.tar.gz' -print -quit)
@@ -94,7 +123,7 @@ make --no-print-directory -C "${repo_dir}" package DISTDIR="${dist_dir}" \
 second_checksum=$(sha256sum "${archive}" | awk '{ print $1 }')
 [[ ${first_checksum} == "${second_checksum}" ]]
 tar -tzf "${archive}" >"${runtime_dir}/archive.list"
-for path in ./usr/sbin/censorguardd ./usr/bin/censorguardctl \
+for path in ./usr/sbin/censorguardd ./usr/bin/censorguardctl ./usr/bin/censorguard-grpc \
     ./usr/lib/censorguard/enforce.bpf.o ./etc/censorguard/base.yaml.example \
     ./usr/lib/systemd/system/censorguardd.service; do
     grep -Fxq "${path}" "${runtime_dir}/archive.list"
@@ -107,7 +136,9 @@ fi
 make --no-print-directory -C "${repo_dir}" uninstall DESTDIR="${stage}"
 [[ ! -e ${stage}/usr/sbin/censorguardd ]]
 [[ ! -e ${stage}/usr/bin/censorguardctl ]]
+[[ ! -e ${stage}/usr/bin/censorguard-grpc ]]
 [[ ! -e ${stage}/usr/lib/systemd/system/censorguardd.service ]]
+[[ ! -e ${stage}/usr/share/doc/censorguard ]]
 grep -q '^rules:' "${stage}/etc/censorguard/base.yaml"
 
 echo "deployment integration passed: layout, preservation, unit, package and uninstall"

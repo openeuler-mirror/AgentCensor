@@ -258,7 +258,7 @@ export const AuditView: FC<AuditViewProps> = (props) => {
   const filtered = s.items.filter((it) => it.type === 'row').length;
 
   return (
-    <div style={styles.root}>
+    <div style={styles.root} data-censorguard-audit data-stream-state={s.bar.connected ? 'live' : 'reconnecting'} data-daemon-boot-id={s.bar.daemonBootId} data-last-sequence={s.bar.lastSequence}>
       {/* 顶部状态条: 实时/断线/重连中 + boot ID + 最后 sequence + 丢失/淘汰 */}
       <div style={styles.bar}>
         <span style={styles.chip}>
@@ -267,14 +267,16 @@ export const AuditView: FC<AuditViewProps> = (props) => {
           </span>
           {s.bar.stateLabel}
         </span>
-        <span style={styles.chip}>boot: {s.bar.daemonBootId ? s.bar.daemonBootId.slice(0, 8) : '-'}</span>
-        <span style={styles.chip}>seq: {s.bar.lastSequence}</span>
-        <span style={styles.chip}>丢失: {s.bar.droppedCount}</span>
-        <span style={styles.chip}>淘汰: {s.bar.evictedCount}</span>
+        <span style={styles.chip} title="当前 daemon 的事件编号，包含放行；跳号不代表丢失或拦截。">事件序号: {s.bar.lastSequence}</span>
+        <span style={styles.chip} title="daemon 明确报告的本订阅丢失数；断线和内核丢失另行诊断。">传输丢失: {s.bar.droppedCount}</span>
+        <span style={styles.chip} title={`缓存超过上限后移除旧记录，不是拦截失败。Host 移除 ${s.bar.hostEvictedCount} 条；浏览器移除 ${s.bar.localEvictedCount} 条；两者可能重叠。`}>
+          缓存移除: {s.bar.hostEvictedCount} / {s.bar.localEvictedCount}
+        </span>
         <span style={{ ...styles.chip, marginLeft: 'auto', border: 'none', background: 'transparent' }}>
           {filtered} 条
         </span>
       </div>
+      <div style={{ ...styles.barHint, color: C.text3 }}>当前 DSH 实例的审计，包含启动、页面访问和各会话工具操作。</div>
       {!s.bar.connected ? <div style={styles.barHint}>{AUDIT_DISCONNECTED_HINT}</div> : null}
 
       {/* 过滤 (草稿态, [查找]/回车 应用, [重置] 清空) */}
@@ -389,6 +391,9 @@ const RowView: FC<{
   const args = row.args.length > 0 ? `[${row.args.join(' ')}]` : '';
   return (
     <div
+      data-audit-sequence={row.sequence}
+      data-audit-result={row.result}
+      data-audit-tgid={row.tgid}
       style={{
         ...styles.row,
         background: selected ? C.accentDim : hover ? C.surface : undefined,

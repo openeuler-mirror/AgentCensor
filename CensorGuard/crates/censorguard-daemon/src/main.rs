@@ -1,12 +1,10 @@
 mod event;
+mod lifecycle;
 mod procfs;
 mod runtime;
 mod server;
 
-use censorguard_common::protocol::{
-    DEFAULT_CONTROL_SOCKET, DEFAULT_DSH_SOCKET, DEFAULT_EVENT_SOCKET, DEFAULT_LAUNCH_SOCKET,
-    DEFAULT_UI_SOCKET,
-};
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
 use censorguard_kernel::{HookManifest, NativeKernel};
 use censorguard_policy::{CompileWarning, CompiledPolicy, compile_yaml, load};
 use event::EventHub;
@@ -17,21 +15,21 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io;
+use std::io::{BufRead, BufReader};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::Duration;
 
-const DEFAULT_DNS_REFRESH_SECONDS: u64 = 60;
-const DEFAULT_DSH_SELF_GROUPS: &str = "censorguard-dsh-default";
-
 #[derive(Debug)]
 struct Args {
-    policy_free: bool,
     config: PathBuf,
+    reload: bool,
+    stop: bool,
     bpf_object: PathBuf,
     control_socket: PathBuf,
     event_socket: PathBuf,
@@ -39,12 +37,9 @@ struct Args {
     dsh_socket: PathBuf,
     ui_socket: PathBuf,
     state_dir: PathBuf,
-    state_dir_ephemeral: bool,
     socket_group: Option<String>,
     gateway_user: Option<String>,
     check_config: bool,
-    track_pid: Option<u32>,
-    domain: String,
     duration_seconds: Option<u64>,
     dns_refresh_seconds: u64,
     dsh_self_groups: Vec<String>,
@@ -54,23 +49,36 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::args()
+        .nth(1)
+        .is_some_and(|argument| argument == "--version" || argument == "-V")
+    {
+        println!("censorguardd {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let args = parse_args(env::args().skip(1))?;
-    let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
-    let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
+    if args.reload || args.stop {
+        if args.reload {
+            load(&args.config)?;
+        }
+        lifecycle::control(
+            &args.control_socket,
+            &fs::canonicalize(&args.config)?,
+            args.stop,
+        )?;
+        return Ok(());
+    }
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGHUP);
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
     pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None)?;
-    let (canonical_policy, initial_revision) = if !args.policy_free && args.config.exists() {
-        if args.check_config {
-            (load(&args.config)?, 1)
-        } else {
-            load_startup_policy(&args.config, &args.state_dir)?
-        }
+    let (canonical_policy, initial_revision) = if args.check_config {
+        (load(&args.config)?, 1)
     } else {
-        // Policy-free daemon startup: ctl applies the canonical rules document later.
-        (compile_yaml(b"rules: []")?, 1)
+        // Startup must have a real baseline/config input; never silently launch empty.
+        load(&args.config)?;
+        load_startup_policy(&args.config, &args.state_dir)?
     };
     let (resolved_policy, dns_cache, dns_status) =
         canonical_policy.resolve_dns(&Default::default());
@@ -80,13 +88,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("configuration is valid; kernel state was not changed");
         return Ok(());
     }
+    let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
+    let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
+    let _instance = lifecycle::acquire_instance(
+        &args.state_dir,
+        &[
+            &args.control_socket,
+            &args.event_socket,
+            &args.launch_socket,
+            &args.dsh_socket,
+            &args.ui_socket,
+        ],
+    )?;
+    if args.spawn_grpc {
+        lifecycle::check_grpc_port(args.grpc_listen.as_deref())?;
+    }
+    let mut cleanup = lifecycle::SocketCleanup::default();
 
     // All policy dimensions stay attached so a later atomic reload can enable a dimension that
     // was disabled at startup. The filter_config map keeps disabled hooks fail-open and cheap.
     let manifest = HookManifest::for_policy([true, true, true]);
     let kernel = Arc::new(NativeKernel::load(&args.bpf_object, &manifest)?);
-    let installed =
-        kernel.install_policy_version(&policy, initial_revision, [true; 3], [false; 3])?;
+    let installed = kernel.install_policy_version(
+        &policy,
+        initial_revision,
+        [
+            policy.daemon.enable_file,
+            policy.daemon.enable_exec,
+            policy.daemon.enable_net,
+        ],
+        [
+            policy.daemon.audit_file,
+            policy.daemon.audit_exec,
+            policy.daemon.audit_net,
+        ],
+    )?;
     kernel.protect_pid(std::process::id())?;
     // NativeKernel::load fails unless every required hook attached, so reaching this
     // point means the enforcement surface is fully mounted.
@@ -94,12 +130,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let boot_id = read_boot_id();
     let runtime = Arc::new(Runtime::new(RuntimeInit {
         kernel: Arc::clone(&kernel),
-        config_path: args.config.clone(),
         policy: Arc::clone(&policy),
         installed,
         dns_cache,
         dns_status,
         revision_dir: args.state_dir.clone(),
+        config_path: fs::canonicalize(&args.config)?,
         initial_revision,
         boot_id: boot_id.clone(),
         hooks_healthy,
@@ -116,10 +152,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         Arc::clone(&hub),
         gateway_uid,
     )?;
+    cleanup.record(&args.control_socket)?;
     let _events = server::start_events(&args.event_socket, socket_group, Arc::clone(&hub))?;
+    cleanup.record(&args.event_socket)?;
     let _launch = server::start_launch(&args.launch_socket, socket_group, Arc::clone(&runtime))?;
+    cleanup.record(&args.launch_socket)?;
     let _dsh = server::start_dsh(&args.dsh_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+    cleanup.record(&args.dsh_socket)?;
     let _ui = server::start_ui(&args.ui_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+    cleanup.record(&args.ui_socket)?;
     let _reconciler = start_reconciler(Arc::clone(&runtime))?;
     let _dns = start_dns_refresher(
         Arc::clone(&runtime),
@@ -132,23 +173,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let _grpc = if args.spawn_grpc {
         Some(start_grpc_supervisor(
             args.grpc_bin,
-            args.grpc_listen,
-            args.ui_socket.clone(),
-            args.event_socket.clone(),
+            args.config.clone(),
             Arc::clone(&grpc_shutdown),
         )?)
     } else {
         None
     };
 
-    if let Some(pid) = args.track_pid {
-        let result = runtime.track(pid, &args.domain, true, 0)?;
-        println!(
-            "migration track: pid={pid} domain={} slot={} seeded={}",
-            result.domain.name, result.domain.slot, result.seeded
-        );
-    }
-
+    runtime.mark_ready();
     println!(
         "[READY] {} required hooks attached; control={} events={} launch={} dsh={} ui={}",
         manifest.required().len(),
@@ -159,18 +191,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.ui_socket.display()
     );
 
-    wait_for_shutdown(args.duration_seconds, &shutdown_receiver)?;
+    wait_for_shutdown(args.duration_seconds, &shutdown_receiver, &runtime)?;
     grpc_shutdown.store(true, Ordering::SeqCst);
 
-    let _ = fs::remove_file(&args.control_socket);
-    let _ = fs::remove_file(&args.event_socket);
-    let _ = fs::remove_file(&args.launch_socket);
-    let _ = fs::remove_file(&args.dsh_socket);
-    let _ = fs::remove_file(&args.ui_socket);
-    if args.state_dir_ephemeral {
-        let _ = fs::remove_dir_all(&args.state_dir);
-    }
+    drop(cleanup);
+    drop(_grpc);
     eprintln!("censorguardd shutdown complete");
+    if runtime.restart_requested() {
+        eprintln!("restarting daemon with {}", args.config.display());
+        let error = Command::new(env::current_exe()?)
+            .arg("launch")
+            .arg("--config")
+            .arg(&args.config)
+            .exec();
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -207,17 +242,14 @@ fn start_signal_handler(
         .spawn(move || {
             loop {
                 match signals.wait() {
-                    Ok(Signal::SIGHUP) => match runtime.reload(None, None, None, false) {
-                        Ok(result) => eprintln!(
-                            "SIGHUP reload complete: generation={} version={} changed={:?}",
-                            result.generation, result.version, result.changed
-                        ),
-                        Err(error) => {
-                            eprintln!("SIGHUP reload failed; old bank remains active: {error}")
+                    Ok(Signal::SIGHUP) => {
+                        if let Err(error) = runtime.request_restart() {
+                            eprintln!("restart failed: {error}");
                         }
-                    },
+                    }
                     Ok(Signal::SIGINT | Signal::SIGTERM) => {
                         eprintln!("shutdown requested by signal");
+                        let _ = runtime.request_stop();
                         let _ = shutdown.send(());
                         return;
                     }
@@ -234,86 +266,145 @@ fn start_signal_handler(
 
 /// Supervisor for the unprivileged gRPC adapter child process.
 ///
-/// `--spawn-grpc` lets one systemd unit own the full DSH delegated surface: the
-/// daemon spawns `censorguard-grpc` (default: sibling binary of the daemon's own
-/// executable), restarts it after a 1s backoff if it crashes, and terminates it
+/// The `daemon.spawn_grpc` setting lets one systemd unit own the full DSH delegated
+/// surface: the daemon spawns `censorguard-grpc` (default: sibling binary of the
+/// daemon's own executable), restarts it after a 1s backoff if it crashes, and terminates it
 /// (TERM, then KILL after a 2s grace period) when the daemon shuts down. The
 /// adapter keeps its own process boundary, so tonic panics never take down the
 /// eBPF enforcement plane.
-fn start_grpc_supervisor(
-    grpc_bin: Option<PathBuf>,
-    grpc_listen: Option<String>,
-    ui_socket: PathBuf,
-    event_socket: PathBuf,
+struct GrpcSupervisor {
     shutdown: Arc<AtomicBool>,
-) -> Result<thread::JoinHandle<()>, io::Error> {
-    let bin = grpc_bin.unwrap_or_else(|| {
-        let exe =
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/sbin/censorguardd"));
-        exe.parent()
-            .unwrap_or_else(|| Path::new("/usr/sbin"))
-            .join("censorguard-grpc")
-    });
-    if !bin.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "gRPC adapter not found at {}; build it or pass --grpc-bin PATH",
-                bin.display()
-            ),
-        ));
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for GrpcSupervisor {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(supervisor) = self.thread.take() {
+            let _ = supervisor.join();
+        }
     }
-    let listen = grpc_listen.unwrap_or_else(|| "127.0.0.1:50051".to_owned());
-    let mut command = Command::new(&bin);
-    command
-        .arg("--sock")
-        .arg(&ui_socket)
-        .arg("--ev-sock")
-        .arg(&event_socket)
-        .arg("--listen")
-        .arg(&listen);
-    thread::Builder::new()
-        .name("censorguard-grpc".into())
+}
+
+fn spawn_ready_grpc(command: &mut Command) -> Result<Child, io::Error> {
+    let mut child = command.stdout(Stdio::piped()).spawn()?;
+    let output = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("gRPC stdout unavailable"))?;
+    let (sender, receiver) = sync_channel(1);
+    let reader = thread::Builder::new()
+        .name("censorguard-grpc-log".into())
         .spawn(move || {
-            loop {
-                if shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-                let mut child = match command.spawn() {
-                    Ok(child) => child,
-                    Err(error) => {
-                        eprintln!("gRPC adapter spawn failed: {error}; retrying in 5s");
-                        thread::sleep(Duration::from_secs(5));
-                        continue;
-                    }
-                };
-                eprintln!("gRPC adapter spawned: pid={} {listen}", child.id());
-                let child_pid = nix::unistd::Pid::from_raw(child.id() as i32);
-                // Poll the shutdown flag and child liveness with short timeouts.
-                loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        let _ = nix::sys::signal::kill(child_pid, Signal::SIGTERM);
-                        for _ in 0..10 {
-                            if shutdown_reaped(&mut child) {
-                                eprintln!("gRPC adapter terminated by signal");
-                                return;
-                            }
-                            thread::sleep(Duration::from_millis(200));
-                        }
-                        let _ = nix::sys::signal::kill(child_pid, Signal::SIGKILL);
-                        let _ = child.wait();
-                        eprintln!("gRPC adapter killed after grace period");
-                        return;
-                    }
-                    if shutdown_reaped(&mut child) {
-                        eprintln!("gRPC adapter exited; restarting in 1s");
-                        thread::sleep(Duration::from_secs(1));
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(200));
+            let mut notified = false;
+            for line in BufReader::new(output).lines() {
+                let Ok(line) = line else { break };
+                println!("{line}");
+                if !notified && line.starts_with("[READY] censorguard-grpc listening on ") {
+                    let _ = sender.send(());
+                    notified = true;
                 }
             }
-        })
+        });
+    let ready = reader.and_then(|_| {
+        receiver
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "gRPC did not become ready: {error}; verify port and adapter version"
+                ))
+            })
+    });
+    if let Err(error) = ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    if let Some(status) = child.try_wait()? {
+        return Err(io::Error::other(format!(
+            "gRPC exited during startup: {status}"
+        )));
+    }
+    eprintln!("gRPC adapter ready: pid={}", child.id());
+    Ok(child)
+}
+
+fn start_grpc_supervisor(
+    grpc_bin: Option<PathBuf>,
+    config_path: PathBuf,
+    shutdown: Arc<AtomicBool>,
+) -> Result<GrpcSupervisor, io::Error> {
+    let bin = grpc_bin.unwrap_or_else(|| {
+        env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("/usr/sbin/censorguardd"))
+            .with_file_name("censorguard-grpc")
+    });
+    let mut command = Command::new(&bin);
+    command.arg("--config").arg(config_path);
+    // A failed initial bind is a startup error, not an endless restart loop.
+    let first_child = spawn_ready_grpc(&mut command)?;
+    let thread_shutdown = Arc::clone(&shutdown);
+    // Share ownership until spawning succeeds so a thread creation failure also reaps the child.
+    let initial = Arc::new(std::sync::Mutex::new(Some(first_child)));
+    let for_thread = Arc::clone(&initial);
+    let supervisor = thread::Builder::new()
+        .name("censorguard-grpc".into())
+        .spawn(move || {
+            let mut child = match for_thread.lock() {
+                Ok(mut guard) => match guard.take() {
+                    Some(child) => child,
+                    None => return,
+                },
+                Err(_) => return,
+            };
+            loop {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    let child_pid = nix::unistd::Pid::from_raw(child.id() as i32);
+                    let _ = nix::sys::signal::kill(child_pid, Signal::SIGTERM);
+                    for _ in 0..10 {
+                        if shutdown_reaped(&mut child) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                if shutdown_reaped(&mut child) {
+                    eprintln!("gRPC adapter exited; retrying in 1s");
+                    loop {
+                        thread::sleep(Duration::from_secs(1));
+                        if thread_shutdown.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match spawn_ready_grpc(&mut command) {
+                            Ok(next) => {
+                                child = next;
+                                break;
+                            }
+                            Err(error) => eprintln!("gRPC restart failed: {error}"),
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+    match supervisor {
+        Ok(thread) => Ok(GrpcSupervisor {
+            shutdown,
+            thread: Some(thread),
+        }),
+        Err(error) => {
+            if let Ok(mut guard) = initial.lock()
+                && let Some(mut child) = guard.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Try to reap the adapter child without blocking; true when it has exited.
@@ -344,160 +435,109 @@ fn start_reconciler(runtime: Arc<Runtime>) -> Result<thread::JoinHandle<()>, io:
 fn wait_for_shutdown(
     duration_seconds: Option<u64>,
     receiver: &Receiver<()>,
+    runtime: &Runtime,
 ) -> Result<(), io::Error> {
-    match duration_seconds {
-        Some(seconds) => match receiver.recv_timeout(Duration::from_secs(seconds)) {
-            Ok(()) | Err(RecvTimeoutError::Timeout) => Ok(()),
+    let deadline =
+        duration_seconds.map(|seconds| std::time::Instant::now() + Duration::from_secs(seconds));
+    loop {
+        if runtime.restart_requested()
+            || runtime.stop_requested()
+            || deadline.is_some_and(|time| std::time::Instant::now() >= time)
+        {
+            return Ok(());
+        }
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => return Ok(()),
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                Err(io::Error::other("signal handler stopped unexpectedly"))
+                return Err(io::Error::other("signal handler stopped unexpectedly"));
             }
-        },
-        None => receiver
-            .recv()
-            .map_err(|_| io::Error::other("signal handler stopped unexpectedly")),
+        }
     }
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
-    // The daemon is a background service; `launch` is an explicit, policy-free
-    // entrypoint. Policy loading/application is performed by censorguardctl.
     let mut values: Vec<String> = args.collect();
-    let policy_free = if values.first().is_some_and(|value| value == "launch") {
+    let reload = values.first().is_some_and(|value| value == "reload");
+    let stop = values.first().is_some_and(|value| value == "stop");
+    if values
+        .first()
+        .is_some_and(|value| matches!(value.as_str(), "launch" | "reload" | "stop"))
+    {
         values.remove(0);
-        true
-    } else {
-        false
-    };
-    parse_args_with_values(values.into_iter(), policy_free)
+    } else if !values
+        .first()
+        .is_some_and(|value| matches!(value.as_str(), "--help" | "-h"))
+    {
+        return Err(invalid_input(
+            "expected launch, reload or stop; usage: censorguardd launch|reload|stop [--config PATH]",
+        ));
+    }
+    let parsed = parse_args_with_values(values.into_iter())?;
+    if (reload || stop) && (parsed.check_config || parsed.duration_seconds.is_some()) {
+        return Err(invalid_input("reload/stop accept only --config PATH"));
+    }
+    Ok(Args {
+        reload,
+        stop,
+        ..parsed
+    })
 }
 
-fn parse_args_with_values(
-    mut args: impl Iterator<Item = String>,
-    policy_free: bool,
-) -> Result<Args, io::Error> {
+fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
     let mut config = None;
-    let mut bpf_object = PathBuf::from("bpf/enforce.bpf.o");
-    let mut control_socket = PathBuf::from(DEFAULT_CONTROL_SOCKET);
-    let mut event_socket = PathBuf::from(DEFAULT_EVENT_SOCKET);
-    let mut launch_socket = PathBuf::from(DEFAULT_LAUNCH_SOCKET);
-    let mut dsh_socket = PathBuf::from(DEFAULT_DSH_SOCKET);
-    let mut ui_socket = PathBuf::from(DEFAULT_UI_SOCKET);
-    let mut launch_socket_explicit = false;
-    let mut dsh_socket_explicit = false;
-    let mut ui_socket_explicit = false;
-    let mut state_dir = None;
-    let mut socket_group = None;
-    let mut gateway_user = None;
+
     let mut check_config = false;
-    let mut track_pid = None;
-    let mut domain = String::from("default");
     let mut duration_seconds = None;
-    let mut dns_refresh_seconds = DEFAULT_DNS_REFRESH_SECONDS;
-    let mut dsh_self_groups: Vec<String> = DEFAULT_DSH_SELF_GROUPS
-        .split(',')
-        .map(str::to_owned)
-        .collect();
-    let mut spawn_grpc = false;
-    let mut grpc_bin: Option<PathBuf> = None;
-    let mut grpc_listen: Option<String> = None;
+    let mut seen = std::collections::HashSet::new();
     while let Some(argument) = args.next() {
+        if !seen.insert(argument.clone()) {
+            return Err(invalid_input(format!("duplicate option {argument:?}")));
+        }
         match argument.as_str() {
             "--config" => config = Some(next_value(&mut args, "--config")?.into()),
-            "--bpf-object" => bpf_object = next_value(&mut args, "--bpf-object")?.into(),
-            "--ctl-sock" => control_socket = next_value(&mut args, "--ctl-sock")?.into(),
-            "--event-sock" | "--ev-sock" => {
-                event_socket = next_value(&mut args, "--event-sock")?.into()
-            }
-            "--launch-sock" => {
-                launch_socket = next_value(&mut args, "--launch-sock")?.into();
-                launch_socket_explicit = true;
-            }
-            "--dsh-sock" => {
-                dsh_socket = next_value(&mut args, "--dsh-sock")?.into();
-                dsh_socket_explicit = true;
-            }
-            "--ui-sock" => {
-                ui_socket = next_value(&mut args, "--ui-sock")?.into();
-                ui_socket_explicit = true;
-            }
-            "--dsh-self-groups" => {
-                dsh_self_groups = next_value(&mut args, "--dsh-self-groups")?
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|group| !group.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            }
-            "--state-dir" => state_dir = Some(PathBuf::from(next_value(&mut args, "--state-dir")?)),
-            "--socket-group" => socket_group = Some(next_value(&mut args, "--socket-group")?),
-            "--gateway-user" => gateway_user = Some(next_value(&mut args, "--gateway-user")?),
             "--check-config" => check_config = true,
-            "--track-pid" => track_pid = Some(parse_u32(next_value(&mut args, "--track-pid")?)?),
-            "--domain" => domain = next_value(&mut args, "--domain")?,
-            "--duration" | "--hold-seconds" => {
+            "--duration" => {
                 duration_seconds = Some(parse_u64(next_value(&mut args, "--duration")?)?)
             }
-            "--dns-refresh-seconds" => {
-                dns_refresh_seconds =
-                    parse_positive_u64(next_value(&mut args, "--dns-refresh-seconds")?)?
-            }
-            "--spawn-grpc" => spawn_grpc = true,
-            "--grpc-bin" => grpc_bin = Some(PathBuf::from(next_value(&mut args, "--grpc-bin")?)),
-            "--grpc-listen" => grpc_listen = Some(next_value(&mut args, "--grpc-listen")?),
             "-h" | "--help" => {
                 println!(
-                    "usage: censorguardd launch [--bpf-object PATH]\n\
-                     [--ctl-sock PATH] [--event-sock PATH] [--launch-sock PATH]\n\
-                     [--dsh-sock PATH] [--ui-sock PATH]\n\
-                     [--dsh-self-groups NAME[,NAME...]]\n\
-                     [--socket-group NAME] [--gateway-user NAME] [--state-dir PATH]\n\
+                    "usage: censorguardd launch [--config PATH] [--check-config]\n\
                      [--duration SECONDS]\n\
-                     [--dns-refresh-seconds SECONDS]\n\
-                     [--spawn-grpc [--grpc-bin PATH] [--grpc-listen ADDR]]\n\
-                     [--check-config] [--track-pid PID --domain NAME]\n\
-                     policy is applied later with censorguardctl"
+                     censorguardd reload [--config PATH]\n\
+                     censorguardd stop [--config PATH]\n\
+                     censorguardd --version\n\
+                     all daemon paths and runtime settings are read from the config file"
                 );
                 std::process::exit(0);
             }
             _ => return Err(invalid_input(format!("unknown argument {argument:?}"))),
         }
     }
-    let config = config.unwrap_or_else(|| PathBuf::from("/etc/censorguard/base.yaml"));
-    // Keep ad-hoc daemons isolated from the system service. The production default remains
-    // /run/censorguard/*.sock, while a custom control socket gets sibling sockets
-    // unless the caller explicitly supplied them.
-    if !control_socket.starts_with("/run/censorguard") {
-        let sibling = |name: &str| {
-            control_socket
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(name)
-        };
-        if !launch_socket_explicit {
-            launch_socket = sibling("launch.sock");
-        }
-        if !dsh_socket_explicit {
-            dsh_socket = sibling("dsh.sock");
-        }
-        if !ui_socket_explicit {
-            ui_socket = sibling("ui.sock");
-        }
-    }
-    let state_dir_ephemeral =
-        state_dir.is_none() && !control_socket.starts_with("/run/censorguard");
-    let state_dir = state_dir.unwrap_or_else(|| {
-        if control_socket.starts_with("/run/censorguard") {
-            PathBuf::from("/var/lib/censorguard")
-        } else {
-            control_socket
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(format!(".censorguard-state-{}", std::process::id()))
-        }
-    });
+    let explicit_config = config.is_some();
+    let config = config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    let daemon = if explicit_config || config.exists() {
+        config::load(&config).map_err(|error| invalid_input(format!("invalid config: {error}")))?
+    } else {
+        config::DaemonConfig::default()
+    };
+    let bpf_object = daemon.bpf_object;
+    let control_socket = daemon.control_socket;
+    let event_socket = daemon.event_socket;
+    let launch_socket = daemon.launch_socket;
+    let dsh_socket = daemon.dsh_socket;
+    let ui_socket = daemon.ui_socket;
+    let state_dir = daemon.state_dir;
+    let socket_group = daemon.socket_group;
+    let gateway_user = daemon.gateway_user;
+    let dsh_self_groups = daemon.dsh_self_groups;
+    let dns_refresh_seconds = daemon.dns_refresh_seconds;
+    let spawn_grpc = daemon.spawn_grpc;
+    let grpc_bin = daemon.grpc_bin;
     Ok(Args {
-        policy_free,
         config,
+        reload: false,
+        stop: false,
         bpf_object,
         control_socket,
         event_socket,
@@ -505,18 +545,15 @@ fn parse_args_with_values(
         dsh_socket,
         ui_socket,
         state_dir,
-        state_dir_ephemeral,
         socket_group,
         gateway_user,
         check_config,
-        track_pid,
-        domain,
         duration_seconds,
         dns_refresh_seconds,
         dsh_self_groups,
         spawn_grpc,
         grpc_bin,
-        grpc_listen,
+        grpc_listen: daemon.grpc_listen,
     })
 }
 
@@ -559,25 +596,10 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-fn parse_u32(value: String) -> Result<u32, io::Error> {
-    value
-        .parse()
-        .map_err(|_| invalid_input(format!("expected u32, got {value:?}")))
-}
-
 fn parse_u64(value: String) -> Result<u64, io::Error> {
     value
         .parse()
         .map_err(|_| invalid_input(format!("expected u64, got {value:?}")))
-}
-
-fn parse_positive_u64(value: String) -> Result<u64, io::Error> {
-    let parsed = parse_u64(value)?;
-    if parsed == 0 {
-        Err(invalid_input("expected a positive u64, got 0"))
-    } else {
-        Ok(parsed)
-    }
 }
 
 fn load_startup_policy(
@@ -604,12 +626,31 @@ fn load_startup_policy(
     }
     let snapshot = state_dir.join("revisions").join(format!("{revision}.yaml"));
     let bytes = fs::read(&snapshot)?;
-    Ok((compile_yaml(&bytes)?, revision))
+    let persisted = compile_yaml(&bytes)?;
+    let base = load(config)?;
+    let mut root = persisted.to_root();
+    let changed = root.rules != base.to_root().rules || root.daemon != base.daemon;
+    root.rules = base.to_root().rules;
+    root.daemon = base.daemon;
+    let revision = if changed {
+        revision
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("revision exhausted"))?
+    } else {
+        revision
+    };
+    Ok((censorguard_policy::compile(root)?, revision))
 }
 
 fn print_summary(policy: &CompiledPolicy) {
     println!(
-        "switches: enable file=true exec=true net=true; audit file=false exec=false net=false"
+        "switches: enable file={} exec={} net={}; audit file={} exec={} net={}",
+        policy.daemon.enable_file,
+        policy.daemon.enable_exec,
+        policy.daemon.enable_net,
+        policy.daemon.audit_file,
+        policy.daemon.audit_exec,
+        policy.daemon.audit_net,
     );
     println!(
         "policy: baseline={} groups={} domains={}",
@@ -629,39 +670,88 @@ fn print_summary(policy: &CompiledPolicy) {
     }
 }
 
+/// Validate the new startup input before dropping the running enforcement plane.
+fn validate_restart_config(path: &Path) -> Result<(), io::Error> {
+    config::load(path).map_err(|error| invalid_input(error.to_string()))?;
+    let policy = load(path).map_err(|error| invalid_input(error.to_string()))?;
+    let daemon = &policy.daemon;
+    resolve_socket_group(daemon.socket_group.as_deref())?;
+    resolve_gateway_user(daemon.gateway_user.as_deref())?;
+    fs::File::open(&daemon.bpf_object)?;
+    if daemon.spawn_grpc {
+        let grpc = daemon.grpc_bin.clone().unwrap_or_else(|| {
+            env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("censorguard-grpc")
+        });
+        fs::File::open(grpc)?;
+    }
+    load_startup_policy(path, &daemon.state_dir)
+        .map_err(|error| invalid_input(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn dns_refresh_defaults_to_sixty_seconds() -> Result<(), io::Error> {
-        let args = parse_args(["--config", "policy.yaml"].into_iter().map(str::to_owned))?;
-        assert_eq!(args.dns_refresh_seconds, DEFAULT_DNS_REFRESH_SECONDS);
+    fn startup_uses_current_base_settings_and_restores_dynamic_memberships()
+    -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        let state = directory.path().join("state");
+        fs::create_dir_all(state.join("revisions"))?;
+        fs::write(&config, "rules:\n  - exec deny /bin/false\n")?;
+        let saved = load(&config)?
+            .replace_group_yaml_from(
+                "a",
+                b"rules:\n  - exec deny /bin/true\n",
+                censorguard_common::protocol::PolicySource::File {
+                    path: "/policies/a.yaml".into(),
+                },
+            )?
+            .replace_group_yaml("b", b"rules: []")?
+            .bind_domain("agent", "a", &[])?
+            .bind_domain("agent", "b", &[])?;
+        fs::write(state.join("current"), "7\n")?;
+        fs::write(
+            state.join("revisions/7.yaml"),
+            serde_yaml::to_string(&saved.to_root())?,
+        )?;
+        assert_eq!(load_startup_policy(&config, &state)?.1, 7);
+        fs::write(
+            &config,
+            "daemon:\n  audit_exec: true\n  enable_net: false\nrules:\n  - exec deny /bin/echo\n",
+        )?;
+        let (restored, revision) = load_startup_policy(&config, &state)?;
+        assert_eq!(revision, 8);
+        assert_eq!(restored.to_root().rules, vec!["exec deny /bin/echo"]);
+        assert_eq!(restored.domains["agent"], "a+b");
+        assert_eq!(restored.group_definitions, saved.group_definitions);
+        assert_eq!(restored.group_sources, saved.group_sources);
+        assert!(restored.daemon.audit_exec);
+        assert!(!restored.daemon.enable_net);
+        assert!(restored.groups.contains_key("a+b"));
+        // A stale snapshot never overrides a newer public baseline.
+        assert_eq!(fs::read_to_string(state.join("current"))?, "7\n");
         Ok(())
     }
 
     #[test]
-    fn dns_refresh_rejects_zero() {
-        let result = parse_args(
-            ["--config", "policy.yaml", "--dns-refresh-seconds", "0"]
-                .into_iter()
-                .map(str::to_owned),
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn socket_group_is_parsed_and_resolved() -> Result<(), io::Error> {
+    fn dns_refresh_defaults_to_sixty_seconds() -> Result<(), io::Error> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(&config, "rules: []\n")?;
         let args = parse_args(
-            ["--config", "policy.yaml", "--socket-group", "root"]
-                .into_iter()
-                .map(str::to_owned),
+            [
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
+            ]
+            .into_iter(),
         )?;
-        assert_eq!(args.socket_group.as_deref(), Some("root"));
-        assert_eq!(
-            resolve_socket_group(args.socket_group.as_deref())?,
-            Some(Gid::from_raw(0))
-        );
+        assert_eq!(args.dns_refresh_seconds, 60);
         Ok(())
     }
 
@@ -671,52 +761,75 @@ mod tests {
     }
 
     #[test]
-    fn gateway_user_is_explicit_and_resolved() -> Result<(), io::Error> {
-        let args = parse_args(
-            ["--config", "policy.yaml", "--gateway-user", "root"]
-                .into_iter()
-                .map(str::to_owned),
-        )?;
-        assert_eq!(args.gateway_user.as_deref(), Some("root"));
-        assert_eq!(resolve_gateway_user(args.gateway_user.as_deref())?, Some(0));
-        Ok(())
-    }
-
-    #[test]
     fn unknown_gateway_user_is_rejected() {
         assert!(resolve_gateway_user(Some("censorguard-user-that-does-not-exist")).is_err());
     }
 
     #[test]
     fn spawn_grpc_defaults_to_off() -> Result<(), io::Error> {
-        let args = parse_args(["--config", "policy.yaml"].into_iter().map(str::to_owned))?;
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(&config, "rules: []\n")?;
+        let args = parse_args(
+            [
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
+            ]
+            .into_iter(),
+        )?;
         assert!(!args.spawn_grpc);
         assert_eq!(args.grpc_bin, None);
-        assert_eq!(args.grpc_listen, None);
         Ok(())
     }
 
     #[test]
-    fn spawn_grpc_options_are_parsed() -> Result<(), io::Error> {
+    fn explicit_config_overrides_daemon_defaults() -> Result<(), io::Error> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(
+            &config,
+            "daemon:\n  spawn_grpc: true\n  dns_refresh_seconds: 7\n  grpc_bin: /test/grpc\nrules: []\n",
+        )?;
         let args = parse_args(
             [
-                "--config",
-                "policy.yaml",
-                "--spawn-grpc",
-                "--grpc-bin",
-                "/opt/censorguard-grpc",
-                "--grpc-listen",
-                "127.0.0.1:50052",
+                "launch".to_owned(),
+                "--config".to_owned(),
+                config.display().to_string(),
             ]
-            .into_iter()
-            .map(str::to_owned),
+            .into_iter(),
         )?;
         assert!(args.spawn_grpc);
-        assert_eq!(
-            args.grpc_bin.as_deref(),
-            Some(std::path::Path::new("/opt/censorguard-grpc"))
-        );
-        assert_eq!(args.grpc_listen.as_deref(), Some("127.0.0.1:50052"));
+        assert_eq!(args.grpc_bin, Some(PathBuf::from("/test/grpc")));
+        assert_eq!(args.dns_refresh_seconds, 7);
         Ok(())
+    }
+
+    #[test]
+    fn missing_explicit_config_is_rejected() {
+        assert!(
+            parse_args(
+                ["launch", "--config", "/does-not-exist/censorguard.yaml"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn removed_runtime_flags_are_rejected() {
+        for flag in [
+            "--bpf-object",
+            "--ctl-sock",
+            "--event-sock",
+            "--state-dir",
+            "--spawn-grpc",
+            "--hold-seconds",
+            "--track-pid",
+            "--domain",
+        ] {
+            assert!(parse_args(["launch", flag, "value"].into_iter().map(str::to_owned)).is_err());
+        }
     }
 }

@@ -6,6 +6,7 @@ mod dns;
 mod error;
 mod evaluator;
 mod net;
+mod overlay;
 
 pub use compiler::{
     CompileWarning, CompiledPolicy, CompiledRules, RuleValue, compile, compile_yaml, load,

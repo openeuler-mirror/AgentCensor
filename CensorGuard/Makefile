@@ -15,17 +15,52 @@ ARCH ?= $(shell uname -m)
 BPF_ARCH ?= $(shell uname -m | sed -e 's/x86_64/x86/' -e 's/aarch64/arm64/')
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 INSTALL ?= install
+WITH_DSH ?= 1
+PNPM ?= pnpm
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all check test bpf vmlinux build install install-files uninstall package startup-test clean
+.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-audit-filter integration-exec-arguments integration-grpc integration-network-ops
 
-all: check bpf build
+all: check bpf build $(if $(filter 1,$(WITH_DSH)),plugin)
+
+help:
+	@printf '%s\n' \
+	  'make deps          Download locked build dependencies (first run)' \
+	  'make all           Check and build Rust, BPF and the DSH plugin package' \
+	  'make setup         Build, install and restart the systemd service; run doctor' \
+	  'make plugin-install DSH_REPO=/path/to/deepseek-harness [DSH_PROFILE=web]' \
+	  'make build / bpf / plugin    Build individual components' \
+	  'make test / plugin-test     Run component tests' \
+	  'WITH_DSH=0         Build/setup the daemon without Node or DSH tooling'
+
+deps:
+	cargo fetch --locked
+ifeq ($(WITH_DSH),1)
+	cd plugins/dsh-censorguard && $(PNPM) install --frozen-lockfile
+endif
+
+plugin:
+	PNPM="$(PNPM)" bash scripts/build-dsh-plugin.sh
+
+plugin-test: plugin
+	cd plugins/dsh-censorguard && $(PNPM) test
+	node scripts/test/verify-dsh-package.mjs
+
+DSH_PROFILE ?= web
+plugin-install:
+	bash scripts/install-dsh-censorguard.sh "$(DSH_REPO)" "$(DSH_PROFILE)"
+
+setup: all
+	@if [ -n "$(DESTDIR)" ] || [ "$(PREFIX)" != /usr ] || [ "$(SYSCONFDIR)" != /etc/censorguard ] || [ "$(SBINDIR)" != /usr/sbin ] || [ "$(BINDIR)" != /usr/bin ] || [ "$(SYSTEMDUNITDIR)" != /usr/lib/systemd/system ] || [ "$(SYSUSERSDIR)" != /usr/lib/sysusers.d ] || [ "$(TMPFILESDIR)" != /usr/lib/tmpfiles.d ] || [ "$(AGENTLIBDIR)" != /usr/lib/censorguard ]; then \
+	  printf '%s\n' 'make setup uses the standard /usr and /etc layout; use make install for custom/staged layouts.' >&2; exit 2; \
+	fi
+	bash scripts/setup-system.sh
 
 check:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --offline -- -D warnings
-	bash -n scripts/*.sh
+	@for script in scripts/*.sh scripts/test/*.sh; do bash -n "$$script" || exit; done
 	@for source in tools/*.c; do \
 		$(CC) -O2 -Wall -Wextra -Werror -fsyntax-only "$$source"; \
 	done
@@ -44,7 +79,7 @@ vmlinux:
 	mv -f bpf/vmlinux.h.tmp bpf/vmlinux.h
 
 build:
-	cargo build --workspace --release --offline
+	cargo build -p censorguard-daemon -p censorguardctl -p censorguard-grpc --release --offline
 
 install: build bpf
 	$(MAKE) --no-print-directory install-files
@@ -53,9 +88,7 @@ install-files:
 	$(INSTALL) -d -m 0755 "$(DESTDIR)$(BINDIR)" "$(DESTDIR)$(SBINDIR)"
 	$(INSTALL) -m 0755 target/release/censorguardd "$(DESTDIR)$(SBINDIR)/censorguardd"
 	$(INSTALL) -m 0755 target/release/censorguardctl "$(DESTDIR)$(BINDIR)/censorguardctl"
-	$(INSTALL) -m 0755 target/release/censorguard-audit "$(DESTDIR)$(BINDIR)/censorguard-audit"
 	$(INSTALL) -m 0755 target/release/censorguard-grpc "$(DESTDIR)$(BINDIR)/censorguard-grpc"
-	$(INSTALL) -m 0755 target/release/censorguard-exec "$(DESTDIR)$(BINDIR)/censorguard-exec"
 	$(INSTALL) -d -m 0755 "$(DESTDIR)$(AGENTLIBDIR)"
 	$(INSTALL) -m 0644 bpf/enforce.bpf.o "$(DESTDIR)$(AGENTLIBDIR)/enforce.bpf.o"
 	$(INSTALL) -d -m 0750 "$(DESTDIR)$(SYSCONFDIR)"
@@ -77,12 +110,15 @@ install-files:
 
 uninstall:
 	$(RM) "$(DESTDIR)$(SBINDIR)/censorguardd"
-	$(RM) "$(DESTDIR)$(BINDIR)/censorguardctl" "$(DESTDIR)$(BINDIR)/censorguard-audit" "$(DESTDIR)$(BINDIR)/censorguard-grpc" "$(DESTDIR)$(BINDIR)/censorguard-exec"
+	$(RM) "$(DESTDIR)$(BINDIR)/censorguardctl" "$(DESTDIR)$(BINDIR)/censorguard-grpc"
 	$(RM) "$(DESTDIR)$(AGENTLIBDIR)/enforce.bpf.o"
 	$(RM) "$(DESTDIR)$(SYSTEMDUNITDIR)/censorguardd.service"
 	$(RM) "$(DESTDIR)$(SYSUSERSDIR)/censorguard.conf"
 	$(RM) "$(DESTDIR)$(TMPFILESDIR)/censorguard.conf"
 	$(RM) "$(DESTDIR)$(DOCDIR)/README.md" "$(DESTDIR)$(DOCDIR)/NOTICE"
+	@for doc in docs/*.md; do \
+		$(RM) "$(DESTDIR)$(DOCDIR)/$${doc##*/}"; \
+	done
 	$(RM) "$(DESTDIR)$(DOCDIR)/architecture.md" "$(DESTDIR)$(DOCDIR)/migration-matrix.md"
 	$(RM) "$(DESTDIR)$(DOCDIR)/deployment.md" "$(DESTDIR)$(DOCDIR)/refactor-plan.md"
 	$(RM) "$(DESTDIR)$(DOCDIR)/verification.md" "$(DESTDIR)$(DOCDIR)/current-runbook.md"
@@ -96,136 +132,173 @@ package: build bpf
 	./scripts/package.sh "$(VERSION)" "$(ARCH)" "$(DISTDIR)"
 
 startup-test: build bpf
-	./scripts/test/startup-test.sh
+	bash ./scripts/test/startup-test.sh
+
+integration-ctl-output: build
+	python3 scripts/test/integration-ctl-output.py
 
 integration-install: build bpf
-	./scripts/test/integration-install.sh
+	bash ./scripts/test/integration-install.sh
 
 integration-basic: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-basic.sh
+	sudo bash ./scripts/test/integration-basic.sh
 
 integration-file-deny: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-deny.sh
+	sudo bash ./scripts/test/integration-file-deny.sh
 
 integration-file-ops: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-ops.sh
+	sudo bash ./scripts/test/integration-file-ops.sh
 
 integration-file-extended: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-extended.sh
+	sudo bash ./scripts/test/integration-file-extended.sh
 
 integration-deep-directory: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-deep-directory.sh
+	sudo bash ./scripts/test/integration-deep-directory.sh
 
 integration-file-stress: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-file-stress.sh
+	sudo bash ./scripts/test/integration-file-stress.sh
 
 integration-daemon: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-daemon.sh
+	sudo bash ./scripts/test/integration-daemon.sh
 
 integration-event-pressure: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-event-pressure.sh
+	sudo bash ./scripts/test/integration-event-pressure.sh
 
 integration-spawn: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-spawn.sh
+	sudo bash ./scripts/test/integration-spawn.sh
 
 integration-launcher-race: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-launcher-race.sh
+	sudo bash ./scripts/test/integration-launcher-race.sh
 
 integration-policy-revision: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-policy-revision.sh
+	sudo bash ./scripts/test/integration-policy-revision.sh
 
 integration-exec-domains: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-exec-domains.sh
+	sudo bash ./scripts/test/integration-exec-domains.sh
 
 integration-execveat: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-execveat.sh
+	sudo bash ./scripts/test/integration-execveat.sh
 
 integration-reload: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-reload.sh
+	sudo bash ./scripts/test/integration-reload.sh
 
 integration-bind: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-bind.sh
+	sudo bash ./scripts/test/integration-bind.sh
 
 integration-network: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-network.sh
+	sudo bash ./scripts/test/integration-network.sh
 
 integration-ipv6: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-ipv6.sh
+	sudo bash ./scripts/test/integration-ipv6.sh
 
 integration-self-protect: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-self-protect.sh
+	sudo bash ./scripts/test/integration-self-protect.sh
 
 integration-auth: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-auth.sh
+	sudo bash ./scripts/test/integration-auth.sh
 
 integration-sighup: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-sighup.sh
+	sudo bash ./scripts/test/integration-sighup.sh
 
 integration-shutdown: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-shutdown.sh
+	sudo bash ./scripts/test/integration-shutdown.sh
 
 integration-inspection: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-inspection.sh
+	sudo bash ./scripts/test/integration-inspection.sh
 
 integration-draining: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-draining.sh
+	sudo bash ./scripts/test/integration-draining.sh
 
 integration-pidtree: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pidtree.sh
+	sudo bash ./scripts/test/integration-pidtree.sh
 
 integration-generation: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-generation.sh
+	sudo bash ./scripts/test/integration-generation.sh
 
 integration-pid-churn: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pid-churn.sh
+	sudo bash ./scripts/test/integration-pid-churn.sh
 
 integration-pid-capacity: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-pid-capacity.sh
+	sudo bash ./scripts/test/integration-pid-capacity.sh
 
 integration-rollback: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-rollback.sh
+	sudo bash ./scripts/test/integration-rollback.sh
 
 integration-policy-sharing: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-policy-sharing.sh
+	sudo bash ./scripts/test/integration-policy-sharing.sh
+
+# Requires the DSH plugin's gRPC dependencies (pnpm install in its package).
+# Isolated daemon lifecycle and gRPC startup conflict acceptance.
+integration-lifecycle: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-lifecycle.py
+
+integration-audit-config: build bpf
+	sudo python3 scripts/test/integration-audit-config.py
+
+integration-audit-filter: build bpf
+	sudo python3 scripts/test/integration-audit-filter.py
+
+integration-exec-arguments: build bpf
+	sudo python3 scripts/test/integration-exec-arguments.py
+
+integration-network-ops: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-network-ops.py
+
+integration-grpc: bpf
+	cargo build --workspace --offline
+	sudo node scripts/test/integration-grpc.mjs
+
+integration-policy-entry: bpf
+	cargo build --workspace --offline
+	sudo python3 scripts/test/integration-policy-entry.py
+
+# Optional: needs a built DSH checkout and its Playwright Chromium installation.
+DSH_REPO ?= $(HOME)/deepseek-harness
+integration-dsh-web: bpf
+	cargo build --workspace --offline
+	cd plugins/dsh-censorguard && pnpm build
+	sudo node ./scripts/test/integration-dsh-web.mjs "$(DSH_REPO)"
 
 integration-dns: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-dns.sh
+	sudo bash ./scripts/test/integration-dns.sh
 
 integration-dns-refresh: bpf
 	cargo build --workspace --offline
-	sudo ./scripts/test/integration-dns-refresh.sh
+	sudo bash ./scripts/test/integration-dns-refresh.sh
 
-integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh
+integration: integration-basic integration-install integration-file-deny integration-file-ops integration-file-extended integration-deep-directory integration-file-stress integration-daemon integration-event-pressure integration-spawn integration-launcher-race integration-policy-revision integration-exec-domains integration-execveat integration-reload integration-bind integration-network integration-ipv6 integration-self-protect integration-auth integration-sighup integration-shutdown integration-inspection integration-draining integration-pidtree integration-generation integration-pid-churn integration-pid-capacity integration-rollback integration-policy-sharing integration-dns integration-dns-refresh integration-lifecycle integration-audit-config integration-audit-filter integration-network-ops
 
 clean:
 	cargo clean

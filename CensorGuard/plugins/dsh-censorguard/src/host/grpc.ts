@@ -32,6 +32,7 @@ export interface DomainInfo {
   id: number;
   slot: number;
   group: string;
+  policies?: string[];
   roots: number;
   version: number;
   draining: boolean;
@@ -100,13 +101,14 @@ export interface EventsRequest {
   kinds?: number[];
   allowed?: boolean;
   context?: RequestContext;
+  observerTgid?: number; // omit the UI host's unruled ALLOW send/recv packets
 }
 
 // AuditEvent 审计事件 (proto Event 的 TS 形态, uint64 已转 number)
 export interface AuditEvent {
   ts: string;               // RFC3339, daemon 收到事件的时刻
   kind: number;             // 1=FILE 2=EXEC 3=NET 4=GUARD
-  op: number;               // kind=1 时 FILE_OP_*, kind=4 时 GUARD_OP_*
+  op: number;               // kind=1 FILE_OP_*, kind=3 NET_OP_*, kind=4 GUARD_OP_*
   pid: number;
   tgid: number;
   allowed: boolean;
@@ -261,12 +263,14 @@ export class GrpcClient {
     policyYaml: string,
     dryRun: boolean,
     ctx?: RequestContext,
+    expectedRevision?: number,
   ): Promise<ApplyPolicyReply> {
     const r = await this.call<Record<string, unknown>>('ApplyPolicy', {
       name,
       policyYaml,
       dryRun,
       context: ctx,
+      expectedRevision: expectedRevision == null ? undefined : String(expectedRevision),
     });
     return {
       reloadGen: Number(r.reloadGen ?? 0),
@@ -315,6 +319,7 @@ export class GrpcClient {
       kinds: req.kinds ?? [],
       allowed: req.allowed,
       context: req.context,
+      observerTgid: req.observerTgid ?? 0,
     }, meta);
   }
 
@@ -333,6 +338,7 @@ export class GrpcClient {
       id: Number(d.id ?? 0),
       slot: Number(d.slot ?? 0),
       group: String(d.group ?? ''),
+      policies: (d.policies ?? []) as string[],
       roots: Number(d.roots ?? 0),
       version: Number(d.version ?? 0),
       draining: Boolean(d.draining ?? false),

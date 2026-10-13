@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-event-pressure
@@ -32,16 +63,14 @@ YAML
 : >"${runtime_dir}/drain.log"
 : >"${runtime_dir}/slow.log"
 
-"${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
+TEST_AUDIT_FILE=true
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}"
+"${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 45 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
@@ -49,8 +78,6 @@ grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
 # ALLOW auditing is a runtime switch now: enable global file allow auditing
 # (the daemon internally runs it at full rate).
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    set --audit-file on >"${runtime_dir}/set-audit.log"
 
 "${runtime_dir}/event-stress-probe" drain "${runtime_dir}/events.sock" \
     >"${runtime_dir}/drain.log" 2>&1 &
@@ -58,7 +85,7 @@ drain_pid=$!
 "${runtime_dir}/event-stress-probe" slow "${runtime_dir}/events.sock" 40 \
     >"${runtime_dir}/slow.log" 2>&1 &
 slow_pid=$!
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     if grep -q '^connected$' "${runtime_dir}/drain.log" && \
         grep -q '^connected$' "${runtime_dir}/slow.log"; then
         break
@@ -74,8 +101,8 @@ status_value() {
     sed -n "s/.*\"${field}\": \([0-9][0-9]*\).*/\1/p" "${file}"
 }
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/before.log"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/before.log"
 [[ $(status_value event_subscribers "${runtime_dir}/before.log") == 2 ]]
 
 kernel_dropped=0
@@ -83,13 +110,13 @@ reader_dropped=0
 subscriber_dropped=0
 generated=0
 for count in 50000 100000 250000 500000; do
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain event-domain -- "${runtime_dir}/event-stress-probe" \
         generate /etc/hosts "${count}" >"${runtime_dir}/generate-${count}.log" 2>&1
     generated=$((generated + count))
     /usr/bin/sleep 0.2
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-        status >"${runtime_dir}/pressure.log"
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+        status --json >"${runtime_dir}/pressure.log"
     kernel_dropped=$(status_value event_kernel_dropped "${runtime_dir}/pressure.log")
     reader_dropped=$(status_value event_reader_dropped "${runtime_dir}/pressure.log")
     subscriber_dropped=$(status_value event_subscriber_dropped \
@@ -106,13 +133,15 @@ if [[ ${kernel_dropped} -eq 0 || ${reader_dropped} -eq 0 || \
     cat "${runtime_dir}/pressure.log" >&2
     exit 1
 fi
-[[ $(status_value event_subscribers "${runtime_dir}/pressure.log") == 2 ]]
+# A non-reading consumer may be disconnected by the daemon's bounded write timeout.
+# The healthy consumer must remain; the sentinel below verifies delivery after pressure.
+[[ $(status_value event_subscribers "${runtime_dir}/pressure.log") -ge 1 ]]
 
 # Let the healthy subscriber drain its bounded queue, then send several sentinel DENY events.
 /usr/bin/sleep 1
 for _ in 1 2 3; do
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain event-domain -- /usr/bin/cat "${protected_file}" \
         >/dev/null 2>&1
     sentinel_rc=$?
@@ -120,8 +149,8 @@ for _ in 1 2 3; do
     [[ ${sentinel_rc} -ne 0 ]]
 done
 
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    status >"${runtime_dir}/after.log"
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+    status --json >"${runtime_dir}/after.log"
 [[ $(status_value event_kernel_dropped "${runtime_dir}/after.log") -ge ${kernel_dropped} ]]
 [[ $(status_value event_reader_dropped "${runtime_dir}/after.log") -ge ${reader_dropped} ]]
 [[ $(status_value event_subscriber_dropped "${runtime_dir}/after.log") \

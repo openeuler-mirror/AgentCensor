@@ -1,6 +1,6 @@
 {
   "name": "@censorguard/dsh",
-  "version": "0.5.1",
+  "version": "0.5.0",
   "description": "Censorguard DSH plugin: whole-tree wrapping security for DeepSeek Harness (bootstrap attach + gRPC host bridge + WebUI security section & audit tab)",
   "type": "module",
   "exports": {
@@ -26,7 +26,9 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings-general",
         "@deepseek-ai/dsh-client-ui-conversation"
       ],
       "platform": "web"
@@ -35,12 +37,13 @@
   "files": [
     "dist",
     "lib/client.js",
+    "bin",
     "proto",
     "cordis.patch.yml"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && bash scripts/build-client.sh",
-    "test": "node --test dist/**/*.test.js",
+    "test": "node --test test/*.test.mjs",
     "clean": "rm -rf dist lib",
     "verify-profile": "node ./bin/dump-config.mjs"
   },

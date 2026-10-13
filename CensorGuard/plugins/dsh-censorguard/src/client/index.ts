@@ -28,7 +28,7 @@ interface ClientContext {
 export const name = 'censorguard-ui';
 
 // slots: 注册点; connection: RPC 调用点。声明方包 (dsh-client-ui-settings /
-// dsh-client-ui-conversation) 由 package.json 的 dsh.client.inject 表达
+// dsh-client-ui-conversation / ui-settings-general) 由 package.json 的 dsh.client.inject 表达
 export const inject = ['slots', 'connection'];
 
 export function apply(ctx: ClientContext): void {

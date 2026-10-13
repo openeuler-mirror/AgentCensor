@@ -1,213 +1,279 @@
-# DSH 插件指南
+# CensorGuard 0.5.0 DSH 插件指南
 
-本文档描述 Censorguard DSH 插件的架构、安装、使用与故障排查。该插件为
-DeepSeek Harness(DSH)提供**整树包裹模式**的安全保护:DSH 主进程启动时
-自动 attach 到 daemon,此后整棵进程树(包括不经任何插件通道启动的子进程)
-都在 eBPF LSM 强制之下。
+本页负责把 `@censorguard/dsh` 安装到 DeepSeek Harness 的 profile，并在 Web 中使用。
+系统构建、daemon 安装与升级统一见 [构建指南](构建指南.md)。当前适配验证对象为 **DSH 0.1.5-rc.2**。
 
-系统构建见 [构建指南](构建指南.md);Censorguard 整体使用见 [使用手册](使用手册.md)。
+## 快速安装
 
-## 1. 架构概览
+先按构建指南完成 `make setup`，确认 `sudo censorguardctl doctor` 全部通过。
+以下前三步在 **CensorGuard 仓库根目录**执行；DSH 仓库本身应已安装依赖且可以运行 Web。
 
-### 1.1 整树包裹(默认降级不阻塞)
-
-DSH 主进程启动时,最先激活的 Bootstrap 插件经 `dsh.sock` 调 `attach_self`
-(pid 由 SO_PEERCRED 获取,不可伪造),daemon 将该进程注册为追踪根,此后
-整棵进程树(fork 自动继承 + pending 降级层)都在强制之下。
-
-attach 未成功时(daemon 未运行 / 策略组未下发 / hook 未挂载等),Bootstrap
-切 **degraded** 态并照常提供 `censorguardReady`:**DSH 正常启动**,WebUI
-显示"保护未启用",后台指数退避重试——daemon 就绪后自动转 protected,
-无需重启 DSH。需要"没有保护就不启动"的强语义时,把
-`cordis.patch.yml` 里的 `blockOnFailure` 改为 `true`(fail-closed:
-attach 失败则 DSH 启动失败)。
-
-### 1.2 三条通路
-
-```text
-自助面: DSH Bootstrap → dsh.sock (0666) attach_self / status_self / tree_self
-        5s 心跳比对 boot_id, daemon 重启即自动重 attach
-
-委托面: DSH Host 插件 → censorguard-grpc (127.0.0.1:50051, 非特权)
-        → ui.sock (0666) 白名单组策略读写 + 运行时开关切换
-        (daemon 永不监听网络; systemd 下 daemon --spawn-grpc 自动派生守护)
-
-事件面: eBPF ringbuf → daemon events.sock → gRPC 流
-        → Host 有界缓存 (5000 条 / 10 MiB) → Client 长轮询 → WebUI 审计页签
-```
-
-事件带单调 `sequence`(从 1 起)、`daemon_boot_id`(区分 daemon 重启)与
-`dropped_before`(累计丢失数)。断线、daemon 重启、ringbuf 满都会在审计
-列表留下 gap 标记条目,不制造"日志完整"的错觉。
-
-### 1.3 插件包结构
-
-`plugins/dsh-censorguard/` 自身即单包 `@censorguard/dsh`（无 workspace）：
-
-| 模块 | 职责 |
-|---|---|
-| `src/runtime` | attach 客户端、心跳守护、保护状态机（内部模块，供 bootstrap/host 复用） |
-| `src/bootstrap` | Cordis 入口（`@censorguard/dsh/bootstrap` 子路径），最先激活，attach 后提供 `censorguardReady` 服务 |
-| `src/host` | gRPC 桥（`@censorguard/dsh/host` 子路径）：在 webServer 上挂载 `/censorguard-read`（trust fence 放行即可读）与 `/censorguard-admin`（仅 loopback）两条 RPC 前缀路由；审计事件流有界缓存 |
-| `src/ui` + `src/client` | 浏览器半（裸包名 `@censorguard/dsh` entry + `./client` 导出）：安全策略设置页 + "安全拦截审计"页签 |
-| `cordis.patch.yml` | 插件行与依赖闸门（`dsh.bundle` 声明，`dsh plugin add` 后自动进入层列表） |
-
-> 为什么 UI entry 用裸包名而 bootstrap/host 用子路径：client-modules 对 entry
-> name 做 `require.resolve('<name>/package.json')` 找 `dsh.client` 声明，
-> 子路径 entry 解析不到 package.json 会被判为非 client 行。
-
-## 2. 前置条件
-
-| 条件 | 验证方法 |
-|---|---|
-| daemon 已运行且带 `--spawn-grpc` | `systemctl status censorguardd`;`ss -tln | grep 50051` |
-| gRPC 适配器已安装 | `ls /usr/bin/censorguard-grpc` |
-| DSH 策略组已由 root 下发 | `sudo censorguardctl policy-dump \| grep censorguard` |
-| 当前用户在 `censorguard` 组 | `id \| grep censorguard`(**加入后需重新登录才生效**) |
-| DSH 可用且 profile 已初始化 | 四者任一:`--dsh` 指定源码仓库、`$DSH_BIN`、PATH 上的 `dsh`、npx 可达 `@deepseek-ai/dsh`;`ls ~/.dsh/profiles/web/` |
-| 插件已构建 | `plugins/dsh-censorguard/dist/` 与 `lib/client.js` 存在 |
-
-## 3. 安装步骤
-
-### 3.1 构建插件
+### 1. 发布 DSH 策略组
 
 ```bash
-cd plugins/dsh-censorguard
-pnpm install && pnpm build
+sudo censorguardctl policy apply --policy censorguard-dsh-default --file config/policy.dsh-default.yaml
 ```
 
-### 3.2 root 一次性准备
+策略组会持久保存。升级插件通常无需再次发布；重发会用文件内容更新该组，可能覆盖 Web 中的编辑。
+示例 exec 黑名单只覆盖指定程序/参数写法；保护重要目录需补充 `file` 规则。
+匹配范围和通配符限制见 [策略编写与保护范围](策略编写与保护范围.md)。
+
+### 2. 给使用 DSH 的用户访问权限
+
+普通用户需要加入 `censorguard` 组。将下面 `alice` 换为实际使用 DSH 的用户名，加入后重新登录：
 
 ```bash
-# 下发 DSH 默认策略组(黑名单式,防 DSH 起不来;跨重启持久,只需一次)
-sudo censorguardctl policy apply \
-    --name censorguard-dsh-default \
-    --file config/policy.dsh-default.yaml
-
-# 把使用 DSH 的普通用户加入 censorguard 组(组内用户才能连各 socket)
-sudo usermod -aG censorguard <用户名>
+sudo usermod -aG censorguard alice
 ```
 
-> 用户加入组后**必须重新登录**(或重启会话),否则 SO_PEERCRED 判定无
-> socket 执行权,attach 报 `EACCES`。
+以 root 运行 DSH 可跳过此步。插件安装应由实际使用 DSH 的用户执行，profile 存储在该用户目录下。
 
-### 3.3 安装到 DSH profile
-
-普通用户执行（以源码仓库形态调用 dsh 为例）:
+### 3. 一键构建并安装插件
 
 ```bash
-cd ~/deepseek-harness-master
+make plugin-install DSH_REPO=/path/to/deepseek-harness
+```
+
+命令自动构建并打包 0.5.0 插件、移除旧四包依赖、安装单包到当前用户的 `web` profile。
+默认使用 `~/deepseek-harness`，其他 profile 用 `DSH_PROFILE=名称`；自定义数据目录沿用 `DSH_HOME`。
+首次插件依赖尚未缓存时，先运行 `make deps`。此步骤无需 sudo。
+
+### 4. 检查配置并启动 Web
+
+```bash
+node plugins/dsh-censorguard/bin/dump-config.mjs --dsh /path/to/deepseek-harness
+cd /path/to/deepseek-harness
+pnpm dsh --profile web
+```
+
+配置检查应显示三个插件入口和八个依赖闸门全部通过。打开终端显示的 Web 地址，
+首次打开点内测声明中的“继续”，选择工作区并创建或打开会话。
+
+完成后应看到：
+
+- 设置中的“安全策略”，保护状态为 `protected`。
+- 会话中的“对话”“轨迹”“安全拦截审计”页签。
+- DSH 原生会话侧边栏与文件预览。
+
+审计显示实际产生的事件，初始为空是正常情况。DSH 主进程及子孙都纳入保护，
+基线 `__base__` 与 `censorguard-dsh-default` 组共同生效。
+
+## 更新与停止
+
+| 更新内容 | 操作 | 是否需要重启 DSH |
+| --- | --- | --- |
+| 插件源码 / 0.5.0 插件包 | 再执行 `make plugin-install DSH_REPO=...` | 是，随后刷新浏览器 |
+| daemon / ctl / grpc / BPF / unit | 在 CensorGuard 根目录执行 `make setup` | 自动重新接入；关注 Web 保护状态 |
+| 基线或 daemon 配置 | 修改 `/etc/censorguard/base.yaml`，执行 `sudo censorguardd reload` | 自动重新接入 |
+| DSH 附加组规则 | Web 保存，或 `policy apply` 发布该组 | 立即应用 |
+
+插件更新需要先停止旧 DSH Web 进程，再启动新的进程；浏览器刷新会获取新资源。
+停止 DSH 可在启动终端按 Ctrl+C；daemon 服务独立运行。
+
+## 展开查看细分步骤
+
+<details>
+<summary>1. 系统前提与策略权限</summary>
+
+```bash
+sudo censorguardctl status
+sudo censorguardctl doctor
+id
+```
+
+默认配置提供：
+
+- `daemon.dsh_self_groups: [censorguard-dsh-default]`，允许 DSH 自身绑定这个组。
+- `daemon.spawn_grpc: true`，由 daemon 启动适配器，监听 `127.0.0.1:50051`。
+- Unix socket 所在目录供 `censorguard` 组访问。
+
+如果使用保留的旧配置，需核对上述设置。修改 daemon 配置需要 `sudo censorguardd reload`。
+组文件只有 `rules`，通过 `policy apply` 发布；全局基线位于系统启动配置中。
+Web 与 gRPC 只管理授权的附加组，不能更改基线或 daemon 开关；清空附加组仍保留基线。
+
+</details>
+
+<details>
+<summary>2. 插件构建、安装包与 profile 位置</summary>
+
+```bash
+make plugin
+# 等价的安装入口：
+bash scripts/install-dsh-censorguard.sh /path/to/deepseek-harness web
+```
+
+构建生成 `dist/censorguard-dsh-0.5.0.tgz`。安装器调用 DSH CLI，把安装包加入
+`${DSH_HOME:-~/.dsh}/profiles/web/`，不会把插件复制到上游源码树。
+
+已有安装包时，也可在 DSH 根目录手动执行：
+
+```bash
+pnpm dsh plugin --profile web add --ignore-scripts /path/to/CensorGuard/dist/censorguard-dsh-0.5.0.tgz
+```
+
+旧版本四包迁移由一键安装器处理。手动迁移时，先移除已安装的
+`@censorguard/dsh-bundle`、`@censorguard/dsh-bootstrap`、`@censorguard/dsh-host`、
+`@censorguard/dsh-client`，再添加单包 `@censorguard/dsh`。
+
+发布包已包含构建产物，运行依赖为纯 JavaScript。安装器使用 `--ignore-scripts`，
+避免新 profile 的 pnpm 配置因 protobufjs 的可选 postinstall 中断安装。
+
+开发者也可以把源码目录加入 profile：
+
+```bash
 pnpm dsh plugin --profile web add /path/to/CensorGuard/plugins/dsh-censorguard
 ```
 
-插件是**单包**:包的 `dsh.bundle` 声明让它在 `dsh plugin add` 后自动进入
-profile 的层列表,`cordis.patch.yml` 随之叠加进组合树。插件装进 **profile
-数据目录**(`$DSH_HOME/profiles/<name>`,默认 `~/.dsh`)里的依赖是指回插件
-工作区的符号链接,源码仓库只用于调用 CLI、不被修改。
+这会使用指向源码目录的链接。此方式更新时执行 `make plugin`，再重启 DSH 并刷新浏览器。
+安装包方式更新时必须重新安装包；两种方式的依赖来源可在 profile 的 `package.json` 中核对。
 
-验证组装结果（离线组合 patch 层,不启动服务）:
+</details>
 
-```bash
-pnpm dsh --profile web --dump-config     # 输出应含 censorguard-bootstrap/host/ui 三行
-# 或插件自带的校验脚本(四级探测链定位 dsh: --dsh / $DSH_BIN / PATH / npx 兜底)
-node /path/to/plugins/dsh-censorguard/bin/dump-config.mjs --dsh ~/deepseek-harness-master
-```
-
-> 从旧四包形态迁移:`pnpm dsh plugin --profile web remove @censorguard/dsh-bundle
-> @censorguard/dsh-bootstrap @censorguard/dsh-host @censorguard/dsh-client`,
-> 再按上文 add 单包即可。
-
-### 3.4 验证
+<details>
+<summary>3. 配置组装检查与自定义 profile</summary>
 
 ```bash
-pnpm dsh web        # 启动 DSH,日志应出现:
-                    # [censorguard-bootstrap] attach 成功: domain=dsh-<uid>-<tgid>-<start> ...
-                    # [censorguard-host] RPC 通道已注册: ...
-
-# 或独立自检脚本(不启动 DSH)
-node scripts/test/censorguard-dsh-selfcheck.mjs
+node plugins/dsh-censorguard/bin/dump-config.mjs --dsh /path/to/deepseek-harness --profile web
 ```
 
-attach 成功后域名形如 `dsh-<uid>-<tgid>-<starttime>`(多实例 DSH 可在
-bundle 的 `cordis.patch.yml` 里给 bootstrap 加 `instanceHint` 区分)。
+检查工具按 `--dsh`、`DSH_BIN`、PATH 上的 `dsh` 查找 CLI，不会自动下载其他版本。
+需要检查其他 profile 时修改 `--profile`，启动 Web 的 `--profile` 必须一致。
 
-## 4. 使用方法
+安装后，包中的 `dsh.bundle` 自动叠加 `cordis.patch.yml`。配置包含：
 
-### 4.1 WebUI:安全策略设置页
+| 入口 | 作用 |
+| --- | --- |
+| `censorguard-bootstrap` | 启动时自行接入，提供保护状态与就绪依赖 |
+| `censorguard-host` | 组策略与事件的 gRPC 桥、Web RPC 路由 |
+| `censorguard-ui` | 安全设置和会话审计页签 |
 
-DSH WebUI 的设置区出现"安全策略"区块:
+0.5.0 补丁使用当前 DSH 的 `typert-gateway`。浏览器依赖当前 connection、renderer、
+settings 和 conversation 插件。检查缺少入口时会明确报错，避免旧补丁静默失效。
 
-- **状态条**:保护状态(protected/degraded)、域名、策略版本、daemon
-  boot ID、hooks 健康度。
-- **策略编辑器**:直接展示/编辑当前绑定组的 YAML 原文;**校验策略**只编译
-  不生效;**保存并重新加载**带版本乐观锁(他人改过会提示冲突重新读取)。
-  只能编辑当前绑定组,不能动 `__base__` 或其他组。
-- **运行时开关**:六个 enable/audit 开关即点即切(等价 `ctl set`)。
+</details>
 
-权限边界:**只有本机(loopback)浏览器能调用写接口**,远程浏览器打开
-WebUI 只读——写请求在 RPC 通道层就被拒绝(403)。
+<details>
+<summary>4. 保护如何生效，以及 daemon 重启后的行为</summary>
 
-### 4.2 WebUI:安全拦截审计页签
+```text
+DSH 启动 → Bootstrap 连接 dsh.sock → 当前进程自行接入 → 子孙继承保护
+Web 策略 → Host → gRPC → ui.sock → 授权组更新
+BPF 事件 → events.sock → gRPC → Host 缓存 → Web 审计
+```
 
-会话视图的第三个页签"安全拦截审计"(对话、轨迹之后):
+daemon 通过 Unix socket 的进程凭据确认 DSH 身份。gRPC 用于策略管理和事件读取，
+进程接入由 Bootstrap 直接完成。插件保留官方 subprocess 和其他原生功能，并添加就绪依赖。
 
-- 实时滚动被拦截/被审计的事件(FILE/EXEC/NET/GUARD),可按类型、
-  允许/拒绝过滤,点击条目看完整详情(pid/comm/目标/参数/规则版本)。
-- 顶部状态条:流状态(live/reconnecting)、已丢失事件数、缓存淘汰数、
-  daemon boot ID。
-- 缺口诚实展示:daemon 侧丢失(`dropped_before`)、断线期间丢失
-  (sequence 跳变)、daemon 重启,都以 gap 标记条目出现在列表里。
+默认 `blockOnFailure: false`：daemon 不可达、组尚未发布等情况会显示 `degraded`，
+DSH 仍可启动，后台重试；恢复后转为 `protected`。需要接入失败就阻止启动的部署，可将
+bundle 的 Bootstrap 配置改为 `blockOnFailure: true`，修改后重新构建安装。
 
-### 4.3 域生命周期
+Bootstrap 每 5 秒核对 daemon boot ID；重启后重新接入。保护在 daemon 停机期间中断，
+以恢复后的 Web 状态为准。DSH 根进程退出后，daemon 回收相应追踪域。
 
-- attach 成功即整树纳管;域由 daemon 按根进程退出自动回收,DSH 停止时
-  无需任何清理。
-- Bootstrap 每 5 秒心跳校验 daemon boot ID:daemon 重启后自动重新 attach;
-  daemon 不可达时状态切 degraded 并指数退避重试,期间 WebUI 显示保护未启用
-  (默认不阻塞;`blockOnFailure: true` 时闸门入口不 Ready)。
-- DSH 插件更新(HMR/dispose)只断开连接,不解除纳管。
+</details>
 
-## 5. 卸载与更新
+<details>
+<summary>5. Web 安全设置、审计和原生会话功能</summary>
 
-### 5.1 卸载
+安全策略设置展示当前保护状态和绑定组规则。校验只编译，保存会立即发布组规则；
+版本检查发现冲突时，重新读取后再编辑。写接口只允许本机 loopback 浏览器，远程访问只读。
+
+“安全拦截审计”位于已打开会话的页签区，范围是**当前 DSH 实例及其子孙进程**，
+包含各会话工具、启动加载和页面文件访问。页签放在会话中，不代表事件只属于这一段对话。
+可按事件类型、允许/拒绝、进程和目标筛选，选中条目查看详情。
+切走取消浏览器长轮询，Host 继续接收；回来恢复缓存。daemon 重启后切换到新事件编号。
+
+| 字段 | 含义 |
+| --- | --- |
+| 事件序号（旧版 `seq`） | daemon 当前启动期间分配的全局事件编号，放行也有编号；其他域和显示过滤会造成跳号，不能当作命令数、拒绝数或丢失数 |
+| 传输丢失 | daemon 显式报告的本订阅传输丢失；断线期间数量未知，内核丢失另用 `censorguardctl status --json` 的事件计数诊断 |
+| 缓存移除（旧版“淘汰”） | `Host / 浏览器` 两个缓存各自移除的旧记录数；两者可能重叠，不相加，也不代表保护失效 |
+
+Host 上限为 **5000 条 / 10 MiB**，浏览器上限为 **5000 条**。这是实时观察窗，
+没有审计日志持久化；缓存满后移除旧记录，因此尽量在测试前打开页签。
+登录后 DSH 会加载资源、访问工作区；开启全局放行审计时即使未开始对话也会产生事件。
+
+为避免“接收审计 → 产生网络审计 → 再接收”的循环，插件订阅会过滤 **DSH Host 本进程
+未命中规则的 ALLOW 网络 send/recv 包事件**。该进程的网络连接事件、命中规则事件、
+所有 DENY、文件/执行事件以及子进程事件仍保留。内核检查与 daemon 原始事件不变；
+需要观察完整网络包事件时使用独立终端的 `sudo censorguardctl audit --kind net`。
+此修复需要**同时更新 censorguard-grpc 和插件**；只换浏览器资源不足以修复旧适配器的循环。
+
+对话、轨迹、会话树和文件预览由 DSH 提供。初始首页没有打开会话时，不会出现会话页签。
+实际文件访问受策略检查，因此被拒绝文件可能在预览时提示权限错误，并产生对应审计记录。
+
+</details>
+
+<details>
+<summary>6. 回归检查与卸载</summary>
+
+```bash
+make plugin-test
+make integration-dsh-web DSH_REPO=/path/to/deepseek-harness
+```
+
+Web 验收需要上游 Web 已构建、Playwright Chromium 和浏览器运行库，以及 root/BPF LSM。
+测试使用临时 profile、state、端口及本地模型桩，覆盖对话、轨迹、侧边栏、
+真实对话工具 `read` / `bash cat` / `bash rm` 的 BPF 拒绝及 Web 审计、
+开启全部放行审计后的空闲事件循环检查，以及 reload 后自动重新接入。
+测试只在临时会话中切换 DSH 权限模式，让命令到达 BPF 检查，不改变用户 profile。
+结果见 [策略管理验收](策略管理验收.md)。
+
+在 DSH 根目录卸载：
 
 ```bash
 pnpm dsh plugin --profile web remove @censorguard/dsh
 ```
 
-patch 层随包摘除,所有 inject 闸门回落到 DSH 原始配置,DSH 回到无保护启动。
+随后重启 DSH，插件的补丁和 Web 扩展会移除。系统 daemon 及已发布组独立保留。
 
-### 5.2 更新插件代码
+</details>
 
-profile 里的 `@censorguard/dsh` 依赖是**指向插件工作区的符号链接**,更新
-只需重建工作区产物后重启 DSH:
+## 查看已安装插件与清理旧版本
 
-```bash
-cd plugins/dsh-censorguard && pnpm build
-# 重启 DSH(pnpm dsh web)
-```
-
-### 5.3 升级 daemon / gRPC 适配器
+在 DSH 仓库目录执行，`--profile` 与启动时保持一致：
 
 ```bash
-sudo systemctl stop censorguardd
-sudo cp target/release/censorguardd /usr/sbin/ && sudo cp target/release/censorguard-grpc /usr/bin/
-sudo systemctl start censorguardd
-# DSH 心跳检测到 boot_id 变化后自动重 attach,无需重启 DSH
+pnpm dsh plugin --profile web list --depth 0
 ```
 
-## 6. 常见问题
+命令列出插件包名和实际版本。profile 位于 `${DSH_HOME:-$HOME/.dsh}/profiles/web/`，
+其 `package.json` 中 `dependencies` 表示安装来源，`dsh.profile.bundles` 表示启用的补丁层。
+同一包名在一个 profile 中通常只有一个直接依赖版本；pnpm 缓存里的旧版本不等于被加载。
+其他用户或其他 profile 的插件需要分别检查。
 
-| 现象 | 原因与处理 |
-|---|---|
-| WebUI 保护状态显示"未启用",日志有 `references uninstalled group "censorguard-dsh-default"` | 策略组未下发:root 执行 §3.2 的 `policy apply`。下发后插件后台重试会自动转 protected,无需重启 DSH |
-| WebUI 保护状态显示"未启用",日志有 `connect EACCES /run/censorguard/dsh.sock` | 用户不在 `censorguard` 组,或加组后未重新登录 |
-| DSH 启动直接失败,报 attach 相关错误 | `cordis.patch.yml` 里 `blockOnFailure` 被改成了 `true`(fail-closed);恢复默认 `false` 即可降级启动 |
-| WebUI 连不上、报 `ECONNREFUSED 127.0.0.1:50051` | gRPC 适配器未运行:systemd unit 需带 `--spawn-grpc --grpc-bin /usr/bin/censorguard-grpc`(重装后 `daemon-reload` + restart);手动部署可 `sudo censorguard-grpc` |
-| WebUI 报 `Cannot find module .../lib/client.js` | client 浏览器 bundle 未构建,`cd plugins/dsh-censorguard && pnpm build` |
-| 插件目录 `pnpm install` 报 `ERR_PNPM_IGNORED_BUILDS` | pnpm ≥10 拦 esbuild/protobufjs 的构建脚本:插件根的 `pnpm-workspace.yaml` 已白名单,确认它存在且未被删除 |
-| 保存策略报 `requires policy_yaml and expected_revision` | daemon 与 unit 版本不匹配的老部署问题(已修复),升级到 59d54d0 之后并同步二进制 |
-| 策略保存显示"版本冲突" | 他人/他端已改过策略,点"重新读取"拿最新版本再改 |
-| 审计页签大量 gap 条目 | 按 message 区分:daemon 报告丢失(ringbuf 满/消费慢)、断线重连、daemon 重启均正常记录;持续丢失说明事件量超出消费能力 |
-| DSH 进程内存持续增长 | 旧版本审计流重连 bug(已在 59d54d0 修复),升级插件并重启 DSH |
-| attach 成功但子进程没被拦 | 该进程在 attach 之前已存在且未 seed?重启用 `spawn` 启动或确认 `seed: true`(默认开) |
+旧包名可能是 `dsh-censorguard`、`@censorguard/dsh-bundle`、`@censorguard/dsh-bootstrap`、
+`@censorguard/dsh-host`、`@censorguard/dsh-client`。从列表中找到实际安装的旧包后移除，例如：
+
+```bash
+pnpm dsh plugin --profile web remove --ignore-scripts @censorguard/dsh-bundle
+```
+
+替换成实际旧包名，可一次传入多个包。保留新版 `@censorguard/dsh`，随后重启 DSH 并刷新浏览器。
+一键安装器 `make plugin-install DSH_REPO=...` 已会清理上述旧包，通常不需要手动操作。
+
+## 常见问题
+
+| 现象 | 先检查什么 |
+| --- | --- |
+| 所有页签或侧边栏不见了 | 首次声明是否点“继续”；是否选择工作区并打开会话；是否启动了安装插件的 profile |
+| 安全设置 / 审计页签缺失 | 运行配置检查；重新安装插件、重启 DSH、刷新浏览器 |
+| 状态是 `degraded`，提示组不存在 | 用 root 发布 `censorguard-dsh-default`；插件后台会重试 |
+| `EACCES` 访问 dsh.sock | 用户是否属于 `censorguard`，加入组后是否重新登录 |
+| `ECONNREFUSED 127.0.0.1:50051` | `sudo censorguardctl doctor`；确认同版本 grpc 已安装及 spawn_grpc 已启用 |
+| 缺失 `lib/client.js` | 执行 `make plugin-install`，完整重建并安装插件 |
+| Web 保存失败或版本冲突 | 使用 loopback 地址；重新读取组；检查 daemon 与 grpc 是否同版本 |
+| 审计为空 | 确认 protected，再产生受控进程的文件/执行/网络事件；核对 daemon 审计开关与规则 |
+| 对话操作没有出现 DENY | 看轨迹中的真实工具结果：若 DSH 权限/沙箱在执行前拒绝，操作未到内核；若命令成功，核对实际域绑定组和目标规则；若 EPERM 且 ctl 有 DENY，则检查插件与 grpc 更新及页面过滤 |
+| 登录后事件暴涨、拒绝记录消失 | 同时更新 grpc 和插件；旧版审计网络收发可能形成循环，将记录挤出缓存 |
+| 重启后暂时 degraded / 审计出现 gap | 等待自动接入；持续失败时查看 daemon 和 DSH 日志 |
+
+详细 CLI 语义见 [命令手册](命令手册.md)，系统部署问题见 [构建指南](构建指南.md)。
+
+对话执行本地 `cat`/`rm` 时，放行程序启动可以是 `EXEC ALLOW`，
+目标文件读取/删除被拒绝则是 `FILE DENY`。查文件拦截时选择 `FILE` 或“全部类型”，
+不能只看 `EXEC`。原生 `read` 工具由 Node 读文件，线程名可能是 `node` 或 `libuv-worker`，
+详情中的 `tgid` 对应 DSH 主进程；不是所有工具都通过独立命令执行。
+默认真实 DSH 域绑定 `censorguard-dsh-default`；手工测试的 `dsh-web → web` 是另一个域，
+仅把规则发布到 `web` 不会更改当前 DSH 保护规则。用 `sudo censorguardctl status` 核对实际绑定。

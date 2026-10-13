@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib-cli.sh"
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 set -euo pipefail
+
+# 断言依赖系统工具的英文输出 (id(1) strerror(3) 等会被 locale 本地化),
+# 统一固定 C locale, 避免 zh_CN 环境下 grep 误判。
+export LC_ALL=C
+
+# Failure checkpoint: report script/line and dump the daemon log tail.
+on_err() {
+    local rc=$?
+    echo "[FAIL] $(basename "$0"):${1} rc=${rc}" >&2
+    for d in "${runtime_dir:-}" "${lab_dir:-}"; do
+        if [[ -n ${d} && -f ${d}/daemon.log ]]; then
+            echo "--- ${d}/daemon.log (last 30 lines) ---" >&2
+            tail -30 "${d}/daemon.log" >&2
+        fi
+    done
+}
+trap 'on_err "${LINENO}"' ERR
 
 repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 runtime_dir=/tmp/censorguard-ipv6
@@ -48,6 +79,8 @@ YAML
 : >"${runtime_dir}/daemon.log"
 : >"${runtime_dir}/audit.log"
 
+TEST_AUDIT_NET=true
+write_test_config "${runtime_dir}/config.yaml" "${runtime_dir}/policy.yaml" "${repo_dir}/bpf/enforce.bpf.o" "${runtime_dir}" "" "" 1
 unshare --mount --propagation private /bin/bash -c '
     set -e
     mount --bind "$1" /etc/hosts
@@ -56,17 +89,12 @@ unshare --mount --propagation private /bin/bash -c '
     exec "$@"
 ' Censorguard-ipv6 \
     "${runtime_dir}/hosts" "${runtime_dir}/nsswitch.conf" \
-    "${repo_dir}/target/debug/censorguardd" \
-    --config "${runtime_dir}/policy.yaml" \
-    --bpf-object "${repo_dir}/bpf/enforce.bpf.o" \
-    --ctl-sock "${runtime_dir}/ctl.sock" \
-    --event-sock "${runtime_dir}/events.sock" \
-    --launch-sock "${runtime_dir}/launch.sock" \
-    --dns-refresh-seconds 1 \
+    "${repo_dir}/target/debug/censorguardd" launch \
+    --config "${runtime_dir}/config.yaml" \
     --duration 40 >"${runtime_dir}/daemon.log" 2>&1 &
 daemon_pid=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 1200); do
     grep -q '^\[READY\]' "${runtime_dir}/daemon.log" && break
     /usr/bin/sleep 0.05
 done
@@ -75,12 +103,8 @@ if ! grep -q '^\[READY\]' "${runtime_dir}/daemon.log"; then
     exit 1
 fi
 
-# ALLOW auditing is a runtime switch now: enable global network allow auditing.
-"${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-    set --audit-net on >"${runtime_dir}/set-audit.log"
-
-"${repo_dir}/target/debug/censorguard-audit" \
-    --socket "${runtime_dir}/events.sock" --kind 3 \
+# ALLOW auditing is configured before startup.
+"${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit --kind 3 \
     >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 /usr/bin/sleep 0.1
@@ -88,7 +112,7 @@ audit_pid=$!
 status_value() {
     local field=$1
     local file=$2
-    sed -n "s/.*\"${field}\": \([0-9][0-9]*\).*/\1/p" "${file}"
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[2]))[sys.argv[1]])' "${field}" "${file}"
 }
 
 probe_denied() {
@@ -96,7 +120,7 @@ probe_denied() {
     local port=$2
     local name=$3
     set +e
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain ipv6-domain -- "${runtime_dir}/connect-probe" \
         "${address}" "${port}" >"${runtime_dir}/${name}.log" 2>&1
     local result=$?
@@ -109,7 +133,7 @@ probe_allowed() {
     local address=$1
     local port=$2
     local name=$3
-    "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
+    "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
         spawn --domain ipv6-domain -- "${runtime_dir}/connect-probe" \
         "${address}" "${port}" >"${runtime_dir}/${name}.log" 2>&1
     if grep -q 'Operation not permitted' "${runtime_dir}/${name}.log"; then
@@ -125,10 +149,10 @@ wait_dns_state() {
     local stale=$4
     local prefix=$5
     for _ in $(seq 1 120); do
-        "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-            policy-dump >"${runtime_dir}/${prefix}-policy.log"
-        "${repo_dir}/target/debug/censorguardctl" --socket "${runtime_dir}/ctl.sock" \
-            status >"${runtime_dir}/${prefix}-status.log"
+        "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+            status --json >"${runtime_dir}/${prefix}-policy.log"
+        "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" \
+            status --json >"${runtime_dir}/${prefix}-status.log"
         if grep -q "\"${address}\"" "${runtime_dir}/${prefix}-policy.log" && \
             [[ $(status_value version "${runtime_dir}/${prefix}-status.log") == "${version}" ]] && \
             [[ $(status_value active_bank "${runtime_dir}/${prefix}-status.log") == "${bank}" ]]; then
