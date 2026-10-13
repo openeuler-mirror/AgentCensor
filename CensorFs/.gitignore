@@ -1,6 +1,8 @@
 /target/
+/dist/
 /.tools/
 /.censorfs-test/
 *.log
 node_modules/
-
+*.tgz
+*.tgz.sha256

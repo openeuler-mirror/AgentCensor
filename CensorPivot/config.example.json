@@ -1,4 +1,5 @@
 {
+  "supervisor_config": "/etc/agentcensor/censord.json",
   "socket_path": "/run/censorpivot/control.sock",
   "state_dir": "/var/lib/censorpivot/transactions",
   "socket_mode": 432,
@@ -21,9 +22,11 @@
     "cgroup_state_dir": "/run/censorpivot-cgroups"
   },
   "censorguard": {
-    "launch_socket": "/run/censorguard/launch.sock",
-    "exec_command": "/usr/bin/censorguard-exec",
-    "allowed_groups": ["censorguard-dsh-default"]
+    "config": "/etc/censorguard/agentcensor.yaml",
+    "control": "/usr/bin/censorguardctl",
+    "allowed_groups": [
+      "censorguard-dsh-default"
+    ]
   },
   "censorscope": {
     "command": "/usr/bin/censorscopectl",

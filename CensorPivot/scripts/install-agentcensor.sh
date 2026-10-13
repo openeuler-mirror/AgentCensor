@@ -53,6 +53,40 @@ run_step() {
   "$@" || fail "$description failed" "review the command output above and fix the first reported error"
 }
 
+# sudo commonly removes ~/.cargo/bin from PATH. Use the installed rustup
+# explicitly, preserving each component's pin; unpinned components use Pivot's
+# tested toolchain rather than an older distro Cargo.
+build_release() {
+  local component_root=$1
+  shift
+  local rustup_bin toolchain_file toolchain
+  rustup_bin=$(command -v rustup || true)
+  if [[ -z "$rustup_bin" && -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]]; then
+    rustup_bin="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
+  fi
+  if [[ -n "$rustup_bin" ]]; then
+    toolchain_file="$component_root/rust-toolchain.toml"
+    [[ -f "$toolchain_file" ]] || toolchain_file="$pivot_root/rust-toolchain.toml"
+    toolchain=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$toolchain_file")
+    [[ -n "$toolchain" ]] || fail "cannot read Rust toolchain from $toolchain_file"
+    # A distro toolchain may already match the pin (not registered in rustup).
+    if [[ -x /usr/bin/cargo && -x /usr/bin/rustc ]] \
+      && [[ $(/usr/bin/cargo --version) == "cargo $toolchain "* ]] \
+      && [[ $(/usr/bin/rustc --version) == "rustc $toolchain "* ]]; then
+      info "using system Rust $toolchain for $(basename "$component_root")"
+      (cd -- "$component_root" && RUSTC=/usr/bin/rustc /usr/bin/cargo build --release --locked "$@")
+      return
+    fi
+    if ! "$rustup_bin" run "$toolchain" rustc --version >/dev/null 2>&1; then
+      run_step "installing Rust $toolchain" "$rustup_bin" toolchain install "$toolchain" --profile minimal
+    fi
+    info "using Rust $toolchain for $(basename "$component_root")"
+    (cd -- "$component_root" && "$rustup_bin" run "$toolchain" cargo build --release --locked "$@")
+  else
+    (cd -- "$component_root" && cargo build --release --locked "$@")
+  fi
+}
+
 ensure_group() {
   if ! getent group censorpivot >/dev/null 2>&1; then
     run_step "creating system group censorpivot" groupadd --system censorpivot
@@ -94,7 +128,7 @@ install_fs() {
   require_source_tree "$fs_root" CensorFS CENSORFS_ROOT
   ensure_group
   run_step "building CensorFS release binaries" \
-    cargo build --manifest-path "$fs_root/Cargo.toml" --workspace --release --locked
+    build_release "$fs_root" --workspace
   for binary in censorfs censorfsd censorfsctl censorfs-mounter; do
     [[ -x "$fs_root/target/release/$binary" ]] || fail \
       "CensorFS build did not produce $binary" "rerun the build in $fs_root"
@@ -126,22 +160,22 @@ install_guard() {
   fi
   run_step "building the CensorGuard eBPF object" make -C "$guard_root" bpf
   run_step "building CensorGuard release binaries" \
-    cargo build --manifest-path "$guard_root/Cargo.toml" --workspace --release --locked
+    build_release "$guard_root" --workspace
   run_step "installing CensorGuard files" make -C "$guard_root" install-files
   if command -v systemd-sysusers >/dev/null 2>&1; then
     systemd-sysusers /usr/lib/sysusers.d/censorguard.conf
   elif ! getent group censorguard >/dev/null 2>&1; then
     groupadd --system censorguard
   fi
-  install -d -m 0750 /etc/censorguard
+  install -d -o root -g censorpivot -m 0750 /etc/censorguard
   install_config "$pivot_root/deploy/censorguard/agentcensor.yaml" \
-    /etc/censorguard/agentcensor.yaml 0640 root root
+    /etc/censorguard/agentcensor.yaml 0640 root censorpivot
   install -d -m 0750 /etc/censorguard/policy.d
   install_config "$guard_root/config/policy.dsh-default.yaml" \
     /etc/censorguard/policy.d/censorguard-dsh-default.yaml 0640 root root
   install -d -m 0750 /var/lib/censorguard
   # Guard rejects a socket parent writable by group/other. Socket files are
-  # chgrp'd separately through --socket-group.
+  # chgrp'd separately through daemon.socket_group in the YAML.
   install -d -o root -g censorpivot -m 0750 /run/censorguard
   info "CensorGuard installed; the standalone censorguardd.service was not enabled"
 }
@@ -152,7 +186,7 @@ install_scope() {
   require_source_tree "$scope_root" CensorScope CENSORSCOPE_ROOT
   ensure_group
   run_step "building CensorScope release binaries" \
-    cargo build --manifest-path "$scope_root/Cargo.toml" --release --locked -p daemon -p ctl
+    build_release "$scope_root" -p daemon -p ctl
   for binary in censorscoped censorscopectl; do
     [[ -x "$scope_root/target/release/$binary" ]] || fail \
       "CensorScope build did not produce $binary" "rerun the build in $scope_root"
@@ -188,6 +222,7 @@ require_component_file() {
 install_pivot() {
   require_root
   require_command cargo "install Rust 1.88+ and Cargo, then retry"
+  require_command python3 "install Python 3 to read the unified configuration"
   require_command sudo "install sudo; CensorPivot uses it for the privileged CensorFS mounter"
   require_command visudo "install the sudo package, then retry"
   require_command systemctl "CensorPivot service installation requires systemd"
@@ -197,14 +232,22 @@ install_pivot() {
   require_component_file CensorScope /usr/sbin/censorscoped scope
   ensure_user
   run_step "building CensorPivot release binaries" \
-    cargo build --manifest-path "$pivot_root/Cargo.toml" --release --locked
+    build_release "$pivot_root"
   install -d -m 0755 /usr/local/bin /usr/share/doc/censorpivot /usr/lib/systemd/system /etc/sudoers.d
   install -m 0755 "$pivot_root/target/release/censorpivot" /usr/local/bin/censorpivot
   install -m 0755 "$pivot_root/target/release/censord" /usr/local/bin/censord
-  install -d -m 0750 /etc/agentcensor
+  install -d -o root -g censorpivot -m 0750 /etc/agentcensor
   install -d -o root -g censorpivot -m 0750 /etc/censorpivot
   install_config "$pivot_root/censord.example.json" /etc/agentcensor/censord.json 0640 root censorpivot
   install_config "$pivot_root/config.example.json" /etc/censorpivot/config.json 0640 root censorpivot
+  run_step "migrating preserved Guard configuration to 0.5" \
+    /usr/local/bin/censord migrate-guard --config /etc/agentcensor/censord.json \
+    --pivot-config /etc/censorpivot/config.json
+  install -d -o root -g censorpivot -m 0750 /etc/censorguard
+  local guard_config
+  guard_config=$(guard_config_path)
+  chown root:censorpivot "$guard_config"
+  chmod 0640 "$guard_config"
   install -d -o root -g censorpivot -m 0750 /run/censorfs /run/censorguard
   install -d -m 0755 /run/censorscope
   install -d -o censorpivot -g censorpivot -m 0750 /var/lib/censorpivot/transactions /run/censorpivot
@@ -278,6 +321,14 @@ wait_for_data_plane() {
   return 1
 }
 
+guard_config_path() {
+  python3 - /etc/agentcensor/censord.json <<'PYTHON'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as stream:
+    print(json.load(stream)['censorguard']['config'])
+PYTHON
+}
+
 start_services() {
   require_root
   require_command systemctl "this start command requires systemd"
@@ -285,6 +336,9 @@ start_services() {
   require_component_file CensorGuard /usr/sbin/censorguardd guard
   require_component_file CensorScope /usr/sbin/censorscoped scope
   require_component_file CensorPivot /usr/local/bin/censord pivot
+  require_command python3 "install Python 3 to read the unified configuration"
+  local guard_config
+  guard_config=$(guard_config_path)
   require_cgroup_v2
   run_step "stopping any existing unified AgentCensor instance" \
     systemctl stop censorpivot.service agentcensord.service
@@ -301,8 +355,8 @@ start_services() {
       "run sudo $script_dir/install-agentcensor.sh doctor and fix its first error"
   fi
   run_step "applying the default CensorGuard policy group" \
-    /usr/bin/censorguardctl --socket /run/censorguard/ctl.sock policy apply \
-    --name censorguard-dsh-default \
+    /usr/bin/censorguardctl --config "$guard_config" policy apply \
+    --policy censorguard-dsh-default \
     --file /etc/censorguard/policy.d/censorguard-dsh-default.yaml
   if ! start_systemd_with_diagnostics censorpivot.service restart; then
     fail "starting CensorPivot failed" "fix the first error shown above, then rerun start"

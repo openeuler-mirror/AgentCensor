@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub supervisor_config: Option<PathBuf>,
     pub socket_path: PathBuf,
     pub state_dir: PathBuf,
     pub socket_mode: u32,
@@ -24,6 +25,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            supervisor_config: None,
             socket_path: "/run/censorpivot/control.sock".into(),
             state_dir: "/var/lib/censorpivot/transactions".into(),
             socket_mode: 0o660,
@@ -69,16 +71,16 @@ impl Default for CensorFsConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CensorGuardConfig {
-    pub launch_socket: PathBuf,
-    pub exec_command: PathBuf,
+    pub config: PathBuf,
+    pub control: PathBuf,
     pub allowed_groups: Vec<String>,
 }
 
 impl Default for CensorGuardConfig {
     fn default() -> Self {
         Self {
-            launch_socket: "/run/censorguard/launch.sock".into(),
-            exec_command: "/usr/local/bin/censorguard-exec".into(),
+            config: "/etc/censorguard/agentcensor.yaml".into(),
+            control: "/usr/bin/censorguardctl".into(),
             allowed_groups: vec!["censorguard-dsh-default".into()],
         }
     }
@@ -96,7 +98,7 @@ pub struct CensorScopeConfig {
 impl Default for CensorScopeConfig {
     fn default() -> Self {
         Self {
-            command: "/usr/local/bin/censorscopectl".into(),
+            command: "/usr/bin/censorscopectl".into(),
             socket: "/run/censorscope/censorscoped.sock".into(),
             operator_config: "/etc/censorscope/censorscoped.conf".into(),
             required: false,
@@ -109,7 +111,57 @@ impl Config {
         let bytes = fs::read(path)?;
         let config: Self = serde_json::from_slice(&bytes)?;
         config.validate()?;
+        if let Some(supervisor_path) = &config.supervisor_config {
+            let supervisor = crate::daemon::DaemonConfig::load(supervisor_path)?;
+            config.validate_supervisor(&supervisor)?;
+        }
         Ok(config)
+    }
+
+    /// Unified deployment must use the endpoints and policy sources actually
+    /// launched by censord. Refuse a split configuration before accepting work.
+    pub fn validate_supervisor(&self, supervisor: &crate::daemon::DaemonConfig) -> Result<()> {
+        for (name, actual, expected) in [
+            (
+                "censorfs.socket",
+                &self.censorfs.socket,
+                &supervisor.censorfs.socket,
+            ),
+            (
+                "censorguard.config",
+                &self.censorguard.config,
+                &supervisor.censorguard.config,
+            ),
+            (
+                "censorguard.control",
+                &self.censorguard.control,
+                &supervisor.censorguard.control,
+            ),
+            (
+                "censorscope.socket",
+                &self.censorscope.socket,
+                &supervisor.censorscope.socket,
+            ),
+            (
+                "censorscope.operator_config",
+                &self.censorscope.operator_config,
+                &supervisor.censorscope.config,
+            ),
+            (
+                "censorscope.command",
+                &self.censorscope.command,
+                &supervisor.censorscope.control,
+            ),
+        ] {
+            if actual != expected {
+                return Err(PivotError::Invalid(format!(
+                    "{name}={} differs from supervisor configuration {}",
+                    actual.display(),
+                    expected.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -130,12 +182,18 @@ impl Config {
             || self.max_frame_bytes > 16 * 1024 * 1024
             || !self.censorfs.cgroup_root.is_absolute()
             || !self.censorfs.cgroup_state_dir.is_absolute()
+            || !self.censorguard.config.is_absolute()
+            || !self.censorguard.control.is_absolute()
+            || self
+                .supervisor_config
+                .as_ref()
+                .is_some_and(|path| !path.is_absolute())
             || self.censorguard.allowed_groups.is_empty()
             || self
                 .censorguard
                 .allowed_groups
                 .iter()
-                .any(|group| group.is_empty())
+                .any(|group| !crate::guard::valid_name(group))
         {
             return Err(PivotError::Invalid(
                 "invalid I/O limits, cgroup paths or allowed Guard groups".into(),
@@ -152,6 +210,31 @@ mod tests {
     #[test]
     fn example_config_is_valid() -> Result<()> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
-        Config::load(&path).map(|_| ())
+        let config: Config = serde_json::from_slice(&fs::read(path)?)?;
+        config.validate()?;
+        let supervisor: crate::daemon::DaemonConfig =
+            serde_json::from_str(include_str!("../censord.example.json"))?;
+        config.validate_supervisor(&supervisor)
+    }
+
+    #[test]
+    fn mismatched_component_configuration_is_rejected() -> Result<()> {
+        let config: Config = serde_json::from_str(include_str!("../config.example.json"))?;
+        let supervisor: crate::daemon::DaemonConfig =
+            serde_json::from_str(include_str!("../censord.example.json"))?;
+        for field in 0..6 {
+            let mut changed = config.clone();
+            let path = PathBuf::from("/tmp/other-component");
+            match field {
+                0 => changed.censorfs.socket = path,
+                1 => changed.censorguard.config = path,
+                2 => changed.censorguard.control = path,
+                3 => changed.censorscope.socket = path,
+                4 => changed.censorscope.operator_config = path,
+                _ => changed.censorscope.command = path,
+            }
+            assert!(changed.validate_supervisor(&supervisor).is_err());
+        }
+        Ok(())
     }
 }

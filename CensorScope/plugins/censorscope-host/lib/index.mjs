@@ -27,7 +27,7 @@ export const name = 'censorscope-host'
 export const inject = []
 
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -212,6 +212,10 @@ export async function resolveTraceRecord(dshHome) {
 async function ensureHostTrace(ctx) {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
   const myPid = process.pid
+  // Guard denies cross-process ptrace checks, including /proc/PID/ns reads
+  // performed by a ctl child. The host can read its own namespace and send
+  // exact coordinates; the Scope daemon still resolves and authorizes them.
+  const myPidNamespace = await readlink('/proc/self/ns/pid')
   // Up to six attempts, ~2.5s apart; one attempt can itself block on the daemon
   // for the whole track-add budget below.
   const attempts = 6
@@ -235,7 +239,7 @@ async function ensureHostTrace(ctx) {
     // the writer's 30s control barrier so a slow start reports a real reason
     // instead of being killed by this deadline.
     const added = await runCensorscopectl(
-      ['track-add', '--root-pid', String(myPid), '--name', 'dsh-main', ...traceArg],
+      ['track-add', '--root-pid', String(myPid), '--root-pid-namespace', myPidNamespace, '--name', 'dsh-main', ...traceArg],
       40000,
     )
     if (!added.ok) {

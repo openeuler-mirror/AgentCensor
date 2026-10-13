@@ -71,7 +71,7 @@
       config:
         policyGroup: censorguard-dsh-default
         dshSockPath: /run/censorguard/dsh.sock
-        blockOnFailure: false
+        blockOnFailure: true
     - id: censorguard-host
       name: '@censorguard/dsh/host'
       config:
@@ -94,7 +94,7 @@
   inject: [webStartup, censorguardReady]
 - id: web-runtime
   inject: [webStartup, censorguardReady]
-- id: api-gateway
+- id: typert-gateway
   inject: [censorguardReady]
 - id: cordis-host-runner
   inject: [censorguardReady]
@@ -107,6 +107,13 @@
 - id: agent-loop
   inject: [censorguardReady]
   disabled: true
+
+# Gate the component plugins before they can start workers. Preserve their
+# existing service requirements because inject is replaced as a whole.
+- id: censorfs-parallel-worlds
+  inject: [tools, commands, subagents, sessions, censorguardReady]
+- id: agentcensor-session-proxy
+  inject: [agents, sessions, sessionPersistence, sessionProjections, censorguardReady]
 
 # Scope's session proxy owns web conversations and Scope UI replaces the native
 # trajectory view. The worker keeps the native agent loop in its headless profile.

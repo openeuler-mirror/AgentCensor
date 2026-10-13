@@ -159,6 +159,7 @@ pub struct DaemonServiceHost {
     pending_payloads: Vec<model_core::payload::PayloadSegment>,
     ingest_capture: Option<IngestCapture>,
     buffered_spool: VecDeque<BufferedSpoolRecord>,
+    committed_spool_next: u64,
     track_operations: BTreeMap<RequestId, TrackAddOperation>,
     /// Where captured data was lost, by stage.
     loss_ledger: LossLedger,
@@ -200,7 +201,6 @@ impl DaemonServiceHost {
         let (block_start, block_end) = storage
             .reserve_process_id_block(PROCESS_ID_BLOCK_SIZE)
             .map_err(storage_error)?;
-        drop(storage);
         let processes =
             ProcessIdentityManager::with_reserved_block(block_start, block_end, records)
                 .map_err(|error| control_error("process_identity", error))?;
@@ -212,6 +212,10 @@ impl DaemonServiceHost {
             fs::remove_dir_all(&spool_path)
                 .map_err(|error| control_error("spool_reset", error.to_string()))?;
         }
+        // Sequence numbers restart at zero with this empty spool. Keeping the
+        // previous DB checkpoint would silently discard new batches as replay.
+        storage.reset_spool_checkpoint().map_err(storage_error)?;
+        drop(storage);
         let checkpoint_path = spool_path.join("database.checkpoint");
         let sink = SpoolBatchSink::open(
             &spool_path,
@@ -275,6 +279,7 @@ impl DaemonServiceHost {
             pending_payloads: Vec::new(),
             ingest_capture: None,
             buffered_spool: VecDeque::new(),
+            committed_spool_next: 0,
             track_operations: BTreeMap::new(),
             loss_ledger: LossLedger::default(),
             ingested: LossCounts::default(),
@@ -508,6 +513,7 @@ impl DaemonServiceHost {
                 self.spool_consumer = Some(consumer);
                 return Err(ControlError::new("spool_checkpoint", error.to_string()));
             }
+            self.committed_spool_next = record.record.sequence.saturating_add(1);
         }
         self.spool_consumer = Some(consumer);
         Ok(())
@@ -2236,15 +2242,32 @@ impl DaemonServiceHost {
             ));
         };
         let trace_id = *trace_id;
+        // Capture a durable collector watermark, then finish decoding and DB
+        // commits while this trace and its attribution state still exist.
+        // Short batches otherwise exit and lose all queued events on removal.
+        let watermark = self
+            .collector
+            .unbind_trace(trace_id)
+            .map_err(collector_control_error)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.committed_spool_next < watermark {
+            self.fill_spool_buffer()?;
+            self.dispatch_buffered_spool()?;
+            self.progress_buffered_ingest()?;
+            if Instant::now() >= deadline {
+                return Err(ControlError::new(
+                    "trace_remove_drain",
+                    "collector events did not commit before trace removal",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.runtime
             .track_remove_root(RootRemovalRequest {
                 trace_id,
                 removed_at: SystemTime::now(),
             })
             .map_err(|error| control_error("track_remove", error))?;
-        self.collector
-            .unbind_trace(trace_id)
-            .map_err(collector_control_error)?;
         let mut writes = Vec::new();
         if let Some(entry) = self.runtime.get_trace(trace_id) {
             writes.push(PersistWrite::TraceLifecycle {

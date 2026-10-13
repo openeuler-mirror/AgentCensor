@@ -37,6 +37,29 @@ sudo target/release/censord doctor
 Scope 配置不存在时创建、存在时校验。`doctor` 检查本地文件、Unix socket，并分别调用
 FS `info`、Guard `doctor`、Scope `doctor`。当前不调用 Variant 或批次执行接口。
 
+## CensorGuard 0.5.0 接入与升级
+
+`censord.example.json` 和 `config.example.json` 都用 `censorguard.config` 引用同一份
+`/etc/censorguard/agentcensor.yaml`。该 YAML 的 `daemon` 是 socket、BPF、gRPC 与
+开关的唯一配置源，`rules` 是不可被动态组覆盖的基础策略。
+
+执行链为 `censorfs-mounter -> censorpivot __batch-runner -> Tool`。可信 runner 启动后
+先通过保留的私有 `register_self` 协议登记自身 PID；校验成功才输出 Ready、接受工具。
+不再依赖独立 launcher。组名必须在管理员 `allowed_groups` 中，并已用
+`censorguardctl --config /etc/censorguard/agentcensor.yaml policy apply --policy GROUP --file FILE`
+发布。
+
+升级已有安装时，先用安装器 `stop`，再更新 `guard` 和 `pivot`，最后执行 `start`。
+`pivot` 安装步骤会迁移旧 JSON 中的 Guard 参数与 launcher 配置，保留规则、自定义路径和
+白名单，并保存 `.pre-guard-0.5.0.bak`。未知旧参数会报错，需人工检查。
+详细命令见 [安装指南](docs/INSTALL.zh-CN.md)。
+
+Guard `reload` 是完整重启，会清空 PID 登记。统一部署请停止 DSH，并通过安装器
+`stop/start` 一起重启 Pivot 与数据面，再启动 DSH；不要在运行批次期间单独 reload Guard。
+动态组调整使用 `policy apply`，无需重启。Pivot 会在调用前后及批次结束时核查
+daemon boot ID 和 runner 登记；发现重启、失联或登记丢失便 Abort。该核查不能覆盖单次
+syscall 与重启之间的所有竞态，因此维护仍需统一停止工具后重启。
+
 ## DSH 组合插件
 
 CensorPivot 提供一个 DSH 安装入口，把 CensorFS、CensorGuard、CensorScope 的现有插件按
@@ -78,6 +101,10 @@ Candidate、持久化 Commit 决策并发布；任一步失败则持久化 Abort
 
 ## 构建与测试
 
+DSH 当前的聚合层只组合现有组件插件；普通 `read/bash` 对话工具尚未接入下述
+`BatchRequest` 事务流程。只有提交原生 Pivot 批次时才获得统一的 View、工具调用观测和
+Prepare/Commit/Abort。对应实现范围和真实测试证据见 [验收记录](docs/ACCEPTANCE.zh-CN.md)。
+
 ```bash
 cd CensorPivot
 cargo build --release
@@ -91,7 +118,7 @@ cargo clippy --all-targets -- -D warnings
 可信网关身份运行，具备：
 
 - 连接 CensorFS control socket、执行受控 `censorfs-mounter` 的权限；
-- 执行 `censorguard-exec` 并访问 Guard launch socket；
+- 读取共用的 Guard YAML 配置、执行 `censorguardctl` 并访问 launch socket；
 - 按配置访问 CensorScope control socket；
 - 独占写入 `state_dir`。
 
@@ -104,7 +131,8 @@ cargo clippy --all-targets -- -D warnings
 `/sys/fs/cgroup/censorpivot`）；mounter 使用其已有的 supervisor 功能创建独立 leaf cgroup，
 在批次结束或父进程退出时清理后代。`cgroup_state_dir` 必须由 root 管理，工具不可写。
 `runner_timeout_ms` 控制启动握手、发送与结束等待；`component_timeout_ms` 控制 FS/Scope CLI。
-`doctor` 检查这些环境条件，并实际调用 FS `info` 和 Scope `doctor`，但不主动创建 Guard domain。
+`doctor` 检查这些环境条件，并实际调用 FS `info`、Guard `status --json` 和 Scope `doctor`。
+Guard 必须已就绪、hooks 健康且允许的策略组均已发布；诊断不会创建 domain。
 
 不要在尚未创建 `censorpivot` 用户时直接执行带 `-o censorpivot` 的 `install` 命令。完整部署
 应使用 `scripts/install-agentcensor.sh pivot`；需要前台调试时再执行：
@@ -162,13 +190,14 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 `CENSORPIVOT_DEMO_BRANCH` 覆盖默认值。脚本会自动读取当前 Branch Head，生成唯一
 幂等键，提交批次，然后验证事务终态和 Head 确已前进。
 
-不具备内核环境时，可以执行同一示例中的真实 shell 工具及 launcher 协议验证：
+不具备完整内核环境时，可以执行真实 shell 工具与 runner 注册协议验证：
 
 ```bash
 cargo test two_call_artifact_example_runs_with_real_tools
-CENSORGUARD_EXEC=../CensorGuard/target/debug/censorguard-exec \
-  cargo test --test guard_launcher -- --ignored
+cargo test --test guard_launcher
+cargo test --test guard_migration
 ```
 
-后者使用真实 Guard launcher 和 Pivot runner、临时 Unix socket 与模拟注册服务，验证拒绝时
-不 exec、允许时 PID 不变；它不加载 eBPF，也不挂载 FUSE。
+注册测试使用真实 Pivot runner、临时 Unix socket 和模拟 Guard，验证注册回执与
+`SO_PEERCRED` PID 一致，以及拒绝、超时、错误回执时不输出 Ready、不处理工具。
+这些测试不加载 eBPF、不挂载 FUSE。

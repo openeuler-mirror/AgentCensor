@@ -23,8 +23,8 @@
  * `session.append`; the audit pair (`approval/asked` + `approval/decided`), the
  * `tool/result`, and every other durable fact stay authored by the worker — they
  * reach the UI exactly like the rest of the worker's stream, through the driver's
- * 1:1 mirror ("worker is the content authority; the host never synthesizes
- * session data"). Dispatching a waterfall is an interaction request, not session
+ * content mirror. Host UI configuration is synchronized separately and does
+ * not author approval audit records. Dispatching a waterfall is an interaction request, not session
  * content, and it is deliberately the raw waterfall rather than the host's own
  * `ctx.approval.request()` / `ctx.userQuestions.ask()`: those services would
  * append a second audit pair into the same session, and the approval service
@@ -39,7 +39,7 @@
  */
 import { randomUUID } from 'node:crypto'
 const { scopeTarget } = await import(
-  process.execArgv.some((arg) => arg.includes('tsx/esm'))
+  process.execArgv.some(arg => /tsx\/(?:dist\/)?esm(?:\/|$)/.test(arg))
     ? '@deepseek-ai/dsh-scope/src/index.ts'
     : '@deepseek-ai/dsh-scope'
 )

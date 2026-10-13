@@ -101,6 +101,29 @@ install_runtime() {
     add --save-exact --force --ignore-scripts "$@"
 }
 
+# Remove the retired split Guard packages through DSH so its bundle roster is
+# reconciled too. The current aggregate runtime package is replaced below.
+cleanup_legacy_guard() {
+  local profile=$1 package
+  local installed=()
+  initialize_profile "$profile"
+  while IFS= read -r package; do
+    [[ -z "$package" ]] || installed+=("$package")
+  done < <(node - "$dsh_home/profiles/$profile/package.json" <<'NODE'
+const fs = require('node:fs')
+const pkg = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+for (const name of ['dsh-censorguard', '@censorguard/dsh-bundle', '@censorguard/dsh-bootstrap', '@censorguard/dsh-host', '@censorguard/dsh-client']) {
+  if (pkg.dependencies?.[name] || pkg.devDependencies?.[name]) console.log(name)
+}
+NODE
+  )
+  if (( ${#installed[@]} )); then
+    "${dsh_command[@]}" plugin --profile "$profile" remove "${pnpm_store_args[@]}" "${installed[@]}"
+  fi
+}
+cleanup_legacy_guard web
+cleanup_legacy_guard headless
+
 install_runtime web \
   "$package_dir/censorfs-web.tgz" \
   "$package_dir/censorguard-web.tgz" \
@@ -133,6 +156,7 @@ const expected = {
 }
 const retired = new Set([
   '@censorfs/deepseek-harness', '@censorfs/event-exporter', '@censorguard/dsh',
+  'dsh-censorguard', '@censorguard/dsh-bundle', '@censorguard/dsh-bootstrap', '@censorguard/dsh-host', '@censorguard/dsh-client',
   'censorscope-host', 'censorscope-ui', 'agentcensor-session-proxy',
 ])
 for (const [profile, active] of Object.entries(expected)) {

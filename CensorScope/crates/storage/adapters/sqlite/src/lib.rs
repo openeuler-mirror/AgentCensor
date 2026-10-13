@@ -982,6 +982,15 @@ impl SqliteStorage {
         self.connection.borrow_mut().execute_batch("COMMIT")
     }
 
+    /// Reset replay bookkeeping when the daemon discards its lifetime spool.
+    pub fn reset_spool_checkpoint(&mut self) -> Result<(), rusqlite::Error> {
+        self.connection.borrow_mut().execute(
+            "UPDATE spool_checkpoint SET last_sequence = -1 WHERE singleton = 1",
+            [],
+        )?;
+        Ok(())
+    }
+
     /// Commit all rows belonging to one spool batch in one transaction.
     pub fn apply_ingest_batch(
         &mut self,
@@ -2464,6 +2473,23 @@ mod ancillary_batch_tests {
             )
             .unwrap();
         assert_eq!(checkpoint, 7);
+
+        // A daemon restart discards the old spool, but keeps historical events.
+        // Sequence zero in the new spool must be accepted once, then deduped.
+        storage.reset_spool_checkpoint().unwrap();
+        let mut restarted_event = event;
+        restarted_event.envelope.event_id = model_core::ids::EventId::new(11);
+        for _ in 0..2 {
+            storage
+                .apply_ingest_batch(0, Vec::new(), vec![restarted_event.clone()], Vec::new())
+                .unwrap();
+        }
+        let event_count: i64 = storage
+            .connection
+            .borrow()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 2);
     }
 }
 

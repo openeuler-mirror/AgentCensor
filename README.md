@@ -75,10 +75,10 @@ BatchRequest
     │
     ├─ 校验 request_id、工具路径、参数与资源限制
     ├─ CensorFS VariantOpen：创建私有 Ticket / View
-    ├─ 启动 mounter 和 censorguard-exec
+    ├─ 启动 mounter，再 exec 可信 Pivot runner
     │    ├─ 挂载私有 /workspace
-    │    ├─ register_self：把 runner 加入 Guard domain
-    │    └─ runner 回报真实 PID
+    │    ├─ runner 先 register_self：登记真实 PID / Guard domain
+    │    └─ 校验回执后 Ready，才接受工具调用
     ├─ CensorScope track-add：从真实 runner PID 开始跟踪
     ├─ 顺序执行 Tool 1..N
     │    ├─ CallStart → 工具执行 → Guard 内核检查 → Scope 采集 → CallEnd
@@ -179,14 +179,19 @@ DSH_ROOT=/path/to/deepseek-harness \
 
 ### 3. 启动 Web
 
-回到 **DeepSeek Harness 仓库根目录**，用 `pnpm web` 启动：
+回到 **DeepSeek Harness 仓库根目录**，启动 `web` profile：
 
 ```bash
 cd /path/to/deepseek-harness
-pnpm web
+pnpm dsh --profile web
 ```
 
 组合插件会将 CensorFS、CensorGuard、CensorScope 接入 DSH 的 `web` 和 `headless` profile。完整环境变量、源码目录识别、打包和排障说明见 [CensorPivot 安装文档](CensorPivot/docs/INSTALL.zh-CN.md) 和 [DSH 集成说明](CensorFs/integrations/deepseek-harness/README.md)。
+
+当前组合插件提供 Guard 进程树保护、Scope 会话观测和 CensorFS 分支工具。DSH 普通对话
+中的 `read/bash` 仍由原生工具执行，尚未自动提交 Pivot `BatchRequest`，因此这些调用
+不具备 Pivot 批次的统一 Prepare/Commit/Abort。完整事务流程通过下面的原生 CLI 或
+Demo 验证。实际安装、浏览器和系统接口验收见 [验收记录](CensorPivot/docs/ACCEPTANCE.zh-CN.md)。
 
 <details>
 <summary><strong>原生 CLI 与批次 Demo</strong></summary>

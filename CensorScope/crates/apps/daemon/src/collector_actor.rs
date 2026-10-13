@@ -39,6 +39,9 @@ impl SpoolBatchSink {
 }
 
 impl CollectorBatchSink for SpoolBatchSink {
+    fn next_sequence(&self) -> u64 {
+        self.writer.next_sequence()
+    }
     fn append(&mut self, batch: CollectorPollBatch) -> Result<(), String> {
         let envelope = CollectorBatchEnvelope { version: 1, batch };
         let payload = serde_json::to_vec(&envelope).map_err(|error| error.to_string())?;
@@ -79,6 +82,9 @@ impl CollectorBatchSink for SpoolBatchSink {
 /// assembly; the actor does not depend on a particular persistence backend.
 pub trait CollectorBatchSink: Send + 'static {
     fn append(&mut self, batch: CollectorPollBatch) -> Result<(), String>;
+    fn next_sequence(&self) -> u64 {
+        0
+    }
 
     fn append_raw(&mut self, batch: CollectorRawBatch) -> Result<(), String> {
         let _ = batch;
@@ -100,7 +106,7 @@ enum Command {
         Vec<ProcessRecord>,
         Sender<Result<(), CollectorError>>,
     ),
-    Unbind(TraceId, Sender<Result<(), CollectorError>>),
+    Unbind(TraceId, Sender<Result<u64, CollectorError>>),
     Stats(Sender<CollectorStats>),
     Stop(Sender<Result<(), String>>),
 }
@@ -170,7 +176,7 @@ impl CollectorActorHandle {
         result.recv().map_err(|_| actor_closed())?
     }
 
-    pub fn unbind_trace(&self, trace_id: TraceId) -> Result<(), CollectorError> {
+    pub fn unbind_trace(&self, trace_id: TraceId) -> Result<u64, CollectorError> {
         let (reply, result) = reply_channel();
         self.commands
             .send(Command::Unbind(trace_id, reply))
@@ -269,7 +275,23 @@ fn handle_command(
             let _ = reply.send(collector.seed_trace_memberships(trace_id, records));
         }
         Command::Unbind(trace_id, reply) => {
-            let _ = reply.send(collector.unbind_trace(trace_id));
+            let result = (|| {
+                collector.flush_transport()?;
+                if let Some(batch) = collector.poll_raw_batch()? {
+                    sink.append_raw(batch)
+                        .map_err(|error| CollectorError::new("spool_sink", error))?;
+                }
+                collector.unbind_trace(trace_id)?;
+                collector.flush_transport()?;
+                if let Some(batch) = collector.poll_raw_batch()? {
+                    sink.append_raw(batch)
+                        .map_err(|error| CollectorError::new("spool_sink", error))?;
+                }
+                sink.flush()
+                    .map_err(|error| CollectorError::new("spool_sink", error))?;
+                Ok(sink.next_sequence())
+            })();
+            let _ = reply.send(result);
         }
         Command::Stats(reply) => {
             let _ = reply.send(collector.stats());

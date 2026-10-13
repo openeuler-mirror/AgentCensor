@@ -147,7 +147,9 @@ impl PeerIdentity {
             pid_namespace: target_pid_namespace,
             mount_namespace: target_mount_namespace,
         };
-        if self.principal.matches(&target) {
+        if self.principal.matches(&target)
+            || self.authorizes_descendant_across_mounts(host_pid, &target)?
+        {
             Ok(())
         } else {
             Err(peer_error(format!(
@@ -162,6 +164,42 @@ impl PeerIdentity {
                 target.mount_namespace
             )))
         }
+    }
+
+    /// A non-root coordinator may create a private mount namespace for its
+    /// own runner. The ctl peer is its direct child; permit this delegation
+    /// only inside that coordinator's descendant tree, with the same UID and
+    /// PID namespace. An unrelated container or process remains unauthorized.
+    fn authorizes_descendant_across_mounts(
+        &self,
+        target_pid: u32,
+        target: &PeerPrincipal,
+    ) -> Result<bool, ControlError> {
+        if self.credentials.uid == 0
+            || self.principal.uid != target.uid
+            || self.principal.pid_namespace != target.pid_namespace
+        {
+            return Ok(false);
+        }
+        let coordinator = process_parent(self.credentials.pid)?;
+        if coordinator == 0 {
+            return Ok(false);
+        }
+        let coordinator_principal = PeerPrincipal {
+            uid: process_uid(coordinator)?,
+            pid_namespace: process_pid_namespace(coordinator)?,
+            mount_namespace: process_mount_namespace(coordinator)?,
+            host_pid_namespace: self.principal.host_pid_namespace,
+            host_mount_namespace: self.principal.host_mount_namespace,
+        };
+        descendant_delegation_allowed(
+            &self.principal,
+            &coordinator_principal,
+            target,
+            coordinator,
+            target_pid,
+            process_parent,
+        )
     }
 
     /// Authorizes access to an active trace using its principal captured at creation.
@@ -184,6 +222,36 @@ impl PeerIdentity {
     }
 }
 
+fn descendant_delegation_allowed(
+    peer: &PeerPrincipal,
+    coordinator: &PeerPrincipal,
+    target: &PeerPrincipal,
+    coordinator_pid: u32,
+    target_pid: u32,
+    parent: impl Fn(u32) -> Result<u32, ControlError>,
+) -> Result<bool, ControlError> {
+    if peer.uid == 0
+        || peer.uid != target.uid
+        || peer.uid != coordinator.uid
+        || peer.pid_namespace != target.pid_namespace
+        || !peer.matches(coordinator)
+        || coordinator_pid == 0
+    {
+        return Ok(false);
+    }
+    let mut current = target_pid;
+    for _ in 0..256 {
+        if current == coordinator_pid {
+            return Ok(true);
+        }
+        if current <= 1 {
+            return Ok(false);
+        }
+        current = parent(current)?;
+    }
+    Ok(false)
+}
+
 pub(crate) fn peer_error(message: impl Into<String>) -> ControlError {
     ControlError::new("peer_identity", message)
 }
@@ -200,6 +268,23 @@ fn process_uid(pid: u32) -> Result<u32, ControlError> {
                 .and_then(|value| value.parse::<u32>().ok())
         })
         .ok_or_else(|| peer_error(format!("read {path}: missing Uid")))
+}
+
+fn process_parent(pid: u32) -> Result<u32, ControlError> {
+    let path = format!("/proc/{pid}/stat");
+    let content = std::fs::read_to_string(&path)
+        .map_err(|error| peer_error(format!("read {path}: {error}")))?;
+    parent_from_stat(&content).ok_or_else(|| peer_error(format!("read {path}: missing parent PID")))
+}
+
+fn parent_from_stat(content: &str) -> Option<u32> {
+    content
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn process_pid_namespace(pid: u32) -> Result<String, ControlError> {
@@ -219,6 +304,57 @@ fn process_mount_namespace(pid: u32) -> Result<String, ControlError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_mount_delegation_requires_owned_descendant_and_pid_namespace() {
+        let peer = PeerPrincipal {
+            uid: 1000,
+            pid_namespace: "pid:[host]".into(),
+            mount_namespace: "mnt:[host]".into(),
+            host_pid_namespace: true,
+            host_mount_namespace: true,
+        };
+        let target = PeerPrincipal {
+            mount_namespace: "mnt:[runner]".into(),
+            ..peer.clone()
+        };
+        let parent = |pid| {
+            Ok(match pid {
+                12 => 11,
+                11 => 10,
+                _ => 1,
+            })
+        };
+        assert!(descendant_delegation_allowed(&peer, &peer, &target, 10, 12, parent).unwrap());
+        assert!(!descendant_delegation_allowed(&peer, &peer, &target, 10, 20, parent).unwrap());
+        for rejected in [
+            PeerPrincipal {
+                uid: 1001,
+                ..target.clone()
+            },
+            PeerPrincipal {
+                pid_namespace: "pid:[container]".into(),
+                ..target.clone()
+            },
+        ] {
+            assert!(
+                !descendant_delegation_allowed(&peer, &peer, &rejected, 10, 12, parent).unwrap()
+            );
+        }
+        assert!(!descendant_delegation_allowed(&peer, &target, &target, 10, 12, parent).unwrap());
+        let root = PeerPrincipal { uid: 0, ..peer };
+        assert!(!descendant_delegation_allowed(&root, &root, &root, 10, 12, parent).unwrap());
+    }
+
+    #[test]
+    fn parent_parser_handles_spaces_and_parentheses_in_comm() {
+        assert_eq!(
+            parent_from_stat("123 (worker (private)) S 42 1 2"),
+            Some(42)
+        );
+        assert_eq!(parent_from_stat("123 (worker) S invalid"), None);
+        assert_eq!(parent_from_stat("invalid"), None);
+    }
 
     #[test]
     fn isolated_principals_match_by_pid_namespace_across_uids() {
