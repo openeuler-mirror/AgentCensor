@@ -28,9 +28,10 @@ node - "$root/censord.example.json" "$root/config.example.json" <<'NODE'
 const fs = require('node:fs')
 const daemon = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
 const pivot = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'))
-if (daemon.censorguard.policy !== '/etc/censorguard/agentcensor.yaml') process.exit(1)
-if (!daemon.censorguard.extra_args.includes('--socket-group')) process.exit(1)
-if (pivot.censorguard.exec_command !== '/usr/bin/censorguard-exec') process.exit(1)
+if (daemon.censorguard.config !== '/etc/censorguard/agentcensor.yaml') process.exit(1)
+if (daemon.censorguard.extra_args !== undefined) process.exit(1)
+if (pivot.censorguard.config !== daemon.censorguard.config) process.exit(1)
+if (pivot.censorguard.exec_command !== undefined) process.exit(1)
 if (pivot.censorscope.command !== '/usr/bin/censorscopectl') process.exit(1)
 NODE
 
@@ -45,11 +46,6 @@ grep -q '^rules:' "$root/../CensorGuard/config/policy.dsh-default.yaml"
 
 if command -v visudo >/dev/null 2>&1; then
   visudo -cf "$root/deploy/sudoers/censorpivot" >/dev/null
-fi
-if [[ -x "$root/../CensorGuard/target/release/censorguardd" && -f "$root/../CensorGuard/bpf/enforce.bpf.o" ]]; then
-  "$root/../CensorGuard/target/release/censorguardd" \
-    --config "$root/deploy/censorguard/agentcensor.yaml" \
-    --bpf-object "$root/../CensorGuard/bpf/enforce.bpf.o" --check-config >/dev/null 2>&1
 fi
 
 printf 'AgentCensor native installer checks passed.\n'

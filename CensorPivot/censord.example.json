@@ -13,25 +13,9 @@
     "branch": "main"
   },
   "censorguard": {
-    "daemon": "/usr/sbin/censorguardd",
+    "config": "/etc/censorguard/agentcensor.yaml",
     "control": "/usr/bin/censorguardctl",
-    "policy": "/etc/censorguard/agentcensor.yaml",
-    "bpf_object": "/usr/lib/censorguard/enforce.bpf.o",
-    "state_dir": "/var/lib/censorguard",
-    "control_socket": "/run/censorguard/ctl.sock",
-    "event_socket": "/run/censorguard/events.sock",
-    "launch_socket": "/run/censorguard/launch.sock",
-    "dsh_socket": "/run/censorguard/dsh.sock",
-    "ui_socket": "/run/censorguard/ui.sock",
-    "extra_args": [
-      "--socket-group",
-      "censorpivot",
-      "--gateway-user",
-      "censorpivot",
-      "--spawn-grpc",
-      "--grpc-bin",
-      "/usr/bin/censorguard-grpc"
-    ]
+    "daemon": "/usr/sbin/censorguardd"
   },
   "censorscope": {
     "daemon": "/usr/sbin/censorscoped",

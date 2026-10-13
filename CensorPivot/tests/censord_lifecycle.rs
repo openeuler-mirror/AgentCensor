@@ -60,7 +60,15 @@ fn fixture(scope_lifetime: u32) -> Result<Fixture, Box<dyn std::error::Error>> {
     let guard_policy = root.join("guard.yaml");
     let bpf_object = root.join("guard.bpf.o");
     fs::write(&scope_config, b"fixture")?;
-    fs::write(&guard_policy, b"rules: []\n")?;
+    fs::write(
+        &guard_policy,
+        serde_yaml::to_string(&json!({
+            "daemon": {"bpf_object": bpf_object, "state_dir": root.join("guard-state"),
+                "control_socket": root.join("guard-ctl.sock"), "event_socket": root.join("guard-events.sock"),
+                "launch_socket": root.join("guard-launch.sock"), "dsh_socket": root.join("guard-dsh.sock"),
+                "ui_socket": root.join("guard-ui.sock")}, "rules": []
+        }))?,
+    )?;
     fs::write(&bpf_object, b"fixture")?;
 
     let config_path = root.join("censord.json");
@@ -81,15 +89,7 @@ fn fixture(scope_lifetime: u32) -> Result<Fixture, Box<dyn std::error::Error>> {
         "censorguard": {
             "daemon": guard_daemon,
             "control": "/bin/true",
-            "policy": guard_policy,
-            "bpf_object": bpf_object,
-            "state_dir": root.join("guard-state"),
-            "control_socket": root.join("guard-ctl.sock"),
-            "event_socket": root.join("guard-events.sock"),
-            "launch_socket": root.join("guard-launch.sock"),
-            "dsh_socket": root.join("guard-dsh.sock"),
-            "ui_socket": root.join("guard-ui.sock"),
-            "extra_args": []
+            "config": guard_policy
         },
         "censorscope": {
             "daemon": scope_daemon,

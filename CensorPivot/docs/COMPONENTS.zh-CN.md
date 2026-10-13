@@ -51,7 +51,7 @@ chown、共享可写 mmap、在线 GC 和跨分支原子提交。详细清单见
 | 内核强制 | eBPF LSM 对 file/exec/network 做 allow 或 `-EPERM`，DENY 始终记录 |
 | 进程树域 | 根进程绑定 domain/group，fork 子孙自动继承 |
 | 策略管理 | YAML 编译、文件/exec/network 规则、DNS 展开、双 bank 原子热更 |
-| 启动防绕过 | launcher 在执行目标命令前登记自身，`deny` 故障策略下登记失败不 exec |
+| 启动防绕过 | 可信 Pivot runner 先登记自身；失败时不提供 Ready、不接受工具 |
 | 预判与解释 | `evaluate_intent` 按策略组评估 file/exec/network intent，返回规则和原因 |
 | 审计 | `events.sock` 输出带 sequence/boot-id/drop 计数的实时事件 |
 
@@ -61,11 +61,11 @@ chown、共享可写 mmap、在线 GC 和跨分支原子提交。详细清单见
 |---|---|---|---|
 | 执行前快速拒绝 | RPC v3 `evaluate_intent` | `ctl.sock` JSON Lines；一次返回与 intents 等长的 decisions | [protocol](../../CensorGuard/crates/censorguard-common/src/protocol.rs)、[server](../../CensorGuard/crates/censorguard-daemon/src/server.rs) |
 | 使 runner 进入受控域 | RPC v3 `register_self` | `launch.sock` 只接受该方法，daemon 用 `SO_PEERCRED` 绑定真实 PID | [server](../../CensorGuard/crates/censorguard-daemon/src/server.rs) |
-| 无窗口启动 | `censorguard-exec` | 登记成功后原地 exec 工具树；`--failure-policy deny` 保持 fail-closed | [launcher](../../CensorGuard/crates/censorguard-exec/src/main.rs) |
+| 工具启动门禁 | Pivot runner + 私有 `register_self` | runner 校验注册回执后才提供 Ready、接受工具 | [runner](../src/main.rs)、[registration](../src/guard.rs) |
 
 `evaluate_intent` 是 Guard 已有的可选解释接口，不是安全边界。当前 Pivot 不使用该接口，
 也不接收调用方 intent；实际安全边界统一为
-`censorguard-exec -> register_self -> eBPF LSM`。
+`Pivot runner -> register_self -> Tool -> eBPF LSM`。
 
 ## 4. CensorScope
 
@@ -102,7 +102,7 @@ CensorScope 不执行放行策略，不得用它的可用性代替 CensorGuard �
 |---|---|---|
 | 创建/冻结/发布/放弃文件世界 | CensorFS Variant 四接口 + `AttachFuse` | 齐备，Pivot 只做幂等适配和顺序组合 |
 | 执行前意图预判 | CensorGuard `evaluate_intent` | Guard 接口齐备，但 Pivot 明确不接入 |
-| 工具进程树强制 | `censorguard-exec` + `register_self` + eBPF LSM | 齐备，Pivot 负责保证所有工具只从该链启动 |
+| 工具进程树强制 | Pivot runner + `register_self` + eBPF LSM | 齐备，Pivot 负责保证所有工具只从该链启动 |
 | 批次 Trace 和 call span | CensorScope `TrackAdd/Remove/CallStart/CallEnd` | 齐备，Pivot 负责用真实 runner PID 驱动生命周期 |
 | 跨三组件的批次事务 | 无单一组件接口 | **必须由 Pivot 实现** |
 | 一次请求包含 N 个工具调用 | 无单一组件接口 | **必须由 Pivot 实现** |
@@ -114,9 +114,9 @@ Pivot 只能实现“组合能力”：请求协议、身份校验、适配器�
 恢复器、runner 和超时/输出限制。如果缺少的是文件一致性、内核拦截或采集数据面能力，
 应先在所属组件增加稳定接口，Pivot 再适配；不应在 Pivot 复制一份简化实现。
 
-Pivot 当前已实现上表三项组合能力。runner 在经过 mounter 和 Guard launcher 后会先向
+Pivot 当前已实现上表三项组合能力。runner 在经过 mounter、完成 Guard 注册后会先向
 Pivot 回报真实 PID；Pivot 再用该 PID 调用 Scope `track-add`，从而避免把 `sudo`、
-mounter 或 launcher 的中间 PID 误当成观测根。
+sudo 或 mounter supervisor 的中间 PID 误当成观测根。
 
 ## 6. 唯一 Demo 场景：原子生成并校验产物
 

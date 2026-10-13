@@ -1,22 +1,22 @@
 # 使用手册
 
 本文档是 Censorguard的系统使用手册,覆盖核心概念、策略编写、
-运行时开关、进程纳管、策略热更新、观测与故障排查。构建与安装见
-[构建指南](../../../../CensorGuard/docs/构建指南.md);DeepSeek Harness 集成见 [DSH 插件指南](../../../../CensorGuard/docs/DSH插件指南.md)。
+启动配置开关、进程纳管、策略热更新、观测与故障排查。构建与安装见CensorGuard/docs
+
 
 ## 1. 核心概念
 
 **作用域模型**:策略引擎基于 eBPF LSM + 自建 PID 树。**只有被纳管的进程及其
 全部子孙才受策略约束**,系统其它进程完全不受影响。fork 出的子进程自动继承
-所属域;纳管发生在 exec 屏障上,子进程 exec 前即被拦截,无竞态窗口。
+所属域。`spawn` 在目标 exec 前设置屏障；`attach` 纳管已有进程并自动扫描已有子孙，
+不追溯纳管之前已完成的操作。
 
-**域与策略组**:每个被纳管的进程属于一个域(domain),域绑定一个策略组
-(group)。进程实际受 全局基线(rules)+ 所在组规则 叠加约束。策略编译为
-inode/地址等内核可直接匹配的形式,写进双 bank(one active bank switch):
-新策略全部写完后单次切换,失败 reload 不产生"部分新部分旧"的窗口。
+**域与策略组**：每个受控进程属于一个 domain；domain 可绑定多个策略组。
+实际约束为基线 rules 加全部绑定组。基线与每个组独立判定，任一层 deny 即拒绝；
+其它层的 allow 不能取消该拒绝。组可热更新，基线与 daemon 设置只在启动时读取。
 
-**fail-closed 语义**:`enable_*` 开关关闭某维度时该维度放行(fail-open);
-但策略拒绝永远即时生效。审计默认只记 DENY,ALLOW 需显式打开。
+**开关与审计**：`daemon.enable_*` 默认全开，关闭某维度时该维度放行。
+DENY 默认上报，ALLOW 由规则 `+audit` 或 `daemon.audit_*` 开启。
 
 **运行模型**:
 
@@ -32,50 +32,69 @@ syscall -> LSM/tracepoint -> allow or -EPERM -> ringbuf audit
 | 二进制 | 角色 |
 |---|---|
 | `censorguardd` | 守护进程:加载 eBPF、维护进程树域、执行策略(root) |
-| `censorguardctl` | 控制入口:策略发布、域绑定、进程纳管、运行时开关 |
-| `censorguard-audit` | 观测入口:订阅事件流(DENY/ALLOW) |
-| `censorguard-grpc` | 非特权 gRPC 适配器:127.0.0.1:50051 → ui.sock/events.sock,供 DSH 插件使用 |
-| `censorguard-exec` | 启动器:供外部宿主登记进程 |
+| `censorguardctl` | 控制入口:策略发布、域绑定、进程纳管、状态检查与审计 |
+| `censorguard-grpc` | 委托 gRPC 适配器:127.0.0.1:50051 → ui.sock/events.sock,供 DSH 插件使用 |
 
 daemon 暴露五条 Unix socket,各有角色 ACL(SO_PEERCRED 鉴权):
 
 | socket | 默认路径 | 角色 | 用途 |
 |---|---|---|---|
-| ctl.sock | `/run/censorguard/ctl.sock` | Admin | root 级控制(reload/bind/apply) |
+| ctl.sock | `/run/censorguard/ctl.sock` | Admin | root 级策略管理、域绑定与接管 |
 | events.sock | `/run/censorguard/events.sock` | Audit | 事件流订阅 |
 | launch.sock | `/run/censorguard/launch.sock` | Launcher | 以域身份启动命令 |
 | dsh.sock | `/run/censorguard/dsh.sock` | Dsh | DSH 自助 attach(普通用户) |
-| ui.sock | `/run/censorguard/ui.sock` | Ui | DSH 委托面:白名单组策略读写、开关切换 |
+| ui.sock | `/run/censorguard/ui.sock` | Ui | DSH 委托面:白名单组策略读写、只读配置 |
 
 daemon 从不监听网络端口;gRPC 适配器只绑 127.0.0.1。
 
 ## 3. 策略配置(一行式,唯一合法格式)
 
-策略 YAML 只接受三个顶层键,旧格式字段(`enable_file`、`policy_groups`、
-`file_rules` 等)一律被严格拒绝(报 `unknown field`):
+启动配置与后续组策略是两类独立文件。
+
+**启动配置 `base.yaml`** 只接受 `daemon` 和 `rules` 两个顶层键。`daemon`
+包含路径、权限、组件设置和开关，`rules` 是所有受控域共用的基线。例如：
 
 ```yaml
-rules:                    # 全局基线,对所有被纳管进程生效,可省略
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  state_dir: /var/lib/censorguard
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: true
+  audit_exec: true
+  audit_net: true
+rules:
   - file deny+audit /etc/shadow
   - exec deny /usr/bin/nc
-groups:                   # 命名策略组,每组只有 rules,可省略
-  web:
-    rules:
-      - net deny 0.0.0.0/0
-      - net allow api.github.com:443
-domains:                  # 域 → 组绑定,可省略;省略 group 表示仅受基线约束
-  - name: dsh-web
-    group: web
 ```
 
+其它 daemon 字段使用默认值；完整安装样例见 `config/base.yaml` 和
+[命令手册](命令手册.md)。启动配置文件必须存在，未知字段严格拒绝。
+运行中编辑基线或 daemon 配置不生效，需要 `censorguardd reload` 完整重启。
+
+**附加组文件** 只接受一个 `rules` 字段。例如 `web.yaml`：
+
+```yaml
+rules:
+  - net deny 0.0.0.0/0
+  - net allow api.github.com:443
+```
+
+通过 `policy apply --policy web --file web.yaml` 发布，再用 `bind` 加到 domain。
+它在逻辑上叠加于基线，文件不嵌入 base.yaml。公共 YAML 不再接受 `groups`
+或 `domains`，组名和绑定分别由命令管理。同一个组可绑定多个 domain，同一个
+域也可绑定多个组。基线 `__base__` 不能通过组管理命令修改或删除。
+
 ### 3.1 规则语法
+
+保护目录与数据优先使用 `file`；`exec` 参数规则只匹配明确的 token 前缀。
+规则选择、等价选项与通配符边界见 [策略编写与保护范围](策略编写与保护范围.md)。
 
 一行式:`file|exec|net 动作 目标 [掩码]`
 
 以下示例展示的都是 `rules:` 列表内的**单行写法**(规则语法与所在位置无关):
-同一个 `rules:` 列表既可以出现在顶层(全局基线),也可以出现在
-`groups.<name>.rules`(组规则),行内语法完全一致。只写 `rules:` 一个键
-的文件同样合法(如 `config/base.yaml`)。
+基线文件和独立组文件中的规则行语法完全一致；二者由发布方式和生命周期区分。
 
 - **动作**:`allow`、`deny`、`allow+audit`、`deny+audit`(`+audit` 表示命中
   ALLOW 也上报;DENY 永远上报)。
@@ -94,71 +113,159 @@ rules:
   - net deny api.example.com:8443          # 域名规则,DNS 自动展开
 ```
 
-### 3.2 inode 陷阱
+### 3.2 inode 与路径兜底
 
-file/exec 规则在编译期解析为 **inode**。策略加载后重建目标文件会改变
-inode,需 reload 策略才能重新命中。规则"不生效"时先用 `policy-dump`
-确认规范化策略,再检查目标文件是否被重建过。
+file/exec 规则在编译期优先解析为 **inode**。文件规则同时保留同一条 YAML
+规则的规范化路径字符串，内核先查 `(dev, ino)`；只有 inode 未命中时，才走路径
+字符串兜底。这不是两条独立的规则，也不会因为 inode 查询命中就漏掉另一条规则。
+
+路径兜底用于覆盖策略加载后新建或重建文件的短期场景：新文件 inode 尚未出现在
+已加载的 inode map 中，但路径仍与原规则相同。目标文件重建后如需恢复完整的
+inode 身份和审计信息，组规则可重新 `policy apply`，基线规则则需重启 daemon。规则“不生效”时先用 `status`
+确认规范化策略，再检查目标文件是否被重建过。
+
+### 3.3 执行、网络与启动边界
+
+**exec 参数采集。** 参数规则在 `sys_enter_execve`/`sys_enter_execveat` 处先暂存
+`argv[1..3]`，随后由 `bprm_check_security` 检查。例如：
+
+```yaml
+rules:
+  - exec deny /usr/bin/git push
+```
+
+执行 `/usr/bin/git push origin main` 时，如果用户参数读取失败、参数 scratch
+map 不可用，或暂存 map 更新失败，`bprm_check_security` 会记录失败并拒绝该次
+执行。参数采集失败只影响具有参数规则的当前可执行文件；匹配 scratch 不可用仍拒绝。
+其它可执行文件保持原有命令检查和默认放行语义。规则 token 最长 255 字节，运行时
+超过这个长度的 token 不会等于较短的完整规则 token，后续长参数也不会绕过已命中的
+拒绝前缀。脚本的原始 argv 缓存保留到解释器检查完成，再于 exec 成功或线程退出时清理；
+失败 exec 的缓存由下次 exec 入口替换。审计展示仍有每 token 255 字节的长度限制。
+包含可执行文件路径在内，规则最多 4 个 token；长度按 UTF-8 字节计算。
+这里的 255 是项目上限，不能与 Linux 单个文件名、完整路径、单个 argv 或参数总量的
+不同限制混为一谈。超过上限的规则会明确报错，不会静默截短。
+
+**网络范围。** IPv4/IPv6 主动连接、本地绑定、带目标的 UDP 发送以及已连接 socket
+的发送/接收分别由 `socket_connect`、`socket_bind`、`socket_sendmsg`/`socket_recvmsg` 检查。
+没有 `msg_name` 的已连接发送从 socket 读取远端地址，按当前策略重新判断。
+TCP 入站在 `inet_conn_request` 检查远端 IP 和源端口；拒绝请求会丢弃，客户端通常超时，
+而不是让服务端 accept 返回 EPERM。已经排队或在 attach 前建立的连接可能仍能 accept，
+但受控进程后续的 send/recv 会检查当前远端规则。
+
+listen/accept 登记监听 socket 的 inode→scope 身份；attach、自注册及对账回填已有 fd，
+关闭时通过 inode 释放钩子清理。reload 完整重启后需要重新接入；组策略热更新不需要。
+这些检查发生在 socket 操作/握手处，仍不等价于包级别防火墙；未连接 UDP 接收没有在此
+按报文源地址过滤，sendfile/splice 等旁路传输也未由本轮 send/recv 探针证明覆盖。
+
+基线和每个绑定组分别查询带端口规则，未命中时各自回退到不带端口的地址规则；
+任一层选中的规则为 deny 即拒绝。组的带端口 allow 不能跳过基线或其它组的 CIDR deny。
+同一层内带端口规则优先，地址按最长前缀匹配。未命中规则时默认放行。
+
+**allow 语义。** 文件 `allow` 不是白名单开关，也不会清除目录、inode 或路径上
+已有的 deny；文件策略默认放行，`allow+audit` 主要用于审计命中。网络 `allow`
+参与 connect 判定，但只在其查询优先级和 deny/allow 合并规则下生效。需要默认
+拒绝时，应显式配置覆盖范围足够的网络 deny，再配置更具体的端口例外，并用集成
+测试验证实际优先级。
+
+**启动性能。** 当前启动测试只验证 daemon 输出 `[READY]` 和基本拦截，不证明
+daemon 启动或每次 hook 延迟达到微秒级。启动包括 BPF object 加载、hook attach、
+策略 map 填充和多个服务启动；文件热路径还可能遍历祖先目录。微秒级目标需要在
+目标内核、BTF、CPU 和策略规模下分别测量启动耗时、常见文件操作延迟、深目录路径
+延迟及高并发吞吐，不能仅由源码结构推断。
 
 完整示例见 `config/base.yaml`、`config/standard-dev.yaml`、
 `config/high-priv.yaml`、`config/policy.dsh-default.yaml`(DSH 默认组)。
 
-## 4. 运行时开关(替代旧配置字段)
+## 4. daemon 开关
 
-`enable_file/enable_exec/enable_net`(默认全开)与
-`audit_file/audit_exec/audit_net`(默认全关)是**运行时开关**,不写在
-配置文件里:
+`enable_file/enable_exec/enable_net` 默认 true，`audit_file/audit_exec/audit_net`
+默认 false，统一放在 `base.yaml` 的 **daemon 段**，不是 rules 字段。
+仓库 `config/base.yaml` 显式将三个 audit 设为 true；已有安装配置在升级时保留，
+应以 `status` 显示的 Base policy 路径及其内容为准。
+需要开启文件 ALLOW 审计时，将 `daemon.audit_file` 改为 true，再执行：
 
 ```bash
-sudo censorguardctl set --audit-file on                    # 打开文件 ALLOW 审计
-sudo censorguardctl set --enable-net off --audit-exec on   # 可一次多个
+sudo censorguardd reload --config /etc/censorguard/base.yaml
+sudo censorguardctl status
 ```
 
-- 等价接口:RPC v2 `set_switches`;DSH WebUI 设置页(经 ui.sock 委托面)。
-- ctl 设置需 root(SO_PEERCRED 鉴权)。
-- **不持久化**:daemon 重启恢复默认;reload 保持当前值。
-- 任一 `audit_*` 打开时,该类 ALLOW 事件全量上报;`enable_*=off` 时对应
-  维度 fail-open(放行)。
+仅保存 YAML 不会更新运行中的开关；`status` 显示当前实例已加载的值。
+服务已停止时，使用 `sudo systemctl start censorguardd.service`；reload 需要运行中的实例。
+配置文件原子替换导致 inode 改变不会阻止 reload 重新读取；inode 优先匹配针对规则中的
+目标文件。组策略 YAML 是发布时的内容快照，编辑后需再次执行 `policy apply --policy GROUP --file FILE`。
+
+审计针对已纳管进程树；`Managed 0 processes` 时，普通 shell 的活动不会产生受控进程审计。
+先在一个终端运行 `sudo censorguardctl audit`，再在另一终端通过 `censorguardctl spawn`
+启动探针，或接入 DSH，才能观察对应事件。启用全量 ALLOW 审计会增加事件量；只审计某条规则
+可以使用 `allow+audit`。enable 为 false 时对应维度放行。ctl 不再提供 set，
+DSH/gRPC 和旧 RPC 也不能热写这些开关。
 
 ## 5. 启动 daemon
 
-### 5.1 systemd 方式(生产推荐)
+### 5.1 手动方式(测试/调试)
+
+```bash
+sudo censorguardd launch --config /etc/censorguard/base.yaml
+```
+
+`launch` 是唯一启动命令。每次启动都从当前配置读取基线和 daemon 设置；有持久化
+`current` 时恢复该状态目录的组与域绑定。私有 revision 快照不作为公共启动 YAML。
+配置文件必须存在；更换 state_dir 会使用另一份状态。PID 注册不会恢复。
+
+所有 socket、BPF、状态目录、权限和 gRPC 设置都写在配置文件的 `daemon` 段。
+测试时可用 `--duration N` 自动退出，`--check-config` 只校验配置。
+
+手动 launch 在前台运行，Ctrl+C 正常退出。也可以在另一个终端控制它：
+
+```bash
+sudo censorguardd reload --config /etc/censorguard/base.yaml
+sudo censorguardd stop --config /etc/censorguard/base.yaml
+censorguardd --version
+```
+
+reload 需要运行中的实例，会等待新 boot ID 和就绪状态，最多 30 秒；stop 等待实例
+退出并回收托管 gRPC，保留策略快照。停止后要用 launch 重新启动，reload 不负责启动。
+reload 的配置路径必须与启动时一致。若返回超时，应查看日志确认最终状态。
+
+不要在 systemd 已运行时使用同一套路径另起 launch。0.5.0 会在加载 BPF 前检查
+实例锁、活动 socket 与 gRPC 端口，避免重复启动覆盖接口；遗留锁文件无需手动删除。
+若 gRPC 端口占用，检查 `sudo ss -ltnp 'sport = :50051'` 与
+`sudo systemctl status censorguardd.service`。可先停止服务再手动调试，或为测试实例
+设置独立的所有 socket、state_dir 与 grpc_listen。gRPC 实际监听成功才打印 READY。
+
+### 5.2 systemd 方式(生产推荐)
 
 ```bash
 sudo systemctl enable --now censorguardd.service
 sudo systemctl status censorguardd        # 日志出现 [READY] 即就绪
 ```
 
-unit 内置 `--spawn-grpc`:daemon 自动派生并守护 gRPC 适配器
+unit 使用配置中的 `daemon.spawn_grpc`:daemon 自动派生并守护 gRPC 适配器
 (127.0.0.1:50051),DSH 插件无需额外配置即可连接。状态目录为
 `/var/lib/censorguard`(策略 revision 快照,跨重启恢复)。
 
-### 5.2 手动方式(测试/调试)
+停止服务但保留开机启动设置，用 `sudo systemctl stop censorguardd.service`。
+停止并取消开机启动，用 `sudo systemctl disable --now censorguardd.service`，
+没有 `unenable` 子命令。以上只管理该 unit，不能停止在另一终端手动启动的实例。
 
-```bash
-# socket 父目录必须属 root 且 group/other 不可写(/tmp 会被拒绝)
-sudo install -d -m 0755 /run/agsec
-sudo censorguardd \
-    --config /run/agsec/policy.yaml \
-    --bpf-object /usr/lib/censorguard/enforce.bpf.o \
-    --ctl-sock /run/agsec/ctl.sock \
-    --event-sock /run/agsec/events.sock
-```
+`systemctl start` 执行 unit 中的 launch，systemd 负责后台运行、日志和失败重启。
+`systemctl restart` 停止再启动；当前 unit 的 `systemctl reload` 发送 SIGHUP，
+由 daemon 完整重启。`systemctl daemon-reload` 只重读 unit，不应用策略。
+服务默认使用 `/etc/censorguard/base.yaml`，不会自动采用源码目录的配置。
 
-常用参数:`--duration N`(N 秒后自动退出)、`--state-dir DIR`、
-`--socket-group NAME`、`--launch-sock PATH`、`--dsh-sock PATH`、
-`--ui-sock PATH`、`--spawn-grpc`/`--grpc-bin`/`--grpc-listen`(派生适配器)、
-`--check-config`(只校验不加载)。socket 在 `/run/censorguard` 之外时
-状态目录是临时的,退出自动清理。
 
 ## 6. 纳管进程
 
 ```bash
-# 在域里启动命令(推荐,带执行屏障,无竞态)
+# 先下发组、绑定域，再启动或接入进程
+sudo censorguardctl policy apply --policy web --file /path/to/group.yaml
+sudo censorguardctl bind --domain dsh-web --policy web
+
+# 在域里启动命令(带执行屏障)
 sudo censorguardctl spawn --domain dsh-web -- curl https://example.com
 
-# 纳管已在运行的进程(--seed 回填已有子孙)
-sudo censorguardctl attach --pid 12345 --domain dsh-web --seed
+# 纳管已在运行的进程(自动回填已有子孙)
+sudo censorguardctl attach --pid 12345 --domain dsh-web
 ```
 
 `spawn` 透明地以子进程退出码退出(子进程 `exit 3` → ctl 退出码 3;
@@ -167,36 +274,76 @@ sudo censorguardctl attach --pid 12345 --domain dsh-web --seed
 纳管后整棵进程树(fork 自动继承 + pending 降级层)都在 eBPF LSM 强制
 之下,不经任何插件通道启动的子进程也逃不掉。
 
-## 7. 策略热更新
+## 7. 组热更新、绑定与 daemon 重启
 
 ```bash
-# 整份替换(原子双 bank 切换,失败自动回滚)
-sudo censorguardctl reload --file /path/to/policy-v2.yaml
+# 校验后发布一个组，组文件只有 rules
+sudo censorguardctl policy apply --policy web --file web.yaml --dry-run
+sudo censorguardctl policy apply --policy web --file web.yaml
 
-# 组级热更新(组文档只有 rules 一个键)
-printf 'rules:\n  - exec deny /usr/bin/id\n' | \
-    sudo censorguardctl policy apply --name web --stdin
+# 追加第二个组；重复 bind 不会重复增加成员
+sudo censorguardctl policy apply --policy extra --file extra.yaml
+sudo censorguardctl bind --domain dsh-web --policy extra
 
-# 换绑 / 解绑(空组 = 仅受基线约束)
-sudo censorguardctl bind dsh-web --group web
-sudo censorguardctl bind dsh-web --group ''
+# 只移除 extra，保留 web 和基线
+sudo censorguardctl remove --domain dsh-web --policy extra
+# 无任何已发布或活动域引用后，删除已发布组
+sudo censorguardctl policy remove --policy extra
+
+# 移除最后一个附加组，域仍受基线约束
+sudo censorguardctl remove --domain dsh-web --policy web
 ```
 
-组级 apply 带 revision 乐观锁:传 `--expected-revision N` 与当前不符则
-409 冲突。全量 reload 支持 SIGHUP(`systemctl reload censorguardd`)。
-已应用策略以 revision 快照持久化在 `/var/lib/censorguard/revisions/`,
-daemon 重启自动恢复最新 revision。
+同名 apply 是整组替换，所有引用域自动使用新规则，无需重新 bind；`rules: []`
+清空组内容但保留组身份与绑定。换成新组名时先发布并 bind 新组，再 remove 旧组。
+CLI 不提供 `--expected-revision`；DSH 将编辑版本传入 gRPC，daemon 在更新锁内
+检查该 revision，拒绝校验后被其它请求抢先修改的提交。
+组和绑定保存在 `state_dir/revisions/`，重启恢复；原始 YAML 不会被回写。
+公开组和多组组合共同占用最多 63 个非基线有效 slot，超出容量会拒绝更新。
+
+修改基线或 daemon 设置后执行完整重启：
+
+```bash
+sudo censorguardd launch --config /etc/censorguard/base.yaml --check-config
+sudo censorguardd reload --config /etc/censorguard/base.yaml
+# systemd 的 SIGHUP reload 也执行完整重启
+sudo systemctl reload censorguardd
+```
+
+reload 命令会等待新 daemon 就绪；超时后查看日志并执行 status/doctor。
+`systemctl reload` 仅发送信号，不提供相同的等待保证。
+重启会有保护空窗，并清空 PID 注册：手动 agent 需重新 attach，DSH 心跳负责重新接入。
+若同时修改 control_socket，命令会连接新配置中的地址；此时用服务 restart 或向原实例
+发送 SIGHUP。组热更新使用双 bank，但域绑定更新和持久化是后续阶段，不能保证
+所有域同时切换；切换后的错误需结合回执与 status 判断。
 
 ## 8. 观测
 
 ```bash
-sudo censorguard-audit launch --socket /run/censorguard/events.sock            # 全量事件流
-sudo censorguard-audit launch --socket /run/censorguard/events.sock --kind 2   # 只看 exec (1=file 2=exec 3=net 4=guard)
+sudo censorguardctl audit                                      # 全量事件流
+sudo censorguardctl audit --domain dsh-web --result deny       # 该域所有拒绝，验证实际拦截
+sudo censorguardctl audit --kind exec                          # 只看执行检查；兼容 --kind 2
+sudo censorguardctl audit --kind file                          # 只看文件操作；兼容 --kind 1
 
-censorguardctl status        # 开关/版本/bank/reload 状态
-censorguardctl tree          # 域进程树
-censorguardctl policy-dump   # 当前生效的规范化策略
+sudo censorguardctl status          # 保护/审计、基线路径、domain、策略来源和根 PID
+sudo censorguardctl doctor          # 分组健康检查，失败时给出建议
+sudo censorguardctl status --json   # 完整数据与进程树，适用于脚本
+sudo censorguardctl doctor --verbose # 逐项检查细节
 ```
+
+`status` 以实际 domain 名称为树根，基线与各附加组为子节点，并展示策略来源路径。
+无进程的已保存绑定标记 `configured; no processes`，未绑定的组列在 `Unbound policies`。
+文件来源是发布时解析出的绝对路径，当前生效内容保存在 `Group snapshot` 所示路径。
+stdin、API/Web 来源和旧策略的未知原始来源也会明确标注。**编辑源文件后需重新 apply**；
+重启会恢复保存的组与绑定，不会重新读取这些组源文件。
+
+apply/bind/remove/attach/unattach 默认只显示结果、策略/domain/PID、来源或 revision；
+脚本解析旧回执时在相应命令末尾加 `--json`。示例：
+`sudo censorguardctl policy apply --policy web --file web.yaml --json`。
+`status --json` 中 `bindings[]` 列出已保存绑定，`domains[].policies` 列出运行域的附加组，空数组表示 base-only。
+`trees[].nodes[]` 含 PID、父 PID、根标记与命令，后续 `unattach --pid` 使用注册根 PID。
+`doctor` 返回各组件检查结果，失败返回非零。业务 socket 和托管 gRPC 目前检查
+连接可达性，不能代替真实 RPC、受控拦截或 DSH Web 联调。
 
 事件字段要点:每事件带单调 `sequence`(从 1 起)、`daemon_boot_id`(区分
 daemon 重启)与 `dropped_before`(本订阅者累计丢失)。事件无持久化,是
@@ -204,35 +351,63 @@ daemon 重启)与 `dropped_before`(本订阅者累计丢失)。事件无持久�
 
 一个动态链接程序可能产生多个 `FILE ALLOW`(动态加载器、libc、locale 和
 配置文件的读取),这表示文件打开检查点,不表示执行了多个可执行文件;
-只关心执行事件用 `--kind 2` 过滤。
+只关心执行事件用 `--kind exec` 或 `--kind 2` 过滤。
+
+审计 `DECISION` 只代表该行 OP 的判定。cat/rm 启动被允许，随后读取/删除文件被拒绝，
+可以同时出现同一 PID 的 `EXEC ALLOW` 和 `FILE DENY`；这与命令报权限错误一致。
+`--kind 2` 会隐藏 FILE DENY，检查整体拦截应使用 `--domain dsh-web --result deny`，
+不要限定 exec。`--pid PID` 可观察同一进程的各类事件，不包含其子进程；过滤条件同时
+指定时取交集。详细示例见[命令手册](命令手册.md#审计判定与过滤)。
 
 ## 9. 测试
 
 ```bash
-make check                                   # 静态检查(fmt/clippy/bash -n/工具语法)
-make test                                    # Rust 单元与编译器测试(不需要 root)
-cd plugins/dsh-censorguard && pnpm test    # DSH 插件测试(不需要 root)
-sudo bash scripts/test/integration-basic.sh  # 基础验收(14 用例,root + BPF LSM)
-sudo make integration                        # 全量 30+ 场景(root + BPF LSM)
+make check                                  # 格式、Clippy、脚本与工具语法
+make test                                   # Rust 单元与策略测试
+make build
+make bpf
+cd plugins/dsh-censorguard && pnpm build     # DSH 插件构建
+# 返回仓库根目录；实机测试需要 root + BPF LSM
+sudo make integration-policy-entry
+sudo make integration
 ```
 
-集成测试要求内核启用 BPF LSM(`cat /sys/kernel/security/lsm` 含 `bpf`)。
-`integration-basic.sh` 是门禁:全部隔离在临时目录,不碰 `/run` 与生产
-state。场景覆盖:文件 read/write/delete/rename/chmod、link/symlink/mkdir/
-rmdir/mknod、chown/xattr/ACL、预打开 fd、命令与参数级 exec、多域隔离、
-execveat、IPv4/IPv6 与 DNS、reload/bind/SIGHUP/回滚、PID generation/
-fork/draining/churn、事件丢弃压力、审计开关、文件压力、graceful shutdown 等。
+插件测试使用 `make plugin-test`；也可分别执行 `node plugins/dsh-censorguard/test/audit.test.mjs`、
+`node plugins/dsh-censorguard/test/host.test.mjs`、`node plugins/dsh-censorguard/test/bootstrap.test.mjs`
+核对 11 个实际子测试。完整编译、全量集成与 DSH Web 联调需一起执行；
+[验收记录](策略管理验收.md)单独列出本轮针对性检查，历史单组结果不代替本轮全量测试。
+
+持续交互测试可在一个受控 bash 中执行多次命令：
+
+```bash
+sudo censorguardctl spawn --domain dsh-web -- bash
+# 在新 bash 中尝试读取保护文件、执行受限命令、连接受限地址
+# exit 退出这个受控 shell
+```
+
+目标默认继承 sudo 的 root 身份，普通用户测试可改为
+`spawn --domain dsh-web -- runuser -u USER -- bash`。
+管理终端和 daemon 应在受控树之外。目标退出后默认只解除根注册，存活子孙仍受控；
+`--keep` 保留根注册。对仍运行的根执行 `unattach` 才会解除它及子孙的接管：
+
+```bash
+sudo censorguardctl status
+sudo censorguardctl unattach --pid ROOT_PID
+```
+
+同域独立注册的其它根及其子树保留。PID 必须是注册根；进程树扫描与并发 fork
+不构成完全同步的事务。
 
 ## 10. 故障排查
 
 | 现象 | 原因与处理 |
 |---|---|
 | `socket parent must be owned by uid 0 ...` | socket 父目录权限不合(如 /tmp 1777)。建专用目录:`sudo install -d -m 0755 /run/agsec` |
-| 启动报 `unknown field 'enable_file'` 等 | 配置是旧格式,按 §3 改写成一行式;或 `/var/lib/censorguard` 里有旧格式 revision 快照,停机后 `sudo rm -rf /var/lib/censorguard` |
-| daemon 反复重启,日志报 `unknown argument "--spawn-grpc"` | 旧二进制 + 新 systemd unit 不匹配:重新构建并同步安装二进制 |
+| 启动报 `unknown field 'enable_file'` 等 | 按 §3 将开关放入 daemon 段，去掉公共 groups/domains；私有旧快照先备份并核对版本再迁移 |
+| daemon 反复重启 | 检查 `/etc/censorguard/base.yaml` 的 `daemon` 配置和二进制版本 |
 | `Text file busy` 复制二进制失败 | 二进制正在运行,先 `systemctl stop` 再复制 |
 | ctl 报 `No such file or directory` | daemon 未启动或 socket 路径不一致,先确认日志 `[READY]` |
-| `policy apply`/`bind`/`set` 报权限错误 | 需要 root(SO_PEERCRED),用 sudo |
-| 规则不命中 | file/exec 规则按 inode 编译,目标文件重建后需 reload(§3.2);用 `policy-dump` 确认规范化策略 |
-| 看不到 ALLOW 事件 | 默认只记 DENY;`set --audit-<维度> on` 或给规则加 `+audit` |
-| DSH attach 报 `references uninstalled group` | DSH 策略组未下发,root 执行 `sudo censorguardctl policy apply --name censorguard-dsh-default --file config/policy.dsh-default.yaml` |
+| `policy apply`/`bind`/`remove` 报权限错误 | 需要 root(SO_PEERCRED),用 sudo |
+| 规则不命中 | file/exec 规则按 inode 编译,目标文件重建后需重新 apply 组或重启基线(§3.2)；用 status 确认策略与域绑定 |
+| 看不到 ALLOW 事件 | 默认只记 DENY;配置 `daemon.audit_<维度>: true` 并重启，或给规则加 `+audit` |
+| DSH attach 报 `references uninstalled group` | DSH 策略组未下发,root 执行 `sudo censorguardctl policy apply --policy censorguard-dsh-default --file config/policy.dsh-default.yaml` |

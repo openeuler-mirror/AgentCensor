@@ -16,6 +16,10 @@ for command in node npm tar sha256sum; do
   command -v "$command" >/dev/null || { printf '%s is required\n' "$command" >&2; exit 2; }
 done
 
+# Always compile Guard's TypeScript and browser bundle before packing runtime
+# code; npm pack alone can otherwise ship stale artifacts from an older build.
+bash "$censorguard_root/scripts/build-dsh-plugin.sh"
+
 rm -rf -- "$out_dir"
 mkdir -p "$out_dir" "$work/raw" "$work/runtime"
 

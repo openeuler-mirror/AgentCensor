@@ -45,8 +45,8 @@ test('source CLI shares the DSH Scope module and Guard has no retired client dep
   const guardRoot = resolve(root, '../../../CensorGuard/plugins/dsh-censorguard')
   for (const file of ['lib/index.mjs', 'lib/interaction-bridge.mjs']) {
     const source = await readFile(resolve(scopeRoot, file), 'utf8')
-    assert.match(source, /@deepseek-ai\/dsh-scope\/src\/index\.ts/)
     assert.match(source, /@deepseek-ai\/dsh-scope'/)
+    assert.match(source, /@deepseek-ai\/dsh-scope\/src\/index\.ts/)
   }
   const proxy = await readFile(resolve(scopeRoot, 'lib/index.mjs'), 'utf8')
   assert.match(proxy, /const dshLauncher = await resolveDshWorkerLauncher\(\)/)

@@ -34,4 +34,7 @@ proxy_source=$(tar -xOf "$output/packages/censorscope-session-proxy.tgz" package
 [[ "$proxy_source" != *"import { turnBoundaryProjectionDefinition }"* ]]
 [[ "$proxy_source" == *"turnBoundary projection unavailable; compatibility mode"* ]]
 [[ "$proxy_source" == *"prefixArgs: ['--dir', candidate, 'dsh']"* ]]
+if [[ -n ${DSH_ROOT:-} ]]; then
+  node "$root/scripts/verify-dsh-profile.mjs" "$output/packages" "$DSH_ROOT"
+fi
 printf 'CensorPivot DSH composite checks passed.\n'

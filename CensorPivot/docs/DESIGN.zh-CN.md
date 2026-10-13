@@ -8,7 +8,7 @@
 CensorPivot 位于 Agent Runtime 与工具进程之间，只负责两件事：
 
 1. **接入**：暴露单一 Unix Socket，工具批次必须由它启动。调用进程不能获得
-   CensorFS 私有 View、mounter 权限或 CensorGuard launcher 权限，因此正常部署下无法
+   CensorFS 私有 View、mounter 权限或 Guard launch socket 权限，因此正常部署下无法
    绕过这条执行路径。
 2. **编排**：把多个工具调用放进同一个文件系统事务，执行 Prepare，持久化唯一决策，
    再反复推进 Commit 或 Abort，直到终态。
@@ -67,12 +67,12 @@ CensorGuard/eBPF LSM 强制，内核与应用行为仍由 CensorScope 采集。
 |                                                                                                  |
 | CensorFS                     CensorGuard                  CensorScope               Pivot worker  |
 |   censorfs CLI                 censorguardd                 censorscopectl             supervisor  |
-|   censorfsd                    censorguard-exec             censorscoped                  |        |
+|   censorfsd                    runner register_self         censorscoped                  |        |
 |   censorfs-mounter                   |                                                    |        |
 |          |                            +-------------------+--------------------------------+        |
 |          +----> [Mount Namespace + writable View]        |                                         |
 |                                                          v                                         |
-|     Controlled process chain: censorfs-mounter -> censorguard-exec -> Batch Runner -> Tool 1..N  |
+|     Controlled process chain: censorfs-mounter -> Batch Runner(register_self) -> Tool 1..N  |
 +--------------------------------------------------------------------------------------------------+
                                                    |
                                                    v
@@ -97,7 +97,7 @@ CensorGuard/eBPF LSM 强制，内核与应用行为仍由 CensorScope 采集。
 
 | 层级 | 核心职责 | 明确不负责 |
 |---|---|---|
-| 第 1 层：调用方 | 生成工具批次，提供 session、trace、策略组和预期 Branch Head | 不直接获得 View、mounter 或 Guard launcher 权限 |
+| 第 1 层：调用方 | 生成工具批次，提供 session、trace、策略组和预期 Branch Head | 不直接获得 View、mounter 或 Guard launch socket 权限 |
 | 第 2 层：入口 IPC | 通过 Pivot UDS 承载一个完整请求/响应，以 socket 权限形成第一道本机边界 | 不解析三个下游组件的协议；初版不开放 TCP 入口 |
 | 第 3 层：Pivot 应用 | 识别真实 UID、校验输入和幂等键、管理批次状态机、持久化决策并恢复第二阶段 | 不翻转既有决策，不实现文件/安全/观测数据面 |
 | 第 4 层：下游 IPC | 固定 Pivot 到三个组件及 runner 使用的 socket、管道、帧格式和身份来源 | 不包含业务状态机，不承载工具的外联网络流量 |
@@ -117,7 +117,7 @@ CensorGuard/eBPF LSM 强制，内核与应用行为仍由 CensorScope 采集。
 | I0 | Agent/CLI -> CensorPivot | `/run/censorpivot/control.sock`，Unix Stream | 每连接一个 JSON 请求和一个 JSON 响应，写半边关闭定界 | `execute`、`status`、`recover`、`doctor` | `0660` + `SO_PEERCRED`；请求不能伪造 UID |
 | I1 | Pivot FS Adapter -> `censorfs` -> `censorfsd` | 子进程 + `/run/censorfs/control.sock` | 4-byte little-endian 长度 + Protobuf `ControlRequest/Response` | `VariantOpen`、`VariantPrepare`、`VariantPublish`、`VariantAbort` | daemon 取 socket peer UID/GID；持久 request UUID 保证幂等重试 |
 | I2 | `censorfs-mounter` -> `censorfsd` | `/run/censorfs/control.sock` | 同一 Protobuf 帧，并用 `SCM_RIGHTS` 传 `/dev/fuse` FD | `AttachFuse` | root-only mounter；一个 writable View 只 attach 一次 |
-| I3 | `censorguard-exec` -> `censorguardd` | `/run/censorguard/launch.sock`，Unix Stream | JSON Lines protocol v3 | `RegisterSelf` | daemon 用 `SO_PEERCRED` 取得真实 PID，写入 domain/group 和 PID 内核映射；成功后才 exec runner；`--failure-policy deny` |
+| I3 | Pivot runner -> `censorguardd` | `/run/censorguard/launch.sock`，Unix Stream | JSON Lines protocol v3 | `RegisterSelf` | daemon 用 `SO_PEERCRED` 取得真实 PID，写入 domain/group 和 PID 内核映射；成功回执经校验后才输出 Ready、接受 Tool；失败则退出 |
 | I4 | Pivot Scope Adapter -> `censorscopectl` -> `censorscoped` | 子进程 + `/run/censorscope/censorscoped.sock` | `length#value` 字段帧 | `TrackAdd`、`CallStart`、`CallEnd`、`TrackRemove` | runner 就绪后以真实 PID 建 Trace；required 模式失败即 Abort，否则写 `warnings` |
 | I5 | Pivot Runner Supervisor <-> Batch Runner | 父子进程匿名 stdin/stdout pipe | 每行一个 `RunnerRequest/RunnerReply` JSON | `ToolCall -> CallResult` | FD 只由受控子进程继承；EOF 结束批次，不对系统其他用户开放 socket |
 
@@ -136,7 +136,7 @@ CensorGuard/eBPF LSM 强制，内核与应用行为仍由 CensorScope 采集。
 BatchRequest
   -> 接入校验
   -> CensorFS VariantOpen
-  -> mounter -> Guard launcher -> register_self/domain 生效 -> exec runner
+  -> mounter -> exec runner -> register_self/domain 生效 -> Ready -> Tool
   -> 常驻 runner 就绪并回报 PID
   -> CensorScope TrackAdd(runner PID)
   -> Tool 1..N，每步执行 CallStart -> Tool -> CallEnd
@@ -184,16 +184,16 @@ Received -> Preparing -> Prepared -> CommitDecided -> Committed
 
 1. 原子写入 `Received`，随后写入 `Preparing`。
 2. `VariantOpen` 创建 Tx/Ticket/View；其 request UUID 已在第 1 步持久化，可幂等重放。
-3. 启动一次常驻 batch runner。`censorguard-exec` 先以 `register_self` 将真实 PID 绑定到
-   当前策略 revision 的 baseline + `guard_group`，domain 内核映射成功后才 exec runner。
+3. mounter 降权并 exec 常驻可信 batch runner。runner 先用私有 `register_self` 将自身 PID
+   绑定到当前基础策略 + `guard_group`，验证协议版本、request ID、domain 和组回执后才 Ready。
 4. 所有调用在同一个 View 中顺序执行。每次调用前后写
    CensorScope span，执行环境注入 `CENSORSCOPE_SESSION_ID` 与
    `DSH_CENSORSCOPE_CALL_ID`。
 5. 全部 exit 0 后执行 `VariantPrepare`，得到不可变 Candidate，写入 `Prepared`。
 
-工具进程路径固定为 `mounter -> censorguard-exec -> __batch-runner -> program`。一个批次
+工具进程路径固定为 `mounter -> __batch-runner(register_self) -> program`。一个批次
 只 attach 一次 View；常驻 batch runner 通过 stdin/stdout 协议顺序执行所有工具。mounter
-提供真实 `/workspace` View；Guard launcher 用 SO_PEERCRED 注册 runner，fork/exec 继承使
+提供真实 `/workspace` View；Guard daemon 用 SO_PEERCRED 注册 runner，fork/exec 继承使
 全部工具子进程不能通过绕开 SDK 逃避内核强制。
 
 Pivot 必须传入 mounter 已有的 `--cgroup-root/--cgroup-state-dir/--cgroup-scope` 参数。
@@ -244,10 +244,13 @@ Prepare；`setsid` 后代仍属于该 cgroup。超时/Drop 优先发送 SIGTERM�
 
 ### CensorGuard
 
-Pivot 不调用 `evaluate_intent`，也不依赖 Guard control socket。安全边界是每个工具都必须
-经 `censorguard-exec --failure-policy deny` 启动：launcher 在 exec runner 前调用
-`register_self`，daemon 用 `SO_PEERCRED` 取得真实 PID，解析当前 revision 的 baseline +
-`guard_group`，写入 domain/group 和 PID 的内核映射。任一步失败都不 exec runner。
+Pivot 不调用 `evaluate_intent`。可信 runner 先通过 launch socket 执行私有 `register_self`，
+daemon 用 `SO_PEERCRED` 取得真实 PID，组合基础策略与 `guard_group`，写入 domain/PID
+内核映射。runner 校验回执后才 Ready、接受工具，失败时直接退出。doctor 通过
+`censorguardctl --config PATH status --json` 检查 readiness、hooks 和已发布组。
+调用前后以及批次结束时，适配器核查 daemon boot ID 与 runner 的实际 domain/root 登记。
+重启或丢失登记使批次 Abort；该观测不保证覆盖所有 syscall 竞态。基础 YAML 修改仍需
+统一 stop/start，禁止运行工具时独立 reload Guard。
 
 ### CensorScope
 
