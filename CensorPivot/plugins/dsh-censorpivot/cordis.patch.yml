@@ -19,7 +19,7 @@
         branch: main
         censorfsCommand: !!js 'process.env.CENSORFS_COMMAND ?? "censorfs"'
         socket: !!js 'process.env.CENSORFS_SOCKET ?? "/run/censorfs/control.sock"'
-        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "/usr/local/bin/censorfs-mounter"'
+        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "/usr/libexec/censorfs/censorfs-mounter"'
         mounterBin: !!js 'process.env.CENSORFS_MOUNTER_BIN ?? undefined'
         runnerReadyTimeoutMs: 10000
         inProcessMaxDepth: 1
@@ -71,7 +71,7 @@
       config:
         policyGroup: censorguard-dsh-default
         dshSockPath: /run/censorguard/dsh.sock
-        blockOnFailure: false
+        blockOnFailure: true
     - id: censorguard-host
       name: '@censorguard/dsh/host'
       config:
@@ -100,7 +100,7 @@
   inject: [webStartup, censorguardReady]
 - id: web-runtime
   inject: [webStartup, censorguardReady]
-- id: api-gateway
+- id: typert-gateway
   inject: [censorguardReady]
 - id: cordis-host-runner
   inject: [censorguardReady]
@@ -120,8 +120,14 @@
 - id: skill
   disabled: false
 
-# Scope's session proxy owns web conversations. The Pivot client consumes its
-# public event stream; the native trajectory is retained as the conversation
-# neighbour and Pivot is an additional conversation tab.
+# Gate the component plugins before they can start workers. Preserve their
+# existing service requirements because inject is replaced as a whole.
+- id: censorfs-parallel-worlds
+  inject: [tools, commands, subagents, sessions, censorguardReady]
+- id: agentcensor-session-proxy
+  inject: [agents, sessions, sessionPersistence, sessionProjections, censorguardReady]
+
+# Scope's session proxy owns web conversations. Pivot consumes its public event
+# stream as an additional tab, while the native trajectory remains available.
 - id: session-title-llm
   disabled: true

@@ -34,6 +34,13 @@ enum Commands {
         #[arg(long, default_value = default_config_path())]
         config: PathBuf,
     },
+    /// Upgrade preserved pre-0.5 Guard settings, saving .pre-guard-0.5.0.bak files.
+    MigrateGuard {
+        #[arg(long, default_value = default_config_path())]
+        config: PathBuf,
+        #[arg(long, default_value = "/etc/censorpivot/config.json")]
+        pivot_config: PathBuf,
+    },
     #[command(name = "__component-runner", hide = true)]
     ComponentRunner {
         #[arg(long)]
@@ -73,6 +80,19 @@ fn run() -> Result<i32> {
             let report = doctor(&config);
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(i32::from(!report.ready))
+        }
+        Commands::MigrateGuard {
+            config,
+            pivot_config,
+        } => {
+            let paths = censorpivot::migrate::migrate_guard(&config, &pivot_config)?;
+            for path in &paths {
+                println!("migrated {}", path.display());
+            }
+            if paths.is_empty() {
+                println!("Guard configuration is already current");
+            }
+            Ok(0)
         }
         Commands::ComponentRunner {
             parent_pid,

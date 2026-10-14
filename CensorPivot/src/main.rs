@@ -59,6 +59,14 @@ enum Commands {
         max_output_bytes: usize,
         #[arg(long, default_value_t = 1048576)]
         max_frame_bytes: usize,
+        #[arg(long)]
+        guard_socket: PathBuf,
+        #[arg(long)]
+        guard_domain: String,
+        #[arg(long)]
+        guard_group: String,
+        #[arg(long, default_value_t = 15000)]
+        guard_timeout_ms: u64,
     },
 }
 
@@ -104,7 +112,19 @@ fn run() -> Result<i32> {
         Commands::BatchRunner {
             max_output_bytes,
             max_frame_bytes,
-        } => batch_runner(max_output_bytes, max_frame_bytes),
+            guard_socket,
+            guard_domain,
+            guard_group,
+            guard_timeout_ms,
+        } => {
+            censorpivot::guard::register_runner(
+                &guard_socket,
+                &guard_domain,
+                &guard_group,
+                std::time::Duration::from_millis(guard_timeout_ms),
+            )?;
+            batch_runner(max_output_bytes, max_frame_bytes)
+        }
     }
 }
 

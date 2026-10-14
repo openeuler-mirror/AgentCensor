@@ -18,7 +18,7 @@
         branch: main
         censorfsCommand: !!js 'process.env.CENSORFS_COMMAND ?? "censorfs"'
         socket: !!js 'process.env.CENSORFS_SOCKET ?? "/run/censorfs/control.sock"'
-        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "/usr/local/bin/censorfs-mounter"'
+        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "/usr/libexec/censorfs/censorfs-mounter"'
         mounterBin: !!js 'process.env.CENSORFS_MOUNTER_BIN ?? undefined'
         runnerReadyTimeoutMs: 10000
         inProcessMaxDepth: 1

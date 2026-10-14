@@ -79,6 +79,9 @@ pub trait StorageBackend {
         }
         Ok(())
     }
+    /// Starts a new empty, daemon-lifetime spool. Historical rows remain;
+    /// only the batch replay checkpoint belongs to the previous spool.
+    fn reset_spool_checkpoint(&mut self) -> Result<(), StorageError>;
     /// Commits one decoded spool batch atomically. The consumer may advance
     /// its spool checkpoint only after this method succeeds.
     fn apply_ingest_batch(

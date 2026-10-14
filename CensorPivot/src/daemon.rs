@@ -83,15 +83,7 @@ impl Default for CensorFsDaemonConfig {
 pub struct CensorGuardDaemonConfig {
     pub daemon: PathBuf,
     pub control: PathBuf,
-    pub policy: PathBuf,
-    pub bpf_object: PathBuf,
-    pub state_dir: PathBuf,
-    pub control_socket: PathBuf,
-    pub event_socket: PathBuf,
-    pub launch_socket: PathBuf,
-    pub dsh_socket: PathBuf,
-    pub ui_socket: PathBuf,
-    pub extra_args: Vec<String>,
+    pub config: PathBuf,
 }
 
 impl Default for CensorGuardDaemonConfig {
@@ -99,15 +91,7 @@ impl Default for CensorGuardDaemonConfig {
         Self {
             daemon: "/usr/sbin/censorguardd".into(),
             control: "/usr/bin/censorguardctl".into(),
-            policy: "/etc/censorguard/base.yaml".into(),
-            bpf_object: "/usr/lib/censorguard/enforce.bpf.o".into(),
-            state_dir: "/var/lib/censorguard".into(),
-            control_socket: "/run/censorguard/ctl.sock".into(),
-            event_socket: "/run/censorguard/events.sock".into(),
-            launch_socket: "/run/censorguard/launch.sock".into(),
-            dsh_socket: "/run/censorguard/dsh.sock".into(),
-            ui_socket: "/run/censorguard/ui.sock".into(),
-            extra_args: Vec::new(),
+            config: "/etc/censorguard/agentcensor.yaml".into(),
         }
     }
 }
@@ -173,7 +157,7 @@ impl DaemonConfig {
         Ok(())
     }
 
-    fn required_paths(&self) -> [(&'static str, &Path); 20] {
+    fn required_paths(&self) -> [(&'static str, &Path); 13] {
         [
             ("state_dir", &self.state_dir),
             ("censorfs.daemon", &self.censorfs.daemon),
@@ -183,17 +167,7 @@ impl DaemonConfig {
             ("censorfs.socket", &self.censorfs.socket),
             ("censorguard.daemon", &self.censorguard.daemon),
             ("censorguard.control", &self.censorguard.control),
-            ("censorguard.policy", &self.censorguard.policy),
-            ("censorguard.bpf_object", &self.censorguard.bpf_object),
-            ("censorguard.state_dir", &self.censorguard.state_dir),
-            (
-                "censorguard.control_socket",
-                &self.censorguard.control_socket,
-            ),
-            ("censorguard.event_socket", &self.censorguard.event_socket),
-            ("censorguard.launch_socket", &self.censorguard.launch_socket),
-            ("censorguard.dsh_socket", &self.censorguard.dsh_socket),
-            ("censorguard.ui_socket", &self.censorguard.ui_socket),
+            ("censorguard.config", &self.censorguard.config),
             ("censorscope.daemon", &self.censorscope.daemon),
             ("censorscope.control", &self.censorscope.control),
             ("censorscope.config", &self.censorscope.config),
@@ -232,9 +206,10 @@ struct ComponentSpec {
 pub fn initialize(config: &DaemonConfig) -> Result<()> {
     config.validate()?;
     fs::create_dir_all(&config.state_dir)?;
-    fs::create_dir_all(&config.censorguard.state_dir)?;
+    let guard = crate::guard::load_config(&config.censorguard.config)?;
+    fs::create_dir_all(&guard.state_dir)?;
     fs::create_dir_all(&config.censorfs.import_root)?;
-    for socket in runtime_sockets(config) {
+    for socket in runtime_sockets(config)? {
         let parent = socket.parent().ok_or_else(|| {
             PivotError::Invalid(format!("socket {} has no parent", socket.display()))
         })?;
@@ -284,8 +259,7 @@ pub fn doctor(config: &DaemonConfig) -> DoctorReport {
         ("censorguard.control", &config.censorguard.control),
         ("censorscope.daemon", &config.censorscope.daemon),
         ("censorscope.control", &config.censorscope.control),
-        ("censorguard.policy", &config.censorguard.policy),
-        ("censorguard.bpf_object", &config.censorguard.bpf_object),
+        ("censorguard.config", &config.censorguard.config),
         ("censorscope.config", &config.censorscope.config),
     ] {
         checks.insert(name.into(), file_check(name, path));
@@ -310,17 +284,29 @@ pub fn doctor(config: &DaemonConfig) -> DoctorReport {
     );
     for (name, socket) in [
         ("censorfs.socket", &config.censorfs.socket),
-        (
-            "censorguard.control_socket",
-            &config.censorguard.control_socket,
-        ),
-        (
-            "censorguard.launch_socket",
-            &config.censorguard.launch_socket,
-        ),
         ("censorscope.socket", &config.censorscope.socket),
     ] {
         checks.insert(name.into(), socket_check(socket));
+    }
+    match crate::guard::load_config(&config.censorguard.config) {
+        Ok(guard) => {
+            checks.insert(
+                "censorguard.bpf_object".into(),
+                file_check("censorguard.bpf_object", &guard.bpf_object),
+            );
+            for (name, socket) in [
+                ("control", &guard.control_socket),
+                ("events", &guard.event_socket),
+                ("launch", &guard.launch_socket),
+                ("dsh", &guard.dsh_socket),
+                ("ui", &guard.ui_socket),
+            ] {
+                checks.insert(format!("censorguard.{name}_socket"), socket_check(socket));
+            }
+        }
+        Err(error) => {
+            checks.insert("censorguard.config".into(), error.to_string());
+        }
     }
     for (name, command) in doctor_commands(config) {
         let result = run_checked(name, command, config)
@@ -495,40 +481,20 @@ fn component_specs(config: &DaemonConfig) -> [ComponentSpec; 3] {
 }
 
 fn guard_check_command(config: &DaemonConfig) -> CommandSpec {
-    CommandSpec::new(
-        &config.censorguard.daemon,
-        [
-            OsString::from("--config"),
-            config.censorguard.policy.as_os_str().to_owned(),
-            OsString::from("--bpf-object"),
-            config.censorguard.bpf_object.as_os_str().to_owned(),
-            OsString::from("--check-config"),
-        ],
-    )
+    let mut command = guard_run_command(config);
+    command.args.push("--check-config".into());
+    command
 }
 
 fn guard_run_command(config: &DaemonConfig) -> CommandSpec {
-    let guard = &config.censorguard;
-    let mut args = vec![
-        OsString::from("--config"),
-        guard.policy.as_os_str().to_owned(),
-        OsString::from("--bpf-object"),
-        guard.bpf_object.as_os_str().to_owned(),
-        OsString::from("--ctl-sock"),
-        guard.control_socket.as_os_str().to_owned(),
-        OsString::from("--event-sock"),
-        guard.event_socket.as_os_str().to_owned(),
-        OsString::from("--launch-sock"),
-        guard.launch_socket.as_os_str().to_owned(),
-        OsString::from("--dsh-sock"),
-        guard.dsh_socket.as_os_str().to_owned(),
-        OsString::from("--ui-sock"),
-        guard.ui_socket.as_os_str().to_owned(),
-        OsString::from("--state-dir"),
-        guard.state_dir.as_os_str().to_owned(),
-    ];
-    args.extend(guard.extra_args.iter().map(OsString::from));
-    CommandSpec::new(&guard.daemon, args)
+    CommandSpec::new(
+        &config.censorguard.daemon,
+        [
+            OsString::from("launch"),
+            OsString::from("--config"),
+            config.censorguard.config.as_os_str().to_owned(),
+        ],
+    )
 }
 
 fn scope_init_command(config: &DaemonConfig) -> CommandSpec {
@@ -573,9 +539,10 @@ fn doctor_commands(config: &DaemonConfig) -> [(&'static str, CommandSpec); 3] {
             CommandSpec::new(
                 &config.censorguard.control,
                 [
-                    OsString::from("--socket"),
-                    config.censorguard.control_socket.as_os_str().to_owned(),
+                    OsString::from("--config"),
+                    config.censorguard.config.as_os_str().to_owned(),
                     OsString::from("doctor"),
+                    OsString::from("--json"),
                 ],
             ),
         ),
@@ -623,16 +590,17 @@ fn run_checked(name: &'static str, spec: CommandSpec, config: &DaemonConfig) -> 
     Ok(())
 }
 
-fn runtime_sockets(config: &DaemonConfig) -> [&Path; 7] {
-    [
-        &config.censorfs.socket,
-        &config.censorguard.control_socket,
-        &config.censorguard.event_socket,
-        &config.censorguard.launch_socket,
-        &config.censorguard.dsh_socket,
-        &config.censorguard.ui_socket,
-        &config.censorscope.socket,
-    ]
+fn runtime_sockets(config: &DaemonConfig) -> Result<[PathBuf; 7]> {
+    let guard = crate::guard::load_config(&config.censorguard.config)?;
+    Ok([
+        config.censorfs.socket.clone(),
+        guard.control_socket,
+        guard.event_socket,
+        guard.launch_socket,
+        guard.dsh_socket,
+        guard.ui_socket,
+        config.censorscope.socket.clone(),
+    ])
 }
 
 fn file_check(name: &str, path: &Path) -> String {
@@ -834,7 +802,14 @@ mod tests {
         let specs = component_specs(&config);
         assert_eq!(specs.len(), 3);
         assert!(specs[0].run.args.iter().any(|arg| arg == "--storage-root"));
-        assert!(!specs[1].run.args.iter().any(|arg| arg == "launch"));
+        assert_eq!(
+            specs[1].run.args,
+            [
+                OsString::from("launch"),
+                OsString::from("--config"),
+                config.censorguard.config.as_os_str().to_owned()
+            ]
+        );
         assert!(specs[2].run.args.iter().any(|arg| arg == "run"));
         assert!(!specs[2].run.args.iter().any(|arg| arg == "start"));
     }

@@ -1,5 +1,25 @@
-# CensorPivot baseline. The default Pivot/DSH group is applied through
-# censorguardctl after the daemon is healthy.
+# One runtime configuration shared by censord, Pivot and all Guard clients.
+# Custom policy groups are published separately through policy apply.
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  control_socket: /run/censorguard/ctl.sock
+  event_socket: /run/censorguard/events.sock
+  launch_socket: /run/censorguard/launch.sock
+  dsh_socket: /run/censorguard/dsh.sock
+  ui_socket: /run/censorguard/ui.sock
+  state_dir: /var/lib/censorguard
+  socket_group: censorpivot
+  gateway_user: censorpivot
+  dsh_self_groups: [censorguard-dsh-default]
+  spawn_grpc: true
+  grpc_bin: /usr/bin/censorguard-grpc
+  grpc_listen: 127.0.0.1:50051
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: true
+  audit_exec: true
+  audit_net: true
 rules:
   - file deny+audit /etc/shadow
   - file deny+audit /root/.ssh

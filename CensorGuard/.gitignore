@@ -8,6 +8,8 @@
 *.ll
 *.skel.h
 bpf/vmlinux.h
+bpf/vmlinux.h.tmp
+bpf/enforce.bpf.o.tmp
 
 # Node / TypeScript
 node_modules/
@@ -15,6 +17,7 @@ dist/
 lib/
 *.tsbuildinfo
 *.tgz
+*.tgz.sha256
 
 # Python (api/ 与脚本)
 __pycache__/

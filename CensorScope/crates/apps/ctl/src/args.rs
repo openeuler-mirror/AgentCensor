@@ -10,6 +10,7 @@ use config_core::daemon::{DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig};
 use control_contract::command::ProcessRef;
 use control_contract::selector::TraceSelector;
 use model_core::ids::{ProfileName, RequestId, TraceId, TraceName};
+use model_core::process::NamespaceIdentity;
 
 use crate::process_ref::process_ref;
 
@@ -185,7 +186,10 @@ impl CtlCommandArgs {
             Self::TrackAdd(args) => {
                 let root_pid = args.root_pid;
                 Ok(CtlCommand::TrackAdd {
-                    root: process_ref(root_pid)?,
+                    root: match args.root_pid_namespace {
+                        Some(namespace) => ProcessRef::new(root_pid, namespace),
+                        None => process_ref(root_pid)?,
+                    },
                     display_name: trace_name(args.name, root_pid)?,
                     profile_name: configured_profile(config)?.name.clone(),
                     tags: args.tags.into_iter().collect(),
@@ -322,6 +326,11 @@ struct TrackAddArgs {
     #[arg(long = "root-pid", value_name = "PID")]
     root_pid: u32,
 
+    #[arg(long = "root-pid-namespace", value_name = "pid:[INODE]",
+          value_parser = parse_pid_namespace,
+          help = "Namespace containing --root-pid; skip client procfs lookup, daemon still validates ownership")]
+    root_pid_namespace: Option<NamespaceIdentity>,
+
     #[arg(long = "name", value_name = "NAME")]
     name: Option<String>,
 
@@ -440,6 +449,19 @@ fn parse_trace_id(raw: &str) -> Result<TraceId, String> {
         .map_err(|error| format!("invalid trace id: {error}"))
 }
 
+fn parse_pid_namespace(raw: &str) -> Result<NamespaceIdentity, String> {
+    let inode = raw
+        .strip_prefix("pid:[")
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok());
+    if inode.is_some_and(|value| value > 0) {
+        Ok(NamespaceIdentity::new(raw))
+    } else {
+        Err("expected PID namespace identity pid:[INODE] with a positive inode".to_string())
+    }
+}
+
 fn parse_request_id(raw: &str) -> Result<RequestId, String> {
     raw.parse::<u64>()
         .map(RequestId::new)
@@ -468,6 +490,42 @@ fn parse_session_id(raw: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_namespace_sends_coordinates_without_reading_target_procfs() {
+        let cli = CtlCli::try_parse_from([
+            "censorscopectl",
+            "track-add",
+            "--root-pid",
+            "4294967295",
+            "--root-pid-namespace",
+            "pid:[4026531836]",
+        ])
+        .unwrap();
+        let config = OperatorConfig::init().unwrap();
+        let command = cli
+            .command
+            .into_command(Some(&config), PathBuf::new(), false)
+            .unwrap();
+        assert!(matches!(command, CtlCommand::TrackAdd { root, .. }
+            if root.namespace_pid == u32::MAX
+                && root.pid_namespace.as_str() == "pid:[4026531836]"));
+    }
+
+    #[test]
+    fn explicit_namespace_rejects_unknown_and_malformed_identities() {
+        for invalid in [
+            "unknown",
+            "mnt:[123]",
+            "pid:[0]",
+            "pid:[-1]",
+            "pid:[+1]",
+            "pid:[]",
+            "pid:[1]extra",
+        ] {
+            assert!(parse_pid_namespace(invalid).is_err(), "{invalid}");
+        }
+    }
 
     #[test]
     fn init_uses_default_config_path_without_socket_path() {

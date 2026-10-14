@@ -1,3 +1,4 @@
+# Local editor and agent settings
 .claude/
 .vscode/
 .idea/
@@ -7,3 +8,29 @@ CLAUDE.md
 .codex
 .agents/
 .workbuddy
+
+# Build outputs and dependency caches (all components)
+target/
+dist/
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# Generated plugin packages and checksums
+*.tgz
+*.tgz.sha256
+
+# Native compilation outputs
+*.o
+*.a
+*.so
+*.rlib
+*.rmeta
+*.ll
+*.skel.h
+
+# Python bytecode and test caches
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

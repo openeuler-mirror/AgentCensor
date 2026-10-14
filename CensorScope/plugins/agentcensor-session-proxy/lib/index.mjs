@@ -18,8 +18,11 @@
  * persistence root (its overlay redirects the writable data roots out of the
  * shared host home) seeded with a snapshot copy of the durable session log; it
  * executes with the native agent-loop there and streams events back over
- * stdout. The host replays worker events 1:1 — worker is the content
- * authority; the host never synthesizes session data.
+ * stdout. The worker authors turn/tool/approval content; the host preserves
+ * its event payloads and writes the shared log. UI configuration events are
+ * authored by the host and synchronized into the worker's native event fold.
+ * Each process has its own contiguous sequence cursor because host-only UI
+ * events and synchronized configuration need not occupy identical positions.
  *
  * ── Stdout protocol (worker → host, see worker.mjs) ──
  *   ACEVT\t<json>    one session event {type,seq,data,surfaceOp?,sourceEventSeqs?}
@@ -29,11 +32,13 @@
  *   ACCANCEL\t<json> cancel handed to the worker's native agent: {cause,keepInbox,seq,applied}
  *   ACASK\t<json>    approval/question ask forwarded by the worker: {id,kind,…payload}
  *   ACWITHDRAW\t<json> withdrawal of one forwarded ask: {id}
+ *   ACSYNC\t<json>   worker accepted an existing host configuration event: {seq}
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
  *   {"type":"message","message":{content,source,id?,role?}}  original user message
  *   {"type":"cancel","cause":{kind},"keepInbox":bool}         native turn cancellation
  *   {"type":"answer","kind":…,"id":…,"ok":bool,…}             answer to a forwarded ask
+ *   {"type":"host-session-event","event":{type,data,…}}      native configuration event
  *   {"type":"shutdown"}                                      graceful exit
  *
  * ── Human interaction (approval + ask_user_question) ──
@@ -77,11 +82,10 @@ import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-// The source CLI runs through tsx and loads DSH's TS source graph. Importing
-// the package default from this external .mjs would load its built lib graph
-// instead, minting a second private scope Symbol. Use the same entry as DSH.
+// The source CLI uses the TS graph; a built CLI uses package exports. Recognize
+// both the public tsx/esm specifier and its resolved tsx/dist/esm entry path.
 const { createScope } = await import(
-  process.execArgv.some((arg) => arg.includes('tsx/esm'))
+  process.execArgv.some(arg => /tsx\/(?:dist\/)?esm(?:\/|$)/.test(arg))
     ? '@deepseek-ai/dsh-scope/src/index.ts'
     : '@deepseek-ai/dsh-scope'
 )
@@ -99,6 +103,7 @@ const READY_PREFIX = 'ACREADY\t'
 const IDLE_PREFIX = 'ACIDLE\t'
 const ERR_PREFIX = 'ACERR\t'
 const CANCEL_PREFIX = 'ACCANCEL\t'
+const SYNC_PREFIX = 'ACSYNC\t'
 const ASK_PREFIX = 'ACASK\t'
 const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
@@ -306,6 +311,18 @@ class WebDriverAgent {
     this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
     this.sendChain = Promise.resolve()
     this.closedByHost = false
+    this.workerAuthoredSequences = new Set()
+    this.workerNextSeq = undefined
+    // Permission changes are authored by the host UI. A resident worker must
+    // receive the same events before the next message, otherwise the browser
+    // shows one mode while tools keep enforcing the previous mode.
+    this.ctx.on('session/event', (changedSession, event) => {
+      if (changedSession.id !== this.id) return
+      if (this.workerAuthoredSequences.delete(event.seq)) return
+      if (!['permission/preset', 'sandbox/mode', 'approval/policy', 'model/selection'].includes(event.type)) return
+      const state = this.workerState
+      if (state?.alive && !state.stopping) state.write({ type: 'host-session-event', event })
+    }, { global: true })
     // Cancels received while the worker could not accept them yet (spawn in
     // flight). Applied right after the next forwarded message so a stop that
     // races its own message still aborts that message's turn.
@@ -475,6 +492,7 @@ class WebDriverAgent {
       AGENTCENSOR_HOST_SEQ: String(this.session.seq),
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
+    this.workerNextSeq = this.session.seq
     process.stdout.write(`[agentcensor] worker shares host home DSH_HOME=${hostHome} (no key/model env)\n`)
 
     const cwd = header.cwd ?? process.cwd()
@@ -582,6 +600,10 @@ class WebDriverAgent {
           )
         } else if (line.startsWith(IDLE_PREFIX)) {
           this.onTurnIdle()
+        } else if (line.startsWith(SYNC_PREFIX)) {
+          const payload = JSON.parse(line.slice(SYNC_PREFIX.length))
+          if (payload.seq !== this.workerNextSeq) throw new Error('worker synchronization sequence mismatch')
+          this.workerNextSeq += 1
         } else if (line.startsWith(ASK_PREFIX)) {
           let payload = {}
           /* keep {} */
@@ -752,37 +774,17 @@ class WebDriverAgent {
       stats.failed += 1
       return
     }
-    if (event.seq < this.session.seq) {
+    if (event.seq < this.workerNextSeq) {
       // Already present in the host log (boot/policy events etc.).
       stats.skipped += 1
       return
     }
-    if (event.seq > this.session.seq) {
-      // A resume worker appends its own `session/end-seed` marker (Session
-      // constructor) when the seeded log does not end with one, so its stream
-      // legitimately starts one seq past the host's. Mirror that one-time +1
-      // by inserting the marker on the host; any other gap is real divergence
-      // and is refused.
-      if (event.seq === this.session.seq + 1 && !this.endSeedInserted) {
-        try {
-          this.session.append('session/end-seed', {})
-          this.endSeedInserted = true
-          stats.mirrored += 1
-          process.stdout.write(
-            `[agentcensor] mirror inserted resume session/end-seed at seq=${String(event.seq - 1)}\n`,
-          )
-        } catch (error) {
-          stats.failed += 1
-          process.stdout.write(`[agentcensor] mirror end-seed append failed: ${error?.message ?? String(error)}\n`)
-          return
-        }
-      } else {
-        process.stdout.write(
-          `[agentcensor] mirror gap: worker seq ${String(event.seq)} > host seq ${String(this.session.seq)} (type=${event.type})\n`,
-        )
-        stats.failed += 1
-        return
-      }
+    if (event.seq > this.workerNextSeq) {
+      process.stdout.write(
+        `[agentcensor] mirror gap: worker seq ${String(event.seq)} > expected ${String(this.workerNextSeq)} (type=${event.type})\n`,
+      )
+      stats.failed += 1
+      return
     }
     try {
       // The host assigns seq/time on append; retain every other envelope
@@ -799,6 +801,7 @@ class WebDriverAgent {
         return
       }
       const hasSurface = intent.surfaceOp !== undefined || intent.sourceEventSeqs !== undefined
+      this.workerAuthoredSequences.add(this.session.seq)
       if (hasSurface) {
         this.session.append(type, data, {
           ...(intent.surfaceOp === undefined ? {} : { surfaceOp: intent.surfaceOp }),
@@ -808,6 +811,7 @@ class WebDriverAgent {
         this.session.append(type, data)
       }
       stats.mirrored += 1
+      this.workerNextSeq += 1
     } catch (error) {
       stats.failed += 1
       process.stdout.write(

@@ -61,6 +61,11 @@ test('web patch composes all three existing modules', async () => {
   ]) assert.match(patch, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   assert.doesNotMatch(patch, /name: 'censorscope-ui'/)
   assert.match(patch, /id: agent-loop\r?\n  inject: \[censorguardReady\]\r?\n  disabled: true/)
+  assert.match(patch, /blockOnFailure: true/)
+  assert.match(patch, /id: censorfs-parallel-worlds\r?\n  inject: \[tools, commands, subagents, sessions, censorguardReady\]/)
+  assert.match(patch, /id: agentcensor-session-proxy\r?\n  inject: \[agents, sessions, sessionPersistence, sessionProjections, censorguardReady\]/)
+  assert.match(patch, /id: skill\r?\n  disabled: false/)
+  assert.doesNotMatch(patch, /id: ui-trajectory\r?\n  disabled: true/)
 })
 
 test('headless companion contains only worker-side integrations', async () => {
@@ -76,4 +81,22 @@ test('headless companion contains only worker-side integrations', async () => {
   assert.match(source, /track-add/)
   assert.match(source, /--trace-id/)
   assert.match(source, /censorscopectl-dsh/)
+})
+
+test('source CLI shares the DSH Scope module and Guard has no retired client dependency', async () => {
+  const scopeRoot = resolve(root, '../../../CensorScope/plugins/agentcensor-session-proxy')
+  const guardRoot = resolve(root, '../../../CensorGuard/plugins/dsh-censorguard')
+  for (const file of ['lib/index.mjs', 'lib/interaction-bridge.mjs']) {
+    const source = await readFile(resolve(scopeRoot, file), 'utf8')
+    assert.match(source, /@deepseek-ai\/dsh-scope'/)
+    assert.match(source, /@deepseek-ai\/dsh-scope\/src\/index\.ts/)
+  }
+  const proxy = await readFile(resolve(scopeRoot, 'lib/index.mjs'), 'utf8')
+  assert.match(proxy, /const dshLauncher = await resolveDshWorkerLauncher\(\)/)
+  assert.match(proxy, /persistence\.open\(id, 'write'\)/)
+  assert.match(proxy, /persistence\.create\(session\.header, \{/)
+  assert.match(proxy, /inheritedEventCount: options\.inheritedEventCount/)
+  assert.doesNotMatch(proxy, /persistence\.prepare\(/)
+  const guard = JSON.parse(await readFile(resolve(guardRoot, 'package.json'), 'utf8'))
+  assert.ok(!guard.dsh.client.inject.includes('@deepseek-ai/dsh-client-runtime'))
 })

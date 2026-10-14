@@ -77,6 +77,15 @@ impl CommandAdapters {
 
     pub fn doctor_report(&self) -> DoctorReport {
         let mut checks = BTreeMap::new();
+        if let Some(path) = &self.config.supervisor_config {
+            checks.insert(
+                "components.configuration".into(),
+                crate::daemon::DaemonConfig::load(path)
+                    .and_then(|supervisor| self.config.validate_supervisor(&supervisor))
+                    .map(|()| "ok".to_string())
+                    .unwrap_or_else(|error| error.to_string()),
+            );
+        }
         check_file(
             &mut checks,
             "censorfs.mounter_command",
@@ -113,8 +122,8 @@ impl CommandAdapters {
         );
         check_file(
             &mut checks,
-            "censorguard.exec_command",
-            &self.config.censorguard.exec_command,
+            "censorguard.control",
+            &self.config.censorguard.control,
         );
         check_file(
             &mut checks,
@@ -122,10 +131,32 @@ impl CommandAdapters {
             &self.config.censorscope.command,
         );
         check_socket(&mut checks, "censorfs.socket", &self.config.censorfs.socket);
-        check_socket(
-            &mut checks,
-            "censorguard.launch_socket",
-            &self.config.censorguard.launch_socket,
+        match crate::guard::load_config(&self.config.censorguard.config) {
+            Ok(guard) => check_socket(
+                &mut checks,
+                "censorguard.launch_socket",
+                &guard.launch_socket,
+            ),
+            Err(error) => {
+                checks.insert("censorguard.config".into(), error.to_string());
+            }
+        }
+        checks.insert(
+            "censorguard.rpc".into(),
+            crate::guard::status(
+                &self.config.censorguard.control,
+                &self.config.censorguard.config,
+                Duration::from_millis(self.config.component_timeout_ms),
+            )
+            .and_then(|status| {
+                crate::guard::require_ready(
+                    &status,
+                    &self.config.censorguard.config,
+                    &self.config.censorguard.allowed_groups,
+                )
+            })
+            .map(|()| "ok".into())
+            .unwrap_or_else(|error| error.to_string()),
         );
         check_socket(
             &mut checks,
@@ -454,6 +485,18 @@ impl ToolRunner for CommandAdapters {
             .owner_gid
             .filter(|gid| *gid != 0)
             .ok_or_else(|| PivotError::Invalid("runner View group must be non-root".into()))?;
+        let guard = crate::guard::load_config(&self.config.censorguard.config)?;
+        let status = crate::guard::status(
+            &self.config.censorguard.control,
+            &self.config.censorguard.config,
+            Duration::from_millis(self.config.component_timeout_ms),
+        )?;
+        crate::guard::require_ready(
+            &status,
+            &self.config.censorguard.config,
+            std::slice::from_ref(&request.guard_group),
+        )?;
+        let guard_boot = status.daemon_boot_id;
         let executable = std::env::current_exe()?;
         let identity = uuid::Uuid::new_v4();
         let mut command = Command::new(&self.config.censorfs.mounter_command[0]);
@@ -476,19 +519,16 @@ impl ToolRunner for CommandAdapters {
             .arg("--cgroup-cleanup-timeout-ms")
             .arg("5000")
             .arg("--")
-            .arg(&self.config.censorguard.exec_command)
-            .arg("--socket")
-            .arg(&self.config.censorguard.launch_socket)
-            // Caller-controlled scope names must never rebind another active domain.
-            .arg("--scope")
-            .arg(&request.guard_scope)
-            .arg("--group")
-            .arg(&request.guard_group)
-            .arg("--failure-policy")
-            .arg("deny")
-            .arg("--")
             .arg(executable)
             .arg("__batch-runner")
+            .arg("--guard-socket")
+            .arg(&guard.launch_socket)
+            .arg("--guard-domain")
+            .arg(&request.guard_scope)
+            .arg("--guard-group")
+            .arg(&request.guard_group)
+            .arg("--guard-timeout-ms")
+            .arg(self.config.runner_timeout_ms.to_string())
             .arg("--max-output-bytes")
             .arg(self.config.max_output_bytes.to_string())
             .arg("--max-frame-bytes")
@@ -514,7 +554,29 @@ impl ToolRunner for CommandAdapters {
                 ));
             }
         };
+        let status = crate::guard::status(
+            &self.config.censorguard.control,
+            &self.config.censorguard.config,
+            Duration::from_millis(self.config.component_timeout_ms),
+        )?;
+        crate::guard::require_ready(
+            &status,
+            &self.config.censorguard.config,
+            std::slice::from_ref(&request.guard_group),
+        )?;
+        crate::guard::require_runner(
+            &status,
+            &request.guard_scope,
+            &request.guard_group,
+            host_pid,
+            &guard_boot,
+        )?;
         Ok(Box::new(CommandSession {
+            guard: self.config.censorguard.clone(),
+            guard_timeout: Duration::from_millis(self.config.component_timeout_ms),
+            guard_boot,
+            guard_domain: request.guard_scope.clone(),
+            guard_group: request.guard_group.clone(),
             process: Some(process),
             host_pid,
             timeout,
@@ -525,11 +587,44 @@ impl ToolRunner for CommandAdapters {
 }
 
 struct CommandSession {
+    guard: crate::config::CensorGuardConfig,
+    guard_timeout: Duration,
+    guard_boot: String,
+    guard_domain: String,
+    guard_group: String,
     process: Option<Process>,
     host_pid: u32,
     timeout: Duration,
     environment: BTreeMap<String, String>,
     session_id: String,
+}
+
+impl CommandSession {
+    fn check_guard(&self, require_runner: bool) -> Result<()> {
+        let status =
+            crate::guard::status(&self.guard.control, &self.guard.config, self.guard_timeout)?;
+        crate::guard::require_ready(
+            &status,
+            &self.guard.config,
+            std::slice::from_ref(&self.guard_group),
+        )?;
+        if status.daemon_boot_id != self.guard_boot {
+            return Err(PivotError::component(
+                "censorguard",
+                "daemon restarted during batch; aborting",
+            ));
+        }
+        if require_runner {
+            crate::guard::require_runner(
+                &status,
+                &self.guard_domain,
+                &self.guard_group,
+                self.host_pid,
+                &self.guard_boot,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl ToolSession for CommandSession {
@@ -538,6 +633,7 @@ impl ToolSession for CommandSession {
     }
 
     fn run(&mut self, call: &ToolCall) -> Result<CallResult> {
+        self.check_guard(true)?;
         let process = self
             .process
             .as_mut()
@@ -549,9 +645,11 @@ impl ToolSession for CommandSession {
         })?;
         frame.push(b'\n');
         process.send(&frame, self.timeout)?;
-        match serde_json::from_slice(
+        let reply = serde_json::from_slice(
             &process.line(Duration::from_millis(call.timeout_ms) + self.timeout)?,
-        )? {
+        )?;
+        self.check_guard(true)?;
+        match reply {
             RunnerReply::Result(result) if result.call_id == call.id => Ok(result),
             RunnerReply::Error(message) => Err(PivotError::component("runner", message)),
             _ => Err(PivotError::Protocol(
@@ -561,12 +659,13 @@ impl ToolSession for CommandSession {
     }
 
     fn finish(&mut self) -> Result<()> {
+        self.check_guard(true)?;
         let Some(process) = self.process.take() else {
             return Ok(());
         };
         let output = process.collect(self.timeout)?;
         if output.status.success() && !output.timed_out {
-            Ok(())
+            self.check_guard(false)
         } else {
             Err(PivotError::component(
                 "runner",
@@ -736,6 +835,101 @@ mod tests {
         assert!(result.succeeded());
         assert_eq!(result.stdout, "pivot:call-1:0123456");
         assert!(result.output_truncated);
+        Ok(())
+    }
+    #[test]
+    fn real_command_adapter_correlates_guard_registration_and_stops_on_restart() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        let config_path = root.join("guard.yaml");
+        let launch_socket = root.join("launch.sock");
+        fs::write(
+            &config_path,
+            format!(
+                "daemon:\n  launch_socket: {}\nrules: []\n",
+                launch_socket.display()
+            ),
+        )?;
+        let status_path = root.join("status.json");
+        let args_path = root.join("args.json");
+        let calls_path = root.join("calls.jsonl");
+        let control = root.join("ctl.py");
+        fs::write(
+            &control,
+            format!(
+                r#"#!/usr/bin/python3
+import json, sys
+from pathlib import Path
+assert sys.argv[1:] == ['--config', {config_path:?}, 'status', '--json'], sys.argv
+print(Path({status_path:?}).read_text())
+"#
+            ),
+        )?;
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o755))?;
+        let mounter = root.join("mounter.py");
+        fs::write(
+            &mounter,
+            format!(
+                r#"#!/usr/bin/python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+Path({args_path:?}).write_text(json.dumps(args))
+assert args[args.index('--guard-socket') + 1] == {launch_socket:?}
+assert args[args.index('--guard-domain') + 1] == 'pivot-fixture'
+assert args[args.index('--guard-group') + 1] == 'censorguard-dsh-default'
+assert 'censorguard-exec' not in ' '.join(args)
+path = Path({status_path:?})
+status = json.loads(path.read_text())
+status['domains'] = [{{'name':'pivot-fixture','id':1,'slot':1,'group':'censorguard-dsh-default','policies':['censorguard-dsh-default'],'roots':1,'version':7}}]
+status['trees'] = [{{'domain':'pivot-fixture','domain_id':1,'nodes':[{{'pid':os.getpid(),'ppid':os.getppid(),'comm':'runner','root':True}}]}}]
+path.write_text(json.dumps(status))
+print(json.dumps({{'kind':'ready','data':{{'host_pid':os.getpid()}}}}), flush=True)
+for line in sys.stdin:
+  request = json.loads(line)
+  with Path({calls_path:?}).open('a') as stream: stream.write(line)
+  print(json.dumps({{'kind':'result','data':{{'call_id':request['call']['id'],'exit_code':0,'timed_out':False,'duration_ms':0,'stdout':'ok','stderr':'','output_truncated':False}}}}), flush=True)
+"#
+            ),
+        )?;
+        fs::set_permissions(&mounter, fs::Permissions::from_mode(0o755))?;
+        let initial = serde_json::json!({"ok":true,"daemon_ready":true,"hooks_healthy":true,"daemon_boot_id":"first", "config_path":config_path,
+            "groups":[{"name":"censorguard-dsh-default","version":7,"definition":{"rules":[]}}]});
+        fs::write(&status_path, serde_json::to_vec(&initial)?)?;
+        let mut config = Config::default();
+        config.censorguard.config = config_path;
+        config.censorguard.control = control;
+        config.censorfs.mounter_command = vec![mounter.to_string_lossy().into_owned()];
+        let adapter = CommandAdapters::new(config);
+        let mut batch: BatchRequest = serde_json::from_str(include_str!("../examples/batch.json"))?;
+        batch.guard_scope = "pivot-fixture".into();
+        batch.guard_group = "censorguard-dsh-default".into();
+        let view = FsResources {
+            view_id: Some("fixture-view".into()),
+            owner_uid: Some(1000),
+            owner_gid: Some(1000),
+            ..FsResources::default()
+        };
+        let mut session = adapter.start(&batch, &view)?;
+        let result = session.run(&batch.calls[0])?;
+        assert!(result.succeeded());
+        let mut status: Value = serde_json::from_slice(&fs::read(&status_path)?)?;
+        status["daemon_boot_id"] = serde_json::json!("second");
+        fs::write(&status_path, serde_json::to_vec(&status)?)?;
+        assert!(session.run(&batch.calls[0]).is_err());
+        assert!(session.finish().is_err());
+        drop(session);
+        assert_eq!(fs::read_to_string(&calls_path)?.lines().count(), 1);
+        let args: Vec<String> = serde_json::from_slice(&fs::read(args_path)?)?;
+        assert!(args.contains(&"__batch-runner".into()));
+        assert!(args.contains(&"--cgroup-scope".into()));
+        // An unhealthy daemon must be rejected before the mounter starts again.
+        fs::remove_file(&calls_path)?;
+        status["daemon_ready"] = serde_json::json!(false);
+        fs::write(&status_path, serde_json::to_vec(&status)?)?;
+        assert!(adapter.start(&batch, &view).is_err());
+        assert!(!calls_path.exists());
         Ok(())
     }
 }
