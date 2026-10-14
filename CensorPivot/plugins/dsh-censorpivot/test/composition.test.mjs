@@ -19,6 +19,7 @@ test('publishes one user-facing web bundle', async () => {
     '@deepseek-ai/dsh-client-runtime',
     '@deepseek-ai/dsh-client-ui-settings',
     '@deepseek-ai/dsh-client-ui-conversation',
+    '@censorfs/deepseek-harness',
   ])
 })
 
@@ -47,6 +48,22 @@ test('registers the browser client with its package identity', async () => {
   assert.match(source, /closePivotSettings/)
   assert.match(source, /censorguard-read/)
   assert.match(source, /audit\/snapshot/)
+})
+
+test('Worlds reuses FS execution graph and keeps decisions after completion', async () => {
+  const source = await readFile(resolve(root, 'lib/client.js'), 'utf8')
+  const worlds = source.slice(source.indexOf('function FSWorld('), source.indexOf('function Scope('))
+  assert.match(worlds, /require\('@censorfs\/deepseek-harness'\)/)
+  assert.match(worlds, /fsClient\.SubagentGraphPanel/)
+  assert.match(worlds, /subagentsView/)
+  assert.match(worlds, /expanded && activities\.length/)
+  assert.match(worlds, /expanded && finished && result/)
+  assert.match(worlds, /finished && canDecide/)
+  assert.match(worlds, /strategyOpen \? '收起 ▴' : '展开 ▾'/)
+  assert.doesNotMatch(worlds, /invoke\('preview'|invoke\('validate'/)
+  assert.match(source, /key === 'fs' \? '并行沙箱环境' : key === 'guard' \? '实时安全审计' : '会话工具调用观测'/)
+  assert.match(source, /pivot-guard-title-row[^\n]*'Guard'[^\n]*pivot-live/)
+  assert.match(source, /pivot-guard-title-row \.pivot-live\{margin-left:0/)
 })
 
 test('web patch composes all three existing modules', async () => {
