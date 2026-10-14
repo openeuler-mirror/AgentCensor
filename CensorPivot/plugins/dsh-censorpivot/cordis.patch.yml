@@ -19,7 +19,7 @@
         branch: main
         censorfsCommand: !!js 'process.env.CENSORFS_COMMAND ?? "censorfs"'
         socket: !!js 'process.env.CENSORFS_SOCKET ?? "/run/censorfs/control.sock"'
-        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "censorfs-mounter"'
+        mounterCommand: !!js 'process.env.CENSORFS_MOUNTER ?? "/usr/local/bin/censorfs-mounter"'
         mounterBin: !!js 'process.env.CENSORFS_MOUNTER_BIN ?? undefined'
         runnerReadyTimeoutMs: 10000
         inProcessMaxDepth: 1
@@ -80,13 +80,19 @@
     - id: censorguard-ui
       name: '@censorguard/dsh'
 
-    # CensorScope host observation, per-session worker, and UI.
+    # CensorScope host observation and per-session worker.  Its original UI is
+    # deliberately not registered: CensorPivot reads the same public session
+    # event stream and is the only browser surface presented to the user.
     - id: censorscope-host
       name: 'censorscope-host'
     - id: agentcensor-session-proxy
       name: 'agentcensor-session-proxy'
-    - id: censorscope-ui
-      name: 'censorscope-ui'
+
+    # The session proxy uses a WebDriverAgent rather than an agent preset.
+    # Mount this provider globally so the host-side slash catalog can resolve
+    # skills for those proxied sessions as well as native preset sessions.
+    - id: agentcensor-skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
 
 # Guard readiness gates. Existing inject lists are repeated because DSH patch
 # replacement is field-level, not an array merge.
@@ -108,9 +114,14 @@
   inject: [censorguardReady]
   disabled: true
 
-# Scope's session proxy owns web conversations and Scope UI replaces the native
-# trajectory view. The worker keeps the native agent loop in its headless profile.
+# Keep the global registry available for WebDriverAgent sessions.  Native
+# agent presets normally supply a scoped registry, but the proxy intentionally
+# bypasses that preset composition.
+- id: skill
+  disabled: false
+
+# Scope's session proxy owns web conversations. The Pivot client consumes its
+# public event stream; the native trajectory is retained as the conversation
+# neighbour and Pivot is an additional conversation tab.
 - id: session-title-llm
-  disabled: true
-- id: ui-trajectory
   disabled: true

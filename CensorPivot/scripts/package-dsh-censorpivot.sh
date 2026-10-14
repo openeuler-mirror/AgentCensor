@@ -59,9 +59,18 @@ pack_meta() {
 
 pack_runtime "$censorfs_root/integrations/deepseek-harness" censorfs-web.tgz censorfs-web
 pack_runtime "$censorfs_root/integrations/deepseek-harness/event-exporter" censorfs-headless.tgz censorfs-headless
+
+# Guard publishes host/bootstrap/browser entry points from generated dist/
+# artifacts.  A bare source checkout does not contain them, so build before
+# packing rather than producing a tarball whose exports resolve to missing
+# files at DSH boot.
+guard_plugin="$censorguard_root/plugins/dsh-censorguard"
+if [[ ! -x "$guard_plugin/node_modules/.bin/tsc" || ! -x "$guard_plugin/node_modules/.bin/esbuild" ]]; then
+  (cd "$guard_plugin" && pnpm install --frozen-lockfile --ignore-scripts)
+fi
+(cd "$guard_plugin" && npm run build)
 pack_runtime "$censorguard_root/plugins/dsh-censorguard" censorguard-web.tgz censorguard-web
 pack_runtime "$censorscope_root/plugins/censorscope-host" censorscope-host.tgz censorscope-host
-pack_runtime "$censorscope_root/plugins/censorscope-ui" censorscope-ui.tgz censorscope-ui
 pack_runtime "$censorscope_root/plugins/agentcensor-session-proxy" censorscope-session-proxy.tgz censorscope-session-proxy
 pack_meta "$root/plugins/dsh-censorpivot" censorpivot-web.tgz censorpivot-web
 pack_meta "$root/plugins/dsh-censorpivot/headless" censorpivot-headless.tgz censorpivot-headless
