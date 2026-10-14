@@ -13,19 +13,21 @@ bash -n "$root/scripts/install-dsh-censorpivot.sh"
 expected=(
   censorpivot-web.tgz censorpivot-headless.tgz
   censorfs-web.tgz censorfs-headless.tgz censorguard-web.tgz
-  censorscope-host.tgz censorscope-ui.tgz censorscope-session-proxy.tgz
+  censorscope-host.tgz censorscope-session-proxy.tgz
 )
 for archive in "${expected[@]}"; do
   test -s "$output/packages/$archive"
   test -s "$output/packages/$archive.sha256"
 done
 
-for runtime in censorfs-web censorfs-headless censorguard-web censorscope-host censorscope-ui censorscope-session-proxy; do
+test ! -e "$output/packages/censorscope-ui.tgz"
+
+for runtime in censorfs-web censorfs-headless censorguard-web censorscope-host censorscope-session-proxy; do
   tar -xOf "$output/packages/$runtime.tgz" package/package.json | \
     node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const p=JSON.parse(s);if(p.dsh?.bundle)process.exit(1)})'
 done
 
-for runtime in censorfs-web censorguard-web censorscope-ui; do
+for runtime in censorfs-web censorguard-web; do
   tar -xOf "$output/packages/$runtime.tgz" package/package.json | \
     node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const p=JSON.parse(s);if(!p.dsh?.client)process.exit(1)})'
 done

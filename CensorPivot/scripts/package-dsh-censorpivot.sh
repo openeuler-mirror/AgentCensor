@@ -63,9 +63,9 @@ pack_meta() {
 
 pack_runtime "$censorfs_root/integrations/deepseek-harness" censorfs-web.tgz censorfs-web
 pack_runtime "$censorfs_root/integrations/deepseek-harness/event-exporter" censorfs-headless.tgz censorfs-headless
+
 pack_runtime "$censorguard_root/plugins/dsh-censorguard" censorguard-web.tgz censorguard-web
 pack_runtime "$censorscope_root/plugins/censorscope-host" censorscope-host.tgz censorscope-host
-pack_runtime "$censorscope_root/plugins/censorscope-ui" censorscope-ui.tgz censorscope-ui
 pack_runtime "$censorscope_root/plugins/agentcensor-session-proxy" censorscope-session-proxy.tgz censorscope-session-proxy
 pack_meta "$root/plugins/dsh-censorpivot" censorpivot-web.tgz censorpivot-web
 pack_meta "$root/plugins/dsh-censorpivot/headless" censorpivot-headless.tgz censorpivot-headless

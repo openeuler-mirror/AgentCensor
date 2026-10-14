@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import vm from 'node:vm'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -14,7 +15,55 @@ test('publishes one user-facing web bundle', async () => {
   const pkg = await manifest()
   assert.equal(pkg.name, '@agentcensor/censorpivot')
   assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
-  assert.equal(pkg.dsh.client, undefined)
+  assert.deepEqual(pkg.dsh.client.inject, [
+    '@deepseek-ai/dsh-client-runtime',
+    '@deepseek-ai/dsh-client-ui-settings',
+    '@deepseek-ai/dsh-client-ui-conversation',
+    '@censorfs/deepseek-harness',
+  ])
+})
+
+test('registers the browser client with its package identity', async () => {
+  const source = await readFile(resolve(root, 'lib/client.js'), 'utf8')
+  let registration
+  vm.runInNewContext(source, {
+    window: { __ModuleLoader__: { load: (value) => { registration = value } } },
+    localStorage: { getItem: () => null, setItem: () => undefined },
+    document: {},
+    setTimeout: () => undefined,
+  })
+  assert.equal(registration.id, '@agentcensor/censorpivot')
+  const client = registration.factory((id) => {
+    assert.equal(id, 'react')
+    return { createElement: () => undefined, useState: () => undefined, useSyncExternalStore: () => undefined }
+  })
+  assert.equal(client.name, 'censorpivot-ui')
+  assert.equal(typeof client.apply, 'function')
+  assert.match(source, /\/censorpivot\/call\?session=/)
+  assert.match(source, /censorscoped 原始系统调用/)
+  assert.match(source, /会话工具调用观测/)
+  assert.match(source, /user\/message/)
+  assert.match(source, /pivot-scope-scroll/)
+  assert.match(source, /isRuntimeContext/)
+  assert.match(source, /closePivotSettings/)
+  assert.match(source, /censorguard-read/)
+  assert.match(source, /audit\/snapshot/)
+})
+
+test('Worlds reuses FS execution graph and keeps decisions after completion', async () => {
+  const source = await readFile(resolve(root, 'lib/client.js'), 'utf8')
+  const worlds = source.slice(source.indexOf('function FSWorld('), source.indexOf('function Scope('))
+  assert.match(worlds, /require\('@censorfs\/deepseek-harness'\)/)
+  assert.match(worlds, /fsClient\.SubagentGraphPanel/)
+  assert.match(worlds, /subagentsView/)
+  assert.match(worlds, /expanded && activities\.length/)
+  assert.match(worlds, /expanded && finished && result/)
+  assert.match(worlds, /finished && canDecide/)
+  assert.match(worlds, /strategyOpen \? '收起 ▴' : '展开 ▾'/)
+  assert.doesNotMatch(worlds, /invoke\('preview'|invoke\('validate'/)
+  assert.match(source, /key === 'fs' \? '并行沙箱环境' : key === 'guard' \? '实时安全审计' : '会话工具调用观测'/)
+  assert.match(source, /pivot-guard-title-row[^\n]*'Guard'[^\n]*pivot-live/)
+  assert.match(source, /pivot-guard-title-row \.pivot-live\{margin-left:0/)
 })
 
 test('web patch composes all three existing modules', async () => {
@@ -26,18 +75,29 @@ test('web patch composes all three existing modules', async () => {
     "name: '@censorguard/dsh'",
     "name: 'censorscope-host'",
     "name: 'agentcensor-session-proxy'",
-    "name: 'censorscope-ui'",
   ]) assert.match(patch, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
-  assert.match(patch, /id: agent-loop\n  inject: \[censorguardReady\]\n  disabled: true/)
+  assert.doesNotMatch(patch, /name: 'censorscope-ui'/)
+  assert.match(patch, /id: agent-loop\r?\n  inject: \[censorguardReady\]\r?\n  disabled: true/)
+  assert.match(patch, /blockOnFailure: true/)
+  assert.match(patch, /id: censorfs-parallel-worlds\r?\n  inject: \[tools, commands, subagents, sessions, censorguardReady\]/)
+  assert.match(patch, /id: agentcensor-session-proxy\r?\n  inject: \[agents, sessions, sessionPersistence, sessionProjections, censorguardReady\]/)
+  assert.match(patch, /id: skill\r?\n  disabled: false/)
+  assert.doesNotMatch(patch, /id: ui-trajectory\r?\n  disabled: true/)
 })
 
 test('headless companion contains only worker-side integrations', async () => {
   const pkg = await manifest('headless/package.json')
   const patch = await readFile(resolve(root, 'headless/cordis.patch.yml'), 'utf8')
+  const source = await readFile(resolve(root, 'headless/lib/index.mjs'), 'utf8')
   assert.equal(pkg.name, '@agentcensor/censorpivot-headless')
+  assert.match(patch, /name: '@censorfs\/deepseek-harness'/)
   assert.match(patch, /name: '@censorfs\/event-exporter'/)
   assert.match(patch, /name: 'censorscope-host'/)
   assert.doesNotMatch(patch, /censorguard|session-proxy|censorscope-ui/)
+  assert.match(source, /AGENTCENSOR_SESSION_ID/)
+  assert.match(source, /track-add/)
+  assert.match(source, /--trace-id/)
+  assert.match(source, /censorscopectl-dsh/)
 })
 
 test('source CLI shares the DSH Scope module and Guard has no retired client dependency', async () => {

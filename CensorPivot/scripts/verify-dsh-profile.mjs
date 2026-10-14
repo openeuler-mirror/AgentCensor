@@ -55,7 +55,9 @@ try {
     const entries = yaml.load(dump, { schema });
     const byId = new Map(entries.map(entry => [entry.id, entry]));
     if (profile === 'web') {
-      for (const id of ['censorguard-bootstrap', 'censorguard-host', 'censorguard-ui', 'censorfs-parallel-worlds', 'censorscope-host', 'agentcensor-session-proxy', 'censorscope-ui']) assert(byId.has(id), `missing ${id}`);
+      for (const id of ['censorguard-bootstrap', 'censorguard-host', 'censorguard-ui', 'censorfs-parallel-worlds', 'censorscope-host', 'agentcensor-session-proxy', 'agentcensor-skill-filesystem', 'skill']) assert(byId.has(id), `missing ${id}`);
+      assert(!byId.has('censorscope-ui'), 'standalone Scope UI should not be active');
+      assert.notEqual(byId.get('ui-trajectory')?.disabled, true, 'native trajectory should remain available');
       assert.equal(byId.get('censorguard-bootstrap').config.blockOnFailure, true);
       for (const id of ['webserver', 'web-runtime', 'typert-gateway', 'cordis-host-runner', 'code-runtime', 'subprocess', 'tools', 'agent-loop', 'censorfs-parallel-worlds', 'agentcensor-session-proxy']) {
         assert(byId.get(id)?.inject.includes('censorguardReady'), `unguarded ${id}`);

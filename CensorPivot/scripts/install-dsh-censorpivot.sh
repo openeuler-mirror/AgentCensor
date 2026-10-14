@@ -77,7 +77,7 @@ node_major=$(node -p 'process.versions.node.split(".")[0]')
 required=(
   censorpivot-web.tgz censorpivot-headless.tgz
   censorfs-web.tgz censorfs-headless.tgz censorguard-web.tgz
-  censorscope-host.tgz censorscope-ui.tgz censorscope-session-proxy.tgz
+  censorscope-host.tgz censorscope-session-proxy.tgz
 )
 missing=false
 for archive in "${required[@]}"; do
@@ -90,6 +90,34 @@ fi
 initialize_profile() {
   local profile=$1
   "${dsh_command[@]}" plugin --profile "$profile" list --depth 0 >/dev/null
+}
+
+# The composite bundle owns the patch set.  Retire component bundles from an
+# existing profile before adding it, otherwise their browser modules can
+# register duplicate tabs alongside Pivot.  Runtime packages are installed
+# below and are deliberately retained as ordinary dependencies.
+retire_component_bundles() {
+  local profile=$1 profile_dir bundle
+  profile_dir="$dsh_home/profiles/$profile"
+  [[ -f "$profile_dir/package.json" ]] || return 0
+  for bundle in \
+    '@censorfs/deepseek-harness' \
+    '@censorfs/event-exporter' \
+    '@censorguard/dsh' \
+    'censorscope-host' \
+    'censorscope-ui' \
+    'agentcensor-session-proxy'; do
+    if node - "$profile_dir/package.json" "$bundle" <<'NODE'
+const fs = require('node:fs')
+const [file, wanted] = process.argv.slice(2)
+const bundles = JSON.parse(fs.readFileSync(file, 'utf8')).dsh?.profile?.bundles ?? []
+process.exit(bundles.includes(wanted) ? 0 : 1)
+NODE
+    then
+      printf '[INFO] removing retired %s bundle from %s profile\n' "$bundle" "$profile"
+      "${dsh_command[@]}" plugin --profile "$profile" remove "$bundle"
+    fi
+  done
 }
 
 install_runtime() {
@@ -124,16 +152,18 @@ NODE
 cleanup_legacy_guard web
 cleanup_legacy_guard headless
 
+retire_component_bundles web
 install_runtime web \
   "$package_dir/censorfs-web.tgz" \
   "$package_dir/censorguard-web.tgz" \
   "$package_dir/censorscope-host.tgz" \
-  "$package_dir/censorscope-ui.tgz" \
   "$package_dir/censorscope-session-proxy.tgz"
 "${dsh_command[@]}" plugin --profile web add "${pnpm_store_args[@]}" \
   --force --ignore-scripts "$package_dir/censorpivot-web.tgz"
 
+retire_component_bundles headless
 install_runtime headless \
+  "$package_dir/censorfs-web.tgz" \
   "$package_dir/censorfs-headless.tgz" \
   "$package_dir/censorscope-host.tgz"
 "${dsh_command[@]}" plugin --profile headless add "${pnpm_store_args[@]}" \
