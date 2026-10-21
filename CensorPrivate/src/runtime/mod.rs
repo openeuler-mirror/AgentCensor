@@ -470,3 +470,8 @@ impl Drop for RuntimeChild {
         let _ = self.process.wait();
     }
 }
+mod executor;
+pub use executor::LinuxRuntime;
+
+#[cfg(test)]
+mod tests;
