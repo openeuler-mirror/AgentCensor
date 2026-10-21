@@ -6,8 +6,13 @@
 
 pub mod compute;
 pub mod detection;
+pub mod display;
 pub mod error;
+pub mod gate;
 pub mod json;
 pub mod policy;
+pub mod protocols;
 pub mod references;
+pub mod response;
+pub mod streaming;
 pub mod vault;
