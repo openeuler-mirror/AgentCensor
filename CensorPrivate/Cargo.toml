@@ -1,0 +1,28 @@
+[package]
+name = "censorprivacy"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MulanPSL-2.0"
+description = "AgentCensor privacy gateway, private computation and isolated agent launcher"
+
+[workspace]
+members = []
+resolver = "2"
+
+[dependencies]
+
+[profile.release]
+overflow-checks = true
+lto = "thin"
+strip = "debuginfo"
+
+
+[profile.dev]
+debug = 0
+incremental = false
+
+
+[profile.test]
+debug = 0
+incremental = false
