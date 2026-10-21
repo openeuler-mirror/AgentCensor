@@ -6,6 +6,7 @@
 
 阅读路线：
 
+- [快速开始](#快速开始)
 - [1. 版本与目录约定](#1-版本与目录约定)
 - [2. 准备操作系统与源码](#2-准备操作系统与源码)
 - [3. 构建与安装](#3-构建与安装)
@@ -15,6 +16,162 @@
 - [7. 接入工具和可选运行模式](#7-接入工具和可选运行模式)
 - [8. 策略更新、版本更新与回退](#8-策略更新版本更新与回退)
 - [9. 常见问题](#9-常见问题)
+
+### 快速开始
+
+CensorPrivate 是 AgentCensor 的模型数据隐私子项目，支持两种内容接入方式：**本机消息网关**通过 Agent 已有的模型地址配置接入，统一处理请求与响应；**TLS 明文就地处理**面向已适配的动态 OpenSSL 客户端，在保留原有 TLS 连接的情况下完成内容保护。
+
+网关还可配合 **Linux 受管运行**，将 Agent 及其子进程的网络出口限制到指定网关。内容接入与出口约束各有职责，可以结合实际环境选择，配置见[第 7 节](#7-接入工具和可选运行模式)。
+
+下面以 **Linux 终端本机网关**为例，用 Rust 0.3.0 的四步接入现有 Agent。需要 Rust 1.85 或以上、C 链接器、`openssl` 命令，以及支持自定义模型地址的 Agent。基础依赖安装见[第 2 节](#2-准备操作系统与源码)。本节沿用后续教程的 `rust` 配置目录和 `8765` 端口。
+
+### 第一步：安装 Rust 本机网关
+
+进入源码根目录（包含 `Cargo.toml`、`Cargo.lock` 和 `examples/`），执行：
+
+```bash
+bash scripts/install.sh --prefix "$HOME/.local"
+"$HOME/.local/bin/censorprivacy" --version
+```
+
+安装脚本按锁文件构建 release 并安装命令。下文使用安装后的绝对路径，版本输出应为 `censorprivacy 0.3.0`。
+
+### 第二步：配置保护策略
+
+在 Agent 工作区之外准备私有目录，并复制示例策略。以下策略与凭据初始化只执行一次，后续启动复用已有文件：
+
+```bash
+CP_CONTROL_DIR="$HOME/.config/censorprivacy/rust"
+umask 077
+install -d -m 0700 "$CP_CONTROL_DIR"
+install -m 0600 examples/policy.yaml "$CP_CONTROL_DIR/policy.yaml"
+```
+
+在该目录的 `policy.yaml` 中填写业务词典，例如将 `dictionaries` 段设为：
+
+```yaml
+dictionaries:
+  PERSON: [小明]
+  ORG: [示例客户甲]
+```
+
+本例使用规则与词典识别；金额、日期等开关可在同一文件中调整，也可以补充业务正则。
+
+### 第三步：准备凭据并启动
+
+本机访问令牌用于 Agent 连接网关，上游 API Key 由网关持有。下面在 Bash 中生成令牌，并输入不回显的上游密钥：
+
+```bash
+openssl rand -hex 32 > "$CP_CONTROL_DIR/gateway.token"
+read -r -s -p '模型服务 API Key: ' CP_MODEL_KEY
+printf '\n'
+printf '%s\n' "$CP_MODEL_KEY" > "$CP_CONTROL_DIR/upstream.key"
+unset CP_MODEL_KEY
+printf 'Authorization: Bearer %s\n' "$(cat "$CP_CONTROL_DIR/gateway.token")" \
+  > "$CP_CONTROL_DIR/curl.headers"
+chmod 0600 "$CP_CONTROL_DIR/gateway.token" "$CP_CONTROL_DIR/upstream.key" "$CP_CONTROL_DIR/curl.headers"
+```
+
+`curl.headers` 供后续连通性检查使用，同样按凭据保管。将下面的上游地址和模型 ID 换成实际配置，再启动网关。`--upstream` 填 HTTPS 服务地址，不附加 `/v1`；`model.example` 是占位域名：
+
+```bash
+"$HOME/.local/bin/censorprivacy" serve \
+  --policy "$CP_CONTROL_DIR/policy.yaml" \
+  --upstream https://model.example \
+  --model MODEL_ID \
+  --token-file "$CP_CONTROL_DIR/gateway.token" \
+  --upstream-key-file "$CP_CONTROL_DIR/upstream.key" \
+  --run-state-file "$CP_CONTROL_DIR/run.json" \
+  --host 127.0.0.1 --port 8765
+```
+
+上游可以是本机、内网或云端模型服务。无需认证的上游可省略上游密钥准备和 `--upstream-key-file`；本机 HTTP 上游的配置见[第 4.3 节](#43-连接实际模型服务并前台启动)。仅演示保护流程、无需真实模型或云密钥时，参阅[第 5.3 节](#53-验证隐私行为)。
+
+### 第四步：配置 Agent，开始使用
+
+保持网关运行，在 Agent 的模型设置中选择其支持的 Chat Completions 或 Responses 接口，填写：
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8765/v1` |
+| API Key | `gateway.token` 文件中的本机访问令牌 |
+| 模型 ID | 与启动命令中配置的实际模型 ID 一致 |
+
+随后按原来的方式启动 Agent、提交任务即可，无需修改 Agent 源码。本例保护经该网关发送的模型请求；其他独立网络出口需另行纳管。映射保存在网关内存中，重启网关后应新建 Agent 会话。安装、认证和模型请求的检查命令见[第 5 节](#5-验证安装认证和模型连通性)。
+
+<details>
+<summary>Python 0.2.1 历史示例（点击展开）</summary>
+
+以下保留旧推文的四步接入流程，仅适用于单独检出的旧提交 `577ec4a`（含 `pyproject.toml`），需要 Python 3.11 或以上。当前 Rust 分支不包含 Python 实现，请在旧版源码目录使用本卡片。旧安装的命令为 `censorprivacy`。本例使用独立的 `python-legacy` 配置目录。
+
+#### 第一步：安装 Python 本机网关
+
+进入旧版源码目录（包含 `pyproject.toml` 和 `examples/`），执行：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
+```
+
+#### 第二步：配置保护策略
+
+```bash
+cp examples/policy.yaml policy.local.yaml
+```
+
+在 `policy.local.yaml` 中填写业务词典，例如将 `dictionaries` 段改为：
+
+```yaml
+dictionaries:
+  PERSON: [小明]
+  ORG: [示例客户甲]
+```
+
+本例使用规则与词典识别；金额、日期等开关可在同一文件中调整，也可以补充业务正则。
+
+#### 第三步：准备凭据并启动
+
+在 Agent 工作区之外准备私有目录。下面的凭据初始化只执行一次，后续启动复用现有文件：
+
+```bash
+CP_PY_CONTROL_DIR="$HOME/.config/censorprivacy/python-legacy"
+umask 077
+install -d -m 0700 "$CP_PY_CONTROL_DIR"
+python -c 'import secrets; print(secrets.token_urlsafe(32))' > "$CP_PY_CONTROL_DIR/gateway.token"
+read -r -s -p '模型服务 API Key: ' CP_PY_MODEL_KEY
+printf '\n'
+printf '%s\n' "$CP_PY_MODEL_KEY" > "$CP_PY_CONTROL_DIR/upstream.key"
+unset CP_PY_MODEL_KEY
+chmod 0600 "$CP_PY_CONTROL_DIR/gateway.token" "$CP_PY_CONTROL_DIR/upstream.key"
+```
+
+将上游地址和模型 ID 换成实际配置，再启动网关。`--upstream` 填 HTTPS 服务地址，不附加 `/v1`。使用虚拟环境中的命令以明确选择 Python 版本：
+
+```bash
+"$VIRTUAL_ENV/bin/censorprivacy" serve \
+  --policy policy.local.yaml \
+  --upstream https://model.example \
+  --model MODEL_ID \
+  --token-file "$CP_PY_CONTROL_DIR/gateway.token" \
+  --upstream-key-file "$CP_PY_CONTROL_DIR/upstream.key" \
+  --run-state-file "$CP_PY_CONTROL_DIR/run.json" \
+  --host 127.0.0.1 --port 8765
+```
+
+#### 第四步：配置 Agent，开始使用
+
+保持网关运行，在 Agent 中选择 Chat Completions 或 Responses 接口，填写：
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8765/v1` |
+| API Key | `python-legacy/gateway.token` 中的本机访问令牌 |
+| 模型 ID | 与 Python 网关启动命令中配置的实际模型 ID 一致 |
+
+随后按原来的方式启动 Agent、提交任务即可。原值与引用映射保存在网关内存中，重启后应新建 Agent 会话。这个历史示例同样占用 `8765`，运行前先停止该端口上的 Rust 网关。
+
+</details>
 
 ## 1. 版本与目录约定
 
@@ -165,7 +322,7 @@ stat -c '%a %n' "$CP_CONTROL_DIR" "$CP_CONTROL_DIR/gateway.token" "$CP_CONTROL_D
 
 目录应为 `700`，凭据应为 `600`。Rust 版拒绝使用组或其他用户可读的私密文件，并要求 run 状态文件的父目录私有。
 
-复制的策略只是起点：金额、日期等内置规则已启用，组织名称、客户和业务秘密需要填写词典或正则。可以在 `policy.yaml` 的 `dictionaries` 中加入演示规则，例如用以下内容替换原来的 `dictionaries: {}`：
+复制的策略只是起点：金额、日期等内置规则已启用，组织名称、客户和业务秘密需要填写词典或正则。可以在 `policy.yaml` 的 `dictionaries` 中加入演示规则，例如用以下内容替换现有的 `dictionaries` 段：
 
 ```yaml
 dictionaries:
