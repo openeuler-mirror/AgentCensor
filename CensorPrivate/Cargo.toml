@@ -11,6 +11,8 @@ members = []
 resolver = "2"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [profile.release]
 overflow-checks = true

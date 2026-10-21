@@ -4,3 +4,5 @@
 //! access. Secret values have no public serialization or Debug implementation.
 #![forbid(unsafe_code)]
 
+pub mod error;
+pub mod json;
