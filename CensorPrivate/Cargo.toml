@@ -11,8 +11,12 @@ members = []
 resolver = "2"
 
 [dependencies]
+fancy-regex = "0.14"
+getrandom = "0.2"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+serde_yaml = "0.9"
 
 [profile.release]
 overflow-checks = true
