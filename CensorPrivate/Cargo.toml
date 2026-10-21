@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "MulanPSL-2.0"
 description = "AgentCensor privacy gateway, private computation and isolated agent launcher"
+default-run = "censorprivacy"
 
 [workspace]
 members = []
