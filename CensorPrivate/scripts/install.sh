@@ -29,7 +29,6 @@ for directory in scripts/ops plugins/dsh-censorprivacy docs deploy examples nati
   install -d -m 0755 "$destdir$prefix/share/censorprivacy/$directory"
 done
 for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md docs/*.md deploy/censorprivacy@.service examples/policy.yaml native/README.md README.md CONTRIBUTING.md LICENSE; do
-  [[ -f $file ]] || continue
   install -m 0644 "$file" "$destdir$prefix/share/censorprivacy/$file"
 done
 printf 'Installed Rust commands to %s\n' "$destdir$prefix/bin"
