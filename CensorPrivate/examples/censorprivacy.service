@@ -1,0 +1,30 @@
+[Unit]
+Description=Local agent privacy broker and model gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=censorprivacy
+Group=censorprivacy
+UMask=0077
+EnvironmentFile=/etc/censorprivacy/service.env
+WorkingDirectory=/opt/censorprivacy
+StateDirectory=censorprivacy
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/censorprivacy serve --tls-direct --host 127.0.0.1 --port 8765 --upstream ${CP_UPSTREAM} --model ${CP_MODEL} --policy /etc/censorprivacy/policy.yaml --token-file /etc/censorprivacy/gateway.token --upstream-key-file /etc/censorprivacy/upstream.key --run-state-file /var/lib/censorprivacy/run.json
+Restart=no
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+- insert:
+    - id: censorprivacy
+      name: dsh-censorprivacy
+      config:
+        mode: !!js process.env.CP_DSH_MODE || 'gateway'
+        baseURL: !!js process.env.CP_DSH_BASE_URL
+        model: !!js process.env.CP_DSH_MODEL
+        broker: !!js process.env.CENSORPRIVACY_URL
+        tlsRun: !!js process.env.CP_DSH_TLS_RUN
+        nativeLibrary: !!js process.env.CP_DSH_NATIVE_LIBRARY
+        tokenFile: !!js process.env.CP_DSH_TOKEN_FILE
+        runStateFile: !!js process.env.CP_DSH_RUN_STATE_FILE
+        upstreamKeyFile: !!js process.env.CP_DSH_KEY_FILE
+        caFile: !!js process.env.CP_DSH_CA_FILE
+        workspace: !!js process.env.CP_DSH_WORKSPACE
+        timeoutMs: 90000
+        maxTokens: 512
+        contextWindow: 32768
+        privateToolsOnly: true
+- id: agent-default-model
+  config:
+    provider: censorprivacy
+    model: !!js process.env.CP_DSH_MODEL
+- id: llm-deepseek
+  disabled: true
+- id: llm-pi-ai
+  disabled: true
+- id: session-title-llm
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: session-telemetry-otel
+  disabled: true

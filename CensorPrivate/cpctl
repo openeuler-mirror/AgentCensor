@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Short entry point; implementation is split by operation under scripts/ops.
+set -euo pipefail
+CP_REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+CP_DEFAULT_BIN_DIR=$CP_REPO_ROOT
+if [[ ! -f $CP_REPO_ROOT/scripts/ops/main.sh ]]; then
+  CP_REPO_ROOT=$(cd -- "$CP_REPO_ROOT/../share/censorprivacy" && pwd -P)
+fi
+export CP_REPO_ROOT CP_DEFAULT_BIN_DIR
+exec bash "$CP_REPO_ROOT/scripts/ops/main.sh" "$@"
