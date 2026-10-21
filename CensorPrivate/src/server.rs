@@ -6,6 +6,7 @@ use crate::{
     policy::PrivacyPolicy,
     protocols::Api,
     streaming::SseTransformer,
+    tls_broker::{self, TlsBroker},
 };
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -33,6 +34,7 @@ pub struct GatewayConfig {
     pub max_decompression_ratio: usize,
     pub upstream_timeout: Duration,
     pub upstream_ca_pem: Option<Vec<u8>>,
+    pub enable_tls_direct: bool,
 }
 impl GatewayConfig {
     pub fn new(
@@ -73,6 +75,7 @@ impl GatewayConfig {
             max_decompression_ratio: 20,
             upstream_timeout: Duration::from_secs(60),
             upstream_ca_pem: None,
+            enable_tls_direct: false,
         })
     }
 }
@@ -82,6 +85,7 @@ struct ServiceState {
     gate: Arc<Mutex<PrivacyGate>>,
     config: Arc<GatewayConfig>,
     client: reqwest::Client,
+    tls: Arc<Mutex<Option<TlsBroker>>>,
 }
 pub struct GatewayService {
     state: ServiceState,
@@ -98,6 +102,15 @@ impl GatewayService {
         if let Some(key) = &config.upstream_key {
             gate.register_transport_secret(key)?;
         }
+        let tls = if config.enable_tls_direct {
+            Some(TlsBroker::new(
+                &gate,
+                config.upstream.as_str(),
+                config.upstream_key.as_deref().map(String::as_str),
+            )?)
+        } else {
+            None
+        };
         let mut client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -113,6 +126,7 @@ impl GatewayService {
                 gate: Arc::new(Mutex::new(gate)),
                 config: Arc::new(config),
                 client: client.build().map_err(|_| Error::ServiceUnavailable)?,
+                tls: Arc::new(Mutex::new(tls)),
             },
         })
     }
@@ -145,6 +159,11 @@ impl GatewayService {
         }
     }
     pub fn close(&self) -> Result<()> {
+        if let Ok(mut tls) = self.state.tls.lock() {
+            if let Some(tls) = tls.as_mut() {
+                tls.close();
+            }
+        }
         self.state
             .gate
             .lock()
@@ -321,9 +340,59 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
             return Ok(Json(json!({"object":"list","data":gate.model_ids().iter().map(|id| json!({"id":id,"object":"model"})).collect::<Vec<_>>()})).into_response());
         }
         ("POST", "/v1/private_compute") => {
-            let payload = body(request, &state).await?;
+            let mut payload = body(request, &state).await?;
             let gate = lock(&state)?;
+            if let Some(refs) = payload.get_mut("refs").and_then(Value::as_array_mut) {
+                let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
+                if let Some(tls) = tls.as_mut() {
+                    // status revalidates epoch before resolving any alias.
+                    tls.status(&gate)?;
+                    for reference in refs {
+                        if let Some(alias) = reference
+                            .as_str()
+                            .filter(|value| !value.starts_with("<CP_"))
+                        {
+                            *reference = Value::String(
+                                tls.transformer.resolve_alias(&gate, alias)?.to_string(),
+                            );
+                        }
+                    }
+                }
+            }
             return Ok(Json(gate.compute(&payload)?).into_response());
+        }
+        ("GET", "/v1/tls/status") => {
+            let gate = lock(&state)?;
+            let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
+            return Ok(Json(tls.as_mut().ok_or(Error::TlsBlocked)?.status(&gate)?).into_response());
+        }
+        ("POST", "/v1/tls/out" | "/v1/tls/in") => {
+            if header_value(request.headers(), "content-type", "")? != "application/octet-stream"
+                || request.headers().contains_key("content-encoding")
+            {
+                return Err(Error::TlsBlocked.into());
+            }
+            let direction = if path.ends_with("/out") { 1 } else { 2 };
+            let raw = Zeroizing::new(
+                to_bytes(request.into_body(), tls_broker::MAX_MESSAGE + 20)
+                    .await
+                    .map_err(|_| Error::ResourceLimit)?
+                    .to_vec(),
+            );
+            let mut gate = lock(&state)?;
+            let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
+            let tls = tls.as_mut().ok_or(Error::TlsBlocked)?;
+            let decision = tls_broker::decode_frame(&raw, direction, tls.max_bytes)
+                .and_then(|(stream, payload)| tls.decide(&mut gate, stream, payload, direction));
+            let (action, payload) = decision.unwrap_or((tls_broker::BLOCK, Vec::new()));
+            return Ok((
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                tls_broker::encode_reply(action, &payload),
+            )
+                .into_response());
         }
         (
             "POST",

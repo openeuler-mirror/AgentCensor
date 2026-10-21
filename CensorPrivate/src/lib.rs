@@ -21,5 +21,6 @@ pub mod response;
 pub mod runtime;
 pub mod server;
 pub mod streaming;
+pub mod tls_broker;
 pub mod tls_privacy;
 pub mod vault;
