@@ -234,12 +234,14 @@ version = "0.3.0"
 dependencies = [
  "axum",
  "axum-server",
+ "censorprivacy-runtime-sys",
  "chrono",
  "clap",
  "fancy-regex",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
+ "ipnet",
  "libc",
  "num-bigint",
  "num-integer",
@@ -257,6 +259,14 @@ dependencies = [
  "tower",
  "url",
  "zeroize",
+]
+
+[[package]]
+name = "censorprivacy-runtime-sys"
+version = "0.3.0"
+dependencies = [
+ "libc",
+ "libloading",
 ]
 
 [[package]]
@@ -739,6 +749,16 @@ name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "log"
