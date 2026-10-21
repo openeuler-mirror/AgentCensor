@@ -52,6 +52,8 @@ struct Serve {
     #[arg(long)]
     allow_http_test_upstream: bool,
     #[arg(long)]
+    tls_direct: bool,
+    #[arg(long)]
     sensitive_path: Vec<String>,
     #[arg(long)]
     run_state_file: Option<PathBuf>,
@@ -144,6 +146,7 @@ async fn serve(args: Serve) -> Result<()> {
         upstream_key.as_ref().map(|key| key.trim().to_owned()),
         args.allow_http_test_upstream,
     )?;
+    config.enable_tls_direct = args.tls_direct;
     if let Some(path) = args.upstream_ca_file {
         config.upstream_ca_pem = Some(read_file(&path, false, 1_048_576)?.as_bytes().to_vec());
     }
