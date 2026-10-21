@@ -42,21 +42,17 @@ zeroize = "1.8"
 [target.'cfg(target_os = "linux")'.dependencies]
 censorprivacy-runtime-sys = { path = "crates/runtime-sys" }
 
-
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
-
 
 [profile.release]
 overflow-checks = true
 lto = "thin"
 strip = "debuginfo"
 
-
 [profile.dev]
 debug = 0
 incremental = false
-
 
 [profile.test]
 debug = 0

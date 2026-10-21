@@ -1,0 +1,25 @@
+name: Rust
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: bash scripts/check-commit-size.sh --all
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.85.1'
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.3'
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libseccomp2 iproute2 nftables util-linux jq curl openssl
+      - run: bash scripts/test/rust.sh
+      - run: bash scripts/test/native.sh
+      - run: bash scripts/test/operations.sh
+      - run: cargo build --locked --example runtime_probe
+      - run: sudo env PATH="$PATH" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" cargo test --locked --test runtime_linux -- --ignored --nocapture
