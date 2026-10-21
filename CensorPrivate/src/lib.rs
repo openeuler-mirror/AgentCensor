@@ -17,6 +17,8 @@ pub mod policy;
 pub mod protocols;
 pub mod references;
 pub mod response;
+#[cfg(target_os = "linux")]
+pub mod runtime;
 pub mod server;
 pub mod streaming;
 pub mod vault;
