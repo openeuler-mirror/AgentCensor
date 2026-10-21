@@ -11,12 +11,18 @@ members = []
 resolver = "2"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 fancy-regex = "0.14"
 getrandom = "0.2"
+num-bigint = "0.4"
+num-integer = "0.1"
+num-traits = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 serde_yaml = "0.9"
+sha2 = "0.10"
+zeroize = "1.8"
 
 [profile.release]
 overflow-checks = true
