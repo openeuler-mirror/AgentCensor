@@ -5,11 +5,14 @@
 #![forbid(unsafe_code)]
 
 pub mod compute;
+#[cfg(target_os = "linux")]
+pub mod control;
 pub mod detection;
 pub mod display;
 pub mod error;
 pub mod gate;
 pub mod json;
+pub mod mcp;
 pub mod policy;
 pub mod protocols;
 pub mod references;
