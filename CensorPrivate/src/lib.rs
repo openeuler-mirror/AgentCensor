@@ -14,4 +14,5 @@ pub mod policy;
 pub mod protocols;
 pub mod references;
 pub mod response;
+pub mod streaming;
 pub mod vault;
