@@ -1,0 +1,28 @@
+[Unit]
+Description=CensorPrivacy local gateway for run %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=censorprivacy
+Group=censorprivacy
+EnvironmentFile=/etc/censorprivacy/%i.env
+ExecStart=/usr/local/bin/censorprivacy serve --policy /etc/censorprivacy/%i.policy.yaml --upstream $CP_UPSTREAM --host $CP_BIND --port $CP_PORT --model $CP_MODEL --token-file /etc/censorprivacy/%i.token --upstream-key-file /etc/censorprivacy/%i.upstream-key --run-state-file /var/lib/censorprivacy/%i.run.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=no
+UMask=0077
+StateDirectory=censorprivacy
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/censorprivacy
+RestrictAddressFamilies=AF_INET AF_INET6
+LimitCORE=0
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
