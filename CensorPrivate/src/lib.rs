@@ -9,3 +9,4 @@ pub mod error;
 pub mod json;
 pub mod policy;
 pub mod references;
+pub mod vault;
