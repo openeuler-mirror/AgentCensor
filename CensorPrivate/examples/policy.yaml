@@ -1,0 +1,12 @@
+# Example policy; add organization-specific sensitive values and patterns.
+epoch: 1
+ttl_seconds: 3600
+mask_money: true
+mask_dates: true
+mask_all_numbers: false
+dictionaries:
+  PERSON: [小明]
+  ORG: [示例客户甲]
+patterns: {}
+default_labels:
+  - confidential
