@@ -1,0 +1,11 @@
+[package]
+name = "censorprivacy-runtime-sys"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MulanPSL-2.0"
+publish = false
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
