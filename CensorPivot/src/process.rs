@@ -17,7 +17,8 @@ pub(crate) struct Process {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     limit: usize,
-    truncated: bool,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
     status: Option<ExitStatus>,
     // A mounter supervisor needs SIGTERM to run cgroup.kill before exiting.
     supervised: bool,
@@ -27,6 +28,8 @@ pub(crate) struct Output {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Either stream overflowed the byte limit. Frames are read through `Process::line`,
+    /// which is bounded by stdout alone.
     pub truncated: bool,
     pub timed_out: bool,
 }
@@ -47,7 +50,8 @@ impl Process {
             stdout: Vec::new(),
             stderr: Vec::new(),
             limit,
-            truncated: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
             status: None,
             supervised,
         };
@@ -103,8 +107,11 @@ impl Process {
         let started = Instant::now();
         loop {
             self.pump()?;
-            if self.truncated {
-                return Err(self.failure("runner output exceeded limit"));
+            // Only the protocol stream gates a frame read. A tool may fill the limit on
+            // stderr while its reply on stdout has already arrived in full, and that reply
+            // must not be discarded because of diagnostics written elsewhere.
+            if self.stdout_truncated {
+                return Err(self.failure("runner stdout exceeded limit"));
             }
             if let Some(end) = self.stdout.iter().position(|byte| *byte == b'\n') {
                 return Ok(self.stdout.drain(..=end).collect());
@@ -149,14 +156,14 @@ impl Process {
             status,
             stdout: std::mem::take(&mut self.stdout),
             stderr: std::mem::take(&mut self.stderr),
-            truncated: self.truncated,
+            truncated: self.stdout_truncated || self.stderr_truncated,
             timed_out,
         })
     }
 
     fn pump(&mut self) -> Result<()> {
-        self.truncated |= drain(&mut self.output, &mut self.stdout, self.limit)?;
-        self.truncated |= drain(&mut self.error, &mut self.stderr, self.limit)?;
+        self.stdout_truncated |= drain(&mut self.output, &mut self.stdout, self.limit)?;
+        self.stderr_truncated |= drain(&mut self.error, &mut self.stderr, self.limit)?;
         Ok(())
     }
 
@@ -278,6 +285,42 @@ mod tests {
         .collect(Duration::from_millis(100))?;
         assert!(output.timed_out);
         assert!(started.elapsed() < Duration::from_secs(3));
+        Ok(())
+    }
+
+    #[test]
+    fn stderr_flood_does_not_hide_a_complete_stdout_frame() -> Result<()> {
+        // The runner writes diagnostics to stderr; a verbose tool can fill the byte
+        // limit there while the protocol frame on stdout is already complete.
+        let mut process = Process::spawn(
+            Command::new("/bin/sh").args([
+                "-c",
+                "i=0; while [ $i -lt 200 ]; do printf 'noise' >&2; i=$((i+1)); done; printf '{\"ok\":true}\n'",
+            ]),
+            64,
+            false,
+        )?;
+        let frame = process.line(Duration::from_secs(2))?;
+        assert_eq!(frame, b"{\"ok\":true}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn stderr_overflow_is_still_reported_by_collect() -> Result<()> {
+        let output = Process::spawn(
+            Command::new("/bin/sh").args([
+                "-c",
+                "i=0; while [ $i -lt 200 ]; do printf 'noise' >&2; i=$((i+1)); done",
+            ]),
+            64,
+            false,
+        )?
+        .collect(Duration::from_secs(2))?;
+        assert!(
+            output.truncated,
+            "an overflowing stderr must still be reported"
+        );
+        assert!(output.stderr.len() <= 64);
         Ok(())
     }
 
