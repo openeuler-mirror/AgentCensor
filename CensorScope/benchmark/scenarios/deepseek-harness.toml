@@ -1,0 +1,121 @@
+[benchmark]
+name = "deepseek-harness"
+description = "Modular CensorScope end-to-end benchmark through dsh headless"
+seed = 42
+
+[agent]
+name = "deepseek-harness"
+args = ["--profile", "headless"]
+
+[censorscope]
+level = "L3"
+
+[censorscope.writer]
+batch_items = 2048
+idle_timeout_ms = 8
+checkpoint_interval_secs = 60
+queue_cap_items = 65536
+queue_budget_bytes = 268435456
+spool_max_bytes = 4294967296
+
+[memory]
+sample_interval_seconds = 1.0
+tail_fraction = 0.25
+max_tail_growth_ratio = 0.05
+
+[modules.preflight]
+repetitions = 1
+drain_seconds = 1
+
+[modules.collector]
+repetitions = 1
+timeout_seconds = 300
+drain_seconds = 5
+stop_grace_seconds = 15
+prompt_prefix = "Run the collector module workload exactly once using the shell tool."
+[modules.collector.workload]
+iterations = 4
+file_operations = 30
+payload_bytes = 16384
+children = 3
+concurrency = 1
+
+[modules.ingest]
+repetitions = 1
+timeout_seconds = 600
+drain_seconds = 8
+stop_grace_seconds = 20
+prompt_prefix = "Run the ingest module workload exactly once and wait for its JSON result."
+[modules.ingest.workload]
+iterations = 20
+file_operations = 80
+payload_bytes = 131072
+children = 4
+concurrency = 2
+
+[modules.storage]
+repetitions = 1
+timeout_seconds = 900
+drain_seconds = 10
+stop_grace_seconds = 20
+prompt_prefix = "Run the storage module workload exactly once; do not retry the command."
+[modules.storage.workload]
+iterations = 40
+file_operations = 100
+payload_bytes = 262144
+children = 4
+concurrency = 2
+
+[modules.control]
+repetitions = 1
+timeout_seconds = 900
+drain_seconds = 8
+stop_grace_seconds = 20
+control_probe_interval_seconds = 0.2
+prompt_prefix = "Run the control-plane module workload exactly once using the shell tool."
+[modules.control.workload]
+iterations = 30
+file_operations = 60
+payload_bytes = 65536
+children = 3
+concurrency = 2
+
+[modules.export]
+repetitions = 1
+timeout_seconds = 900
+drain_seconds = 10
+stop_grace_seconds = 20
+prompt_prefix = "Run the export module workload exactly once and wait for completion."
+[modules.export.workload]
+iterations = 50
+file_operations = 120
+payload_bytes = 524288
+children = 4
+concurrency = 2
+
+[modules.memory]
+repetitions = 1
+timeout_seconds = 2100
+drain_seconds = 15
+stop_grace_seconds = 30
+prompt_prefix = "Run the memory stability workload exactly once and keep it running until its duration completes."
+[modules.memory.workload]
+iterations = 1
+duration_seconds = 1800
+file_operations = 30
+payload_bytes = 65536
+children = 2
+concurrency = 2
+
+[modules.e2e]
+repetitions = 3
+timeout_seconds = 900
+drain_seconds = 10
+stop_grace_seconds = 20
+prompt_prefix = "Run the complete CensorScope dsh end-to-end workload exactly once."
+[modules.e2e.workload]
+iterations = 40
+file_operations = 100
+payload_bytes = 262144
+children = 4
+concurrency = 2
