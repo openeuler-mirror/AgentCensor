@@ -25,7 +25,7 @@ pub struct CollectorBatchEnvelope {
     pub batch: CollectorPollBatch,
 }
 
-/// Durable sink for collector batches.
+/// On-disk sink for collector batches during the current daemon lifetime.
 pub struct SpoolBatchSink {
     writer: SpoolWriter,
 }

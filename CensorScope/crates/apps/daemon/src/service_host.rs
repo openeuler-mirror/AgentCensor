@@ -5,6 +5,7 @@ use std::fs;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant, SystemTime};
 
+use agentcensor_events::{ExternalEvent, SecurityCategory, SecurityDecision};
 use collector_binding::TraceBindingRequest;
 use collector_instance::{CollectorInstance, CollectorPollBatch};
 use config_core::capture_profile::CaptureProfile;
@@ -40,8 +41,8 @@ use crate::attribution::unique_call_window_match;
 use crate::collector_actor::{CollectorActorHandle, CollectorBatchEnvelope, SpoolBatchSink};
 use crate::peer_identity::PeerIdentity;
 use crate::writer::{
-    BulkItem, CallCloseWrite, CallStartWrite, IngestBatchWrite, PersistWrite, WriterHandle,
-    WriterParams,
+    BulkItem, CallCloseWrite, CallStartWrite, ExternalEventWrite, IngestBatchWrite, PersistWrite,
+    WriterHandle, WriterParams,
 };
 use storage_spool::{RecordKind, SpoolConfig, SpoolConsumer};
 
@@ -348,7 +349,7 @@ impl DaemonServiceHost {
             .map(SessionIdentity::new)
     }
 
-    /// Drain durable collector records without coupling the control socket to
+    /// Drain spooled collector records without coupling the control socket to
     /// the collector transport.
     pub fn drain_live_events(&mut self) -> Result<(), ControlError> {
         self.progress_buffered_ingest()?;
@@ -367,6 +368,130 @@ impl DaemonServiceHost {
         self.absorb_writer_losses();
         self.report_loss_ledger(false);
         Ok(())
+    }
+
+    pub fn ingest_external_event(&mut self, external: ExternalEvent) -> Result<(), ControlError> {
+        self.drain_live_events()?;
+        let correlation = external
+            .correlation
+            .as_ref()
+            .ok_or_else(|| ControlError::new("external_event", "correlation is missing"))?;
+        let trace_id = TraceId::new(
+            correlation
+                .trace_id
+                .ok_or_else(|| ControlError::new("external_event", "trace_id is missing"))?,
+        );
+        if self.runtime.get_trace(trace_id).is_none() {
+            return Err(ControlError::new(
+                "external_event",
+                format!("trace {} is not active", trace_id.get()),
+            ));
+        }
+        let observed_at = SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_nanos(external.occurred_at_ns))
+            .ok_or_else(|| ControlError::new("external_event", "occurred_at_ns is invalid"))?;
+        let (identity, mut record) = match ProcfsIdentityReader.read_identity(external.subject.tgid)
+        {
+            Ok(observation) => self.resolve_process(observation)?,
+            Err(error) => {
+                let identity = self
+                    .processes
+                    .active_host_pid(external.subject.tgid)
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "external_event",
+                            format!(
+                                "process {} cannot be resolved: {error:?}",
+                                external.subject.tgid
+                            ),
+                        )
+                    })?;
+                let record = self.processes.record(identity).cloned().ok_or_else(|| {
+                    ControlError::new("external_event", "resolved process record is missing")
+                })?;
+                (identity, record)
+            }
+        };
+        let membership = self
+            .runtime
+            .find_membership_in_trace(trace_id, &identity)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "external_event",
+                    format!(
+                        "process {} is not a member of trace {}",
+                        external.subject.tgid,
+                        trace_id.get()
+                    ),
+                )
+            })?;
+        let session_id = correlation
+            .session_id
+            .as_ref()
+            .map(|value| SessionIdentity::new(value.clone()));
+        record.session_id = session_id.clone();
+        let mut ancillary = vec![
+            PersistWrite::ProcessRecord(record),
+            PersistWrite::Membership(membership),
+        ];
+        if let Some(session_id) = &session_id {
+            ancillary.push(PersistWrite::Session {
+                session_id: session_id.clone(),
+                trace_id,
+                observed_at,
+            });
+        }
+        let policy = external.event.policy.as_ref();
+        let payload = model_core::event::GuardPayload {
+            category: match external.event.category {
+                SecurityCategory::File => "file",
+                SecurityCategory::Exec => "exec",
+                SecurityCategory::Network => "network",
+                SecurityCategory::Guard => "guard",
+            }
+            .into(),
+            operation: external.event.operation.clone(),
+            decision: match external.event.decision {
+                SecurityDecision::Allow => model_core::event::GuardDecision::Allow,
+                SecurityDecision::Deny => model_core::event::GuardDecision::Deny,
+            },
+            path: external.event.target.path.clone(),
+            endpoint: external.event.target.endpoint.clone(),
+            executable: external.event.target.executable.clone(),
+            args: external.event.target.args.clone(),
+            detail: external.event.target.detail.clone(),
+            domain_id: external.subject.domain_id,
+            domain: external.subject.domain.clone(),
+            policy_version: policy.and_then(|value| value.policy_version),
+            rule_version: policy.and_then(|value| value.rule_version),
+            rule_name: policy.and_then(|value| value.rule_name.clone()),
+            source_instance_id: external.source_instance_id.clone(),
+            source_sequence: external.source_sequence,
+            transaction_id: correlation.transaction_id.clone(),
+            metadata: external.attributes.clone(),
+        };
+        let event = model_core::event::DomainEvent::new(
+            model_core::event::EventEnvelope {
+                event_id: self.take_event_id()?,
+                trace_id,
+                observed_at,
+                process: identity,
+                collector: model_core::ids::CollectorName::new("censorguard"),
+                kind: model_core::event::EventKind::Guard,
+                flags: model_core::event::EventFlags::empty(),
+                session_id,
+                call_id: correlation.call_id.clone(),
+            },
+            model_core::event::EventPayload::Guard(Box::new(payload)),
+        );
+        self.writer
+            .external_event(ExternalEventWrite {
+                source_instance_id: external.source_instance_id,
+                source_sequence: external.source_sequence,
+                ancillary,
+                event,
+            })
+            .map_err(|error| control_error("external_event", error))
     }
 
     fn fill_spool_buffer(&mut self) -> Result<(), ControlError> {
@@ -3170,6 +3295,91 @@ mod writer_pipeline_tests {
             tags: BTreeSet::new(),
             trace_id,
         }
+    }
+
+    #[test]
+    fn external_guard_events_are_correlated_and_retries_are_deduplicated() {
+        let (mut host, db) = test_host();
+        let reply = host
+            .handle_command(
+                None,
+                ControlCommand::TrackAdd(track_add_command(RequestId::new(1), None)),
+            )
+            .unwrap();
+        let ControlReply::TrackAdded(reply) = reply else {
+            panic!("expected track reply");
+        };
+        let trace_id = reply.trace_id.unwrap();
+        let event = agentcensor_events::ExternalEvent {
+            schema_version: 1,
+            source: agentcensor_events::EventSource::CensorGuard,
+            source_instance_id: "guard-instance".into(),
+            source_sequence: 4,
+            occurred_at_ns: 10,
+            subject: agentcensor_events::EventSubject {
+                pid: std::process::id(),
+                tgid: std::process::id(),
+                comm: None,
+                domain_id: Some(7),
+                domain: Some("sandbox".into()),
+            },
+            event: agentcensor_events::SecurityEvent {
+                category: SecurityCategory::File,
+                operation: "file.open_read".into(),
+                decision: SecurityDecision::Deny,
+                target: agentcensor_events::EventTarget {
+                    path: Some("/etc/shadow".into()),
+                    ..Default::default()
+                },
+                policy: None,
+            },
+            correlation: Some(agentcensor_events::CorrelationContext {
+                trace_id: Some(trace_id.get()),
+                session_id: Some("session-a".into()),
+                call_id: Some("call-a".into()),
+                transaction_id: Some("transaction-a".into()),
+            }),
+            attributes: BTreeMap::new(),
+        };
+        host.ingest_external_event(event.clone()).unwrap();
+        host.ingest_external_event(event).unwrap();
+        host.shutdown().unwrap();
+        let connection = rusqlite::Connection::open(&db).unwrap();
+        let rows: Vec<(u64, String, String, String, String)> = connection
+            .prepare(
+                "SELECT trace_id, session_id, call_id, path, metadata FROM events WHERE kind = 10",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, trace_id.get());
+        assert_eq!(rows[0].1, "session-a");
+        assert_eq!(rows[0].2, "call-a");
+        assert_eq!(rows[0].3, "/etc/shadow");
+        let metadata: serde_json::Value = serde_json::from_str(&rows[0].4).unwrap();
+        assert_eq!(metadata["guard.decision"], "deny");
+        assert_eq!(metadata["guard.transaction_id"], "transaction-a");
+        assert_eq!(metadata["guard.domain"], "sandbox");
+        let count: u64 = connection
+            .query_row("SELECT COUNT(*) FROM external_event_receipts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(connection);
+        drop(host);
+        remove_db(&db);
     }
 
     /// One `track-add` request must answer with the terminal state: the trace

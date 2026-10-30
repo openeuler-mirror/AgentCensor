@@ -12,7 +12,7 @@ use uds_control_server::UdsControlConnection;
 
 use crate::bootstrap::LocalDaemonServer;
 
-/// Idle poll timeout in milliseconds: the longest a durable record waits for
+/// Idle poll timeout in milliseconds: the longest a spooled record waits for
 /// the next independent drain step when no control socket is active.
 const IDLE_POLL_MS: libc::c_int = 10;
 
@@ -64,7 +64,7 @@ impl LocalDaemonServer {
                     revents: 0,
                 }
             }));
-            // The timeout bounds how long a durable record waits for the next
+            // The timeout bounds how long a spooled record waits for the next
             // spool drain while control connections remain independently paced.
             // SAFETY: `pollfds` remains exclusively borrowed for the syscall,
             // its length matches the initialized array, and descriptors come

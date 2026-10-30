@@ -300,6 +300,8 @@ window.__ModuleLoader__.load({
       "background:var(--dsw-alias-bg-layer-2,#f7f8fa);padding:4px 8px;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(0,0,0,.1))}",
       ".censorscope-table td{padding:3px 8px;vertical-align:top;color:var(--dsw-alias-label-primary,#1f2329);border-bottom:0.5px solid var(--dsw-alias-border-l1,rgba(0,0,0,.05));word-break:break-all}",
       ".censorscope-table tr:last-child td{border-bottom:none}",
+      ".censorscope-guardDeny td{color:var(--dsw-alias-state-error-primary,#d92d20);background:var(--dsw-alias-state-error-tertiary,#fdecec)}",
+      ".censorscope-guardAllow td{color:var(--dsw-alias-state-success-primary,#188a4d)}",
       ".censorscope-muted{color:var(--dsw-alias-label-tertiary,#8f959e)}",
       ".censorscope-link{cursor:pointer;color:var(--dsw-alias-state-business-primary,#2f6bff);text-decoration:underline}",
       ".censorscope-num{text-align:right}",
@@ -393,23 +395,42 @@ window.__ModuleLoader__.load({
         const expandNoise = !!noiseOn[callId];
         const rowsSource = expandNoise ? kept.concat(noise) : kept;
         const shown = rowsSource.slice(0, 300);
-        const rowEl = (event, index) =>
-          react.createElement("tr", {
+        const rowEl = (event, index) => {
+          const guard = event.kind_name === "guard";
+          const denied = guard && (event.decision === "deny" || event.blocked === true);
+          const rowClass = isFdChannelNoise(event)
+            ? "censorscope-muted"
+            : denied
+              ? "censorscope-guardDeny"
+              : guard
+                ? "censorscope-guardAllow"
+                : null;
+          const operation = String(event.kind_name || "") +
+            (event.operation && event.operation !== event.kind_name ? "/" + event.operation : "") +
+            (denied ? " [DENY]" : guard ? " [ALLOW]" : "");
+          const detail = event.metadata && event.metadata["guard.detail"];
+          const result = guard
+            ? String(event.decision || (denied ? "deny" : "allow")).toUpperCase()
+            : event.result !== undefined && event.result !== null && event.result !== ""
+              ? dash(event.result)
+              : "—";
+          return react.createElement("tr", {
             key: String(event.event_id || "e") + ":" + index,
-            className: isFdChannelNoise(event) ? "censorscope-muted" : null,
+            className: rowClass,
           },
             react.createElement("td", null, fmtSysTime(event.observed_at)),
             react.createElement("td", { className: "censorscope-num" },
               dash(event.host_pid !== undefined && event.host_pid !== null ? event.host_pid : event.process_id)),
             react.createElement("td", null,
-              String(event.kind_name || "") + (event.operation && event.operation !== event.kind_name ? "/" + event.operation : "")),
-            react.createElement("td", null, dash(event.path || event.endpoint || event.stream ||
+              operation),
+            react.createElement("td", null, dash(event.path || event.endpoint || event.executable || detail || event.stream ||
               (event.fd !== undefined && event.fd !== null && event.fd !== "" ? "fd " + event.fd : null))),
             react.createElement("td", { className: "censorscope-num" },
               event.size !== undefined && event.size !== null && Number(event.size) > 0 ? dash(event.size) : "—"),
             react.createElement("td", { className: "censorscope-num" },
-              event.result !== undefined && event.result !== null && event.result !== "" ? dash(event.result) : "—"),
+              result),
           );
+        };
         const bodyRows = shown.map(rowEl);
         const tail = [];
         if (!expandNoise && noise.length > 0) {
@@ -443,7 +464,7 @@ window.__ModuleLoader__.load({
             react.createElement("table", { className: "censorscope-table" },
               react.createElement("thead", null,
                 react.createElement("tr", null,
-                  th("时间"), th("进程"), th("类型/操作"), th("目标"), th("大小"), th("结果"))),
+                  th("时间"), th("进程"), th("类型/操作"), th("目标"), th("大小"), th("结果/决策"))),
               react.createElement("tbody", null, bodyRows.concat(tail)),
             )),
         );

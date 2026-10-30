@@ -14,6 +14,8 @@ collector_stats = { path = "../../contracts/collector/stats" }
 control_contract = { path = "../../contracts/control_plane" }
 config_core = { path = "../../core/config" }
 ebpf_collector = { path = "../../adapters/collectors/ebpf" }
+external_events_adapter = { path = "../../adapters/external_events" }
+agentcensor-events = { path = "../../../../contracts/agentcensor-events" }
 ingest_runtime = { path = "../../core/ingest_runtime" }
 libc = "0.2"
 model_core = { path = "../../core/model" }

@@ -90,6 +90,9 @@ pub fn stop_daemon(config: &OperatorConfig) -> Result<(), String> {
             }
             remove_runtime_file(&config.pid_file)?;
             remove_runtime_file(&config.socket_path)?;
+            if config.external_events.enabled {
+                remove_runtime_file(&config.external_events.socket_path)?;
+            }
             println!("censorscoped stopped pid={pid}");
             Ok(())
         }
@@ -141,6 +144,9 @@ pub(super) fn cleanup_runtime_files(
         remove_runtime_file(&config.pid_file)?;
     }
     remove_runtime_file(&config.socket_path)?;
+    if config.external_events.enabled {
+        remove_runtime_file(&config.external_events.socket_path)?;
+    }
     Ok(())
 }
 
@@ -179,6 +185,12 @@ fn ensure_start_preconditions(config: &OperatorConfig) -> Result<(), String> {
         return Err(format!(
             "socket path already exists: {}; remove it explicitly after confirming no daemon owns it",
             config.socket_path.display()
+        ));
+    }
+    if config.external_events.enabled && config.external_events.socket_path.exists() {
+        return Err(format!(
+            "external event socket path already exists: {}; remove it explicitly after confirming no daemon owns it",
+            config.external_events.socket_path.display()
         ));
     }
     Ok(())
