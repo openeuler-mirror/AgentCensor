@@ -179,7 +179,7 @@ impl CommandAdapters {
         );
         check_socket(
             &mut checks,
-            "events.scope_ingest_socket",
+            "censorscope.external_events_socket",
             &self.config.events.scope_ingest_socket,
         );
         checks.insert(
@@ -205,14 +205,24 @@ impl CommandAdapters {
                 Err(error) => error.to_string(),
             },
         );
-        let ready = checks.values().all(|value| value == "ok")
-            || (!self.config.censorscope.required
-                && checks
-                    .iter()
-                    .filter(|(key, _)| !key.starts_with("censorscope."))
-                    .all(|(_, value)| value == "ok"));
+        let ready = ready_with_checks(&checks, self.config.censorscope.required);
         DoctorReport { ready, checks }
     }
+}
+
+/// Whether the doctor checks amount to a usable installation.
+///
+/// A check passes when it reports `ok`. CensorScope is the only optional component: with
+/// `censorscope.required == false` its failures are tolerated, so a deployment without Scope
+/// still reports `ready` (and `censord doctor` still exits 0).
+///
+/// Ownership is decided by the `censorscope.` key prefix, not by the socket path. Every check
+/// that can only pass while Scope is healthy must therefore carry that prefix — an unprefixed
+/// one stays mandatory and silently turns an optional dependency into a required one.
+fn ready_with_checks(checks: &BTreeMap<String, String>, censorscope_required: bool) -> bool {
+    checks.iter().all(|(key, value)| {
+        value == "ok" || (!censorscope_required && key.starts_with("censorscope."))
+    })
 }
 
 fn check_file(checks: &mut BTreeMap<String, String>, name: &str, path: &Path) {
@@ -785,6 +795,65 @@ fn decode_reply(component: &'static str, output: Output) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::model::ToolCall;
+
+    fn checks(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn ready_requires_every_check_to_pass_when_scope_is_required() {
+        let all_ok = checks(&[
+            ("censorguard.rpc", "ok"),
+            ("censorscope.rpc", "ok"),
+            ("censorscope.external_events_socket", "ok"),
+            ("events.guard_ingress_socket", "ok"),
+        ]);
+        assert!(ready_with_checks(&all_ok, true));
+
+        let scope_down = checks(&[
+            ("censorguard.rpc", "ok"),
+            ("censorscope.rpc", "connection refused"),
+            ("censorscope.external_events_socket", "missing"),
+            ("events.guard_ingress_socket", "ok"),
+        ]);
+        assert!(!ready_with_checks(&scope_down, true));
+    }
+
+    #[test]
+    fn ready_tolerates_a_stopped_scope_when_scope_is_optional() {
+        // Regression: the Scope-owned ingest socket used to be keyed `events.scope_ingest_socket`,
+        // so the optional-scope exemption (keyed on the `censorscope.` prefix) missed it and a
+        // deployment without CensorScope reported not-ready.
+        let scope_down = checks(&[
+            ("censorguard.rpc", "ok"),
+            ("censorscope.command", "ok"),
+            ("censorscope.socket", "missing"),
+            ("censorscope.rpc", "connection refused"),
+            ("censorscope.external_events_socket", "missing"),
+            ("events.guard_ingress_socket", "ok"),
+        ]);
+        assert!(ready_with_checks(&scope_down, false));
+    }
+
+    #[test]
+    fn ready_still_fails_on_other_components_when_scope_is_optional() {
+        let guard_ingress_broken = checks(&[
+            ("censorguard.rpc", "ok"),
+            ("censorscope.rpc", "connection refused"),
+            ("censorscope.external_events_socket", "missing"),
+            ("events.guard_ingress_socket", "missing"),
+        ]);
+        assert!(!ready_with_checks(&guard_ingress_broken, false));
+
+        let guard_down = checks(&[
+            ("censorguard.rpc", "connection refused"),
+            ("censorscope.rpc", "connection refused"),
+        ]);
+        assert!(!ready_with_checks(&guard_down, false));
+    }
 
     #[test]
     fn structured_fs_error_from_stdout_survives_nonzero_exit() -> Result<()> {
