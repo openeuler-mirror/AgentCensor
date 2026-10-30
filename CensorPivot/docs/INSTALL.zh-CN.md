@@ -216,6 +216,8 @@ pnpm dsh --profile web --dump-config
 插件安装默认重建并打包当前源码。使用 nvm 时，确保安装用户的登录 shell 能找到 Node/pnpm。
 Web 与 headless worker 使用同一 DSH 源码目录。
 
+`DSH_ROOT=/root/deepseek-harness` 中 `=` 两边不能有空格；`DSH_BIN` 应指向真实可执行文件。
+
 | 设置 | 用途 |
 |---|---|
 | `DSH_ROOT` | DSH 源码目录 |
@@ -224,6 +226,14 @@ Web 与 headless worker 使用同一 DSH 源码目录。
 | `CENSORPIVOT_PACKAGE_DIR` | 复用预构建组合包；默认从源码重建 |
 
 </details>
+
+## Guard 事件观测配置
+
+统一部署在 `/etc/censorguard/agentcensor.yaml` 中设置
+`daemon.event_forward_socket: /run/censorpivot/guard-events.sock`，与 Pivot 配置中的
+`events.guard_ingress_socket` 保持一致。Pivot 关联事务、trace 和工具调用后，转发到
+`events.scope_ingest_socket` 指定的 Scope 外部事件入口。独立 Guard 默认不转发；
+设为 `null` 可关闭转发。修改后按上述 stop/start 重启统一服务。
 
 可选原生事务验证：`setup-agentcensor.sh start --demo`，会向 FS `main` 发布测试结果。
 当前 DSH 普通对话尚未自动提交 Pivot `BatchRequest`；完整事务接入范围见

@@ -151,10 +151,13 @@ fn migrate_args(value: &Value, settings: &mut Map<String, Value>) -> Result<()> 
         let arg = args[index]
             .as_str()
             .ok_or_else(|| invalid("extra_args must contain strings"))?;
-        let key = arg
-            .strip_prefix("--")
-            .ok_or_else(|| invalid(format!("unsupported Guard option {arg}")))?
-            .replace('-', "_");
+        let key = if arg == "--event-forward-sock" {
+            "event_forward_socket".to_owned()
+        } else {
+            arg.strip_prefix("--")
+                .ok_or_else(|| invalid(format!("unsupported Guard option {arg}")))?
+                .replace('-', "_")
+        };
         if !settings.contains_key(&key) {
             return Err(invalid(format!(
                 "unsupported legacy Guard option {arg}; migrate it explicitly"

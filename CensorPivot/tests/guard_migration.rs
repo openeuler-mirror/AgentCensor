@@ -16,7 +16,7 @@ fn fixture(
         &daemon_path,
         serde_json::to_vec(&json!({"censorguard":{
         "policy":yaml_path, "launch_socket":root.join("launch.sock"), "state_dir":root.join("state"),
-        "extra_args":["--socket-group", "operators", "--gateway-user", "operator", "--spawn-grpc", "--grpc-bin", "/custom/grpc", "--audit-exec", "false"]
+        "extra_args":["--socket-group", "operators", "--gateway-user", "operator", "--spawn-grpc", "--grpc-bin", "/custom/grpc", "--audit-exec", "false", "--event-forward-sock", root.join("guard-events.sock")]
     }, "poll_interval_ms":17}))?,
     )?;
     fs::write(
@@ -47,6 +47,10 @@ fn upgrade_retains_rules_custom_paths_and_permissions_and_is_idempotent() -> Tes
     assert!(parsed.daemon.spawn_grpc);
     assert!(!parsed.daemon.audit_exec);
     assert_eq!(parsed.daemon.grpc_bin, Some(PathBuf::from("/custom/grpc")));
+    assert_eq!(
+        parsed.daemon.event_forward_socket,
+        Some(temporary.path().join("guard-events.sock"))
+    );
     assert_eq!(fs::metadata(&yaml)?.permissions().mode() & 0o777, 0o640);
     assert_eq!(
         fs::read(format!("{}.pre-guard-0.5.0.bak", yaml.display()))?,

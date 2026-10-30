@@ -68,13 +68,24 @@ CensorPivot 提供一个 DSH 安装入口，把 CensorFS、CensorGuard、CensorS
 `@agentcensor/censorpivot-headless` 配套层。各组件包仍作为普通运行时依赖安装，因此不会
 重复应用原来的 bundle patch，浏览器端的 `dsh.client` 声明则继续生效。
 
-已安装 Node.js 22+、pnpm 和 dsh 后，在仓库根目录执行：
+已安装 Node.js 22+、pnpm 和 dsh 后，先将运行 DSH 的当前用户加入 `censorpivot` 组：
+
+```bash
+sudo usermod -aG censorpivot "$(id -un)"
+```
+
+组成员关系只会在新登录会话中生效；执行后应注销并重新登录，再用 `id -nG` 确认输出包含
+`censorpivot`。该组允许 DSH 访问 `/run/censorfs`、`/run/censorguard` 和
+`/run/censorscope` 下受保护的 Unix socket，不应把不可信用户加入该组。
+
+重新登录后，在仓库根目录执行一个命令即可构建、打包并安装组合插件：
 
 ```bash
 CensorPivot/scripts/install-dsh-censorpivot.sh
 ```
 
-脚本会在需要时自动生成八个本地 tarball，然后配置 `web` 和 `headless` 两个 profile。
+脚本会自动安装锁定的 CensorGuard 插件构建依赖、生成八个本地 tarball，然后配置 `web` 和
+`headless` 两个 profile。
 可用 `DSH_HOME` 指定独立的 DSH 数据目录，用 `DSH_BIN=/path/to/dsh` 指定可执行文件，
 或用 `DSH_ROOT=/root/deepseek-harness` 指定源码目录。变量赋值的 `=` 两边不能有空格。
 安装器也会自动查找当前目录及 AgentCensor 相邻的 `deepseek-harness/`。用
