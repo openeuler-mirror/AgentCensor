@@ -62,11 +62,14 @@ resolve_dsh_command() {
   fi
 }
 
-for command in node pnpm; do
+for command in node pnpm tar; do
   command -v "$command" >/dev/null || fail "$command is required"
 done
 resolve_dsh_command
 mkdir -p "$dsh_home"
+dsh_home=$(cd "$dsh_home" && pwd -P)
+mkdir -p "$package_dir"
+package_dir=$(cd "$package_dir" && pwd -P)
 if [[ -n ${DSH_PNPM_STORE_DIR:-} ]]; then
   mkdir -p "$DSH_PNPM_STORE_DIR"
   pnpm_store_args=(--store-dir "$DSH_PNPM_STORE_DIR")
@@ -74,18 +77,49 @@ fi
 node_major=$(node -p 'process.versions.node.split(".")[0]')
 (( node_major >= 22 )) || fail "Node 22+ is required (found $node_major)"
 
+if [[ $(id -u) -ne 0 ]]; then
+  getent group censorpivot >/dev/null 2>&1 || fail \
+    "required system group is missing: censorpivot" \
+    "install the native AgentCensor components before installing the DSH plugin"
+  if ! id -nG | tr ' ' '\n' | grep -Fxq censorpivot; then
+    fail "current user $(id -un) is not a member of censorpivot" \
+      "run: sudo usermod -aG censorpivot $(id -un), then log out and log in again"
+  fi
+fi
+
 required=(
   censorpivot-web.tgz censorpivot-headless.tgz
   censorfs-web.tgz censorfs-headless.tgz censorguard-web.tgz
   censorscope-host.tgz censorscope-session-proxy.tgz
 )
+censorguard_entries=(
+  package/dist/bootstrap/index.js
+  package/dist/host/index.js
+  package/dist/ui/index.js
+  package/lib/client.js
+)
 missing=false
 for archive in "${required[@]}"; do
   [[ -f "$package_dir/$archive" ]] || missing=true
 done
+if [[ -f "$package_dir/censorguard-web.tgz" ]]; then
+  for entry in "${censorguard_entries[@]}"; do
+    if ! tar -tzf "$package_dir/censorguard-web.tgz" "$entry" >/dev/null 2>&1; then
+      printf '[INFO] rebuilding incomplete CensorGuard DSH package: missing %s\n' "$entry"
+      missing=true
+      break
+    fi
+  done
+fi
 if [[ "$missing" == true || "$reuse_packages" == false ]]; then
   "$root/scripts/package-dsh-censorpivot.sh" "$package_dir"
 fi
+
+for entry in "${censorguard_entries[@]}"; do
+  tar -tzf "$package_dir/censorguard-web.tgz" "$entry" >/dev/null 2>&1 || fail \
+    "CensorGuard DSH package is incomplete: missing $entry" \
+    "rebuild the plugin packages after checking the CensorGuard build output"
+done
 
 initialize_profile() {
   local profile=$1
@@ -173,6 +207,7 @@ install_runtime headless \
 # native module daemons/binaries remain owned by their normal system install.
 censorfs_root=${CENSORFS_ROOT:-$(cd "$root/../CensorFs" && pwd)}
 mkdir -p "$bin_dir"
+bin_dir=$(cd "$bin_dir" && pwd -P)
 install -m 0755 "$censorfs_root/integrations/deepseek-harness/bin/dsh-jsonrpc-agent" \
   "$bin_dir/dsh-jsonrpc-agent"
 

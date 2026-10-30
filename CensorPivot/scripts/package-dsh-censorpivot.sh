@@ -11,14 +11,28 @@ export npm_config_cache=${NPM_CACHE_DIR:-$work/npm-cache}
 censorfs_root=${CENSORFS_ROOT:-$repo_root/CensorFs}
 censorguard_root=${CENSORGUARD_ROOT:-$repo_root/CensorGuard}
 censorscope_root=${CENSORSCOPE_ROOT:-$repo_root/CensorScope}
+pnpm_store_args=()
+if [[ -n ${DSH_PNPM_STORE_DIR:-} ]]; then
+  mkdir -p "$DSH_PNPM_STORE_DIR"
+  pnpm_store_args=(--store-dir "$DSH_PNPM_STORE_DIR")
+fi
 
-for command in node npm tar sha256sum; do
+for command in node npm pnpm tar sha256sum; do
   command -v "$command" >/dev/null || { printf '%s is required\n' "$command" >&2; exit 2; }
 done
 
-# Always compile Guard's TypeScript and browser bundle before packing runtime
-# code; npm pack alone can otherwise ship stale artifacts from an older build.
-bash "$censorguard_root/scripts/build-dsh-plugin.sh"
+build_censorguard_plugin() {
+  local source=$censorguard_root/plugins/dsh-censorguard
+  printf 'Building CensorGuard DSH plugin...\n'
+  pnpm --dir "$source" "${pnpm_store_args[@]}" install --frozen-lockfile
+  bash "$censorguard_root/scripts/build-dsh-plugin.sh"
+  for output in dist/bootstrap/index.js dist/host/index.js dist/ui/index.js lib/client.js; do
+    [[ -f "$source/$output" ]] || {
+      printf 'CensorGuard DSH build output missing: %s\n' "$source/$output" >&2
+      exit 1
+    }
+  done
+}
 
 rm -rf -- "$out_dir"
 mkdir -p "$out_dir" "$work/raw" "$work/runtime"
@@ -63,6 +77,7 @@ pack_meta() {
 
 pack_runtime "$censorfs_root/integrations/deepseek-harness" censorfs-web.tgz censorfs-web
 pack_runtime "$censorfs_root/integrations/deepseek-harness/event-exporter" censorfs-headless.tgz censorfs-headless
+build_censorguard_plugin
 
 pack_runtime "$censorguard_root/plugins/dsh-censorguard" censorguard-web.tgz censorguard-web
 pack_runtime "$censorscope_root/plugins/censorscope-host" censorscope-host.tgz censorscope-host
