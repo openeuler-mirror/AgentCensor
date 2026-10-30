@@ -8,7 +8,8 @@ trap 'rm -rf -- "$output"' EXIT
 node --test "$root/plugins/dsh-censorpivot/test/composition.test.mjs"
 bash -n "$root/scripts/package-dsh-censorpivot.sh"
 bash -n "$root/scripts/install-dsh-censorpivot.sh"
-"$root/scripts/package-dsh-censorpivot.sh" "$output/packages"
+DSH_PNPM_STORE_DIR="$output/pnpm-store" \
+  "$root/scripts/package-dsh-censorpivot.sh" "$output/packages"
 
 expected=(
   censorpivot-web.tgz censorpivot-headless.tgz
@@ -30,6 +31,14 @@ done
 for runtime in censorfs-web censorguard-web; do
   tar -xOf "$output/packages/$runtime.tgz" package/package.json | \
     node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const p=JSON.parse(s);if(!p.dsh?.client)process.exit(1)})'
+done
+
+for entry in \
+  package/dist/bootstrap/index.js \
+  package/dist/host/index.js \
+  package/dist/ui/index.js \
+  package/lib/client.js; do
+  tar -tzf "$output/packages/censorguard-web.tgz" "$entry" >/dev/null
 done
 
 proxy_source=$(tar -xOf "$output/packages/censorscope-session-proxy.tgz" package/lib/index.mjs)
