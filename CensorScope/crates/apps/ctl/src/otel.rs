@@ -90,6 +90,29 @@ struct LinkExport {
     link_valid: bool,
 }
 
+mod json;
+
+use json::write_json_streaming;
+#[cfg(test)]
+use json::write_json;
+
+pub fn export_to_path(
+    database: &Path,
+    trace_id: u64,
+    output: &Path,
+    attributes: OtelAttributeMode,
+) -> Result<(), String> {
+    let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("cannot open read-only database: {error}"))?;
+    let details = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("cannot open OTLP detail reader: {error}"))?;
+    write_atomic(output, |writer| {
+        write_json_streaming(writer, &connection, &details, trace_id, attributes)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| format!("write OTLP export failed: {error}"))
+}
+
 fn coverage_counts(connection: &Connection, trace_id: u64) -> Result<(u64, u64), rusqlite::Error> {
     let mut statement = connection.prepare(
         "SELECT metadata FROM events WHERE trace_id = ?1 AND protocol LIKE '%.coverage'",

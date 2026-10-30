@@ -67,9 +67,11 @@ pub enum CtlCommand {
     Export {
         database: PathBuf,
         trace_id: TraceId,
-        session_id: String,
+        session_id: Option<String>,
         call_id: Option<String>,
         out_path: PathBuf,
+        format: ExportFormat,
+        attributes: OtelAttributeMode,
         full: bool,
         no_internal: bool,
         page_size: Option<usize>,
@@ -167,7 +169,7 @@ enum CtlCommandArgs {
     CallStart(CallSpanStartArgs),
     #[command(name = "call-end", about = "End a tool call span")]
     CallEnd(CallSpanEndArgs),
-    #[command(about = "Export a trace/session snapshot")]
+    #[command(about = "Export a trace/session snapshot or OTLP trace")]
     Export(ExportArgs),
 }
 
@@ -222,22 +224,66 @@ impl CtlCommandArgs {
                 ended_at: a.ended_at.unwrap_or_else(now_secs),
                 status: a.status,
             }),
-            Self::Export(a) => Ok(CtlCommand::Export {
-                database: config
-                    .ok_or_else(|| "missing operator config".to_string())?
-                    .storage
-                    .path()
-                    .to_path_buf(),
-                trace_id: a.trace_id,
-                session_id: a.session_id,
-                call_id: a.call_id,
-                out_path: a.out_path,
-                full: a.full,
-                no_internal: a.no_internal,
-                page_size: a.page_size,
-                after_observed_at: a.after_observed_at,
-                after_event: a.after_event,
-            }),
+            Self::Export(a) => {
+                if a.format == ExportFormat::Snapshot {
+                    let session_id = a
+                        .session_id
+                        .ok_or_else(|| "snapshot export requires --session-id".to_string())?;
+                    if a.attributes != OtelAttributeMode::Metadata {
+                        return Err("--attributes is only valid with an OTLP export".to_string());
+                    }
+                    Ok(CtlCommand::Export {
+                        database: config
+                            .ok_or_else(|| "missing operator config".to_string())?
+                            .storage
+                            .path()
+                            .to_path_buf(),
+                        trace_id: a.trace_id,
+                        session_id: Some(session_id),
+                        call_id: a.call_id,
+                        out_path: a.out_path,
+                        format: a.format,
+                        attributes: a.attributes,
+                        full: a.full,
+                        no_internal: a.no_internal,
+                        page_size: a.page_size,
+                        after_observed_at: a.after_observed_at,
+                        after_event: a.after_event,
+                    })
+                } else {
+                    if a.session_id.is_some()
+                        || a.call_id.is_some()
+                        || a.full
+                        || a.no_internal
+                        || a.page_size.is_some()
+                        || a.after_observed_at.is_some()
+                        || a.after_event.is_some()
+                    {
+                        return Err(
+                            "session/call snapshot options cannot be combined with an OTLP export"
+                                .to_string(),
+                        );
+                    }
+                    Ok(CtlCommand::Export {
+                        database: config
+                            .ok_or_else(|| "missing operator config".to_string())?
+                            .storage
+                            .path()
+                            .to_path_buf(),
+                        trace_id: a.trace_id,
+                        session_id: None,
+                        call_id: None,
+                        out_path: a.out_path,
+                        format: a.format,
+                        attributes: a.attributes,
+                        full: false,
+                        no_internal: false,
+                        page_size: None,
+                        after_observed_at: None,
+                        after_event: None,
+                    })
+                }
+            }
         }
     }
 
@@ -280,7 +326,7 @@ struct ExportArgs {
     #[arg(long = "trace-id", alias = "trace", value_parser = parse_trace_id)]
     trace_id: TraceId,
     #[arg(long = "session-id", value_parser = parse_session_id)]
-    session_id: String,
+    session_id: Option<String>,
     #[arg(
         long = "call-id",
         alias = "call",
@@ -290,20 +336,36 @@ struct ExportArgs {
     call_id: Option<String>,
     #[arg(long = "out-path", value_name = "PATH")]
     out_path: PathBuf,
+    #[arg(long = "format", value_enum, default_value_t = ExportFormat::Snapshot)]
+    format: ExportFormat,
+    #[arg(long = "attributes", value_enum, default_value_t = OtelAttributeMode::Metadata)]
+    attributes: OtelAttributeMode,
     #[arg(long = "full")]
     full: bool,
     #[arg(
         long = "no-internal",
-        help = "Drop plugin self-noise and diagnostics: censorscopectl housekeeping \
-                  processes and tls.coverage application rows"
+        help = "Drop internal event rows: censorscopectl housekeeping processes and \
+                  tls.coverage application rows"
     )]
     no_internal: bool,
     #[arg(long = "page-size", value_parser = parse_page_size)]
     page_size: Option<usize>,
-    #[arg(long = "after-observed-at", requires = "after_event")]
-    after_observed_at: Option<u64>,
     #[arg(long = "after-event")]
     after_event: Option<u64>,
+    #[arg(long = "after-observed-at", requires = "after_event")]
+    after_observed_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ExportFormat {
+    Snapshot,
+    OtlpJson,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OtelAttributeMode {
+    Metadata,
+    Full,
 }
 
 fn now_secs() -> u64 {
@@ -565,10 +627,48 @@ mod tests {
             } if config_path == &PathBuf::from("/tmp/censorscope-ctl-test.conf")
         ));
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum OtelAttributeMode {
-    Metadata,
-    Full,
+    #[test]
+    fn export_keeps_plugin_snapshot_shape() {
+        let cli = CtlCli::try_parse_from([
+            "censorscopectl",
+            "export",
+            "--trace-id",
+            "7",
+            "--session-id",
+            "session-a",
+            "--call-id",
+            "call-1",
+            "--out-path",
+            "/tmp/snapshot.json",
+        ])
+        .unwrap();
+        let CtlCommandArgs::Export(args) = cli.command else {
+            panic!("expected export command");
+        };
+        assert_eq!(args.format, ExportFormat::Snapshot);
+        assert_eq!(args.session_id.as_deref(), Some("session-a"));
+        assert_eq!(args.call_id.as_deref(), Some("call-1"));
+    }
+
+    #[test]
+    fn export_accepts_trace_only_otlp_shape() {
+        let cli = CtlCli::try_parse_from([
+            "censorscopectl",
+            "export",
+            "--trace-id",
+            "7",
+            "--format",
+            "otlp-json",
+            "--out-path",
+            "/tmp/trace.otlp.json",
+        ])
+        .unwrap();
+        let CtlCommandArgs::Export(args) = cli.command else {
+            panic!("expected export command");
+        };
+        assert_eq!(args.format, ExportFormat::OtlpJson);
+        assert_eq!(args.session_id, None);
+        assert_eq!(args.attributes, OtelAttributeMode::Metadata);
+    }
 }
