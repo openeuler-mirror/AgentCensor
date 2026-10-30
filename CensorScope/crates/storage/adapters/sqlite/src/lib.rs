@@ -756,6 +756,67 @@ impl SqliteStorage {
                 dropped_bytes = Some(payload.bytes);
                 String::new()
             }),
+            model_core::event::EventPayload::Guard(payload) => (payload.operation.clone(), {
+                path = payload.path.clone();
+                endpoint = payload.endpoint.clone();
+                executable = payload.executable.clone();
+                result = Some(match payload.decision {
+                    model_core::event::GuardDecision::Allow => 0,
+                    model_core::event::GuardDecision::Deny => -1,
+                });
+                let mut metadata = payload.metadata.clone();
+                metadata.insert("guard.category".into(), payload.category.clone());
+                metadata.insert("guard.decision".into(), payload.decision.as_str().into());
+                metadata.insert(
+                    "guard.source_instance_id".into(),
+                    payload.source_instance_id.clone(),
+                );
+                metadata.insert(
+                    "guard.source_sequence".into(),
+                    payload.source_sequence.to_string(),
+                );
+                if !payload.args.is_empty() {
+                    metadata.insert(
+                        "guard.args".into(),
+                        serde_json::to_string(&payload.args).unwrap_or_default(),
+                    );
+                }
+                for (key, value) in [
+                    (
+                        "guard.detail",
+                        payload.detail.as_ref().map(ToString::to_string),
+                    ),
+                    (
+                        "guard.domain",
+                        payload.domain.as_ref().map(ToString::to_string),
+                    ),
+                    (
+                        "guard.domain_id",
+                        payload.domain_id.map(|value| value.to_string()),
+                    ),
+                    (
+                        "guard.policy_version",
+                        payload.policy_version.map(|value| value.to_string()),
+                    ),
+                    (
+                        "guard.rule_version",
+                        payload.rule_version.map(|value| value.to_string()),
+                    ),
+                    (
+                        "guard.rule_name",
+                        payload.rule_name.as_ref().map(ToString::to_string),
+                    ),
+                    (
+                        "guard.transaction_id",
+                        payload.transaction_id.as_ref().map(ToString::to_string),
+                    ),
+                ] {
+                    if let Some(value) = value {
+                        metadata.insert(key.into(), value);
+                    }
+                }
+                encode_map(&metadata)
+            }),
         };
         self.execute_cached(
             "INSERT OR REPLACE INTO events (
@@ -800,6 +861,53 @@ impl SqliteStorage {
                 metadata,
             ],
         )?;
+        if let model_core::event::EventPayload::Application(payload) = &event.payload
+            && payload
+                .protocol
+                .ends_with(model_core::event::COVERAGE_PROTOCOL_SUFFIX)
+        {
+            let capability = payload
+                .metadata
+                .get(model_core::event::COVERAGE_CAPABILITY_METADATA_KEY)
+                .map(String::as_str)
+                .unwrap_or_else(|| {
+                    payload
+                        .protocol
+                        .strip_suffix(model_core::event::COVERAGE_PROTOCOL_SUFFIX)
+                        .unwrap_or(payload.protocol.as_str())
+                });
+            let state = payload
+                .metadata
+                .get("state")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            let reason = payload
+                .metadata
+                .get(model_core::event::COVERAGE_GAP_REASON_METADATA_KEY)
+                .or_else(|| payload.metadata.get("message"))
+                .map(String::as_str)
+                .unwrap_or("");
+            let observed_at = encode_time(event.envelope.observed_at);
+            self.execute_cached(
+                "INSERT INTO coverage_ledger (
+                    trace_id, process_id, capability, collector, state,
+                    first_observed_at, last_observed_at, gap_reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
+                 ON CONFLICT(trace_id, process_id, capability, collector, state, gap_reason)
+                 DO UPDATE SET
+                    first_observed_at = MIN(first_observed_at, excluded.first_observed_at),
+                    last_observed_at = MAX(last_observed_at, excluded.last_observed_at)",
+                params![
+                    event.envelope.trace_id.get(),
+                    event.envelope.process.get(),
+                    capability,
+                    event.envelope.collector.to_string(),
+                    state,
+                    observed_at,
+                    reason,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -814,6 +922,53 @@ impl SqliteStorage {
             }
         }
         self.connection.borrow_mut().execute_batch("COMMIT")
+    }
+
+    pub fn append_external_event(
+        &mut self,
+        source_instance_id: &str,
+        source_sequence: u64,
+        event: &DomainEvent,
+    ) -> Result<bool, rusqlite::Error> {
+        self.connection
+            .borrow_mut()
+            .execute_batch("BEGIN IMMEDIATE")?;
+        let existing = self.connection.borrow().query_row(
+            "SELECT 1 FROM external_event_receipts
+             WHERE source_instance_id = ?1 AND source_sequence = ?2",
+            params![source_instance_id, source_sequence],
+            |_| Ok(()),
+        );
+        match existing {
+            Ok(()) => {
+                self.connection.borrow_mut().execute_batch("COMMIT")?;
+                return Ok(false);
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {}
+            Err(error) => {
+                let _ = self.connection.borrow_mut().execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.append_event(event) {
+            let _ = self.connection.borrow_mut().execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        let receipt = self.connection.borrow_mut().execute(
+            "INSERT INTO external_event_receipts(source_instance_id, source_sequence, event_id)
+             VALUES (?1, ?2, ?3)",
+            params![
+                source_instance_id,
+                source_sequence,
+                event.envelope.event_id.get()
+            ],
+        );
+        if let Err(error) = receipt {
+            let _ = self.connection.borrow_mut().execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        self.connection.borrow_mut().execute_batch("COMMIT")?;
+        Ok(true)
     }
 
     /// Append one retained payload segment. The bytes column is nullable so
@@ -1494,11 +1649,7 @@ fn encode_set(values: &BTreeSet<String>) -> String {
 }
 
 fn encode_map(values: &BTreeMap<String, String>) -> String {
-    values
-        .iter()
-        .map(|(key, value)| format!("{}={}", escape(key), escape(value)))
-        .collect::<Vec<_>>()
-        .join("\n")
+    serde_json::to_string(values).expect("metadata map is JSON serializable")
 }
 
 fn encode_argv(argv: &model_core::process::ArgvCapture) -> String {
@@ -1560,7 +1711,11 @@ mod tests {
     use std::time::SystemTime;
 
     use model_core::diagnostics::{CaptureDiagnostic, DiagnosticKind, DiagnosticSeverity};
-    use model_core::ids::TraceId;
+    use model_core::event::{
+        ApplicationPayload, DomainEvent, EventEnvelope, EventFlags, EventKind, EventPayload,
+        GuardDecision, GuardPayload,
+    };
+    use model_core::ids::{CollectorName, EventId, TraceId};
     use model_core::payload::{
         PayloadContentState, PayloadDirection, PayloadSegment, PayloadSourceBoundary,
     };
@@ -1604,6 +1759,169 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn external_event_receipt_makes_retries_idempotent() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let event = |event_id| {
+            DomainEvent::new(
+                EventEnvelope {
+                    event_id: EventId::new(event_id),
+                    trace_id: TraceId::new(1),
+                    observed_at: SystemTime::UNIX_EPOCH,
+                    process: ProcessIdentity::new(2),
+                    collector: CollectorName::new("censorguard"),
+                    kind: EventKind::Guard,
+                    flags: EventFlags::empty(),
+                    session_id: None,
+                    call_id: None,
+                },
+                EventPayload::Guard(Box::new(GuardPayload {
+                    category: "file".into(),
+                    operation: "file.open_read".into(),
+                    decision: GuardDecision::Deny,
+                    path: Some("/etc/shadow".into()),
+                    endpoint: None,
+                    executable: None,
+                    args: Vec::new(),
+                    detail: None,
+                    domain_id: None,
+                    domain: None,
+                    policy_version: None,
+                    rule_version: None,
+                    rule_name: None,
+                    source_instance_id: "boot".into(),
+                    source_sequence: 4,
+                    transaction_id: None,
+                    metadata: BTreeMap::new(),
+                })),
+            )
+        };
+        assert!(
+            storage
+                .append_external_event("boot", 4, &event(10))
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .append_external_event("boot", 4, &event(11))
+                .unwrap()
+        );
+        let count: u64 = storage
+            .connection
+            .borrow()
+            .query_row("SELECT COUNT(*) FROM events WHERE kind = 10", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn coverage_ledger_merges_repeated_observations_without_event_rows() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let event = |id: u64,
+                     seconds: u64,
+                     state: &str,
+                     reason: &str,
+                     protocol: &str,
+                     capability: Option<&str>| {
+            let mut metadata = BTreeMap::new();
+            metadata.insert("state".to_string(), state.to_string());
+            metadata.insert("message".to_string(), reason.to_string());
+            if let Some(capability) = capability {
+                metadata.insert("capability".to_string(), capability.to_string());
+            }
+            DomainEvent::new(
+                EventEnvelope {
+                    event_id: EventId::new(id),
+                    trace_id: TraceId::new(7),
+                    observed_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    process: ProcessIdentity::new(11),
+                    collector: CollectorName::new("ebpf"),
+                    kind: EventKind::Unknown,
+                    session_id: None,
+                    call_id: None,
+                    flags: EventFlags::empty(),
+                },
+                EventPayload::Application(ApplicationPayload {
+                    protocol: protocol.to_string(),
+                    metadata,
+                }),
+            )
+        };
+        storage
+            .append_event(&event(1, 20, "covered", "", "tls.coverage", None))
+            .unwrap();
+        storage
+            .append_event(&event(2, 10, "covered", "", "tls.coverage", None))
+            .unwrap();
+        storage
+            .append_event(&event(
+                3,
+                30,
+                "gap",
+                "library unavailable",
+                "tls.coverage",
+                None,
+            ))
+            .unwrap();
+        storage
+            .append_event(&event(4, 40, "covered", "", "tls.coverage", None))
+            .unwrap();
+        storage
+            .append_event(&event(
+                5,
+                50,
+                "covered",
+                "",
+                "http.coverage",
+                Some("http-plaintext"),
+            ))
+            .unwrap();
+
+        let connection = storage.connection.borrow();
+        let rows: Vec<(String, i64, i64, String)> = connection
+            .prepare(
+                "SELECT state, first_observed_at, last_observed_at, gap_reason
+                 FROM coverage_ledger ORDER BY state, gap_reason, first_observed_at",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            (
+                "covered".to_string(),
+                10_000_000_000,
+                40_000_000_000,
+                "".to_string()
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "covered".to_string(),
+                50_000_000_000,
+                50_000_000_000,
+                "".to_string()
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "gap".to_string(),
+                30_000_000_000,
+                30_000_000_000,
+                "library unavailable".to_string()
+            )
+        );
     }
 
     #[test]

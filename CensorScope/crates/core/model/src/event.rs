@@ -39,6 +39,7 @@ pub enum EventKind {
     Resource = 7,
     Control = 8,
     Loss = 9,
+    Guard = 10,
 }
 
 impl EventKind {
@@ -54,6 +55,7 @@ impl EventKind {
             Self::Resource => "resource",
             Self::Control => "control",
             Self::Loss => "loss",
+            Self::Guard => "guard",
         }
     }
 }
@@ -155,6 +157,42 @@ pub struct LossPayload {
     pub bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardDecision {
+    Allow,
+    Deny,
+}
+
+impl GuardDecision {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardPayload {
+    pub category: String,
+    pub operation: String,
+    pub decision: GuardDecision,
+    pub path: Option<String>,
+    pub endpoint: Option<String>,
+    pub executable: Option<String>,
+    pub args: Vec<String>,
+    pub detail: Option<String>,
+    pub domain_id: Option<u64>,
+    pub domain: Option<String>,
+    pub policy_version: Option<u32>,
+    pub rule_version: Option<u32>,
+    pub rule_name: Option<String>,
+    pub source_instance_id: String,
+    pub source_sequence: u64,
+    pub transaction_id: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EventPayload {
     Process(ProcessPayload),
@@ -166,6 +204,7 @@ pub enum EventPayload {
     Resource(ResourcePayload),
     Control(ControlPayload),
     Loss(LossPayload),
+    Guard(Box<GuardPayload>),
 }
 
 impl EventPayload {
@@ -180,6 +219,7 @@ impl EventPayload {
             Self::Resource(_) => EventKind::Resource,
             Self::Control(_) => EventKind::Control,
             Self::Loss(_) => EventKind::Loss,
+            Self::Guard(_) => EventKind::Guard,
         }
     }
 }

@@ -889,6 +889,7 @@ dependencies = [
  "model_core",
  "rusqlite",
  "semantic_action_contract",
+ "serde_json",
  "storage_core",
 ]
 

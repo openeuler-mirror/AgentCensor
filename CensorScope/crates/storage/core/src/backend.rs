@@ -71,6 +71,16 @@ pub trait StorageBackend {
         }
         Ok(())
     }
+    /// Appends one external event exactly once for its producer identity.
+    fn append_external_event(
+        &mut self,
+        _source_instance_id: &str,
+        _source_sequence: u64,
+        event: DomainEvent,
+    ) -> Result<bool, StorageError> {
+        self.append_event(event)?;
+        Ok(true)
+    }
     /// Appends one retained payload segment without exposing internal codecs.
     fn append_payload(&mut self, segment: PayloadSegment) -> Result<(), StorageError>;
     fn append_payloads_batch(&mut self, segments: &[PayloadSegment]) -> Result<(), StorageError> {

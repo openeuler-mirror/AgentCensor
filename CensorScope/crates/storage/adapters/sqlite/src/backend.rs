@@ -70,6 +70,16 @@ impl StorageBackend for SqliteStorage {
             .map_err(|error| storage_error("append_event", error))
     }
 
+    fn append_external_event(
+        &mut self,
+        source_instance_id: &str,
+        source_sequence: u64,
+        event: DomainEvent,
+    ) -> Result<bool, StorageError> {
+        SqliteStorage::append_external_event(self, source_instance_id, source_sequence, &event)
+            .map_err(|error| storage_error("append_external_event", error))
+    }
+
     fn append_events_batch(&mut self, events: &[DomainEvent]) -> Result<(), StorageError> {
         SqliteStorage::append_events_batch(self, events)
             .map_err(|error| storage_error("append_events_batch", error))
