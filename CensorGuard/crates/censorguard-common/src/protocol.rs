@@ -416,6 +416,8 @@ pub struct DomainTree {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Event {
     pub ts: String,
+    #[serde(skip)]
+    pub occurred_at_ns: u64,
     pub kind: u32,
     pub op: u32,
     pub pid: u32,

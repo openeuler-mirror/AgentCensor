@@ -1,0 +1,13 @@
+[package]
+name = "censorguard-event-forwarder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+agentcensor-events = { path = "../../../contracts/agentcensor-events" }
+censorguard-common = { path = "../censorguard-common" }
+
+[lints]
+workspace = true

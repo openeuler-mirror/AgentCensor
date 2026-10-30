@@ -151,6 +151,7 @@ pub fn start_event_pump(
 fn to_event(runtime: &Runtime, raw: &RawEvent) -> Event {
     Event {
         ts: now_rfc3339(),
+        occurred_at_ns: unix_nanos(),
         kind: raw.kind,
         op: raw.op,
         pid: raw.pid,
@@ -200,6 +201,14 @@ fn now_rfc3339() -> String {
     )
 }
 
+fn unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
+
 fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
     let z = days_since_epoch + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -240,6 +249,7 @@ mod tests {
         let receiver = hub.subscribe();
         let event = Event {
             ts: String::new(),
+            occurred_at_ns: 0,
             kind: 1,
             op: 1,
             pid: 1,
