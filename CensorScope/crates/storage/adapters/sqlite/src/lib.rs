@@ -18,6 +18,9 @@ use model_core::process::{
 };
 use model_core::trace::{TraceLifecycleState, TraceRecord};
 use rusqlite::{Connection, OptionalExtension, Row, params};
+use semantic_action_contract::{
+    ACTION_VALID_ATTRIBUTE, AGENT_IDENTITY_STATE_ATTRIBUTE, PROCESS_PARENT_STATE_ATTRIBUTE,
+};
 use semantic_action_contract::{SemanticAction, SemanticActionLink, SemanticContent};
 use storage_core::{BackfillJob, BackfillJobKind, BackfillJobState, CallSpanRecord};
 
@@ -823,9 +826,10 @@ impl SqliteStorage {
             "INSERT INTO payload_segments (
                 trace_id, process_id, session_id, observed_at, source, content_state, direction,
                 stream_key, sequence, operation_id, offset_bytes, completed,
+                operation_completion_state, truncation_state, redaction_state,
                 original_size, captured_size, library, symbol, protocol_hint,
                 loss_reason, bytes, call_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 segment.trace_id.get(),
                 segment.process.get(),
@@ -839,6 +843,9 @@ impl SqliteStorage {
                 segment.operation_id,
                 segment.offset,
                 i64::from(segment.completed),
+                segment.operation_completion_state as i64,
+                segment.truncation as i64,
+                segment.redaction as i64,
                 segment.original_size,
                 segment.captured_size,
                 segment.library,
@@ -1098,11 +1105,12 @@ impl SqliteStorage {
             &connection,
             "INSERT INTO semantic_action_links (
                 trace_id, source_action_id, target_action_id, role, role_name,
-                confidence, valid, schema_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)
+                confidence, valid, link_valid_code, schema_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)
              ON CONFLICT(trace_id, source_action_id, target_action_id, role)
              DO UPDATE SET role_name = excluded.role_name,
                 confidence = excluded.confidence, valid = excluded.valid,
+                link_valid_code = excluded.link_valid_code,
                 schema_version = 1",
             params![
                 link.trace_id.get(),
@@ -1111,6 +1119,7 @@ impl SqliteStorage {
                 link.role as i64,
                 link.role.as_str(),
                 link.confidence as i64,
+                i64::from(link.valid),
                 i64::from(link.valid),
             ],
         )?;
@@ -1294,8 +1303,8 @@ fn write_semantic_action(
             "INSERT INTO semantic_actions (
                 trace_id, action_id, kind, kind_name, title, start_time, end_time,
                 process_id, status, completeness, confidence_millis, session_id,
-                schema_version
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)
+                action_valid_code, agent_observed, process_parent_conflict, schema_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)
              ON CONFLICT(trace_id, action_id) DO UPDATE SET
                 kind = excluded.kind, kind_name = excluded.kind_name,
                 title = excluded.title, start_time = excluded.start_time,
@@ -1303,6 +1312,9 @@ fn write_semantic_action(
                 status = excluded.status, completeness = excluded.completeness,
                 confidence_millis = excluded.confidence_millis,
                 session_id = excluded.session_id,
+                action_valid_code = excluded.action_valid_code,
+                agent_observed = excluded.agent_observed,
+                process_parent_conflict = excluded.process_parent_conflict,
                 schema_version = 1",
         )?
         .execute(params![
@@ -1318,6 +1330,9 @@ fn write_semantic_action(
             action.completeness as i64,
             action.confidence_millis.map(i64::from),
             action.session_id.as_ref().map(|value| value.as_str()),
+            action_valid_code(action),
+            agent_observed(action),
+            process_parent_conflict(action),
         ])?;
     connection
         .prepare_cached(
@@ -1353,6 +1368,34 @@ fn write_semantic_action(
         ])?;
     }
     Ok(())
+}
+
+fn action_valid_code(action: &SemanticAction) -> i64 {
+    i64::from(!matches!(
+        action
+            .attributes
+            .get(ACTION_VALID_ATTRIBUTE)
+            .map(String::as_str),
+        Some("false")
+    ))
+}
+
+fn agent_observed(action: &SemanticAction) -> i64 {
+    i64::from(
+        action
+            .attributes
+            .get(AGENT_IDENTITY_STATE_ATTRIBUTE)
+            .is_some_and(|value| value == "observed"),
+    )
+}
+
+fn process_parent_conflict(action: &SemanticAction) -> i64 {
+    i64::from(
+        action
+            .attributes
+            .get(PROCESS_PARENT_STATE_ATTRIBUTE)
+            .is_some_and(|value| value == "conflict"),
+    )
 }
 
 fn resolution_state_name(value: ProcessResolutionState) -> &'static str {
@@ -1524,6 +1567,7 @@ mod tests {
     use model_core::process::{ArgvCapture, ProcessIdentity};
     use model_core::trace::TraceRecord;
     use semantic_action_contract::{
+        ACTION_VALID_ATTRIBUTE, AGENT_IDENTITY_STATE_ATTRIBUTE, PROCESS_PARENT_STATE_ATTRIBUTE,
         SemanticAction, SemanticActionCompleteness, SemanticActionKind, SemanticActionLink,
         SemanticActionLinkConfidence, SemanticActionLinkRole, SemanticActionStatus,
         SemanticContent, SemanticContentKind, SemanticContentState, SemanticEvidence,
@@ -1559,7 +1603,7 @@ mod tests {
             .borrow()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -1763,6 +1807,11 @@ mod tests {
         let mut metadata = base.clone();
         metadata.sequence = 2;
         metadata.content_state = PayloadContentState::MetadataOnly;
+        metadata.completed = false;
+        metadata.operation_completion_state =
+            model_core::payload::PayloadOperationCompletionState::Partial;
+        metadata.truncation = model_core::payload::PayloadTruncationState::Truncated;
+        metadata.redaction = model_core::payload::PayloadRedactionState::Redacted;
         metadata.captured_size = 0;
         metadata.bytes = None;
         storage.append_payload(&metadata).unwrap();
@@ -1783,6 +1832,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_session, "sess-1");
+        let states: (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT completed, operation_completion_state, truncation_state, redaction_state
+                 FROM payload_segments WHERE sequence = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(states, (0, 2, 2, 2));
     }
 
     #[test]
@@ -1878,6 +1936,19 @@ mod tests {
         let trace = TraceId::new(11);
         storage.upsert_semantic_action(&action(trace, "a")).unwrap();
         storage.upsert_semantic_action(&action(trace, "b")).unwrap();
+        let mut observed = action(trace, "observed");
+        observed.attributes.insert(
+            AGENT_IDENTITY_STATE_ATTRIBUTE.to_string(),
+            "observed".to_string(),
+        );
+        observed.attributes.insert(
+            PROCESS_PARENT_STATE_ATTRIBUTE.to_string(),
+            "conflict".to_string(),
+        );
+        observed
+            .attributes
+            .insert(ACTION_VALID_ATTRIBUTE.to_string(), "false".to_string());
+        storage.upsert_semantic_action(&observed).unwrap();
         storage
             .upsert_semantic_link(&SemanticActionLink {
                 trace_id: trace,
@@ -1900,7 +1971,24 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (2, 2, 2, 1));
+        assert_eq!(counts, (3, 6, 3, 1));
+        let validity: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT action_valid_code, agent_observed, process_parent_conflict
+                 FROM semantic_actions WHERE action_id = 'observed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(validity, (0, 1, 1));
+        let link_valid: i64 = connection
+            .query_row(
+                "SELECT link_valid_code FROM semantic_action_links WHERE trace_id = 11",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(link_valid, 1);
         let view_count: u32 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
