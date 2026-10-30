@@ -23,7 +23,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+fn current_unix_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+        })
+}
 
 #[derive(Debug)]
 struct Args {
@@ -46,6 +54,7 @@ struct Args {
     spawn_grpc: bool,
     grpc_bin: Option<PathBuf>,
     grpc_listen: Option<String>,
+    event_forward_socket: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -141,7 +150,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         hooks_healthy,
         dsh_self_groups: args.dsh_self_groups.iter().cloned().collect(),
     })?);
-    let hub = Arc::new(EventHub::new(boot_id));
+    let event_instance_id = format!("{boot_id}-{}-{}", std::process::id(), current_unix_nanos());
+    let hub = Arc::new(EventHub::new(event_instance_id));
 
     let _event_pump =
         event::start_event_pump(Arc::clone(&kernel), Arc::clone(&runtime), Arc::clone(&hub))?;
@@ -154,6 +164,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     cleanup.record(&args.control_socket)?;
     let _events = server::start_events(&args.event_socket, socket_group, Arc::clone(&hub))?;
+    let _event_forwarder = args
+        .event_forward_socket
+        .clone()
+        .map(|socket| {
+            let subscription = hub.subscribe();
+            censorguard_event_forwarder::EventForwarder::spawn_with_source(socket, move |timeout| {
+                subscription.recv_timeout(timeout)
+            })
+        })
+        .transpose()?;
     cleanup.record(&args.event_socket)?;
     let _launch = server::start_launch(&args.launch_socket, socket_group, Arc::clone(&runtime))?;
     cleanup.record(&args.launch_socket)?;
@@ -194,6 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     wait_for_shutdown(args.duration_seconds, &shutdown_receiver, &runtime)?;
     grpc_shutdown.store(true, Ordering::SeqCst);
 
+    drop(_event_forwarder);
     drop(cleanup);
     drop(_grpc);
     eprintln!("censorguardd shutdown complete");
@@ -532,8 +553,6 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
     let gateway_user = daemon.gateway_user;
     let dsh_self_groups = daemon.dsh_self_groups;
     let dns_refresh_seconds = daemon.dns_refresh_seconds;
-    let spawn_grpc = daemon.spawn_grpc;
-    let grpc_bin = daemon.grpc_bin;
     Ok(Args {
         config,
         reload: false,
@@ -551,9 +570,10 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
         duration_seconds,
         dns_refresh_seconds,
         dsh_self_groups,
-        spawn_grpc,
-        grpc_bin,
+        spawn_grpc: daemon.spawn_grpc,
+        grpc_bin: daemon.grpc_bin,
         grpc_listen: daemon.grpc_listen,
+        event_forward_socket: daemon.event_forward_socket,
     })
 }
 
@@ -696,6 +716,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn event_forwarder_releases_subscription_on_shutdown() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let hub = EventHub::new("test-boot".into());
+        let subscription = hub.subscribe();
+        let forwarder = censorguard_event_forwarder::EventForwarder::spawn_with_source(
+            directory.path().join("events.sock"),
+            move |timeout| subscription.recv_timeout(timeout),
+        )?;
+        assert_eq!(hub.stats().subscribers, 1);
+        drop(forwarder);
+        assert_eq!(hub.stats().subscribers, 0);
+        Ok(())
+    }
+
+    #[test]
     fn startup_uses_current_base_settings_and_restores_dynamic_memberships()
     -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
@@ -780,6 +815,7 @@ mod tests {
         )?;
         assert!(!args.spawn_grpc);
         assert_eq!(args.grpc_bin, None);
+        assert_eq!(args.event_forward_socket, None);
         Ok(())
     }
 
@@ -789,7 +825,7 @@ mod tests {
         let config = directory.path().join("base.yaml");
         fs::write(
             &config,
-            "daemon:\n  spawn_grpc: true\n  dns_refresh_seconds: 7\n  grpc_bin: /test/grpc\nrules: []\n",
+            "daemon:\n  spawn_grpc: true\n  dns_refresh_seconds: 7\n  grpc_bin: /test/grpc\n  event_forward_socket: /test/guard-events.sock\nrules: []\n",
         )?;
         let args = parse_args(
             [
@@ -802,6 +838,10 @@ mod tests {
         assert!(args.spawn_grpc);
         assert_eq!(args.grpc_bin, Some(PathBuf::from("/test/grpc")));
         assert_eq!(args.dns_refresh_seconds, 7);
+        assert_eq!(
+            args.event_forward_socket,
+            Some(PathBuf::from("/test/guard-events.sock"))
+        );
         Ok(())
     }
 
@@ -825,6 +865,7 @@ mod tests {
             "--event-sock",
             "--state-dir",
             "--spawn-grpc",
+            "--event-forward-sock",
             "--hold-seconds",
             "--track-pid",
             "--domain",

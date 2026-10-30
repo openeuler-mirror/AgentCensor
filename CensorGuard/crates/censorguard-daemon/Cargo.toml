@@ -14,6 +14,7 @@ path = "src/main.rs"
 censorguard-common = { path = "../censorguard-common" }
 censorguard-kernel = { path = "../censorguard-kernel" }
 censorguard-policy = { path = "../censorguard-policy" }
+censorguard-event-forwarder = { path = "../censorguard-event-forwarder" }
 nix = { version = "0.30.1", features = ["fs", "process", "signal", "socket", "user"] }
 serde_json.workspace = true
 serde_yaml.workspace = true

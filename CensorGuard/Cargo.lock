@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "agentcensor-events"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -142,6 +151,7 @@ name = "censorguard-daemon"
 version = "0.5.0"
 dependencies = [
  "censorguard-common",
+ "censorguard-event-forwarder",
  "censorguard-kernel",
  "censorguard-policy",
  "nix",
@@ -149,6 +159,14 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "censorguard-event-forwarder"
+version = "0.5.0"
+dependencies = [
+ "agentcensor-events",
+ "censorguard-common",
 ]
 
 [[package]]

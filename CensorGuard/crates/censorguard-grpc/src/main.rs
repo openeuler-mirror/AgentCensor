@@ -620,6 +620,7 @@ mod tests {
     fn observer_filter_preserves_denials_rules_children_and_connections() {
         let mut event = Event {
             ts: String::new(),
+            occurred_at_ns: 0,
             kind: 3,
             op: 4,
             pid: 102,
