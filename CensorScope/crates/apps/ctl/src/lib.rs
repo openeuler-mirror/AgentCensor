@@ -5,6 +5,7 @@ pub(crate) mod dispatch;
 mod entry;
 mod event_metadata;
 pub(crate) mod export;
+pub(crate) mod otel;
 pub(crate) mod output;
 pub(crate) mod process_ref;
 pub(crate) mod transport;

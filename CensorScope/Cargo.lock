@@ -293,6 +293,7 @@ dependencies = [
  "libc",
  "model_core",
  "rusqlite",
+ "semantic_action_contract",
  "serde_json",
  "uds_control_client",
 ]

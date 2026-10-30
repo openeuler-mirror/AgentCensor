@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use config_core::capture_profile::CaptureProfile;
 use config_core::daemon::{DEFAULT_OPERATOR_CONFIG_PATH, OperatorConfig};
 use control_contract::command::ProcessRef;
@@ -565,4 +565,10 @@ mod tests {
             } if config_path == &PathBuf::from("/tmp/censorscope-ctl-test.conf")
         ));
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OtelAttributeMode {
+    Metadata,
+    Full,
 }
