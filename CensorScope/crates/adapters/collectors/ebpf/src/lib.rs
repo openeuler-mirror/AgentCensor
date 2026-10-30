@@ -661,6 +661,10 @@ fn tls_coverage_diagnostic(
     message: String,
 ) -> RawCollectorEvent {
     let mut metadata = BTreeMap::new();
+    metadata.insert(
+        model_core::event::COVERAGE_CAPABILITY_METADATA_KEY.to_string(),
+        "tls-plaintext".to_string(),
+    );
     metadata.insert("state".to_string(), state.as_str().to_string());
     metadata.insert("pid".to_string(), pid.to_string());
     metadata.insert("generation".to_string(), generation.to_string());
@@ -1458,6 +1462,10 @@ impl EbpfCollector {
                 }
             }
             let mut metadata = BTreeMap::new();
+            metadata.insert(
+                model_core::event::COVERAGE_CAPABILITY_METADATA_KEY.to_string(),
+                "tls-plaintext".to_string(),
+            );
             metadata.insert("state".to_string(), record.state.as_str().to_string());
             metadata.insert("pid".to_string(), record.pid.to_string());
             metadata.insert("generation".to_string(), record.generation.to_string());
@@ -1572,6 +1580,19 @@ impl EbpfCollector {
                 operation_id: None,
                 offset: None,
                 completed: true,
+                operation_completion_state: if event.fd_io_loss {
+                    model_core::payload::PayloadOperationCompletionState::Failed
+                } else if captured_size < event.result as u64 {
+                    model_core::payload::PayloadOperationCompletionState::Partial
+                } else {
+                    model_core::payload::PayloadOperationCompletionState::Success
+                },
+                truncation: if captured_size < event.result as u64 {
+                    model_core::payload::PayloadTruncationState::Truncated
+                } else {
+                    model_core::payload::PayloadTruncationState::Complete
+                },
+                redaction: model_core::payload::PayloadRedactionState::NotRequired,
                 original_size: event.result as u64,
                 captured_size,
                 library: None,
@@ -1788,6 +1809,19 @@ impl EbpfCollector {
                     operation_id: Some(event.tls_call_id),
                     offset: Some(event.tls_chunk_offset),
                     completed: event.tls_chunk_flags & 8 != 0,
+                    operation_completion_state: if event.tls_flags & 1 != 0 {
+                        model_core::payload::PayloadOperationCompletionState::Failed
+                    } else if event.tls_flags & 2 != 0 || event.tls_chunk_flags & 8 == 0 {
+                        model_core::payload::PayloadOperationCompletionState::Partial
+                    } else {
+                        model_core::payload::PayloadOperationCompletionState::Success
+                    },
+                    truncation: if event.tls_flags & 2 != 0 {
+                        model_core::payload::PayloadTruncationState::Truncated
+                    } else {
+                        model_core::payload::PayloadTruncationState::Complete
+                    },
+                    redaction: model_core::payload::PayloadRedactionState::NotRequired,
                     original_size: chunk_declared_size,
                     captured_size,
                     library: Some(

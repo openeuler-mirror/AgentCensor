@@ -3286,7 +3286,10 @@ mod ingest_bench {
     use super::*;
     use collector_event::{RawEventEnvelope, RawObservationPayload, RawPayloadSegment};
     use model_core::ids::CollectorName;
-    use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBoundary};
+    use model_core::payload::{
+        PayloadContentState, PayloadDirection, PayloadOperationCompletionState,
+        PayloadRedactionState, PayloadSourceBoundary, PayloadTruncationState,
+    };
     use std::collections::BTreeMap;
     use std::time::Instant;
 
@@ -3389,6 +3392,9 @@ mod ingest_bench {
                 operation_id: Some(sequence),
                 offset: Some(0),
                 completed: true,
+                operation_completion_state: PayloadOperationCompletionState::Success,
+                truncation: PayloadTruncationState::Complete,
+                redaction: PayloadRedactionState::NotRequired,
                 original_size: PAYLOAD_BYTES as u64,
                 captured_size: PAYLOAD_BYTES as u64,
                 library: Some("openssl".to_string()),
@@ -3895,7 +3901,10 @@ mod plaintext_window_tests {
     use super::*;
     use collector_event::{RawEventEnvelope, RawPayloadSegment};
     use model_core::ids::CollectorName;
-    use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBoundary};
+    use model_core::payload::{
+        PayloadContentState, PayloadDirection, PayloadOperationCompletionState,
+        PayloadRedactionState, PayloadSourceBoundary, PayloadTruncationState,
+    };
 
     struct Fixture {
         host: DaemonServiceHost,
@@ -3970,6 +3979,17 @@ mod plaintext_window_tests {
                 operation_id: Some(operation_id),
                 offset: Some(chunk_offset),
                 completed,
+                operation_completion_state: if completed {
+                    PayloadOperationCompletionState::Success
+                } else {
+                    PayloadOperationCompletionState::Partial
+                },
+                truncation: if completed {
+                    PayloadTruncationState::Complete
+                } else {
+                    PayloadTruncationState::Truncated
+                },
+                redaction: PayloadRedactionState::NotRequired,
                 original_size: bytes.len() as u64,
                 captured_size: bytes.len() as u64,
                 library: Some("openssl".to_string()),
@@ -4157,7 +4177,10 @@ mod llm_runtime_tests {
     use super::*;
     use collector_event::{RawEventEnvelope, RawPayloadSegment};
     use model_core::ids::CollectorName;
-    use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBoundary};
+    use model_core::payload::{
+        PayloadContentState, PayloadDirection, PayloadOperationCompletionState,
+        PayloadRedactionState, PayloadSourceBoundary, PayloadTruncationState,
+    };
     use rusqlite::Connection;
 
     fn h2_frame(frame_type: u8, flags: u8, stream: u32, body: &[u8]) -> Vec<u8> {
@@ -4238,6 +4261,9 @@ mod llm_runtime_tests {
                     operation_id: Some(sequence),
                     offset: Some(0),
                     completed: true,
+                    operation_completion_state: PayloadOperationCompletionState::Success,
+                    truncation: PayloadTruncationState::Complete,
+                    redaction: PayloadRedactionState::NotRequired,
                     original_size: bytes.len() as u64,
                     captured_size: bytes.len() as u64,
                     library: Some("openssl".to_string()),
@@ -4275,6 +4301,9 @@ mod llm_runtime_tests {
                     operation_id: Some(sequence),
                     offset: Some(0),
                     completed: true,
+                    operation_completion_state: PayloadOperationCompletionState::Success,
+                    truncation: PayloadTruncationState::Complete,
+                    redaction: PayloadRedactionState::NotRequired,
                     original_size: bytes.len() as u64,
                     captured_size: bytes.len() as u64,
                     library: Some("boringssl".to_string()),
@@ -4306,6 +4335,9 @@ mod llm_runtime_tests {
                     operation_id: Some(sequence),
                     offset: Some(0),
                     completed: true,
+                    operation_completion_state: PayloadOperationCompletionState::Failed,
+                    truncation: PayloadTruncationState::Truncated,
+                    redaction: PayloadRedactionState::NotRequired,
                     original_size: (bytes.len() + 32) as u64,
                     captured_size: bytes.len() as u64,
                     library: Some("openssl".to_string()),

@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use model_core::ids::{CollectorName, TraceId};
-use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSourceBoundary};
+use model_core::payload::{
+    PayloadContentState, PayloadDirection, PayloadOperationCompletionState, PayloadRedactionState,
+    PayloadSourceBoundary, PayloadTruncationState,
+};
 use model_core::process::{ArgvCapture, ProcessObservation, SessionIdentity};
 
 /// Collector-side identity and timestamp before ingest normalization.
@@ -88,6 +91,9 @@ pub struct RawPayloadSegment {
     pub operation_id: Option<u64>,
     pub offset: Option<u64>,
     pub completed: bool,
+    pub operation_completion_state: PayloadOperationCompletionState,
+    pub truncation: PayloadTruncationState,
+    pub redaction: PayloadRedactionState,
     pub original_size: u64,
     pub captured_size: u64,
     pub library: Option<String>,

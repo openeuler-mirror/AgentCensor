@@ -44,6 +44,8 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o666;
 /// Environment variable name used to identify the session of an observed
 /// process (for example `DSH_SESSION_ID` injected into model shell calls).
 pub const DEFAULT_SESSION_ENV_NAME: &str = "DSH_SESSION_ID";
+pub const DEFAULT_EXTERNAL_EVENT_SOCKET_MODE: u32 = 0o660;
+pub const DEFAULT_EXTERNAL_EVENT_QUEUE_CAPACITY: u32 = 8_192;
 
 /// Result of initializing an operator configuration file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,11 +191,20 @@ pub struct OperatorConfig {
     /// process; processes without the variable are non-session operations.
     pub session_env_name: String,
     pub writer: WriterConfig,
+    pub external_events: ExternalEventsConfig,
     /// Config-file keys that are still accepted but no longer honored
     /// (for example the removed `payload.max_trace_bytes`). Surfaced so the
     /// daemon can warn at startup instead of silently ignoring an operator's
     /// intent.
     pub deprecated_keys: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalEventsConfig {
+    pub enabled: bool,
+    pub socket_path: PathBuf,
+    pub socket_permissions: SocketPermissions,
+    pub queue_capacity: u32,
 }
 
 /// Persistence writer-thread tuning (censorscoped.conf `[writer]` section).
@@ -250,6 +261,48 @@ struct OperatorDocument {
     session: SessionDocument,
     #[serde(default)]
     writer: WriterDocument,
+    #[serde(default)]
+    external_events: ExternalEventsDocument,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalEventsDocument {
+    #[serde(default = "default_external_events_enabled")]
+    enabled: bool,
+    #[serde(default = "default_external_event_socket_path")]
+    socket_path: PathBuf,
+    #[serde(default = "default_external_event_socket_mode")]
+    socket_mode: u32,
+    #[serde(default = "default_external_event_queue_capacity")]
+    queue_capacity: u32,
+}
+
+fn default_external_events_enabled() -> bool {
+    true
+}
+
+fn default_external_event_socket_path() -> PathBuf {
+    "/run/censorscope/external-events.sock".into()
+}
+
+fn default_external_event_socket_mode() -> u32 {
+    DEFAULT_EXTERNAL_EVENT_SOCKET_MODE
+}
+
+fn default_external_event_queue_capacity() -> u32 {
+    DEFAULT_EXTERNAL_EVENT_QUEUE_CAPACITY
+}
+
+impl Default for ExternalEventsDocument {
+    fn default() -> Self {
+        Self {
+            enabled: default_external_events_enabled(),
+            socket_path: default_external_event_socket_path(),
+            socket_mode: default_external_event_socket_mode(),
+            queue_capacity: default_external_event_queue_capacity(),
+        }
+    }
 }
 
 fn default_writer_batch_items() -> u32 {
@@ -452,6 +505,7 @@ impl Default for OperatorDocument {
             session: SessionDocument::default(),
             payload: PayloadDocument::default(),
             writer: WriterDocument::default(),
+            external_events: ExternalEventsDocument::default(),
         }
     }
 }
@@ -537,6 +591,12 @@ impl OperatorConfig {
         if document.writer.idle_timeout_ms == 0 {
             return Err("writer.idle_timeout_ms must be greater than zero".to_string());
         }
+        if document.external_events.queue_capacity == 0 {
+            return Err("external_events.queue_capacity must be greater than zero".to_string());
+        }
+        if document.external_events.enabled && !document.external_events.socket_path.is_absolute() {
+            return Err("external_events.socket_path must be absolute".to_string());
+        }
         Ok(Self {
             socket_path: document.daemon.socket_path,
             socket_permissions: SocketPermissions {
@@ -582,6 +642,14 @@ impl OperatorConfig {
                 queue_cap_items: document.writer.queue_cap_items,
                 queue_budget_bytes: document.writer.queue_budget_bytes,
                 spool_max_bytes: document.writer.spool_max_bytes,
+            },
+            external_events: ExternalEventsConfig {
+                enabled: document.external_events.enabled,
+                socket_path: document.external_events.socket_path,
+                socket_permissions: SocketPermissions {
+                    mode: document.external_events.socket_mode,
+                },
+                queue_capacity: document.external_events.queue_capacity,
             },
             deprecated_keys: document.payload.deprecated_keys(),
         })
@@ -631,6 +699,12 @@ impl OperatorConfig {
                 queue_cap_items: self.writer.queue_cap_items,
                 queue_budget_bytes: self.writer.queue_budget_bytes,
                 spool_max_bytes: self.writer.spool_max_bytes,
+            },
+            external_events: ExternalEventsDocument {
+                enabled: self.external_events.enabled,
+                socket_path: self.external_events.socket_path.clone(),
+                socket_mode: self.external_events.socket_permissions.mode,
+                queue_capacity: self.external_events.queue_capacity,
             },
         }
     }

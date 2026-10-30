@@ -6,6 +6,10 @@ use std::time::SystemTime;
 use crate::ids::{CollectorName, EventId, TraceId};
 use crate::process::{ArgvCapture, ProcessIdentity, SessionIdentity};
 
+pub const COVERAGE_CAPABILITY_METADATA_KEY: &str = "capability";
+pub const COVERAGE_GAP_REASON_METADATA_KEY: &str = "gap_reason";
+pub const COVERAGE_PROTOCOL_SUFFIX: &str = ".coverage";
+
 /// Common identity and timing fields for a normalized lifecycle event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventEnvelope {

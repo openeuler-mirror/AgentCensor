@@ -11,6 +11,12 @@ use model_core::process::{ProcessIdentity, SessionIdentity};
 
 pub const SEMANTIC_ACTION_SCHEMA_VERSION: u16 = 1;
 
+pub const ACTION_VALID_ATTRIBUTE: &str = "censorscope.action.valid";
+pub const AGENT_IDENTITY_STATE_ATTRIBUTE: &str = "censorscope.agent.identity_state";
+pub const PROCESS_PARENT_STATE_ATTRIBUTE: &str = "censorscope.process.parent_state";
+pub const LLM_ASSOCIATION_STATE_ATTRIBUTE: &str = "llm.association_state";
+pub const CENSORSCOPE_ASSOCIATION_STATE_ATTRIBUTE: &str = "censorscope.association_state";
+
 /// Structured, display-oriented content kept separate from raw payload bytes.
 /// `canonical_json` is a bounded summary or reference, never an implicit copy
 /// of a large body; metadata-only payloads must use `MetadataOnly`.
