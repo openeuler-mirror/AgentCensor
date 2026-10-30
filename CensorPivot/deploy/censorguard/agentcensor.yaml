@@ -4,6 +4,7 @@ daemon:
   bpf_object: /usr/lib/censorguard/enforce.bpf.o
   control_socket: /run/censorguard/ctl.sock
   event_socket: /run/censorguard/events.sock
+  event_forward_socket: /run/censorpivot/guard-events.sock
   launch_socket: /run/censorguard/launch.sock
   dsh_socket: /run/censorguard/dsh.sock
   ui_socket: /run/censorguard/ui.sock

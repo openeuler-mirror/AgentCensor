@@ -3,6 +3,7 @@ pub mod config;
 pub mod daemon;
 pub mod engine;
 pub mod error;
+pub mod events;
 pub mod migrate;
 pub mod model;
 mod process;

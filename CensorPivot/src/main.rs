@@ -150,6 +150,12 @@ fn serve(config_path: &Path) -> Result<()> {
         ))
     })?;
     let adapters = CommandAdapters::new(config.clone());
+    let _event_bridge = censorpivot::events::EventBridge::start(
+        &config.events.guard_ingress_socket,
+        config.events.guard_ingress_mode,
+        config.events.scope_ingest_socket.clone(),
+        adapters.event_registry(),
+    )?;
     let engine = Engine::new(
         store,
         adapters.clone(),

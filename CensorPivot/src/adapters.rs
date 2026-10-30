@@ -11,16 +11,25 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct CommandAdapters {
     config: Config,
+    events: Arc<crate::events::EventRegistry>,
 }
 
 impl CommandAdapters {
-    pub const fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            events: Arc::new(crate::events::EventRegistry::default()),
+        }
+    }
+
+    pub fn event_registry(&self) -> Arc<crate::events::EventRegistry> {
+        Arc::clone(&self.events)
     }
 
     fn command_json(&self, component: &'static str, command: &mut Command) -> Result<Value> {
@@ -162,6 +171,16 @@ impl CommandAdapters {
             &mut checks,
             "censorscope.socket",
             &self.config.censorscope.socket,
+        );
+        check_socket(
+            &mut checks,
+            "events.guard_ingress_socket",
+            &self.config.events.guard_ingress_socket,
+        );
+        check_socket(
+            &mut checks,
+            "events.scope_ingest_socket",
+            &self.config.events.scope_ingest_socket,
         );
         checks.insert(
             "censorfs.rpc".into(),
@@ -391,6 +410,7 @@ impl CensorScope for CommandAdapters {
             .ok_or_else(|| {
                 PivotError::component("censorscope", "track-add returned no trace_id")
             })?;
+        self.events.set_trace(&request.guard_scope, trace_id);
         Ok(Some(trace_id))
     }
 
@@ -408,7 +428,7 @@ impl CensorScope for CommandAdapters {
                 Ok(())
             };
         };
-        self.scope_command(&[
+        let result = self.scope_command(&[
             "call-start".into(),
             "--trace-id".into(),
             trace_id.to_string(),
@@ -418,7 +438,9 @@ impl CensorScope for CommandAdapters {
             call.id.clone(),
             "--pid".into(),
             host_pid.to_string(),
-        ])
+        ]);
+        self.events.call_start(&request.guard_scope, call);
+        result
     }
 
     fn call_end(
@@ -430,9 +452,10 @@ impl CensorScope for CommandAdapters {
         status: &str,
     ) -> Result<()> {
         let Some(trace_id) = trace_id else {
+            self.events.call_end(&request.guard_scope, &call.id);
             return Ok(());
         };
-        self.scope_command(&[
+        let result = self.scope_command(&[
             "call-end".into(),
             "--trace-id".into(),
             trace_id.to_string(),
@@ -444,23 +467,28 @@ impl CensorScope for CommandAdapters {
             host_pid.to_string(),
             "--status".into(),
             status.into(),
-        ])
+        ]);
+        self.events.call_end(&request.guard_scope, &call.id);
+        result
     }
 
     fn finish_batch(
         &self,
-        _request: &BatchRequest,
+        request: &BatchRequest,
         _host_pid: u32,
         trace_id: Option<u64>,
     ) -> Result<()> {
         let Some(trace_id) = trace_id else {
+            self.events.finish_batch(&request.guard_scope);
             return Ok(());
         };
-        self.scope_command(&[
+        let result = self.scope_command(&[
             "track-remove".into(),
             "--trace-id".into(),
             trace_id.to_string(),
-        ])
+        ]);
+        self.events.finish_batch(&request.guard_scope);
+        result
     }
 }
 
@@ -571,6 +599,7 @@ impl ToolRunner for CommandAdapters {
             host_pid,
             &guard_boot,
         )?;
+        self.events.register_runner(request, host_pid);
         Ok(Box::new(CommandSession {
             guard: self.config.censorguard.clone(),
             guard_timeout: Duration::from_millis(self.config.component_timeout_ms),

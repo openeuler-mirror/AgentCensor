@@ -34,5 +34,10 @@
     "operator_config": "/etc/censorscope/censorscoped.conf",
     "required": false
   },
+  "events": {
+    "guard_ingress_socket": "/run/censorpivot/guard-events.sock",
+    "guard_ingress_mode": 432,
+    "scope_ingest_socket": "/run/censorscope/external-events.sock"
+  },
   "runner_environment": {}
 }

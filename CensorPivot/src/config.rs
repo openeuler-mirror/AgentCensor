@@ -19,6 +19,7 @@ pub struct Config {
     pub censorfs: CensorFsConfig,
     pub censorguard: CensorGuardConfig,
     pub censorscope: CensorScopeConfig,
+    pub events: EventsConfig,
     pub runner_environment: BTreeMap<String, String>,
 }
 
@@ -37,7 +38,26 @@ impl Default for Config {
             censorfs: CensorFsConfig::default(),
             censorguard: CensorGuardConfig::default(),
             censorscope: CensorScopeConfig::default(),
+            events: EventsConfig::default(),
             runner_environment: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventsConfig {
+    pub guard_ingress_socket: PathBuf,
+    pub guard_ingress_mode: u32,
+    pub scope_ingest_socket: PathBuf,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            guard_ingress_socket: "/run/censorpivot/guard-events.sock".into(),
+            guard_ingress_mode: 0o660,
+            scope_ingest_socket: "/run/censorscope/external-events.sock".into(),
         }
     }
 }
@@ -182,6 +202,9 @@ impl Config {
             || self.max_frame_bytes > 16 * 1024 * 1024
             || !self.censorfs.cgroup_root.is_absolute()
             || !self.censorfs.cgroup_state_dir.is_absolute()
+            || !self.events.guard_ingress_socket.is_absolute()
+            || !self.events.scope_ingest_socket.is_absolute()
+            || self.events.guard_ingress_mode > 0o777
             || !self.censorguard.config.is_absolute()
             || !self.censorguard.control.is_absolute()
             || self
@@ -196,7 +219,8 @@ impl Config {
                 .any(|group| !crate::guard::valid_name(group))
         {
             return Err(PivotError::Invalid(
-                "invalid I/O limits, cgroup paths or allowed Guard groups".into(),
+                "invalid I/O limits, event configuration, cgroup paths or allowed Guard groups"
+                    .into(),
             ));
         }
         Ok(())

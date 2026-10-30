@@ -11,6 +11,7 @@ name = "censord"
 path = "src/bin/censord.rs"
 
 [dependencies]
+agentcensor-events = { path = "../contracts/agentcensor-events" }
 censorguard-common = { path = "../CensorGuard/crates/censorguard-common" }
 serde_yaml = "0.9"
 blake3 = "1.5.5"
