@@ -73,6 +73,7 @@ pub enum CtlCommand {
         full: bool,
         no_internal: bool,
         page_size: Option<usize>,
+        after_observed_at: Option<u64>,
         after_event: Option<u64>,
     },
 }
@@ -234,6 +235,7 @@ impl CtlCommandArgs {
                 full: a.full,
                 no_internal: a.no_internal,
                 page_size: a.page_size,
+                after_observed_at: a.after_observed_at,
                 after_event: a.after_event,
             }),
         }
@@ -298,6 +300,8 @@ struct ExportArgs {
     no_internal: bool,
     #[arg(long = "page-size", value_parser = parse_page_size)]
     page_size: Option<usize>,
+    #[arg(long = "after-observed-at", requires = "after_event")]
+    after_observed_at: Option<u64>,
     #[arg(long = "after-event")]
     after_event: Option<u64>,
 }
