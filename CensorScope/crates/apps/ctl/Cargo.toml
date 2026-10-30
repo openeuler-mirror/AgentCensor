@@ -11,6 +11,7 @@ control_contract = { path = "../../contracts/control_plane" }
 libc = "0.2"
 serde_json = "1"
 model_core = { path = "../../core/model" }
+semantic_action_contract = { path = "../../contracts/semantic_action" }
 uds_control_client = { path = "../../adapters/control/uds/client" }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
-semantic_action_contract = { path = "../../contracts/semantic_action" }
+prost = "0.13"
