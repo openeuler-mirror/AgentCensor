@@ -1,4 +1,5 @@
-use super::*;
+use prost::Message;
+    use super::*;
 
     fn sample_trace() -> TraceExport {
         TraceExport {
@@ -73,6 +74,19 @@ use super::*;
             attribute["key"] == "censorscope.action.audit_state"
                 && attribute["value"]["stringValue"] == "orphan"
         }));
+    }
+
+    #[test]
+    fn protobuf_contains_one_resource_and_span() {
+        let mut output = Vec::new();
+        write_protobuf(&mut output, &sample_trace()).unwrap();
+        let request = proto::ExportTraceServiceRequest::decode(output.as_slice()).unwrap();
+        assert_eq!(request.resource_spans.len(), 1);
+        assert_eq!(request.resource_spans[0].scope_spans[0].spans.len(), 1);
+        assert_eq!(
+            request.resource_spans[0].scope_spans[0].spans[0].trace_id,
+            trace_id_bytes(7)
+        );
     }
 
     #[test]
@@ -221,4 +235,133 @@ use super::*;
         }
         transaction.commit().unwrap();
         (path, connection)
+    }
+
+    #[test]
+    fn coverage_audit_decodes_stored_metadata_in_json_and_protobuf_exports() {
+        let (path, connection) = large_trace_database(1);
+        connection
+            .execute_batch(
+                "ALTER TABLE semantic_action_links_read ADD COLUMN role INTEGER DEFAULT 1",
+            )
+            .unwrap();
+        for (trace, protocol, metadata) in [
+            (
+                7,
+                "tls.coverage",
+                r#"{"capability":"tls-plaintext","state":"covered"}"#,
+            ),
+            (
+                7,
+                "tls.coverage",
+                r#"{"message":"library unavailable","state":"gap"}"#,
+            ),
+            (7, "http.coverage", r#"{ "state": "covered" }"#),
+            (7, "tls.coverage", r#"{"state":"gap"}"#),
+            (
+                7,
+                "tls.coverage",
+                r#"{"message":"state=covered","state":"unknown"}"#,
+            ),
+            (8, "tls.coverage", r#"{"state":"gap"}"#),
+            (7, "http", r#"{"state":"gap"}"#),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO events VALUES (?1, ?2, ?3)",
+                    rusqlite::params![trace, protocol, metadata],
+                )
+                .unwrap();
+        }
+        let trace = load_trace(&connection, 7, OtelAttributeMode::Metadata).unwrap();
+        assert_eq!(trace.audit.coverage_event_count, 5);
+        assert_eq!(trace.audit.coverage_gap_count, 3);
+        let header = load_trace_header(&connection, 7).unwrap();
+        assert_eq!(header.audit.coverage_event_count, 5);
+        assert_eq!(header.audit.coverage_gap_count, 3);
+        let details = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut output = Vec::new();
+        write_json_streaming(
+            &mut output,
+            &connection,
+            &details,
+            7,
+            OtelAttributeMode::Metadata,
+        )
+        .unwrap();
+        let document: Value = serde_json::from_slice(&output).unwrap();
+        let attributes = document["resourceSpans"][0]["resource"]["attributes"]
+            .as_array()
+            .unwrap();
+        assert!(attributes.iter().any(|attribute| attribute["key"]
+            == "censorscope.audit.coverage_event_count"
+            && attribute["value"]["intValue"] == "5"));
+        assert!(attributes.iter().any(|attribute| attribute["key"]
+            == "censorscope.audit.coverage_gap_count"
+            && attribute["value"]["intValue"] == "3"));
+        output.clear();
+        write_protobuf_streaming(
+            &mut output,
+            &connection,
+            &details,
+            7,
+            OtelAttributeMode::Metadata,
+        )
+        .unwrap();
+        let request = proto::ExportTraceServiceRequest::decode(output.as_slice()).unwrap();
+        let attributes = &request.resource_spans[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
+        let count = attributes
+            .iter()
+            .find(|attribute| attribute.key == "censorscope.audit.coverage_gap_count")
+            .unwrap();
+        assert_eq!(
+            count.value.as_ref().unwrap().value,
+            Some(proto::any_value::Value::IntValue(3))
+        );
+        drop(details);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streaming_export_handles_large_trace_without_building_trace_vector() {
+        let (path, connection) = large_trace_database(2_000);
+        let details = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+
+        let mut json_output = Vec::new();
+        write_json_streaming(
+            &mut json_output,
+            &connection,
+            &details,
+            7,
+            OtelAttributeMode::Metadata,
+        )
+        .unwrap();
+        let document: Value = serde_json::from_slice(&json_output).unwrap();
+        assert_eq!(
+            document["resourceSpans"][0]["scopeSpans"][0]["spans"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2_000
+        );
+
+        let mut protobuf_output = Vec::new();
+        write_protobuf_streaming(
+            &mut protobuf_output,
+            &connection,
+            &details,
+            7,
+            OtelAttributeMode::Full,
+        )
+        .unwrap();
+        let request = proto::ExportTraceServiceRequest::decode(protobuf_output.as_slice()).unwrap();
+        assert_eq!(request.resource_spans[0].scope_spans[0].spans.len(), 2_000);
+        drop(details);
+        drop(connection);
+        fs::remove_file(path).unwrap();
     }

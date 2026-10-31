@@ -78,7 +78,10 @@ pub fn run_from_env() -> Result<i32, String> {
                     &out_path,
                 ),
                 crate::args::ExportFormat::OtlpJson => {
-                    export_otel_to_path(&database, trace_id.get(), &out_path, attributes)
+                    export_otel_to_path(&database, trace_id.get(), &out_path, attributes, false)
+                }
+                crate::args::ExportFormat::OtlpProtobuf => {
+                    export_otel_to_path(&database, trace_id.get(), &out_path, attributes, true)
                 }
             };
             if let Err(error) = result {
@@ -94,6 +97,7 @@ pub fn run_from_env() -> Result<i32, String> {
                 let label = match format {
                     crate::args::ExportFormat::Snapshot => "snapshot",
                     crate::args::ExportFormat::OtlpJson => "OTLP JSON",
+                    crate::args::ExportFormat::OtlpProtobuf => "OTLP protobuf",
                 };
                 println!("exported {label} to {}", out_path.display());
             }

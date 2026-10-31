@@ -360,6 +360,7 @@ struct ExportArgs {
 pub enum ExportFormat {
     Snapshot,
     OtlpJson,
+    OtlpProtobuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

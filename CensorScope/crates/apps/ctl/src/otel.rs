@@ -91,6 +91,11 @@ struct LinkExport {
 }
 
 mod json;
+mod protobuf;
+
+use protobuf::write_protobuf_streaming;
+#[cfg(test)]
+use protobuf::{write_protobuf, trace_id_bytes, proto};
 
 use json::write_json_streaming;
 #[cfg(test)]
@@ -101,14 +106,20 @@ pub fn export_to_path(
     trace_id: u64,
     output: &Path,
     attributes: OtelAttributeMode,
+    protobuf: bool,
 ) -> Result<(), String> {
     let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("cannot open read-only database: {error}"))?;
     let details = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("cannot open OTLP detail reader: {error}"))?;
     write_atomic(output, |writer| {
-        write_json_streaming(writer, &connection, &details, trace_id, attributes)
-            .map_err(|error| error.to_string())
+        if protobuf {
+            write_protobuf_streaming(writer, &connection, &details, trace_id, attributes)
+                .map_err(|error| error.to_string())
+        } else {
+            write_json_streaming(writer, &connection, &details, trace_id, attributes)
+                .map_err(|error| error.to_string())
+        }
     })
     .map_err(|error| format!("write OTLP export failed: {error}"))
 }
