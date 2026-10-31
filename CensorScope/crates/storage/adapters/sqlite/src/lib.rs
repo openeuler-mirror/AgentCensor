@@ -2932,17 +2932,25 @@ mod storage_bench {
     use model_core::trace::{TraceLifecycleState, TraceRecord};
     use storage_core::AncillaryRow;
 
-    const ROWS: u64 = 20_000;
-    const BATCH: usize = 512;
-    const PAYLOAD_BYTES: usize = 4096;
+    const DEFAULT_ROWS: u64 = 20_000;
+    const DEFAULT_BATCH: usize = 512;
+    const DEFAULT_PAYLOAD_BYTES: usize = 4096;
 
-    fn payload_bytes() -> Vec<u8> {
-        vec![b'a'; PAYLOAD_BYTES]
+    fn setting<T: std::str::FromStr>(name: &str, default: T) -> T {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
     }
 
     #[test]
     #[ignore = "opt-in storage benchmark; run with --ignored --nocapture"]
     fn storage_write_throughput() {
+        let rows = setting("CENSORSCOPE_BENCH_ROWS", DEFAULT_ROWS);
+        let batch = setting("CENSORSCOPE_BENCH_BATCH", DEFAULT_BATCH);
+        let payload_bytes = setting("CENSORSCOPE_BENCH_PAYLOAD_BYTES", DEFAULT_PAYLOAD_BYTES);
+        assert!(rows > 0);
+        assert!(batch > 0);
         let path = std::env::temp_dir().join(format!(
             "censorscope-storage-bench-{}-{}.sqlite",
             std::process::id(),
@@ -2983,7 +2991,7 @@ mod storage_bench {
             .expect("create trace");
 
         // Event rows.
-        let events: Vec<DomainEvent> = (1..=ROWS)
+        let events: Vec<DomainEvent> = (1..=rows)
             .map(|id| {
                 DomainEvent::new(
                     envelope(id),
@@ -2991,20 +2999,20 @@ mod storage_bench {
                         operation: "read".to_string(),
                         path: Some("/tmp/bench".to_string()),
                         fd: Some(3),
-                        size: Some(PAYLOAD_BYTES as u64),
+                        size: Some(payload_bytes as u64),
                         metadata: BTreeMap::new(),
                     }),
                 )
             })
             .collect();
         let started = Instant::now();
-        for chunk in events.chunks(BATCH) {
+        for chunk in events.chunks(batch) {
             storage.append_events_batch(chunk).expect("events");
         }
         let event_elapsed = started.elapsed();
 
         // Plaintext rows.
-        let segments: Vec<PayloadSegment> = (1..=ROWS)
+        let segments: Vec<PayloadSegment> = (1..=rows)
             .map(|sequence| PayloadSegment {
                 trace_id: TraceId::new(1),
                 process: ProcessIdentity::new(50),
@@ -3019,31 +3027,32 @@ mod storage_bench {
                 operation_id: Some(sequence),
                 offset: Some(0),
                 completed: true,
-                operation_completion_state: model_core::payload::PayloadOperationCompletionState::Success,
+                operation_completion_state:
+                    model_core::payload::PayloadOperationCompletionState::Success,
                 truncation: model_core::payload::PayloadTruncationState::Complete,
                 redaction: model_core::payload::PayloadRedactionState::NotRequired,
-                original_size: PAYLOAD_BYTES as u64,
-                captured_size: PAYLOAD_BYTES as u64,
+                original_size: payload_bytes as u64,
+                captured_size: payload_bytes as u64,
                 library: Some("openssl".to_string()),
                 symbol: Some("SSL_write".to_string()),
                 protocol_hint: Some("tls".to_string()),
                 loss_reason: None,
-                bytes: Some(payload_bytes()),
+                bytes: Some(vec![b'a'; payload_bytes]),
             })
             .collect();
         let started = Instant::now();
-        for chunk in segments.chunks(BATCH) {
+        for chunk in segments.chunks(batch) {
             storage.append_payloads_batch(chunk).expect("payloads");
         }
         let payload_elapsed = started.elapsed();
 
         // Ancillary rows, one transaction per row: the cost of writing each
         // row on its own.
-        let rows: Vec<AncillaryRow> = (0..ROWS)
+        let ancillary_rows: Vec<AncillaryRow> = (0..rows)
             .map(|_| AncillaryRow::ProcessRecord(record.clone()))
             .collect();
         let started = Instant::now();
-        for row in rows.clone() {
+        for row in ancillary_rows.clone() {
             storage
                 .apply_ancillary_row(row)
                 .expect("single ancillary row");
@@ -3052,7 +3061,7 @@ mod storage_bench {
 
         // The same rows coalesced the way the writer queues them.
         let started = Instant::now();
-        for chunk in rows.chunks(BATCH) {
+        for chunk in ancillary_rows.chunks(batch) {
             let failures = storage
                 .apply_ancillary_batch(chunk.to_vec())
                 .expect("ancillary batch");
@@ -3065,7 +3074,7 @@ mod storage_bench {
 
         // A lifecycle transition is a single statement per trace.
         let started = Instant::now();
-        for _ in 0..ROWS {
+        for _ in 0..rows {
             storage
                 .update_trace_lifecycle(TraceId::new(1), TraceLifecycleState::Active)
                 .expect("lifecycle");
@@ -3077,22 +3086,24 @@ mod storage_bench {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
 
-        let report = |label: &str, elapsed: Duration| {
-            println!(
-                "{label}: {} rows in {:.3}s -> {:.2} us/row, {:.0} rows/s",
-                ROWS,
-                elapsed.as_secs_f64(),
-                elapsed.as_secs_f64() * 1e6 / ROWS as f64,
-                ROWS as f64 / elapsed.as_secs_f64()
-            );
+        let metric = |elapsed: Duration| {
+            serde_json::json!({
+                "seconds": elapsed.as_secs_f64(),
+                "rows_per_second": rows as f64 / elapsed.as_secs_f64(),
+            })
         };
-        report("event rows", event_elapsed);
-        report("plaintext rows (4 KiB)", payload_elapsed);
-        report("ancillary rows, one transaction each", per_row_elapsed);
-        report(
-            &format!("ancillary rows, one transaction per {BATCH}"),
-            batched_elapsed,
+        println!(
+            "CENSORSCOPE_BENCH_RESULT={}",
+            serde_json::json!({
+                "rows": rows,
+                "batch": batch,
+                "payload_bytes": payload_bytes,
+                "event_write": metric(event_elapsed),
+                "payload_write": metric(payload_elapsed),
+                "ancillary_single": metric(per_row_elapsed),
+                "ancillary_batch": metric(batched_elapsed),
+                "lifecycle_update": metric(lifecycle_elapsed),
+            })
         );
-        report("lifecycle updates", lifecycle_elapsed);
     }
 }
