@@ -34,6 +34,8 @@ rules: []
                         config_path=str(directory / 'daemon-policy.yaml'),
                         policy_snapshot_path=str(state / 'revisions/7.yaml'),
                         tracked=2, roots=[123], version=7, enable_file=True, enable_exec=True,
+                        failure_mode='permissive', self_protection=False,
+                        check_failures=dict(file_walk=3, file_path=0, exec_args=0, tail_call=0, socket_owner=0),
                         enable_net=False, audit_file=True, audit_exec=False, audit_net=False,
                         domains=[dict(name='fixture', id=1, slot=1, group='worker', roots=1, version=7)],
                         bindings=[dict(name='idle', policies=['extra', 'worker']), dict(name='base-idle', policies=[])],
@@ -86,6 +88,8 @@ rules: []
         try:
             human = ctl('status')
             assert human.returncode == 0, human.stderr
+            assert 'Failure mode  permissive' in human.stdout and 'Self protect  Off' in human.stdout
+            assert 'Check errors  file walk 3' in human.stdout
             assert 'CensorGuard | Ready' in human.stdout
             assert '2 processes / 1 root' in human.stdout
             assert 'revision 7 / 3 custom groups' in human.stdout
@@ -108,15 +112,20 @@ rules: []
             assert json.loads(raw.stdout)['trees'] == response['trees']
             assert json.loads(raw.stdout)['config_path'] == response['config_path']
             assert json.loads(raw.stdout)['bindings'] == response['bindings']
+            assert json.loads(raw.stdout)['failure_mode'] == 'permissive'
+            assert json.loads(raw.stdout)['check_failures']['file_walk'] == 3
             response['groups'][2]['source'] = dict(kind='stdin')
             assert f'extra  {response["policy_snapshot_path"]} (from stdin)' in ctl('status').stdout
             response['groups'][2]['source'] = dict(kind='api')
             print('PASS concise status and complete JSON data')
             policy_path = response.pop('config_path')
+            response.pop('failure_mode')
             legacy = ctl('status')
             assert legacy.returncode == 0
             assert 'Not reported (update daemon)' in legacy.stdout
+            assert 'Failure mode  Unknown' in legacy.stdout
             response['config_path'] = policy_path
+            response['failure_mode'] = 'permissive'
 
             group_file = directory / 'worker.yaml'
             group_file.write_text('rules: []\n')
@@ -217,6 +226,19 @@ rules: []
             assert ctl('doctor', '--json', '--verbose').returncode != 0
             assert ctl('status', '--json', '--json').returncode != 0
             print('PASS doctor summary/details/JSON and actionable nonzero failures')
+            (state / 'current').write_text('1\n')
+            standalone = config.read_text().replace(
+                'daemon:\n',
+                'daemon:\n  dsh_enabled: false\n  dsh_self_groups: []\n  spawn_grpc: false\n',
+            )
+            standalone = standalone.replace(f'{directory}/dsh.sock', f'{directory}/disabled-dsh.sock')
+            standalone = standalone.replace(f'{directory}/ui.sock', f'{directory}/disabled-ui.sock')
+            config.write_text(standalone)
+            standalone_doctor = json.loads(ctl('doctor', '--json').stdout)
+            assert not any(check['component'] in ('dsh', 'ui', 'grpc')
+                           for check in standalone_doctor['checks']), standalone_doctor
+            assert standalone_doctor['ok'] == payload['ok'], standalone_doctor
+            print('PASS standalone doctor does not require DSH/UI sockets or gRPC')
             print('\n' + human.stdout + compact.stdout)
             response['ok'] = False
             response['error'] = 'state unavailable'

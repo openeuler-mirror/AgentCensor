@@ -20,6 +20,8 @@ daemon:
   ui_socket: ${runtime}/ui.sock
   state_dir: ${state_dir}
   dns_refresh_seconds: ${dns_refresh}
+  failure_mode: ${TEST_FAILURE_MODE:-strict}
+  self_protection: ${TEST_SELF_PROTECTION:-true}
   audit_exec: ${TEST_AUDIT_EXEC:-false}
   audit_file: ${TEST_AUDIT_FILE:-false}
   audit_net: ${TEST_AUDIT_NET:-false}

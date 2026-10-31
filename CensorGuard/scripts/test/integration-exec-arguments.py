@@ -30,6 +30,7 @@ def main():
   dsh_socket: {directory}/dsh.sock
   ui_socket: {directory}/ui.sock
   state_dir: {directory}/state
+  failure_mode: strict
   audit_file: true
   audit_exec: true
 rules: []

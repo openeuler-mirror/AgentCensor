@@ -1,7 +1,29 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createBootstrap } from '../dist/bootstrap/index.js';
+import { apply, createBootstrap } from '../dist/bootstrap/index.js';
 import { AttachSelfClient } from '../dist/runtime/index.js';
+
+test('default bootstrap publishes readiness without waiting for attachment', async () => {
+  const original = AttachSelfClient.prototype.attachSelf;
+  let rejectAttach;
+  AttachSelfClient.prototype.attachSelf = () => new Promise((_, reject) => { rejectAttach = reject; });
+  let core;
+  let dispose;
+  try {
+    await apply({
+      provide(name, service) { assert.equal(name, 'censorguardReady'); core = service; },
+      effect(effect) { dispose = effect(); },
+    }, { policyGroup: 'worker' });
+    assert.ok(core);
+    assert.equal(core.state.kind, 'attaching');
+    await core.waitForReady(20);
+  } finally {
+    dispose?.();
+    rejectAttach?.(new Error('attachment cancelled'));
+    await new Promise(setImmediate);
+    AttachSelfClient.prototype.attachSelf = original;
+  }
+});
 
 test('nonblocking degraded bootstrap is immediately ready', async () => {
   const core = createBootstrap({ policyGroup: 'worker' });

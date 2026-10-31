@@ -27,28 +27,19 @@ export const inject: string[] = [];
 // Config 类型即 Profile patch 里 config 字段的形状 (cordis 不做 schema 校验时原样透传)
 export type Config = BootstrapConfig;
 
-/** apply Cordis 插件体: attach → 提供 censorguardReady → 注册 dispose */
 export async function apply(ctx: CordisContext, config?: BootstrapConfig): Promise<void> {
   const cfg: BootstrapConfig = config ?? { policyGroup: 'censorguard-dsh-default' };
   const core: BootstrapCore = createBootstrap(cfg);
   // HMR/卸载只断开连接, 不调 untrack; 域由 daemon 按根进程退出回收
   ctx.effect(() => () => core.dispose());
 
-  try {
-    const result = await core.start();
-    console.log(
-      `[censorguard-bootstrap] attach 成功: domain=${result.domain} ` +
-        `group=${result.group} version=${result.version} boot=${result.daemonBootId}`,
-    );
-  } catch (e) {
-    // 失败策略: blockOnFailure=true 时抛出, 本插件激活失败,
-    // censorguardReady 永不提供, webserver/API/Agent 不进入 Ready (fail-closed)
-    if (cfg.blockOnFailure ?? false) {
-      throw e;
-    }
-    // 默认 (非阻塞): degraded 态也提供服务, Host/UI 展示保护未启用, 后台重试
-    console.error('[censorguard-bootstrap] attach 失败 (degraded, 后台重试):', e);
+  if (!cfg.blockOnFailure) {
+    ctx.provide('censorguardReady', core);
+    void core.start().catch((error: unknown) => {
+      console.error('[censorguard-bootstrap] attach 失败 (degraded, 后台重试):', error);
+    });
+    return;
   }
-
+  await core.start();
   ctx.provide('censorguardReady', core);
 }

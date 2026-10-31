@@ -26,6 +26,14 @@ pub(crate) fn status(response: &Response) -> String {
         "Ready"
     };
     let mut text = format!("CensorGuard | {state}\n\n");
+    text.push_str(&format!(
+        "  Failure mode  {}\n  Self protect  {}\n\n",
+        response
+            .failure_mode
+            .map(|mode| mode.to_string())
+            .unwrap_or_else(|| "Unknown".into()),
+        on_off(response.self_protection)
+    ));
     text.push_str("                File    Exec    Network\n");
     text.push_str(&format!(
         "  Protection    {:<8}{:<8}{}\n  Audit         {:<8}{:<8}{}\n\n",
@@ -63,6 +71,16 @@ pub(crate) fn status(response: &Response) -> String {
             .as_deref()
             .unwrap_or("Not reported (update daemon)")
     ));
+    if response.check_failures != Default::default() {
+        text.push_str(&format!(
+            "  Check errors  file walk {}, path {}, exec args {}, tail call {}, socket owner {}\n",
+            response.check_failures.file_walk,
+            response.check_failures.file_path,
+            response.check_failures.exec_args,
+            response.check_failures.tail_call,
+            response.check_failures.socket_owner
+        ));
+    }
     append_domains(&mut text, response);
     if response.roots.is_empty() && response.tracked == 0 && response.daemon_ready {
         text.push_str("\n  No processes attached yet.\n");
@@ -337,7 +355,7 @@ pub(crate) fn doctor(checks: &[Check], verbose: bool) -> String {
             &["config", "bpf_object", "state"][..],
         ),
         ("Kernel BPF support", &["kernel_btf", "bpf_lsm"][..]),
-        ("Daemon & hooks", &["daemon", "hooks"][..]),
+        ("Daemon & hooks", &["daemon", "hooks", "failure_mode"][..]),
         ("Local channels", &["events", "launch", "dsh", "ui"][..]),
         ("gRPC adapter", &["grpc"][..]),
     ] {
