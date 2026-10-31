@@ -8,6 +8,7 @@ use uds_control_client::{UdsControlClient, UdsSocketTransport};
 use crate::args::{CtlCommand, parse_args};
 use crate::dispatch::dispatch;
 use crate::export::export_to_path;
+use crate::otel::export_to_path as export_otel_to_path;
 use crate::output::{format_error_json, format_init_json, format_reply, format_reply_json};
 
 /// Run ctl from process arguments and print its user-facing response.
@@ -55,24 +56,31 @@ pub fn run_from_env() -> Result<i32, String> {
             session_id,
             call_id,
             out_path,
+            format,
+            attributes,
             full,
             no_internal,
             page_size,
             after_observed_at,
             after_event,
         } => {
-            let result = export_to_path(
-                &database,
-                trace_id.get(),
-                &session_id,
-                call_id.as_deref(),
-                full,
-                no_internal,
-                page_size,
-                after_observed_at,
-                after_event,
-                &out_path,
-            );
+            let result = match format {
+                crate::args::ExportFormat::Snapshot => export_to_path(
+                    &database,
+                    trace_id.get(),
+                    session_id.as_deref().expect("snapshot session validated"),
+                    call_id.as_deref(),
+                    full,
+                    no_internal,
+                    page_size,
+                    after_observed_at,
+                    after_event,
+                    &out_path,
+                ),
+                crate::args::ExportFormat::OtlpJson => {
+                    export_otel_to_path(&database, trace_id.get(), &out_path, attributes)
+                }
+            };
             if let Err(error) = result {
                 if json_mode {
                     println!("{}", format_error_json("export", &error));
@@ -83,7 +91,11 @@ pub fn run_from_env() -> Result<i32, String> {
             if json_mode {
                 println!("{}", serde_json::json!({"ok": true, "out_path": out_path}));
             } else {
-                println!("exported snapshot to {}", out_path.display());
+                let label = match format {
+                    crate::args::ExportFormat::Snapshot => "snapshot",
+                    crate::args::ExportFormat::OtlpJson => "OTLP JSON",
+                };
+                println!("exported {label} to {}", out_path.display());
             }
         }
         command => {
