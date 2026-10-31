@@ -58,6 +58,7 @@ pub fn run_from_env() -> Result<i32, String> {
             full,
             no_internal,
             page_size,
+            after_observed_at,
             after_event,
         } => {
             let result = export_to_path(
@@ -68,6 +69,7 @@ pub fn run_from_env() -> Result<i32, String> {
                 full,
                 no_internal,
                 page_size,
+                after_observed_at,
                 after_event,
                 &out_path,
             );

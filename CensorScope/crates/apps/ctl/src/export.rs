@@ -1,9 +1,12 @@
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Map, Value, json};
+
+use crate::event_metadata::parse_event_metadata;
 
 fn ns(value: i64) -> Value {
     Value::String(value.to_string())
@@ -30,22 +33,24 @@ fn call_action_predicate(alias: &str) -> String {
     )
 }
 
-/// Fill `path` on fd-relative I/O (read/write/readv/writev/…) from the owning
-/// process's last bind of that fd: eBPF only reports a path at open time, so
-/// without this pass those rows would show `fd N` and no file name.
-fn enrich_fd_paths(events: &mut [Value]) {
-    use std::collections::HashMap;
-    #[derive(Clone)]
-    struct Bound {
-        path: String,
-    }
-    let mut by_fd: HashMap<(u64, u64, i64), Bound> = HashMap::new();
-    for event in events.iter_mut() {
+#[derive(Clone)]
+struct Bound {
+    path: String,
+}
+
+#[derive(Default)]
+struct FdPaths {
+    by_fd: std::collections::HashMap<(u64, u64, i64), Bound>,
+}
+
+impl FdPaths {
+    // File paths are only observed at open time, so later fd-relative I/O needs the binding.
+    fn enrich(&mut self, event: &mut Value) {
         let Some(trace) = event.get("trace_id").and_then(Value::as_u64) else {
-            continue;
+            return;
         };
         let Some(process) = event.get("process_id").and_then(Value::as_u64) else {
-            continue;
+            return;
         };
         let fd = event.get("fd").and_then(Value::as_i64);
         let operation = event.get("operation").and_then(Value::as_str).unwrap_or("");
@@ -54,7 +59,7 @@ fn enrich_fd_paths(events: &mut [Value]) {
         match operation {
             "open" | "openat" | "openat2" | "creat" => {
                 if let (Some(fd), Some(path)) = (fd, path) {
-                    by_fd.insert(
+                    self.by_fd.insert(
                         (trace, process, fd),
                         Bound {
                             path: path.to_string(),
@@ -64,13 +69,13 @@ fn enrich_fd_paths(events: &mut [Value]) {
             }
             "close" => {
                 if let Some(fd) = fd {
-                    by_fd.remove(&(trace, process, fd));
+                    self.by_fd.remove(&(trace, process, fd));
                 }
             }
             "dup" | "dup2" | "dup3" => {
                 if let (Some(fd), Some(target)) = (fd, target_fd_of(event)) {
-                    if let Some(bound) = by_fd.get(&(trace, process, fd)) {
-                        by_fd.insert(
+                    if let Some(bound) = self.by_fd.get(&(trace, process, fd)) {
+                        self.by_fd.insert(
                             (trace, process, target),
                             Bound {
                                 path: bound.path.clone(),
@@ -90,7 +95,7 @@ fn enrich_fd_paths(events: &mut [Value]) {
                     .is_some_and(|value| !value.is_empty());
                 if !has_path {
                     if let Some(fd) = fd {
-                        if let Some(bound) = by_fd.get(&(trace, process, fd)) {
+                        if let Some(bound) = self.by_fd.get(&(trace, process, fd)) {
                             event["path"] = json!(bound.path.clone());
                         }
                     }
@@ -98,6 +103,13 @@ fn enrich_fd_paths(events: &mut [Value]) {
             }
             _ => {}
         }
+    }
+}
+
+fn enrich_fd_paths(events: &mut [Value]) {
+    let mut paths = FdPaths::default();
+    for event in events {
+        paths.enrich(event);
     }
 }
 
@@ -126,24 +138,252 @@ pub fn export_to_path(
     full: bool,
     no_internal: bool,
     page_size: Option<usize>,
+    after_observed_at: Option<u64>,
     after_event: Option<u64>,
     output: &Path,
 ) -> Result<(), String> {
     let connection = Connection::open_with_flags(database, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("cannot open read-only database: {error}"))?;
-    let result = export_with_paging(
-        &connection,
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|error| format!("export failed: {error}"))?;
+    stream_export_to_path(
+        &transaction,
+        trace_id,
+        session_id,
+        call_id,
+        full,
+        no_internal,
+        page_size,
+        after_observed_at,
+        after_event,
+        output,
+    )
+    .map_err(|error| format!("export failed: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("export failed: {error}"))
+}
+
+fn stream_export_to_path(
+    connection: &Connection,
+    trace_id: u64,
+    session_id: &str,
+    call_id: Option<&str>,
+    full: bool,
+    no_internal: bool,
+    page_size: Option<usize>,
+    after_observed_at: Option<u64>,
+    after_event: Option<u64>,
+    output: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        fs::create_dir_all(parent)?;
+    }
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let name = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("snapshot.json");
+    let temporary = output.with_file_name(format!(".{name}.tmp-{}-{nonce}", std::process::id()));
+    let file = fs::File::create(&temporary)?;
+    let mut out = BufWriter::new(file);
+    write!(
+        out,
+        "{{\"schema_version\":2,\"mode\":{},\"trace_id\":{},\"session_id\":{},",
+        serde_json::to_string(if full { "full" } else { "lite" })?,
+        trace_id,
+        serde_json::to_string(session_id)?
+    )?;
+
+    // Small catalog tables are retained in memory; the high-cardinality event and payload
+    // streams below are serialized one row at a time.
+    let mut metadata = export_with_paging_inner(
+        connection,
         Some(trace_id),
         Some(session_id),
         call_id,
         full,
         no_internal,
         usize::MAX,
+        None,
+        None,
+        false,
+    )?;
+    metadata["traces"] = Value::Array(query_json(
+        connection,
+        "SELECT trace_id, display_name, profile_name, lifecycle_state, health, created_at FROM traces WHERE trace_id=?1 ORDER BY trace_id",
+        Some(trace_id),
+        None,
+        |row| {
+            Ok(
+                json!({"trace_id": row.get::<_,u64>(0)?, "display_name": row.get::<_,String>(1)?, "profile_name": row.get::<_,String>(2)?, "lifecycle_state": row.get::<_,String>(3)?, "health": row.get::<_,String>(4)?, "created_at": ns(row.get::<_,i64>(5)?)}),
+            )
+        },
+    )?);
+    for key in [
+        "traces",
+        "processes",
+        "memberships",
+        "sessions",
+        "call_spans",
+        "diagnostics",
+        "coverage",
+        "actions",
+        "semantic_actions",
+        "links",
+        "evidence",
+        "contents",
+    ] {
+        write!(out, "\"{key}\":")?;
+        serde_json::to_writer(
+            &mut out,
+            metadata.get(key).unwrap_or(&Value::Array(Vec::new())),
+        )?;
+        write!(out, ",")?;
+    }
+    write!(out, "\"events\":")?;
+    let next = stream_events(
+        &mut out,
+        connection,
+        trace_id,
+        session_id,
+        call_id,
+        no_internal,
         page_size,
+        after_observed_at,
         after_event,
-    )
-    .map_err(|error| format!("export failed: {error}"))?;
-    write_atomic_json(output, &result).map_err(|error| format!("export write failed: {error}"))
+    )?;
+    write!(out, ",\"payload_segments\":")?;
+    stream_payloads(
+        &mut out, connection, trace_id, session_id, call_id, full, page_size,
+    )?;
+    write!(out, ",\"pagination\":")?;
+    serde_json::to_writer(
+        &mut out,
+        &json!({"page_size": page_size, "after_observed_at": after_observed_at, "after_event": after_event, "next": next.map(|(observed_at, event_id)| json!({"observed_at": observed_at.to_string(), "event_id": event_id})), "next_event": next.map(|(_, event_id)| event_id)}),
+    )?;
+    write!(out, ",\"truncated\":false}}")?;
+    out.flush()?;
+    fs::rename(temporary, output)?;
+    Ok(())
+}
+
+fn stream_events<W: Write>(
+    out: &mut W,
+    connection: &Connection,
+    trace_id: u64,
+    session_id: &str,
+    call_id: Option<&str>,
+    no_internal: bool,
+    page_size: Option<usize>,
+    after_observed_at: Option<u64>,
+    after_event: Option<u64>,
+) -> Result<Option<(u64, u64)>, Box<dyn std::error::Error>> {
+    let mut sql = String::from(
+        "SELECT event_id, trace_id, observed_at, process_id, kind, flags, operation, path, fd, size_bytes, endpoint, direction, result, stream, protocol, loss_reason, dropped, dropped_bytes, session_id, call_id, metadata, collector, parent_process_id, executable, argv, argv_flags, channel, resource FROM events_read WHERE trace_id=?1 AND session_id=?2",
+    );
+    if call_id.is_some() {
+        sql.push_str(" AND call_id=?3");
+    }
+    if no_internal {
+        sql.push_str(" AND (protocol IS NULL OR protocol <> 'tls.coverage') AND (executable IS NULL OR (executable <> 'censorscopectl' AND executable NOT LIKE '%/censorscopectl'))");
+    }
+    if let (Some(observed_at), Some(event_id)) = (after_observed_at, after_event) {
+        sql.push_str(&format!(" AND (observed_at>{observed_at} OR (observed_at={observed_at} AND event_id>{event_id}))"));
+    } else if let Some(event_id) = after_event {
+        sql.push_str(&format!(" AND event_id>{event_id}"));
+    }
+    sql.push_str(" ORDER BY trace_id, observed_at, event_id");
+    if let Some(limit) = page_size {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = match call_id {
+        Some(call) => stmt.query(params![trace_id, session_id, call])?,
+        None => stmt.query(params![trace_id, session_id])?,
+    };
+    let mut paths = FdPaths::default();
+    let mut pid_statement = connection.prepare("SELECT process_id, host_pid FROM processes")?;
+    let pids: std::collections::HashMap<u64, Option<u32>> = pid_statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut first = true;
+    let mut next: Option<(u64, u64)> = None;
+    write!(out, "[")?;
+    while let Some(row) = rows.next()? {
+        let kind: i64 = row.get(4)?;
+        let operation: String = row.get(6)?;
+        let executable: Option<String> = row.get(23)?;
+        let metadata = parse_event_metadata(&row.get::<_, String>(20)?);
+        let guard_decision = metadata
+            .get("guard.decision")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let event = json!({"event_id": row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"observed_at":ns(row.get(2)?),"process_id":row.get::<_,u64>(3)?,"kind":kind,"kind_name":event_kind_name(kind),"observation_category":observation_category(kind,&operation),"syscall_name":(matches!(kind,1..=5)&&!operation.is_empty()).then_some(operation.clone()),"flags":row.get::<_,u32>(5)?,"operation":operation,"path":row.get::<_,Option<String>>(7)?,"fd":row.get::<_,Option<i32>>(8)?,"size":row.get::<_,Option<u64>>(9)?,"endpoint":row.get::<_,Option<String>>(10)?,"direction":row.get::<_,i64>(11)?,"result":row.get::<_,Option<i64>>(12)?,"stream":row.get::<_,Option<String>>(13)?,"protocol":row.get::<_,Option<String>>(14)?,"loss_reason":row.get::<_,Option<String>>(15)?,"dropped":row.get::<_,Option<u64>>(16)?,"dropped_bytes":row.get::<_,Option<u64>>(17)?,"session_id":row.get::<_,Option<String>>(18)?,"call_id":row.get::<_,Option<String>>(19)?,"metadata":metadata,"decision":guard_decision.clone(),"security_category":metadata.get("guard.category").cloned(),"blocked":guard_decision.as_deref() == Some("deny"),"collector":row.get::<_,String>(21)?,"parent_process_id":row.get::<_,Option<u64>>(22)?,"executable":executable,"argv":row.get::<_,Option<String>>(24)?,"argv_flags":row.get::<_,u32>(25)?,"channel":row.get::<_,Option<String>>(26)?,"resource":row.get::<_,Option<String>>(27)?});
+        if let (Some(observed_at), Some(event_id)) = (
+            event["observed_at"].as_str().and_then(|v| v.parse().ok()),
+            event["event_id"].as_u64(),
+        ) {
+            next = Some(next.map_or((observed_at, event_id), |current| {
+                current.max((observed_at, event_id))
+            }));
+        }
+        let mut event = event;
+        let process = event["process_id"].as_u64().unwrap_or(0);
+        if let Some(Some(pid)) = pids.get(&process) {
+            event["host_pid"] = json!(pid);
+        }
+        paths.enrich(&mut event);
+        if !first {
+            write!(out, ",")?;
+        }
+        first = false;
+        serde_json::to_writer(&mut *out, &event)?;
+    }
+    write!(out, "]")?;
+    Ok(next)
+}
+
+fn stream_payloads<W: Write>(
+    out: &mut W,
+    connection: &Connection,
+    trace_id: u64,
+    session_id: &str,
+    call_id: Option<&str>,
+    full: bool,
+    page_size: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut sql = format!(
+        "SELECT segment_id, trace_id, process_id, session_id, observed_at, source, content_state, direction, stream_key, sequence, operation_id, offset_bytes, completed, operation_completion_state, truncation_state, redaction_state, original_size, captured_size, library, symbol, protocol_hint, loss_reason, {}, call_id FROM payload_segments WHERE trace_id=?1 AND session_id=?2",
+        if full { "bytes" } else { "NULL" }
+    );
+    if call_id.is_some() {
+        sql.push_str(" AND call_id=?3");
+    }
+    sql.push_str(" ORDER BY trace_id, sequence, segment_id");
+    if let Some(limit) = page_size {
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
+    let mut stmt = connection.prepare(&sql)?;
+    let mut rows = match call_id {
+        Some(call) => stmt.query(params![trace_id, session_id, call])?,
+        None => stmt.query(params![trace_id, session_id])?,
+    };
+    let mut first = true;
+    write!(out, "[")?;
+    while let Some(row) = rows.next()? {
+        let bytes: Option<Vec<u8>> = row.get(22)?;
+        let value = json!({"segment_id":row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"process_id":row.get::<_,u64>(2)?,"session_id":row.get::<_,Option<String>>(3)?,"observed_at":ns(row.get(4)?),"source":row.get::<_,i64>(5)?,"content_state":row.get::<_,i64>(6)?,"direction":row.get::<_,i64>(7)?,"stream_key":row.get::<_,Option<String>>(8)?,"sequence":row.get::<_,u64>(9)?,"operation_id":row.get::<_,Option<u64>>(10)?,"offset":row.get::<_,Option<u64>>(11)?,"completed":row.get::<_,Option<i64>>(12)?.unwrap_or(0) != 0,"operation_completion_state":row.get::<_,Option<i64>>(13)?.unwrap_or(0),"truncation_state":row.get::<_,Option<i64>>(14)?.unwrap_or(0),"redaction_state":row.get::<_,Option<i64>>(15)?.unwrap_or(1),"original_size":row.get::<_,u64>(16)?,"captured_size":row.get::<_,u64>(17)?,"library":row.get::<_,Option<String>>(18)?,"symbol":row.get::<_,Option<String>>(19)?,"protocol_hint":row.get::<_,Option<String>>(20)?,"loss_reason":row.get::<_,Option<String>>(21)?,"bytes_hex":full.then(||bytes.as_deref().map(hex)).flatten(),"call_id":row.get::<_,Option<String>>(23)?});
+        if !first {
+            write!(out, ",")?;
+        }
+        first = false;
+        serde_json::to_writer(&mut *out, &value)?;
+    }
+    write!(out, "]")?;
+    Ok(())
 }
 
 /// Rows the dsh plugin integration treats as self-noise and hides from call
@@ -162,27 +402,6 @@ fn is_internal_event(event: &Value) -> bool {
     false
 }
 
-fn write_atomic_json(path: &Path, value: &Value) -> Result<(), std::io::Error> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("snapshot.json");
-    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
-    fs::write(&temporary, bytes)?;
-    fs::rename(temporary, path)
-}
-
 #[cfg(test)]
 fn export(
     connection: &Connection,
@@ -195,6 +414,7 @@ fn export(
     )
 }
 
+#[cfg(test)]
 fn export_with_paging(
     connection: &Connection,
     trace_id: Option<u64>,
@@ -217,6 +437,7 @@ fn export_with_paging(
         max_bytes,
         page_size,
         after_event,
+        true,
     );
     match result {
         Ok(value) => {
@@ -240,6 +461,7 @@ fn export_with_paging_inner(
     max_bytes: usize,
     page_size: Option<usize>,
     after_event: Option<u64>,
+    include_streams: bool,
 ) -> Result<Value, rusqlite::Error> {
     let mut traces = query_json(
         connection,
@@ -316,7 +538,7 @@ fn export_with_paging_inner(
     let event_after = after_event
         .map(|cursor| format!(" AND event_id > {cursor}"))
         .unwrap_or_default();
-    let event_limit = page_size
+    let event_limit = if include_streams { page_size } else { Some(0) }
         .map(|limit| format!(" LIMIT {limit}"))
         .unwrap_or_else(|| " LIMIT -1".to_string());
     let event_sql = format!(
@@ -339,6 +561,11 @@ fn export_with_paging_inner(
             let kind: i64 = row.get(4)?;
             let operation: String = row.get(6)?;
             let metadata = row.get::<_, String>(20)?;
+            let metadata_value = parse_event_metadata(&metadata);
+            let decision = metadata_value
+                .get("guard.decision")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
             let category = observation_category(kind, &operation);
             Ok(json!({
                 "event_id": row.get::<_, u64>(0)?, "trace_id": row.get::<_, u64>(1)?,
@@ -355,7 +582,10 @@ fn export_with_paging_inner(
                 "dropped": row.get::<_, Option<u64>>(16)?, "dropped_bytes": row.get::<_, Option<u64>>(17)?,
                 "session_id": row.get::<_, Option<String>>(18)?,
                 "call_id": row.get::<_, Option<String>>(19)?,
-                "metadata": serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| json!({})),
+                "metadata": metadata_value,
+                "decision": decision.clone(),
+                "security_category": metadata_value.get("guard.category").cloned(),
+                "blocked": decision.as_deref() == Some("deny"),
                 "collector": row.get::<_, String>(21)?,
                 "parent_process_id": row.get::<_, Option<u64>>(22)?,
                 "executable": row.get::<_, Option<String>>(23)?,
@@ -366,47 +596,26 @@ fn export_with_paging_inner(
             }))
         },
     )?;
-    // Map process ids once so host-pid enrichment is linear in the page size.
-    let event_by_process: std::collections::HashMap<u64, usize> = events
-        .iter()
-        .enumerate()
-        .filter_map(|(index, event)| {
-            event
-                .get("process_id")
-                .and_then(Value::as_u64)
-                .map(|id| (id, index))
-        })
-        .collect();
-    let process_pids = query_json(
-        connection,
-        "SELECT process_id, host_pid FROM processes",
-        None,
-        None,
-        |row| {
-            Ok(
-                json!({"process_id": row.get::<_, u64>(0)?, "host_pid": row.get::<_, Option<u32>>(1)?}),
-            )
-        },
-    )?;
-    for item in process_pids {
-        if let (Some(id), Some(pid)) = (
-            item.get("process_id").and_then(Value::as_u64),
-            item.get("host_pid").and_then(Value::as_u64),
-        ) {
-            if let Some(index) = event_by_process.get(&id) {
-                events[*index]["host_pid"] = json!(pid);
-            }
+    let mut pid_statement = connection.prepare("SELECT process_id, host_pid FROM processes")?;
+    let pids: std::collections::HashMap<u64, Option<u32>> = pid_statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    for event in &mut events {
+        if let Some(Some(pid)) = event["process_id"].as_u64().and_then(|id| pids.get(&id)) {
+            event["host_pid"] = json!(pid);
         }
     }
     enrich_fd_paths(&mut events);
-    let payload_limit = page_size
+    let payload_limit = if include_streams { page_size } else { Some(0) }
         .map(|limit| format!(" LIMIT {limit}"))
         .unwrap_or_else(|| " LIMIT -1".to_string());
     let payload_bytes = if full { "bytes" } else { "NULL" };
     let payload_sql = format!(
         "SELECT segment_id, trace_id, process_id, session_id, observed_at, source, content_state,
-                direction, stream_key, sequence, original_size, captured_size,
-                library, symbol, protocol_hint, loss_reason, {payload_bytes}, call_id
+                direction, stream_key, sequence, operation_id, offset_bytes, completed,
+                operation_completion_state, truncation_state, redaction_state,
+                original_size, captured_size, library, symbol, protocol_hint, loss_reason,
+                {payload_bytes}, call_id
          FROM payload_segments WHERE (?1 IS NULL OR trace_id = ?1)
            AND (?2 IS NULL OR session_id = ?2)
            AND (?3 IS NULL OR call_id = ?3)
@@ -419,19 +628,23 @@ fn export_with_paging_inner(
         session_id,
         call_id,
         |row| {
-            let bytes = row.get::<_, Option<Vec<u8>>>(16)?;
+            let bytes = row.get::<_, Option<Vec<u8>>>(22)?;
             Ok(json!({
                 "segment_id": row.get::<_, u64>(0)?, "trace_id": row.get::<_, u64>(1)?,
                 "process_id": row.get::<_, u64>(2)?, "session_id": row.get::<_, Option<String>>(3)?,
                 "observed_at": ns(row.get::<_, i64>(4)?), "source": row.get::<_, i64>(5)?,
                 "content_state": row.get::<_, i64>(6)?, "direction": row.get::<_, i64>(7)?,
                 "stream_key": row.get::<_, Option<String>>(8)?, "sequence": row.get::<_, u64>(9)?,
-                "original_size": row.get::<_, u64>(10)?, "captured_size": row.get::<_, u64>(11)?,
-                "library": row.get::<_, Option<String>>(12)?, "symbol": row.get::<_, Option<String>>(13)?,
-                "protocol_hint": row.get::<_, Option<String>>(14)?,
-                "loss_reason": row.get::<_, Option<String>>(15)?,
+                "operation_id": row.get::<_, Option<u64>>(10)?, "offset": row.get::<_, Option<u64>>(11)?,
+                "completed": row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
+                "operation_completion_state": row.get::<_, Option<i64>>(13)?.unwrap_or(0),
+                "truncation_state": row.get::<_, Option<i64>>(14)?.unwrap_or(0), "redaction_state": row.get::<_, Option<i64>>(15)?.unwrap_or(1),
+                "original_size": row.get::<_, u64>(16)?, "captured_size": row.get::<_, u64>(17)?,
+                "library": row.get::<_, Option<String>>(18)?, "symbol": row.get::<_, Option<String>>(19)?,
+                "protocol_hint": row.get::<_, Option<String>>(20)?,
+                "loss_reason": row.get::<_, Option<String>>(21)?,
                 "bytes_hex": full.then(|| bytes.as_deref().map(hex)).flatten(),
-                "call_id": row.get::<_, Option<String>>(17)?,
+                "call_id": row.get::<_, Option<String>>(23)?,
             }))
         },
     )?;
@@ -457,14 +670,39 @@ fn export_with_paging_inner(
             }))
         },
     )?;
+    let coverage = query_json(
+        connection,
+        "SELECT trace_id, process_id, capability, collector, state,
+                first_observed_at, last_observed_at, gap_reason
+         FROM coverage_ledger
+         WHERE (?1 IS NULL OR trace_id = ?1)
+         ORDER BY trace_id, first_observed_at, process_id, capability, state",
+        trace_id,
+        session_id,
+        |row| {
+            Ok(json!({
+                "trace_id": row.get::<_, u64>(0)?,
+                "process_id": row.get::<_, u64>(1)?,
+                "capability": row.get::<_, String>(2)?,
+                "collector": row.get::<_, String>(3)?,
+                "state": row.get::<_, String>(4)?,
+                "first_observed_at": ns(row.get::<_, i64>(5)?),
+                "last_observed_at": ns(row.get::<_, i64>(6)?),
+                "gap_reason": row.get::<_, String>(7)?,
+            }))
+        },
+    )?;
     let mut attributes_by_action: std::collections::HashMap<(u64, String), Map<String, Value>> =
         std::collections::HashMap::new();
-    let mut attrs_stmt = connection.prepare(
+    let attrs_limit = page_size
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
+    let mut attrs_stmt = connection.prepare(&format!(
         "SELECT trace_id, action_id, attr_key, attr_value
          FROM semantic_action_attributes
          WHERE (?1 IS NULL OR trace_id = ?1)
-         ORDER BY trace_id, action_id, attr_key",
-    )?;
+         ORDER BY trace_id, action_id, attr_key{attrs_limit}",
+    ))?;
     for row in attrs_stmt.query_map([trace_id], |row| {
         Ok((
             row.get::<_, u64>(0)?,
@@ -480,14 +718,18 @@ fn export_with_paging_inner(
             .insert(key, json!(value));
     }
     let mut actions = Vec::new();
+    let action_limit = page_size
+        .map(|limit| format!(" LIMIT {limit}"))
+        .unwrap_or_default();
     let action_sql = format!(
         "SELECT a.trace_id, a.action_id, a.kind_name, a.title, a.start_time, a.end_time,
-                a.process_id, a.status, a.completeness, a.confidence_millis, a.session_id, a.schema_version
+                a.process_id, a.status, a.completeness, a.confidence_millis, a.session_id,
+                a.action_valid_code, a.agent_observed, a.process_parent_conflict, a.schema_version
          FROM semantic_actions_read a
          WHERE (?1 IS NULL OR a.trace_id = ?1)
            AND (?2 IS NULL OR a.session_id = ?2)
            AND {}
-         ORDER BY a.trace_id, a.start_time, a.action_id",
+         ORDER BY a.trace_id, a.start_time, a.action_id{action_limit}",
         call_action_predicate("a")
     );
     let mut statement = connection.prepare(&action_sql)?;
@@ -515,7 +757,13 @@ fn export_with_paging_inner(
             "session_id".into(),
             json!(row.get::<_, Option<String>>(10)?),
         );
-        action.insert("schema_version".into(), json!(row.get::<_, i64>(11)?));
+        action.insert("action_valid".into(), json!(row.get::<_, i64>(11)? != 0));
+        action.insert("agent_observed".into(), json!(row.get::<_, i64>(12)? != 0));
+        action.insert(
+            "process_parent_conflict".into(),
+            json!(row.get::<_, i64>(13)? != 0),
+        );
+        action.insert("schema_version".into(), json!(row.get::<_, i64>(14)?));
         let attrs = attributes_by_action
             .get(&(trace, action_id.clone()))
             .cloned()
@@ -534,7 +782,7 @@ fn export_with_paging_inner(
     let mut links = Vec::new();
     let link_sql = format!(
         "SELECT l.trace_id, l.source_action_id, l.target_action_id, l.role_name,
-                l.confidence, l.valid, l.schema_version
+                l.confidence, l.valid, l.link_valid_code, l.schema_version
          FROM semantic_action_links_read l
          WHERE (?1 IS NULL OR l.trace_id = ?1)
            AND (?2 IS NULL OR EXISTS (SELECT 1 FROM semantic_actions_read a
@@ -556,7 +804,8 @@ fn export_with_paging_inner(
             "role": row.get::<_, String>(3)?,
             "confidence": row.get::<_, i64>(4)?,
             "valid": row.get::<_, i64>(5)? != 0,
-            "schema_version": row.get::<_, i64>(6)?,
+            "link_valid": row.get::<_, i64>(6)? != 0,
+            "schema_version": row.get::<_, i64>(7)?,
         }))
     })? {
         links.push(row?);
@@ -617,15 +866,7 @@ fn export_with_paging_inner(
         });
     }
     if let Some(limit) = page_size {
-        for values in [
-            &mut traces,
-            &mut events,
-            &mut payloads,
-            &mut diagnostics,
-            &mut actions,
-            &mut links,
-            &mut evidence,
-        ] {
+        for values in [&mut traces, &mut events, &mut payloads, &mut diagnostics] {
             values.truncate(limit);
         }
     }
@@ -699,7 +940,7 @@ fn export_with_paging_inner(
     )?;
 
     let mut output = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": if full { "full" } else { "lite" },
         "trace_id": trace_id,
         "session_id": session_id,
@@ -711,6 +952,7 @@ fn export_with_paging_inner(
         "events": events,
         "payload_segments": payloads,
         "diagnostics": diagnostics,
+        "coverage": coverage,
         "actions": actions.clone(),
         "semantic_actions": actions,
         "links": links,
@@ -814,6 +1056,7 @@ fn event_kind_name(kind: i64) -> &'static str {
         7 => "resource",
         8 => "control",
         9 => "loss",
+        10 => "guard",
         _ => "unknown",
     }
 }
@@ -828,6 +1071,7 @@ fn observation_category(kind: i64, operation: &str) -> &'static str {
         1 => "process",
         4 => "ipc",
         5 => "stdio",
+        10 => "security",
         _ => event_kind_name(kind),
     }
 }
@@ -894,17 +1138,24 @@ mod tests {
                  CREATE VIEW events_read AS SELECT * FROM events;
                  CREATE TABLE payload_segments(segment_id INTEGER, trace_id INTEGER, process_id INTEGER,
                     session_id TEXT, observed_at INTEGER, source INTEGER, content_state INTEGER, direction INTEGER,
-                    stream_key TEXT, sequence INTEGER, original_size INTEGER, captured_size INTEGER,
+                    stream_key TEXT, sequence INTEGER, operation_id INTEGER, offset_bytes INTEGER,
+                    completed INTEGER, operation_completion_state INTEGER, truncation_state INTEGER,
+                    redaction_state INTEGER, original_size INTEGER, captured_size INTEGER,
                     library TEXT, symbol TEXT, protocol_hint TEXT, loss_reason TEXT, bytes BLOB, call_id TEXT);
                  CREATE TABLE diagnostics(diagnostic_id INTEGER, trace_id INTEGER, observed_at INTEGER,
                     collector TEXT, kind INTEGER, severity INTEGER, message TEXT, dropped INTEGER, dropped_bytes INTEGER);
+                 CREATE TABLE coverage_ledger(trace_id INTEGER, process_id INTEGER, capability TEXT,
+                    collector TEXT, state TEXT, first_observed_at INTEGER, last_observed_at INTEGER,
+                    gap_reason TEXT);
                  CREATE TABLE semantic_actions_read(trace_id INTEGER, action_id TEXT, kind_name TEXT,
                     title TEXT, start_time INTEGER, end_time INTEGER, process_id INTEGER, status INTEGER,
-                    completeness INTEGER, confidence_millis INTEGER, session_id TEXT, schema_version INTEGER);
+                    completeness INTEGER, confidence_millis INTEGER, session_id TEXT,
+                    action_valid_code INTEGER, agent_observed INTEGER, process_parent_conflict INTEGER,
+                    schema_version INTEGER);
                  CREATE TABLE semantic_action_attributes(trace_id INTEGER, action_id TEXT, attr_key TEXT, attr_value TEXT);
                  CREATE TABLE semantic_action_links_read(trace_id INTEGER, source_action_id TEXT,
                     target_action_id TEXT, role_name TEXT, confidence INTEGER, valid INTEGER,
-                    schema_version INTEGER, role INTEGER);
+                    link_valid_code INTEGER, schema_version INTEGER, role INTEGER);
                  CREATE TABLE semantic_action_evidence_read(trace_id INTEGER, action_id TEXT,
                     evidence_kind INTEGER, evidence_id INTEGER, evidence_role TEXT);
                  CREATE TABLE semantic_contents_read(trace_id INTEGER, action_id TEXT,
@@ -918,6 +1169,37 @@ mod tests {
     }
 
     #[test]
+    fn guard_metadata_survives_export_in_both_storage_formats() {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection);
+        let metadata = json!({
+            "guard.decision": "deny",
+            "guard.category": "exec",
+            "guard.args": "[\"--key=value\"]",
+            "guard.detail": "line1\nline2\\name",
+        });
+        for (id, encoded) in [
+            (1, metadata.to_string()),
+            (2, "guard.decision=deny\nguard.category=exec\nguard.args=[\"--key\\evalue\"]\nguard.detail=line1\\nline2\\\\name".to_owned()),
+        ] {
+            connection.execute(
+                "INSERT INTO events (event_id,trace_id,observed_at,process_id,kind,flags,
+                 operation,direction,collector,argv_flags,metadata)
+                 VALUES (?1,1,1,2,10,0,'exec',0,'censorguard',0,?2)",
+                params![id, encoded],
+            ).unwrap();
+        }
+        let output = export(&connection, Some(1), false, usize::MAX).unwrap();
+        assert_eq!(output["events"].as_array().unwrap().len(), 2);
+        for event in output["events"].as_array().unwrap() {
+            assert_eq!(event["blocked"], true);
+            assert_eq!(event["decision"], "deny");
+            assert_eq!(event["security_category"], "exec");
+            assert_eq!(event["metadata"], metadata);
+        }
+    }
+
+    #[test]
     fn lite_does_not_embed_payload_and_limit_is_explicit() {
         let connection = Connection::open_in_memory().unwrap();
         schema(&connection);
@@ -927,7 +1209,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        connection.execute("INSERT INTO payload_segments VALUES (1,1,2,NULL,0,1,1,2,NULL,1,3,3,NULL,NULL,NULL,NULL,X'616263',NULL)", []).unwrap();
+        connection.execute("INSERT INTO payload_segments(segment_id, trace_id, process_id, observed_at, source, content_state, direction, stream_key, sequence, original_size, captured_size, bytes) VALUES (1,1,2,0,1,1,2,NULL,1,3,3,X'616263')", []).unwrap();
         let lite = export(&connection, Some(1), false, usize::MAX).unwrap();
         assert_eq!(lite["processes"][0]["host_pid"], 1234);
         assert!(lite["payload_segments"][0]["bytes_hex"].is_null());
@@ -969,9 +1251,11 @@ mod tests {
             .unwrap();
         connection
             .execute(
-                "INSERT INTO payload_segments VALUES
-                 (1,1,2,'sess-a',1,1,1,2,NULL,1,1,1,NULL,NULL,NULL,NULL,NULL,NULL),
-                 (2,1,2,'sess-b',2,1,1,2,NULL,2,1,1,NULL,NULL,NULL,NULL,NULL,NULL)",
+                "INSERT INTO payload_segments(segment_id, trace_id, process_id, session_id, observed_at, source,
+                    content_state, direction, stream_key, sequence, original_size, captured_size)
+                 VALUES
+                 (1,1,2,'sess-a',1,1,1,2,NULL,1,1,1),
+                 (2,1,2,'sess-b',2,1,1,2,NULL,2,1,1)",
                 [],
             )
             .unwrap();
@@ -992,6 +1276,219 @@ mod tests {
         assert_eq!(output["payload_segments"].as_array().unwrap().len(), 1);
         assert_eq!(output["payload_segments"][0]["session_id"], "sess-a");
         assert_eq!(output["sessions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn coverage_export_keeps_trace_level_ledger_for_session_snapshots() {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO coverage_ledger (
+                    trace_id, process_id, capability, collector, state,
+                    first_observed_at, last_observed_at, gap_reason
+                 ) VALUES (1, 2, 'tls-plaintext', 'ebpf', 'covered', 10, 20, '')",
+                [],
+            )
+            .unwrap();
+        let output = export_with_paging(
+            &connection,
+            Some(1),
+            Some("sess-a"),
+            None,
+            false,
+            false,
+            usize::MAX,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(output["coverage"].as_array().unwrap().len(), 1);
+        assert_eq!(output["coverage"][0]["capability"], "tls-plaintext");
+    }
+
+    #[test]
+    fn streamed_snapshot_preserves_guard_and_semantic_data() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("censorscope-export-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("trace.sqlite");
+        let output = dir.join("snapshot.json");
+        let connection = Connection::open(&database).unwrap();
+        schema(&connection);
+        connection.execute_batch(
+            "INSERT INTO traces VALUES (1, 'trace', 'test', 'active', 'healthy', 0);
+             INSERT INTO processes VALUES (2, 1234, NULL, NULL, NULL, 'resolved', 'sess-a');
+             INSERT INTO events(event_id, trace_id, observed_at, process_id, kind, flags,
+                 collector, operation, path, direction, result, session_id, call_id, argv_flags, metadata)
+             VALUES (1, 1, 30, 2, 10, 0, 'censorguard', 'file.open_read', '/etc/shadow',
+                 0, -1, 'sess-a', 'call-a', 0, '{\"guard.category\":\"file\",\"guard.decision\":\"deny\",\"guard.detail\":\"禁止读取\\nmode=private\"}'),
+                 (2, 1, 10, 2, 10, 0, 'censorguard', 'file.open_read', '/tmp/data',
+                 0, 0, 'sess-a', 'call-a', 0, '{\"guard.decision\":\"allow\",\"guard.category\":\"file\"}');
+             INSERT INTO payload_segments(segment_id, trace_id, process_id, session_id, observed_at,
+                 source, content_state, direction, sequence, operation_id, offset_bytes, completed,
+                 operation_completion_state, truncation_state, redaction_state, original_size,
+                 captured_size, bytes, call_id)
+             VALUES (1, 1, 2, 'sess-a', 10, 1, 1, 1, 1, 9, 0, 1, 1, 1, 1, 3, 3, X'616263', 'call-a');
+             INSERT INTO diagnostics VALUES (1, 1, 10, 'ebpf', 1, 2, 'gap', 3, 4);
+             INSERT INTO coverage_ledger VALUES (1, 2, 'tls-plaintext', 'ebpf', 'gap', 10, 20, 'gap');
+             INSERT INTO semantic_actions_read VALUES (1, 'a', 'http.request', 'request', 10, 20,
+                 2, 1, 1, NULL, 'sess-a', 1, 1, 0, 1);
+             INSERT INTO semantic_action_attributes VALUES (1, 'a', 'key', 'value');
+             INSERT INTO semantic_action_links_read VALUES (1, 'a', 'a', 'related', 1, 1, 1, 1, 1);
+             INSERT INTO semantic_action_evidence_read VALUES (1, 'a', 1, 1, 'request');
+             INSERT INTO semantic_contents_read VALUES (1, 'a', 'content', 'json', 'complete',
+                 NULL, '{}', 1);",
+        ).unwrap();
+        drop(connection);
+        export_to_path(
+            &database,
+            1,
+            "sess-a",
+            Some("call-a"),
+            true,
+            false,
+            None,
+            None,
+            None,
+            &output,
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(snapshot["schema_version"], 2);
+        assert_eq!(snapshot["truncated"], false);
+        for key in [
+            "diagnostics",
+            "coverage",
+            "actions",
+            "semantic_actions",
+            "links",
+            "evidence",
+            "contents",
+        ] {
+            assert_eq!(snapshot[key].as_array().unwrap().len(), 1, "{key}");
+        }
+        assert_eq!(snapshot["actions"][0]["attributes"]["key"], "value");
+        assert_eq!(snapshot["contents"][0]["canonical_json"], "{}");
+        assert_eq!(snapshot["payload_segments"][0]["bytes_hex"], "616263");
+        assert_eq!(
+            snapshot["payload_segments"][0]["operation_completion_state"],
+            1
+        );
+        let events = snapshot["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event["kind_name"], "guard");
+            assert_eq!(event["observation_category"], "security");
+            assert_eq!(event["security_category"], "file");
+            assert_eq!(event["host_pid"], 1234);
+        }
+        assert_eq!(events[0]["decision"], "allow");
+        assert_eq!(events[0]["blocked"], false);
+        assert_eq!(events[1]["decision"], "deny");
+        assert_eq!(events[1]["blocked"], true);
+        assert_eq!(
+            events[1]["metadata"]["guard.detail"],
+            "禁止读取\nmode=private"
+        );
+        assert_eq!(snapshot["pagination"]["next"]["observed_at"], "30");
+        assert_eq!(snapshot["pagination"]["next"]["event_id"], 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn in_memory_snapshot_decodes_guard_metadata() {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection);
+        connection
+            .execute(
+                "INSERT INTO events(event_id, trace_id, observed_at, process_id, kind, flags,
+                 collector, operation, direction, session_id, argv_flags, metadata)
+             VALUES (1, 1, 10, 2, 10, 0, 'censorguard', 'file.open_read', 0, 'sess-a', 0, ?1)",
+                ["{\"guard.category\":\"file\",\"guard.decision\":\"deny\"}"],
+            )
+            .unwrap();
+        let snapshot = export(&connection, Some(1), false, usize::MAX).unwrap();
+        assert_eq!(snapshot["events"][0]["decision"], "deny");
+        assert_eq!(snapshot["events"][0]["blocked"], true);
+        assert_eq!(snapshot["events"][0]["security_category"], "file");
+    }
+
+    #[test]
+    fn streamed_events_support_legacy_and_time_cursors() {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO events(event_id, trace_id, observed_at, process_id, kind, flags,
+                 collector, operation, direction, session_id, argv_flags, metadata)
+             VALUES (1, 1, 30, 2, 2, 0, 'ebpf', 'read', 0, 'sess-a', 0, '{}'),
+                    (2, 1, 10, 2, 2, 0, 'ebpf', 'write', 0, 'sess-a', 0, '{}'),
+                    (3, 1, 30, 2, 2, 0, 'ebpf', 'write', 0, 'sess-a', 0, '{}');",
+            )
+            .unwrap();
+        for (time, id, expected) in [
+            (None, 1, vec![2, 3]),
+            (Some(10), 2, vec![1, 3]),
+            (Some(30), 1, vec![3]),
+        ] {
+            let mut bytes = Vec::new();
+            stream_events(
+                &mut bytes,
+                &connection,
+                1,
+                "sess-a",
+                None,
+                false,
+                None,
+                time,
+                Some(id),
+            )
+            .unwrap();
+            let events: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+            let ids: Vec<u64> = events
+                .iter()
+                .map(|event| event["event_id"].as_u64().unwrap())
+                .collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[test]
+    fn streamed_events_follow_dup_and_close_bindings() {
+        let connection = Connection::open_in_memory().unwrap();
+        schema(&connection);
+        connection
+            .execute_batch(
+                "INSERT INTO events(event_id, trace_id, observed_at, process_id, kind, flags,
+                 collector, operation, path, fd, direction, session_id, argv_flags, metadata)
+             VALUES (1, 1, 1, 2, 2, 0, 'ebpf', 'openat', '/tmp/data', 3, 0, 'sess-a', 0, '{}'),
+                    (2, 1, 2, 2, 2, 0, 'ebpf', 'dup2', NULL, 3, 0, 'sess-a', 0, '{\"target_fd\":4}'),
+                    (3, 1, 3, 2, 2, 0, 'ebpf', 'read', NULL, 4, 0, 'sess-a', 0, '{}'),
+                    (4, 1, 4, 2, 2, 0, 'ebpf', 'close', NULL, 4, 0, 'sess-a', 0, '{}'),
+                    (5, 1, 5, 2, 2, 0, 'ebpf', 'read', NULL, 4, 0, 'sess-a', 0, '{}');",
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        stream_events(
+            &mut bytes,
+            &connection,
+            1,
+            "sess-a",
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let events: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(events[2]["path"], "/tmp/data");
+        assert_eq!(events[4]["path"], Value::Null);
     }
 
     #[test]
