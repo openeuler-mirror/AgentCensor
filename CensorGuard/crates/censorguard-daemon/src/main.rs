@@ -4,7 +4,7 @@ mod procfs;
 mod runtime;
 mod server;
 
-use censorguard_common::config::{self, DEFAULT_CONFIG_PATH};
+use censorguard_common::config::{self, DEFAULT_CONFIG_PATH, FailureMode};
 use censorguard_kernel::{HookManifest, NativeKernel};
 use censorguard_policy::{CompileWarning, CompiledPolicy, compile_yaml, load};
 use event::EventHub;
@@ -23,15 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-fn current_unix_nanos() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-        })
-}
+use std::time::Duration;
 
 #[derive(Debug)]
 struct Args {
@@ -44,6 +36,7 @@ struct Args {
     launch_socket: PathBuf,
     dsh_socket: PathBuf,
     ui_socket: PathBuf,
+    dsh_enabled: bool,
     state_dir: PathBuf,
     socket_group: Option<String>,
     gateway_user: Option<String>,
@@ -55,6 +48,7 @@ struct Args {
     grpc_bin: Option<PathBuf>,
     grpc_listen: Option<String>,
     event_forward_socket: Option<PathBuf>,
+    failure_mode_override: Option<FailureMode>,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -82,13 +76,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     signals.add(Signal::SIGINT);
     signals.add(Signal::SIGTERM);
     pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&signals), None)?;
-    let (canonical_policy, initial_revision) = if args.check_config {
+    let (mut canonical_policy, initial_revision) = if args.check_config {
         (load(&args.config)?, 1)
     } else {
         // Startup must have a real baseline/config input; never silently launch empty.
         load(&args.config)?;
         load_startup_policy(&args.config, &args.state_dir)?
     };
+    if let Some(mode) = args.failure_mode_override {
+        canonical_policy.daemon.failure_mode = mode;
+    }
     let (resolved_policy, dns_cache, dns_status) =
         canonical_policy.resolve_dns(&Default::default());
     let policy = Arc::new(resolved_policy);
@@ -99,16 +96,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let socket_group = resolve_socket_group(args.socket_group.as_deref())?;
     let gateway_uid = resolve_gateway_user(args.gateway_user.as_deref())?;
-    let _instance = lifecycle::acquire_instance(
-        &args.state_dir,
-        &[
-            &args.control_socket,
-            &args.event_socket,
-            &args.launch_socket,
-            &args.dsh_socket,
-            &args.ui_socket,
-        ],
-    )?;
+    let mut sockets: Vec<&Path> = vec![
+        &args.control_socket,
+        &args.event_socket,
+        &args.launch_socket,
+    ];
+    if args.dsh_enabled {
+        sockets.extend([args.dsh_socket.as_path(), args.ui_socket.as_path()]);
+    }
+    let _instance = lifecycle::acquire_instance(&args.state_dir, &sockets)?;
     if args.spawn_grpc {
         lifecycle::check_grpc_port(args.grpc_listen.as_deref())?;
     }
@@ -150,8 +146,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         hooks_healthy,
         dsh_self_groups: args.dsh_self_groups.iter().cloned().collect(),
     })?);
-    let event_instance_id = format!("{boot_id}-{}-{}", std::process::id(), current_unix_nanos());
-    let hub = Arc::new(EventHub::new(event_instance_id));
+    let hub = Arc::new(EventHub::new(boot_id));
 
     let _event_pump =
         event::start_event_pump(Arc::clone(&kernel), Arc::clone(&runtime), Arc::clone(&hub))?;
@@ -177,10 +172,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     cleanup.record(&args.event_socket)?;
     let _launch = server::start_launch(&args.launch_socket, socket_group, Arc::clone(&runtime))?;
     cleanup.record(&args.launch_socket)?;
-    let _dsh = server::start_dsh(&args.dsh_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
-    cleanup.record(&args.dsh_socket)?;
-    let _ui = server::start_ui(&args.ui_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
-    cleanup.record(&args.ui_socket)?;
+    let _dsh_interfaces = if args.dsh_enabled {
+        let dsh = server::start_dsh(&args.dsh_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+        cleanup.record(&args.dsh_socket)?;
+        let ui = server::start_ui(&args.ui_socket, Arc::clone(&runtime), Arc::clone(&hub))?;
+        cleanup.record(&args.ui_socket)?;
+        Some((dsh, ui))
+    } else {
+        None
+    };
     let _reconciler = start_reconciler(Arc::clone(&runtime))?;
     let _dns = start_dns_refresher(
         Arc::clone(&runtime),
@@ -207,8 +207,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.control_socket.display(),
         args.event_socket.display(),
         args.launch_socket.display(),
-        args.dsh_socket.display(),
-        args.ui_socket.display()
+        if args.dsh_enabled {
+            args.dsh_socket.display().to_string()
+        } else {
+            "disabled".into()
+        },
+        if args.dsh_enabled {
+            args.ui_socket.display().to_string()
+        } else {
+            "disabled".into()
+        }
     );
 
     wait_for_shutdown(args.duration_seconds, &shutdown_receiver, &runtime)?;
@@ -220,11 +228,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("censorguardd shutdown complete");
     if runtime.restart_requested() {
         eprintln!("restarting daemon with {}", args.config.display());
-        let error = Command::new(env::current_exe()?)
-            .arg("launch")
-            .arg("--config")
-            .arg(&args.config)
-            .exec();
+        let mut command = Command::new(env::current_exe()?);
+        command.arg("launch").arg("--config").arg(&args.config);
+        if let Some(mode) = args.failure_mode_override {
+            command.arg("--failure-mode").arg(mode.to_string());
+        }
+        let error = command.exec();
         return Err(error.into());
     }
     Ok(())
@@ -495,7 +504,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Args, io::Error> {
         ));
     }
     let parsed = parse_args_with_values(values.into_iter())?;
-    if (reload || stop) && (parsed.check_config || parsed.duration_seconds.is_some()) {
+    if (reload || stop)
+        && (parsed.check_config
+            || parsed.duration_seconds.is_some()
+            || parsed.failure_mode_override.is_some())
+    {
         return Err(invalid_input("reload/stop accept only --config PATH"));
     }
     Ok(Args {
@@ -510,6 +523,7 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
 
     let mut check_config = false;
     let mut duration_seconds = None;
+    let mut failure_mode_override = None;
     let mut seen = std::collections::HashSet::new();
     while let Some(argument) = args.next() {
         if !seen.insert(argument.clone()) {
@@ -518,13 +532,20 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
         match argument.as_str() {
             "--config" => config = Some(next_value(&mut args, "--config")?.into()),
             "--check-config" => check_config = true,
+            "--failure-mode" => {
+                failure_mode_override = Some(
+                    next_value(&mut args, "--failure-mode")?
+                        .parse()
+                        .map_err(invalid_input)?,
+                );
+            }
             "--duration" => {
                 duration_seconds = Some(parse_u64(next_value(&mut args, "--duration")?)?)
             }
             "-h" | "--help" => {
                 println!(
                     "usage: censorguardd launch [--config PATH] [--check-config]\n\
-                     [--duration SECONDS]\n\
+                     [--duration SECONDS] [--failure-mode permissive|strict]\n\
                      censorguardd reload [--config PATH]\n\
                      censorguardd stop [--config PATH]\n\
                      censorguardd --version\n\
@@ -553,6 +574,8 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
     let gateway_user = daemon.gateway_user;
     let dsh_self_groups = daemon.dsh_self_groups;
     let dns_refresh_seconds = daemon.dns_refresh_seconds;
+    let spawn_grpc = daemon.spawn_grpc;
+    let grpc_bin = daemon.grpc_bin;
     Ok(Args {
         config,
         reload: false,
@@ -563,6 +586,7 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
         launch_socket,
         dsh_socket,
         ui_socket,
+        dsh_enabled: daemon.dsh_enabled,
         state_dir,
         socket_group,
         gateway_user,
@@ -570,10 +594,11 @@ fn parse_args_with_values(mut args: impl Iterator<Item = String>) -> Result<Args
         duration_seconds,
         dns_refresh_seconds,
         dsh_self_groups,
-        spawn_grpc: daemon.spawn_grpc,
-        grpc_bin: daemon.grpc_bin,
+        spawn_grpc,
+        grpc_bin,
         grpc_listen: daemon.grpc_listen,
         event_forward_socket: daemon.event_forward_socket,
+        failure_mode_override,
     })
 }
 
@@ -664,6 +689,14 @@ fn load_startup_policy(
 
 fn print_summary(policy: &CompiledPolicy) {
     println!(
+        "integrations: dsh={} grpc={}",
+        policy.daemon.dsh_enabled, policy.daemon.spawn_grpc
+    );
+    println!(
+        "safety: failure_mode={} self_protection={}",
+        policy.daemon.failure_mode, policy.daemon.self_protection
+    );
+    println!(
         "switches: enable file={} exec={} net={}; audit file={} exec={} net={}",
         policy.daemon.enable_file,
         policy.daemon.enable_exec,
@@ -716,6 +749,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn failure_mode_override_is_explicit_and_launch_only() -> Result<(), Box<dyn Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        fs::write(&config, "daemon:\n  failure_mode: strict\nrules: []")?;
+        let parse = |action: &str, extra: &[&str]| {
+            parse_args(
+                [
+                    action.to_owned(),
+                    "--config".into(),
+                    config.display().to_string(),
+                ]
+                .into_iter()
+                .chain(extra.iter().map(|value| (*value).to_owned())),
+            )
+        };
+        assert_eq!(parse("launch", &[])?.failure_mode_override, None);
+        assert_eq!(
+            parse("launch", &["--failure-mode", "permissive"])?.failure_mode_override,
+            Some(FailureMode::Permissive)
+        );
+        assert_eq!(
+            parse("launch", &["--failure-mode", "strict"])?.failure_mode_override,
+            Some(FailureMode::Strict)
+        );
+        for extra in [
+            &["--failure-mode", "unknown"][..],
+            &["--failure-mode"][..],
+            &["--failure-mode", "strict", "--failure-mode", "permissive"][..],
+        ] {
+            assert!(parse("launch", extra).is_err());
+        }
+        assert!(parse("reload", &["--failure-mode", "permissive"]).is_err());
+        assert!(parse("stop", &["--failure-mode", "strict"]).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn event_forwarder_releases_subscription_on_shutdown() -> Result<(), Box<dyn Error>> {
         let directory = tempfile::tempdir()?;
         let hub = EventHub::new("test-boot".into());
@@ -737,7 +807,10 @@ mod tests {
         let config = directory.path().join("base.yaml");
         let state = directory.path().join("state");
         fs::create_dir_all(state.join("revisions"))?;
-        fs::write(&config, "rules:\n  - exec deny /bin/false\n")?;
+        fs::write(
+            &config,
+            "daemon:\n  failure_mode: strict\n  self_protection: true\nrules:\n  - exec deny /bin/false\n",
+        )?;
         let saved = load(&config)?
             .replace_group_yaml_from(
                 "a",
@@ -767,6 +840,8 @@ mod tests {
         assert_eq!(restored.group_sources, saved.group_sources);
         assert!(restored.daemon.audit_exec);
         assert!(!restored.daemon.enable_net);
+        assert_eq!(restored.daemon.failure_mode, FailureMode::Permissive);
+        assert!(restored.daemon.self_protection);
         assert!(restored.groups.contains_key("a+b"));
         // A stale snapshot never overrides a newer public baseline.
         assert_eq!(fs::read_to_string(state.join("current"))?, "7\n");
@@ -814,6 +889,7 @@ mod tests {
             .into_iter(),
         )?;
         assert!(!args.spawn_grpc);
+        assert!(args.dsh_enabled);
         assert_eq!(args.grpc_bin, None);
         assert_eq!(args.event_forward_socket, None);
         Ok(())

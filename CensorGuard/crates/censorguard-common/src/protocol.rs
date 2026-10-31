@@ -279,6 +279,12 @@ pub struct DomainBinding {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Response {
+    #[serde(default)]
+    pub failure_mode: Option<crate::config::FailureMode>,
+    #[serde(default)]
+    pub self_protection: bool,
+    #[serde(default)]
+    pub check_failures: crate::abi::CheckFailures,
     pub ok: bool,
     #[serde(default)]
     pub daemon_ready: bool,

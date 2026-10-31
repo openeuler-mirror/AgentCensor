@@ -1,5 +1,7 @@
 use crate::procfs;
+use censorguard_common::abi::CheckFailures;
 use censorguard_common::abi::{SocketOwner, TrackValue};
+use censorguard_common::config::FailureMode;
 use censorguard_common::protocol::{
     DnsDomainInfo, DomainBinding, DomainInfo, DomainTree, GroupDump, IntentDecision,
     PolicyDefinition, PolicySource, SecurityIntent, TreeNode,
@@ -138,6 +140,8 @@ pub struct Runtime {
     kernel: Arc<NativeKernel>,
     policy_state: RwLock<PolicyState>,
     switches: Mutex<SwitchState>,
+    failure_mode: FailureMode,
+    self_protection: bool,
     reload_lock: Mutex<()>,
     reload_observation: Mutex<ReloadObservation>,
     dns_state: Mutex<DnsState>,
@@ -182,6 +186,9 @@ pub struct ReloadResult {
 }
 
 pub struct RuntimeStatus {
+    pub failure_mode: FailureMode,
+    pub self_protection: bool,
+    pub check_failures: CheckFailures,
     pub roots: Vec<u32>,
     pub tracked: usize,
     pub pid_pending: usize,
@@ -233,6 +240,8 @@ impl Runtime {
                 version: initial_revision,
                 reload_generation: u64::from(initial_revision.saturating_sub(1)),
             }),
+            failure_mode: policy.daemon.failure_mode,
+            self_protection: policy.daemon.self_protection,
             switches: Mutex::new(SwitchState {
                 enables: [
                     policy.daemon.enable_file,
@@ -710,6 +719,9 @@ impl Runtime {
             .map_err(|_| RuntimeError::Poisoned)?
             .clone();
         Ok(RuntimeStatus {
+            failure_mode: self.failure_mode,
+            self_protection: self.self_protection,
+            check_failures: self.kernel.check_failures()?,
             roots,
             tracked: pid.tracked,
             pid_pending: pid.pending,
@@ -1363,10 +1375,14 @@ impl Runtime {
         self.kernel
             .prepare_policy_bank(&next_policy, &next_layout, next_bank, next_version)?;
         self.persist_revision_snapshot(next_version, &revision_snapshot)?;
-        if let Err(error) =
-            self.kernel
-                .activate_policy(switches.enables, switches.audits, next_bank, next_version)
-        {
+        if let Err(error) = self.kernel.activate_policy(
+            switches.enables,
+            switches.audits,
+            next_bank,
+            next_version,
+            self.failure_mode,
+            self.self_protection,
+        ) {
             let _ = fs::remove_file(self.revision_path(u64::from(next_version)));
             return Err(error.into());
         }
@@ -1376,6 +1392,8 @@ impl Runtime {
                 switches.audits,
                 previous_bank,
                 previous_version,
+                self.failure_mode,
+                self.self_protection,
             );
             let _ = fs::remove_file(self.revision_path(u64::from(next_version)));
             return match rollback {

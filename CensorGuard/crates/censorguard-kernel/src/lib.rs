@@ -3,11 +3,13 @@
 mod ffi;
 
 use censorguard_common::abi::{
-    ArgKey, FilterConfig, InodeKey, InodeRuleValue, Net6LpmKey, Net6PortLpmKey, NetLpmKey,
-    NetPortLpmKey, NetRuleValue, PID_PENDING_CAPACITY, PID_TRACKED_CAPACITY, PathKey,
-    PendingProcessOp, PidTrackingStats, RawEvent, SCOPE_POLICY_CAPACITY, ScopePolicyValue,
-    SlotMeta, SocketOwner, StringRuleValue, TrackValue,
+    ArgKey, CheckFailures, FilterConfig, InodeKey, InodeRuleValue, Net6LpmKey, Net6PortLpmKey,
+    NetLpmKey, NetPortLpmKey, NetRuleValue, PID_PENDING_CAPACITY, PID_TRACKED_CAPACITY, PathKey,
+    PendingProcessOp, PidTrackingStats, RULE_AUDIT_EXEC, RULE_AUDIT_FILE, RULE_AUDIT_NET,
+    RULE_EXEC, RULE_FILE, RULE_NET, RawEvent, SCOPE_POLICY_CAPACITY, ScopePolicyValue, SlotMeta,
+    SocketOwner, StringRuleValue, TrackValue,
 };
+use censorguard_common::config::FailureMode;
 use censorguard_policy::{CompiledPolicy, CompiledRules, RuleValue};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -265,7 +267,14 @@ impl NativeKernel {
     ) -> Result<InstalledPolicy, KernelError> {
         let layout = InstalledPolicy::initial(policy)?;
         self.prepare_policy_bank(policy, &layout, 0, version)?;
-        self.activate_policy(enables, audits, 0, version)?;
+        self.activate_policy(
+            enables,
+            audits,
+            0,
+            version,
+            policy.daemon.failure_mode,
+            policy.daemon.self_protection,
+        )?;
         Ok(layout)
     }
 
@@ -286,6 +295,7 @@ impl NativeKernel {
             version,
             baseline.file_strings.len() as u32,
             baseline.arguments.len() as u32,
+            rule_flags(baseline),
         )?;
 
         let mut representatives: Vec<(&CompiledRules, u32)> = vec![(baseline, offset)];
@@ -309,6 +319,7 @@ impl NativeKernel {
                 version,
                 rules.file_strings.len() as u32,
                 rules.arguments.len() as u32,
+                rule_flags(rules),
             )?;
         }
         Ok(())
@@ -320,6 +331,8 @@ impl NativeKernel {
         audits: [bool; 3],
         bank: u32,
         version: u32,
+        failure_mode: FailureMode,
+        self_protection: bool,
     ) -> Result<(), KernelError> {
         // The ABI keeps the legacy allow_sample_rate field: any enabled audit switch turns on
         // full ALLOW reporting so the global audit switches take effect in should_report_allow().
@@ -337,6 +350,8 @@ impl NativeKernel {
                 audit_file: u32::from(audits[0]),
                 audit_exec: u32::from(audits[1]),
                 audit_net: u32::from(audits[2]),
+                strict_mode: u32::from(failure_mode == FailureMode::Strict),
+                self_protection: u32::from(self_protection),
             },
         )
     }
@@ -348,6 +363,7 @@ impl NativeKernel {
         version: u32,
         file_str_count: u32,
         arg_count: u32,
+        rule_flags: u32,
     ) -> Result<(), KernelError> {
         self.update_map(
             "slot_meta_map",
@@ -358,6 +374,8 @@ impl NativeKernel {
                 file_str_count,
                 arg_count,
                 switch_ts: unix_nanos(),
+                rule_flags,
+                pad: 0,
             },
         )
     }
@@ -455,6 +473,10 @@ impl NativeKernel {
         self.delete_map("tracked_pids", &pid)?;
         self.delete_map("pid_start_times", &pid)?;
         self.delete_map("pending_child_proc_ops", &pid)
+    }
+
+    pub fn check_failures(&self) -> Result<CheckFailures, KernelError> {
+        self.lookup_map("check_failures", &0_u32)
     }
 
     pub fn pid_tracking_status(&self) -> Result<PidTrackingStatus, KernelError> {
@@ -813,6 +835,47 @@ fn unix_nanos() -> u64 {
         })
 }
 
+fn table_flags<K: Ord>(
+    table: &BTreeMap<K, RuleValue>,
+    flag: u32,
+    audit_flag: u32,
+    flags: &mut u32,
+) {
+    if !table.is_empty() {
+        *flags |= flag;
+    }
+    // `allow+audit` / `deny+audit` rules push their own events regardless of the global audit
+    // switch, so the data plane needs to know about them separately from "has any rule".
+    if table.values().any(|value| value.audit) {
+        *flags |= audit_flag;
+    }
+}
+
+fn rule_flags(rules: &CompiledRules) -> u32 {
+    let mut flags = 0;
+    table_flags(&rules.file_strings, RULE_FILE, RULE_AUDIT_FILE, &mut flags);
+    table_flags(&rules.file_inodes, RULE_FILE, RULE_AUDIT_FILE, &mut flags);
+    table_flags(
+        &rules.directory_inodes,
+        RULE_FILE,
+        RULE_AUDIT_FILE,
+        &mut flags,
+    );
+    table_flags(&rules.commands, RULE_EXEC, RULE_AUDIT_EXEC, &mut flags);
+    table_flags(
+        &rules.command_inodes,
+        RULE_EXEC,
+        RULE_AUDIT_EXEC,
+        &mut flags,
+    );
+    table_flags(&rules.arguments, RULE_EXEC, RULE_AUDIT_EXEC, &mut flags);
+    table_flags(&rules.network, RULE_NET, RULE_AUDIT_NET, &mut flags);
+    table_flags(&rules.network_ports, RULE_NET, RULE_AUDIT_NET, &mut flags);
+    table_flags(&rules.network6, RULE_NET, RULE_AUDIT_NET, &mut flags);
+    table_flags(&rules.network6_ports, RULE_NET, RULE_AUDIT_NET, &mut flags);
+    flags
+}
+
 const fn inode_value(value: RuleValue, version: u32) -> InodeRuleValue {
     InodeRuleValue {
         mask: value.mask,
@@ -858,6 +921,7 @@ impl_kernel_pod!(
     u32,
     u64,
     FilterConfig,
+    CheckFailures,
     PathKey,
     InodeKey,
     ArgKey,

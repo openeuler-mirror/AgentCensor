@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 struct Subscriber {
     sender: SyncSender<Event>,
@@ -132,10 +132,14 @@ pub fn start_event_pump(
 ) -> Result<thread::JoinHandle<()>, censorguard_kernel::KernelError> {
     let mut reader = kernel.event_reader()?;
     Ok(thread::spawn(move || {
+        let mut stats_at = Instant::now();
         loop {
             let result = reader.next(Duration::from_millis(500));
-            hub.set_kernel_dropped(reader.kernel_dropped());
-            hub.set_reader_dropped(reader.reader_dropped());
+            if stats_at.elapsed() >= Duration::from_millis(500) {
+                hub.set_kernel_dropped(reader.kernel_dropped());
+                hub.set_reader_dropped(reader.reader_dropped());
+                stats_at = Instant::now();
+            }
             match result {
                 Ok(Some(raw)) => hub.broadcast(to_event(&runtime, &raw)),
                 Ok(None) => {}

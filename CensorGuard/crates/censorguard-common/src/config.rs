@@ -9,6 +9,35 @@ use std::path::PathBuf;
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/censorguard/base.yaml";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureMode {
+    Permissive,
+    #[default]
+    Strict,
+}
+
+impl std::fmt::Display for FailureMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Permissive => "permissive",
+            Self::Strict => "strict",
+        })
+    }
+}
+
+impl std::str::FromStr for FailureMode {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "permissive" => Ok(Self::Permissive),
+            "strict" => Ok(Self::Strict),
+            _ => Err("failure mode must be permissive or strict"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
@@ -22,6 +51,7 @@ pub struct DaemonConfig {
     pub state_dir: PathBuf,
     pub socket_group: Option<String>,
     pub gateway_user: Option<String>,
+    pub dsh_enabled: bool,
     pub dsh_self_groups: Vec<String>,
     pub dns_refresh_seconds: u64,
     pub spawn_grpc: bool,
@@ -33,6 +63,8 @@ pub struct DaemonConfig {
     pub audit_file: bool,
     pub audit_exec: bool,
     pub audit_net: bool,
+    pub failure_mode: FailureMode,
+    pub self_protection: bool,
 }
 
 impl Default for DaemonConfig {
@@ -48,6 +80,7 @@ impl Default for DaemonConfig {
             state_dir: PathBuf::from("/var/lib/censorguard"),
             socket_group: None,
             gateway_user: None,
+            dsh_enabled: true,
             dsh_self_groups: vec!["censorguard-dsh-default".to_owned()],
             dns_refresh_seconds: 60,
             spawn_grpc: false,
@@ -59,6 +92,8 @@ impl Default for DaemonConfig {
             audit_file: false,
             audit_exec: false,
             audit_net: false,
+            failure_mode: FailureMode::default(),
+            self_protection: true,
         }
     }
 }
@@ -88,6 +123,34 @@ pub fn load(path: impl AsRef<std::path::Path>) -> Result<DaemonConfig, Box<dyn s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn omitted_failure_mode_is_strict_with_self_protection() -> Result<(), serde_yaml::Error> {
+        let document: ConfigDocument = serde_yaml::from_str("rules: []")?;
+        assert_eq!(document.daemon.failure_mode, FailureMode::Strict);
+        assert!(document.daemon.self_protection);
+        assert!(document.daemon.dsh_enabled);
+        assert!(
+            !document.daemon.audit_file
+                && !document.daemon.audit_exec
+                && !document.daemon.audit_net
+        );
+        let permissive: ConfigDocument =
+            serde_yaml::from_str("daemon:\n  failure_mode: permissive\nrules: []")?;
+        assert_eq!(permissive.daemon.failure_mode, FailureMode::Permissive);
+        let strict: ConfigDocument = serde_yaml::from_str(
+            "daemon:\n  failure_mode: strict\n  self_protection: true\nrules: []",
+        )?;
+        assert_eq!(strict.daemon.failure_mode, FailureMode::Strict);
+        assert!(strict.daemon.self_protection);
+        let unprotected: ConfigDocument =
+            serde_yaml::from_str("daemon:\n  self_protection: false\nrules: []")?;
+        assert!(!unprotected.daemon.self_protection);
+        assert!(
+            serde_yaml::from_str::<ConfigDocument>("daemon:\n  failure_mode: permissve").is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn public_config_rejects_group_and_domain_sections() -> Result<(), serde_yaml::Error> {
