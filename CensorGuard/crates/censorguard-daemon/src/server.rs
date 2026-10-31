@@ -957,6 +957,9 @@ fn dispatch_inner(
                 Response {
                     ok: true,
                     daemon_ready: runtime.ready(),
+                    failure_mode: Some(status.failure_mode),
+                    self_protection: status.self_protection,
+                    check_failures: status.check_failures,
                     roots: status.roots,
                     trees,
                     groups,

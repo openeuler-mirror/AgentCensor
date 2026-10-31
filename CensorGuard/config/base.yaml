@@ -15,16 +15,15 @@ daemon:
   enable_file: true
   enable_exec: true
   enable_net: true
-  audit_file: true
-  audit_exec: true
-  audit_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
+  failure_mode: permissive
+  self_protection: true
   dns_refresh_seconds: 60
   spawn_grpc: true
   grpc_bin: /usr/bin/censorguard-grpc
   grpc_listen: 127.0.0.1:50051
 
 # base.yaml —— 全局基线, 所有域叠加生效
-rules:
-  - file deny+audit /etc/shadow
-  - file deny+audit /root/.ssh
-  - exec deny /usr/bin/nc
+rules: []

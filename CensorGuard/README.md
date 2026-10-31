@@ -29,7 +29,10 @@ rules:
 ```
 
 `enable_*` / `audit_*` 放在启动配置的 `daemon` 段，省略时 enable 全开、audit 全关；
-仓库 `config/base.yaml` 显式开启三个 audit。
+仓库 `config/base.yaml` 保持空基线规则、`failure_mode: permissive`、`self_protection: true`，三个 audit 全关。
+`allow+audit` 的规则审计独立于 enable；只有命中 deny 且对应 enable 开启才主动阻断。
+`strict` 保留路径/参数检查失败后的拒绝，`permissive` 对检查失败放行并累计诊断计数。
+基线规则为空，部署后需通过 `policy apply` + `bind` 显式下发拒绝策略。
 基线和 daemon 设置运行中不可热改，修改后用 `censorguardd reload` 完整重启。
 附加组可热更新；domain 支持多个组，任一层 deny 即拒绝。`remove` 移除域内一个组，
 `policy remove` 删除未被引用的组。`status` 显示简洁摘要，`status --json` 包含 PID 进程树，`doctor` 检查组件。
@@ -41,7 +44,7 @@ rules:
 文件规则同时编译为 inode 身份和同一规则的规范化路径身份：内核先查 inode，inode
 未命中时才使用路径兜底，以覆盖文件重建或新建后的短期窗口。当前 exec 参数规则依赖
 execve/execveat 入口暂存 argv；仅当前可执行文件配置了参数规则且采集/暂存失败时，
-`bprm_check_security` 按 fail-closed 拒绝该次执行（匹配 scratch 不可用仍拒绝）。
+`bprm_check_security` 在 strict 模式下拒绝该次执行；permissive 模式放行并报告诊断计数。
 规则 token 最长 255 字节；运行时长参数不会匹配较短的完整 token，也不会绕过已命中的拒绝前缀。
 参数规则最多 4 个 token（程序路径 + 前 3 个参数）；255 按 UTF-8 字节计算，
 是项目限制，不是 Linux 完整路径或参数的系统上限。

@@ -42,6 +42,16 @@ pub const ACTION_DENY: u8 = 0;
 /// Rule action: allow (optionally audited).
 pub const ACTION_ALLOW: u8 = 1;
 
+pub const RULE_FILE: u32 = 1;
+pub const RULE_EXEC: u32 = 2;
+pub const RULE_NET: u32 = 4;
+/// The same slot also holds at least one rule carrying the `allow+audit` marker. Such a rule
+/// emits events even with the global audit switch off, so the data plane may not prune the
+/// dimension purely on `enable_*` / `audit_*`.
+pub const RULE_AUDIT_FILE: u32 = 8;
+pub const RULE_AUDIT_EXEC: u32 = 16;
+pub const RULE_AUDIT_NET: u32 = 32;
+
 /// Global data-plane switches.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(C)]
@@ -57,6 +67,8 @@ pub struct FilterConfig {
     pub audit_file: u32,
     pub audit_exec: u32,
     pub audit_net: u32,
+    pub strict_mode: u32,
+    pub self_protection: u32,
 }
 
 /// Fixed path key.
@@ -219,6 +231,18 @@ pub struct SlotMeta {
     /// Number of exec argument rules in the slot. Zero means argument matching is disabled.
     pub arg_count: u32,
     pub switch_ts: u64,
+    pub rule_flags: u32,
+    pub pad: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[repr(C)]
+pub struct CheckFailures {
+    pub file_walk: u64,
+    pub file_path: u64,
+    pub exec_args: u64,
+    pub tail_call: u64,
+    pub socket_owner: u64,
 }
 
 /// Raw ring-buffer event. Convert this into the wire protocol before exposing it to clients.
@@ -269,7 +293,7 @@ mod tests {
 
     #[test]
     fn abi_sizes_match_c() {
-        assert_eq!(size_of::<FilterConfig>(), 40);
+        assert_eq!(size_of::<FilterConfig>(), 48);
         assert_eq!(size_of::<PathKey>(), 256);
         assert_eq!(size_of::<InodeKey>(), 16);
         assert_eq!(size_of::<ArgKey>(), 1024);
@@ -284,7 +308,8 @@ mod tests {
         assert_eq!(size_of::<PendingProcessOp>(), 16);
         assert_eq!(size_of::<ScopePolicyValue>(), 8);
         assert_eq!(size_of::<PidTrackingStats>(), 40);
-        assert_eq!(size_of::<SlotMeta>(), 24);
+        assert_eq!(size_of::<SlotMeta>(), 32);
+        assert_eq!(size_of::<CheckFailures>(), 40);
         assert_eq!(size_of::<RawEvent>(), 1256);
         assert_eq!(align_of::<RawEvent>(), 8);
     }

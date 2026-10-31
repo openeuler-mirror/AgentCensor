@@ -303,6 +303,8 @@ struct filter_config {
     __u32 audit_file;
     __u32 audit_exec;
     __u32 audit_net;
+    __u32 strict_mode;
+    __u32 self_protection;
 };
 
 struct {
@@ -311,6 +313,8 @@ struct {
     __type(key, __u32);
     __type(value, struct filter_config);
 } filter_config_map SEC(".maps");
+
+_Static_assert(sizeof(struct filter_config) == 48, "filter_config ABI");
 
 static __always_inline const struct filter_config *get_cfg(void)
 {
@@ -566,8 +570,7 @@ static __always_inline bool in_scope_exec(struct scope_info *si)
  */
 static __always_inline bool guard_scope(const struct filter_config *cfg)
 {
-    (void)cfg;
-    return in_scope();
+    return cfg->self_protection && in_scope();
 }
 
 /* ============ 多域策略 map-in-map (P2 核心) ============
@@ -712,6 +715,8 @@ struct slot_meta {
     __u32 file_str_count; /* 该槽 file_str 规则条数: 0 = 路径兜底判定整体跳过 */
     __u32 arg_count;     /* exec 参数规则及可执行身份索引条数 */
     __u64 switch_ts;     /* 换槽时间戳 (控制面写入, UnixNano), 审计用 */
+    __u32 rule_flags;
+    __u32 pad;
 };
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -719,6 +724,93 @@ struct {
     __type(key, __u32);
     __type(value, struct slot_meta);
 } slot_meta_map SEC(".maps");
+
+_Static_assert(sizeof(struct slot_meta) == 32, "slot_meta ABI");
+
+#define RULE_FILE 1
+#define RULE_EXEC 2
+#define RULE_NET 4
+#define RULE_AUDIT_FILE 8
+#define RULE_AUDIT_EXEC 16
+#define RULE_AUDIT_NET 32
+#define FILE_CHECK_FAILED 0x80
+
+/* 基线槽 + 域槽按维度合并后的规则标志 (控制面 rule_flags() 写入)。
+ * 低 3 位: 该维度有规则; 高 3 位: 该维度有带 audit 标记的规则。 */
+static __always_inline __u32 slot_rule_flags(const struct filter_config *cfg,
+                                             const struct scope_info *si)
+{
+    __u32 base = physical_slot(cfg, BASE_SLOT);
+    __u32 domain = physical_slot(cfg, si->policy_slot);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
+    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
+    return (bm ? bm->rule_flags : 0) | (sm ? sm->rule_flags : 0);
+}
+
+/* 维度级提前剪枝。判定能产出结果的三种可能:
+ *   1. enable 开且有规则            -> 可能拒绝;
+ *   2. 全局 audit 开                -> 全量审计事件;
+ *   3. 存在带 audit 标记的规则      -> 规则级审计事件 (不受全局开关影响)。
+ * 三者皆无则整维跳过, 不再做 inode 查询与祖先目录走链 —— 只开 audit
+ * 而关 enable 的观测模式仍然完整保留。 */
+static __always_inline bool dimension_idle(__u32 flags, __u32 enable,
+                                           __u32 audit, __u32 rule_flag,
+                                           __u32 audit_flag)
+{
+    if (audit || (flags & audit_flag))
+        return false;
+    return !enable || !(flags & rule_flag);
+}
+
+struct check_failures {
+    __u64 file_walk;
+    __u64 file_path;
+    __u64 exec_args;
+    __u64 tail_call;
+    __u64 socket_owner;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct check_failures);
+} check_failures SEC(".maps");
+
+_Static_assert(sizeof(struct check_failures) == 40, "check_failures ABI");
+
+#define CHECK_FILE_WALK 1
+#define CHECK_FILE_PATH 2
+#define CHECK_EXEC_ARGS 3
+#define CHECK_TAIL_CALL 4
+#define CHECK_SOCKET_OWNER 5
+
+static __always_inline void count_check_failure(__u32 reason)
+{
+    __u32 zero = 0;
+    struct check_failures *stats = bpf_map_lookup_elem(&check_failures, &zero);
+    if (!stats)
+        return;
+    if (reason == CHECK_FILE_WALK)
+        __sync_fetch_and_add(&stats->file_walk, 1);
+    else if (reason == CHECK_FILE_PATH)
+        __sync_fetch_and_add(&stats->file_path, 1);
+    else if (reason == CHECK_EXEC_ARGS)
+        __sync_fetch_and_add(&stats->exec_args, 1);
+    else if (reason == CHECK_TAIL_CALL)
+        __sync_fetch_and_add(&stats->tail_call, 1);
+    else if (reason == CHECK_SOCKET_OWNER)
+        __sync_fetch_and_add(&stats->socket_owner, 1);
+}
+
+static __always_inline bool file_denied(const struct filter_config *cfg,
+                                         __u8 result, __u8 operation)
+{
+    if (!cfg->enable_file)
+        return false;
+    if (result & operation)
+        return true;
+    return cfg->strict_mode && (result & FILE_CHECK_FAILED);
+}
 
 /* 白名单相关变量 - 暂时不用, 保留占位
 const volatile char   filter_allow_dir[DIR_MAX_LEN];
@@ -836,8 +928,7 @@ struct {
     __type(value, __u32);
 } file_stage_calls SEC(".maps");
 
-/* 尾调用失败计数: 失败 = loader 未灌阶段表 (READY 门禁失守),
- * 调用方 fail-closed 拒操作。正常应为恒 0。 */
+/* 尾调用失败暴露阶段表不完整，正常应为恒 0。 */
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -1259,7 +1350,7 @@ static long dir_walk_step(__u32 index, void *ctx)
 
 /* 祖先走链查目录集合: 从 victim 的父目录开始, 每级在基线+域 inner 并查
  * 一次, 命中即并入 mask。fs 根 (d_parent 指向自己) 停止。
- * 预算耗尽/读取异常时 fail closed (无法证明不存在更高层受保护目录)。 */
+ * 预算耗尽或读取异常返回独立失败位，已命中的拒绝位仍然有效。 */
 static __always_inline __u8 dir_ancestor_mask(struct dentry *dentry,
                                               __u32 base_slot,
                                               __u32 dom_slot,
@@ -1277,7 +1368,11 @@ static __always_inline __u8 dir_ancestor_mask(struct dentry *dentry,
     bpf_loop(DENTRY_WALK_MAX, dir_walk_step, &st, 0);
     if (st.rule_ver)
         *rule_ver = st.rule_ver;
-    return (!st.stop || st.invalid) ? (st.mask | DENY_ALL) : st.mask;
+    if (!st.stop || st.invalid) {
+        count_check_failure(CHECK_FILE_WALK);
+        return st.mask | FILE_CHECK_FAILED;
+    }
+    return st.mask;
 }
 
 /* 文件钩子统一前奏: scope 判定 + file_ino/dir_ino/file_str 三维 outer 各查
@@ -1305,6 +1400,12 @@ static __always_inline bool file_policy_setup(const struct filter_config *cfg,
         return false;
     __u32 base = physical_slot(cfg, BASE_SLOT);
     __u32 domain = physical_slot(cfg, si.policy_slot);
+    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
+    __u32 flags = (sm ? sm->rule_flags : 0) | (bm ? bm->rule_flags : 0);
+    if (dimension_idle(flags, cfg->enable_file, cfg->audit_file,
+                       RULE_FILE, RULE_AUDIT_FILE))
+        return false;
     fp->base_fino = bpf_map_lookup_elem(&dom_file_ino, &base);
     fp->dom_fino  = bpf_map_lookup_elem(&dom_file_ino, &domain);
     fp->base_dino = bpf_map_lookup_elem(&dom_dir_ino, &base);
@@ -1342,8 +1443,6 @@ static __always_inline bool file_policy_setup(const struct filter_config *cfg,
         fp->dom_dino = (struct bpf_map *)&empty_ino_inner;
     fp->slot = domain;
     fp->base_slot = base;
-    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &fp->slot);
-    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
     fp->policy_ver = sm ? sm->version : 0;
     fp->file_str_count = (sm ? sm->file_str_count : 0) +
                          (bm ? bm->file_str_count : 0);
@@ -1414,8 +1513,7 @@ static __always_inline __u8 file_str_key_lookup(const struct path_key *key,
  * 在热路径上一次走链都不发生。
  *
  * 失败方向:
- *   - 走链预算耗尽/缓冲不可用 (unresolved) -> DENY_ALL, fail-closed,
- *     与 dir_ancestor_mask 深度耗尽的语义一致;
+ *   - 走链预算耗尽/缓冲不可用 (unresolved) -> FILE_CHECK_FAILED;
  *   - mnt 缺失 (partial) -> 0 不表态, inode 判定仍然有效;
  *   - 路径 > 255 字节 -> 0 (pack_path 编译期已拒绝这种规则, 必不命中)。
  *
@@ -1439,8 +1537,12 @@ static __noinline __u8 path_fallback_mask(struct dentry *dentry,
     __u32 len = 0;
     bool partial = false;
     char *path = path_resolve(dentry, mnt, &len, &partial);
-    if (!path)
-        return partial ? 0 : DENY_ALL;
+    if (!path) {
+        if (partial)
+            return 0;
+        count_check_failure(CHECK_FILE_PATH);
+        return FILE_CHECK_FAILED;
+    }
     if (len > 255)
         return 0;
     /* verifier 教训: 上面的分支只收窄了比较用的 (u32) 截断副本,
@@ -1460,8 +1562,10 @@ static __noinline __u8 path_fallback_mask(struct dentry *dentry,
      * len 字节, key 的其余部分保持零填充 (与编译器 pack_path 一致)。 */
     __u32 z = 0;
     struct path_key *key = bpf_map_lookup_elem(&path_key_scratch, &z);
-    if (!key)
-        return DENY_ALL;   /* scratch 不可用 = 无法证明安全, fail-closed */
+    if (!key) {
+        count_check_failure(CHECK_FILE_PATH);
+        return FILE_CHECK_FAILED;
+    }
     __builtin_memset(key, 0, sizeof(*key));   /* per-cpu 缓冲有上轮残留 */
     bpf_probe_read_kernel(key->s, len, path);
     /* fstr inner 现场查 outer, 不经 file_policy 携带: 每个文件钩子的
@@ -1836,10 +1940,10 @@ static __always_inline void report_file_op(__u32 op, __u32 allowed,
  * (非 sleepable, bpf_d_path 已弃用, 见钩子注释)。
  * =================================================================== */
 
-/* 文件钩子统一开场: 全局开关 + 进程树 scope + 文件两维 inner 定位 */
+/* 规则审计与策略阻断共享 scope 和文件策略上下文。 */
 #define FILE_HOOK_PREAMBLE()                       \
     const struct filter_config *cfg = get_cfg();   \
-    if (!cfg || !cfg->enable_file)                 \
+    if (!cfg)                                      \
         return 0;                                  \
     struct file_policy fp = {};                    \
     if (!file_policy_setup(cfg, &fp))              \
@@ -1868,19 +1972,19 @@ int BPF_PROG(enforce_file_open, struct file *file)
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
                                   &fp, &rule_ver, fb_path);
 
     __u32 acc = flags & O_ACCMODE;
     bool want_write = (acc != O_RDONLY) ||
                       (flags & (O_CREAT | O_TRUNC | O_APPEND));
-    if (want_write && (mask & DENY_WRITE)) {
+    if (want_write && file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_OPEN_WRITE, 0, dentry, fb_path,
                        fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
-    if (!want_write && (mask & DENY_READ)) {
+    if (!want_write && file_denied(cfg, mask, DENY_READ)) {
         report_file_op(FILE_OP_OPEN_READ, 0, dentry, fb_path,
                        fp.policy_ver, rule_ver);   /* DENY */
         return -1;
@@ -1895,11 +1999,8 @@ int BPF_PROG(enforce_file_open, struct file *file)
 /* lsm/file_permission: 对已经打开的 fd 在每次实际读写前重新授权。
  * 这关闭了“先 open，再进入受控域，随后通过旧 fd 继续 read/write”的绕过。
  *
- * 该 hook 位于高频 VFS 热路径：非读写请求最先返回；允许操作不产生事件。
- * file_open 等判决点已覆盖普通 ALLOW 审计，避免每次 read/write 都消耗采样
- * 预算并制造无意义事件。
- * 不接路径兜底: 每次 read/write 都走链的开销不可接受; 且重建文件的 fd
- * 必先过 file_open (sleepable, 字符串规则在那里生效), 无绕过窗口。 */
+ * 该 hook 位于高频 VFS 热路径：非读写请求最先返回。维度是否参与判定统一
+ * 由 file_policy_setup 内的 dimension_idle 决定 */
 SEC("lsm/file_permission")
 int BPF_PROG(enforce_file_permission, struct file *file, int mask)
 {
@@ -1916,15 +2017,26 @@ int BPF_PROG(enforce_file_permission, struct file *file, int mask)
 
     __u32 rule_ver = 0;
     __u8 deny = victim_mask(dentry, &fp, &rule_ver);
-    if ((mask & VFS_MAY_WRITE) && (deny & DENY_WRITE)) {
-        report_path_op(FILE_OP_FD_WRITE, 0, dentry, fp.policy_ver, rule_ver);
-        return -1;
+    __u32 op = 0;
+    __u32 allowed = 0;
+    bool deny_hit = false;
+
+    if ((mask & VFS_MAY_WRITE) && file_denied(cfg, deny, DENY_WRITE)) {
+        op = FILE_OP_FD_WRITE;
+        deny_hit = true;
+    } else if ((mask & VFS_MAY_READ) && file_denied(cfg, deny, DENY_READ)) {
+        op = FILE_OP_FD_READ;
+        deny_hit = true;
+    } else if (!cfg->enable_file) {
+        __u8 want = (mask & VFS_MAY_WRITE) ? DENY_WRITE : DENY_READ;
+        if ((deny & (want | FILE_CHECK_FAILED)) || (rule_ver & 0x80000000u)) {
+            op = (mask & VFS_MAY_WRITE) ? FILE_OP_FD_WRITE : FILE_OP_FD_READ;
+            allowed = 1;
+        }
     }
-    if ((mask & VFS_MAY_READ) && (deny & DENY_READ)) {
-        report_path_op(FILE_OP_FD_READ, 0, dentry, fp.policy_ver, rule_ver);
-        return -1;
-    }
-    return 0;
+    if (op)
+        report_path_op(op, allowed, dentry, fp.policy_ver, rule_ver);
+    return deny_hit ? -1 : 0;
 }
 
 /* lsm/path_truncate: truncate()/ftruncate() 不开文件直接截断,
@@ -1942,12 +2054,12 @@ int BPF_PROG(enforce_path_truncate, const struct path *path)
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
                                   &rule_ver, fb_path);
     /* DEBUG: 排障用, 正常时注释掉。bpf_trace_printk 不支持 %#x, 用 %x */
     // bpf_printk("[trunc] mask=%x", mask);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_TRUNCATE, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
@@ -1966,11 +2078,11 @@ int BPF_PROG(enforce_path_unlink, const struct path *dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
                                   &rule_ver, fb_path);
     // bpf_printk("[unlink] mask=%x", mask);
-    if (mask & (DENY_DELETE | DENY_RENAME)) {
+    if (file_denied(cfg, mask, DENY_DELETE | DENY_RENAME)) {
         report_file_op(FILE_OP_UNLINK, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
@@ -1988,11 +2100,11 @@ int BPF_PROG(enforce_path_rmdir, const struct path *dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
                                   &rule_ver, fb_path);
     // bpf_printk("[rmdir] mask=%x", mask);
-    if (mask & (DENY_DELETE | DENY_RENAME)) {
+    if (file_denied(cfg, mask, DENY_DELETE | DENY_RENAME)) {
         report_file_op(FILE_OP_RMDIR, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
@@ -2021,20 +2133,22 @@ int BPF_PROG(enforce_path_rename, const struct path *old_dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(old_dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(old_dentry, BPF_CORE_READ(old_dir, mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(old_dentry, BPF_CORE_READ(old_dir, mnt),
                                   &fp, &rule_ver, fb_path);
     // bpf_printk("[rename] src mask=%x", mask);
-    if (mask & (DENY_DELETE | DENY_RENAME)) {
+    if (file_denied(cfg, mask, DENY_DELETE | DENY_RENAME)) {
         report_file_op(FILE_OP_RENAME, 0, old_dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY (源侧) */
         return -1;
     }
 
-    /* 目标侧移交段 2。尾调用失败 (正常不会发生) = loader 未灌阶段表,
-     * 目标侧判定缺失不能静默放行: 计数 + fail-closed。 */
+    /* 尾调用缺失意味着无法检查目标侧；失败模式决定是否阻断。 */
     bpf_tail_call(ctx, &file_stage_calls, FILE_STAGE_RENAME_DST);
     count_tailcall_miss();
-    return -1;
+    count_check_failure(CHECK_TAIL_CALL);
+    if (cfg->enable_file && cfg->strict_mode)
+        return -1;
+    return 0;
 }
 
 /* rename 段 2: 目标侧判定。同段名 lsm/path_rename (类型/attach id 与
@@ -2050,11 +2164,11 @@ int BPF_PROG(enforce_path_rename_dst, const struct path *old_dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(new_dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(new_dentry, BPF_CORE_READ(new_dir, mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(new_dentry, BPF_CORE_READ(new_dir, mnt),
                                   &fp, &rule_ver, fb_path);
     // bpf_printk("[rename] dst mask=%x", mask);
-    if (mask & (DENY_WRITE | DENY_RENAME)) {
+    if (file_denied(cfg, mask, DENY_WRITE | DENY_RENAME)) {
         report_file_op(FILE_OP_RENAME, 0, new_dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY (目标侧) */
         return -1;
     }
@@ -2083,10 +2197,10 @@ int BPF_PROG(enforce_file_truncate, struct file *file)
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
                                   &fp, &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_FTRUNCATE, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
@@ -2107,7 +2221,7 @@ int BPF_PROG(enforce_path_link, struct dentry *old_dentry,
 
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(old_dentry, &fp, &rule_ver);
-    if (mask & DENY_RENAME) {
+    if (file_denied(cfg, mask, DENY_RENAME)) {
         report_path_op(FILE_OP_LINK, 0, old_dentry, fp.policy_ver, rule_ver);    /* DENY (源侧) */
         return -1;
     }
@@ -2115,10 +2229,10 @@ int BPF_PROG(enforce_path_link, struct dentry *old_dentry,
     rule_ver = 0;
     mask = victim_mask(ndir, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(ndir, BPF_CORE_READ(new_dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(ndir, BPF_CORE_READ(new_dir, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_LINK, 0, ndir, fb_path, fp.policy_ver, rule_ver);          /* DENY (目标父目录) */
         return -1;
     }
@@ -2140,10 +2254,10 @@ int BPF_PROG(enforce_path_symlink, const struct path *dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_SYMLINK, 0, dentry, fb_path, fp.policy_ver, rule_ver);   /* DENY */
         return -1;
     }
@@ -2163,10 +2277,10 @@ int BPF_PROG(enforce_path_mkdir, const struct path *dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_MKDIR, 0, dentry, fb_path, fp.policy_ver, rule_ver);     /* DENY */
         return -1;
     }
@@ -2186,10 +2300,10 @@ int BPF_PROG(enforce_path_chmod, const struct path *path, umode_t mode)
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_ATTR) {
+    if (file_denied(cfg, mask, DENY_ATTR)) {
         report_file_op(FILE_OP_CHMOD, 0, dentry, fb_path, fp.policy_ver, rule_ver);       /* DENY */
         return -1;
     }
@@ -2212,10 +2326,10 @@ int BPF_PROG(enforce_path_chown, const struct path *path,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(path, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_ATTR) {
+    if (file_denied(cfg, mask, DENY_ATTR)) {
         report_file_op(FILE_OP_CHOWN, 0, dentry, fb_path, fp.policy_ver, rule_ver);       /* DENY */
         return -1;
     }
@@ -2239,7 +2353,7 @@ int BPF_PROG(enforce_inode_setxattr, struct mnt_idmap *idmap,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
-    if (mask & DENY_ATTR) {
+    if (file_denied(cfg, mask, DENY_ATTR)) {
         report_path_op(FILE_OP_SETXATTR, 0, dentry, fp.policy_ver, rule_ver);    /* DENY */
         return -1;
     }
@@ -2259,7 +2373,7 @@ int BPF_PROG(enforce_inode_removexattr, struct mnt_idmap *idmap,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
-    if (mask & DENY_ATTR) {
+    if (file_denied(cfg, mask, DENY_ATTR)) {
         report_path_op(FILE_OP_REMOVEXATTR, 0, dentry, fp.policy_ver, rule_ver); /* DENY */
         return -1;
     }
@@ -2280,7 +2394,7 @@ int BPF_PROG(enforce_inode_set_acl, struct mnt_idmap *idmap,
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
-    if (mask & DENY_ATTR) {
+    if (file_denied(cfg, mask, DENY_ATTR)) {
         report_path_op(FILE_OP_SETACL, 0, dentry, fp.policy_ver, rule_ver);      /* DENY */
         return -1;
     }
@@ -2302,10 +2416,10 @@ int BPF_PROG(enforce_path_mknod, const struct path *dir,
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(pd, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(dir, mnt), &fp,
                                   &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_MKNOD, 0, dentry, fb_path, fp.policy_ver, rule_ver);     /* DENY */
         return -1;
     }
@@ -2322,22 +2436,21 @@ SEC("lsm/mmap_file")
 int BPF_PROG(enforce_mmap_file, struct file *file, unsigned long reqprot,
              unsigned long prot, unsigned long flags)
 {
-    FILE_HOOK_PREAMBLE();
-
     if (!((prot & PROT_WRITE) && (flags & MAP_SHARED)))
         return 0;
     if (!file)
         return 0;
+    FILE_HOOK_PREAMBLE();
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     if (!dentry)
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
                                   &fp, &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_MMAP_WRITE, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
@@ -2353,8 +2466,6 @@ SEC("lsm/file_mprotect")
 int BPF_PROG(enforce_file_mprotect, struct vm_area_struct *vma,
              unsigned long reqprot, unsigned long prot)
 {
-    FILE_HOOK_PREAMBLE();
-
     if (!(prot & PROT_WRITE))        /* 只关心写提权 */
         return 0;
     if (!vma)
@@ -2365,16 +2476,17 @@ int BPF_PROG(enforce_file_mprotect, struct vm_area_struct *vma,
     struct file *file = BPF_CORE_READ(vma, vm_file);
     if (!file)                       /* 匿名映射 */
         return 0;
+    FILE_HOOK_PREAMBLE();
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     if (!dentry)
         return 0;
     __u32 rule_ver = 0;
     __u8 mask = victim_mask(dentry, &fp, &rule_ver);
     char fb_path[64] = {};
-    if (!mask)
-        mask = path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
+    if (!(mask & DENY_ALL))
+        mask |= path_fallback_mask(dentry, BPF_CORE_READ(file, f_path.mnt),
                                   &fp, &rule_ver, fb_path);
-    if (mask & DENY_WRITE) {
+    if (file_denied(cfg, mask, DENY_WRITE)) {
         report_file_op(FILE_OP_MPROTECT, 0, dentry, fb_path, fp.policy_ver, rule_ver);  /* DENY */
         return -1;
     }
@@ -2440,24 +2552,30 @@ SEC("lsm/bprm_check_security")
 int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
 {
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_exec)
+    if (!cfg)
         return 0;
 
     struct scope_info si = {};
     if (!in_scope_exec(&si))
         return 0;
 
-    /* 命令/参数两维 outer: 基线 slot + 域 slot 各查一次 */
+    /* 先按维度标志剪枝, 再查 6 个 inner outer 指针 */
     __u32 base = physical_slot(cfg, BASE_SLOT);
     __u32 domain = physical_slot(cfg, si.policy_slot);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
+    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
+    if (dimension_idle((bm ? bm->rule_flags : 0) | (sm ? sm->rule_flags : 0),
+                       cfg->enable_exec, cfg->audit_exec,
+                       RULE_EXEC, RULE_AUDIT_EXEC))
+        return 0;
+
+    /* 命令/参数两维 outer: 基线 slot + 域 slot 各查一次 */
     struct bpf_map *base_cmd = bpf_map_lookup_elem(&dom_cmd, &base);
     struct bpf_map *dom_cmd_m = bpf_map_lookup_elem(&dom_cmd, &domain);
     struct bpf_map *base_cmd_ino = bpf_map_lookup_elem(&dom_cmd_ino, &base);
     struct bpf_map *dom_cmd_ino_m = bpf_map_lookup_elem(&dom_cmd_ino, &domain);
     struct bpf_map *base_arg = bpf_map_lookup_elem(&dom_arg, &base);
     struct bpf_map *dom_arg_m = bpf_map_lookup_elem(&dom_arg, &domain);
-    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
-    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
     __u32 policy_ver = sm ? sm->version : 0;
     __u32 rule_ver = 0;
 
@@ -2483,7 +2601,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
         executable, base_cmd_ino, dom_cmd_ino_m, &rule_ver);
     if (!command_denied && fn_complete)
         command_denied = is_cmd_in_blacklist(fn, base_cmd, dom_cmd_m, &rule_ver);
-    if (command_denied) {
+    if (command_denied && cfg->enable_exec) {
         report_exec(0, fn, ea, policy_ver, rule_ver, si.scope_id);   /* DENY (整命令) */
         if (ea)
             bpf_map_delete_elem(&exec_args_map, &tid);
@@ -2502,22 +2620,27 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
                                               fn_complete ? fn : NULL,
                                               base_arg, dom_arg_m, &rule_ver);
             if (arg_result == ARG_CHECK_UNAVAILABLE) {
-                report_exec(0, fn, ea, policy_ver, 0, si.scope_id);
+                count_check_failure(CHECK_EXEC_ARGS);
+                if (!cfg->enable_exec || !cfg->strict_mode) {
+                    report_exec(1, fn, ea, policy_ver, rule_ver, si.scope_id);
+                    return 0;
+                }
                 if (ea)
                     bpf_map_delete_elem(&exec_args_map, &tid);
                 return -1;
             }
         }
         if (arg_result == ARG_CHECK_MATCH) {
+            if (!cfg->enable_exec) {
+                report_exec(1, fn, ea, policy_ver, rule_ver, si.scope_id);
+                return 0;
+            }
             report_exec(0, fn, ea, policy_ver, rule_ver, si.scope_id);  /* DENY (参数级) */
             bpf_map_delete_elem(&exec_args_map, &tid);
             return -1;
         }
 
-        /* EXEC 审计: 未命中任何黑名单也上报 allowed=1 事件。
-         * 否则 bprm 钩子"放行即静默", ls/cat 这类正常命令只会以
-         * file_open(exec 时要打开二进制) 的形式出现在 FILE 事件里。
-         * 在判决点上报, allowed 状态必然准确; 参数从暂存里带上展示。 */
+        /* 命中规则审计或显式全量审计时才构造允许事件。 */
         report_exec(1, fn, ea, policy_ver, rule_ver, si.scope_id);      /* OK */
         /* A shebang causes further bprm checks for its interpreters. Keep
          * this syscall's original argv until exec succeeds or the task exits.
@@ -2549,18 +2672,22 @@ static __always_inline int capture_exec_argv(const char *const *argv)
     const struct filter_config *cfg = get_cfg();
     if (!cfg)
         return 0;
-    if (!cfg->enable_exec)
-        return 0;
     /* exec 路径 scope: tracked 优先, pending 兜底 —— 新 fork 的子孙
      * 第一次 exec 时 sched_process_exec 尚未落表 (见 in_scope_exec 注释),
      * 纯 tracked 判定会让 argv 暂存错过整个首次 exec */
     struct scope_info si = {};
     if (!in_scope_exec(&si))
         return 0;
-
     __u64 id = bpf_get_current_pid_tgid();
-    // Never reuse prior syscall argv, including when scratch allocation fails.
     bpf_map_delete_elem(&exec_args_map, &id);
+    __u32 base = physical_slot(cfg, BASE_SLOT);
+    __u32 domain = physical_slot(cfg, si.policy_slot);
+    struct slot_meta *bm = bpf_map_lookup_elem(&slot_meta_map, &base);
+    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
+    if (dimension_idle((bm ? bm->rule_flags : 0) | (sm ? sm->rule_flags : 0),
+                       cfg->enable_exec, cfg->audit_exec,
+                       RULE_EXEC, RULE_AUDIT_EXEC))
+        return 0;
     __u32 zero = 0;
     struct exec_args *ea = bpf_map_lookup_elem(&exec_capture_scratch, &zero);
     if (!ea)
@@ -2698,6 +2825,10 @@ static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
     return 0;
 
 deny6:
+    if (!cfg->enable_net) {
+        report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
+        return 0;
+    }
     report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);
     return -1;
 }
@@ -2788,6 +2919,10 @@ static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
     return 0;
 
 deny:
+    if (!cfg->enable_net) {
+        report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
+        return 0;
+    }
     report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);  /* DENY */
     return -1;
 }
@@ -2797,10 +2932,13 @@ static __always_inline int enforce_socket_addr(struct socket *sock,
                                                int addrlen, __u32 op)
 {
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_net || !sock || !addr)
+    if (!cfg || !sock || !addr)
         return 0;
     struct scope_info si = {};
     if (!current_scope_info(&si))
+        return 0;
+    if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
+                       RULE_NET, RULE_AUDIT_NET))
         return 0;
     struct sock *sk = BPF_CORE_READ(sock, sk);
     if (!sk)
@@ -2817,7 +2955,10 @@ static __always_inline int enforce_connected_peer(struct socket *sock, __u32 op)
 {
     const struct filter_config *cfg = get_cfg();
     struct scope_info si = {};
-    if (!cfg || !cfg->enable_net || !sock || !current_scope_info(&si))
+    if (!cfg || !sock || !current_scope_info(&si))
+        return 0;
+    if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
+                       RULE_NET, RULE_AUDIT_NET))
         return 0;
     struct sock *sk = BPF_CORE_READ(sock, sk);
     if (!sk || !BPF_CORE_READ(sk, __sk_common.skc_dport))
@@ -2851,13 +2992,16 @@ SEC("lsm/socket_bind")
 int BPF_PROG(enforce_socket_bind, struct socket *sock, struct sockaddr *addr, int addrlen)
 {
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_net)
+    if (!cfg)
         return 0;
     struct scope_info si = {};
     if (!current_scope_info(&si) || !sock || !addr)
         return 0;
     struct sock *skp = BPF_CORE_READ(sock, sk);
     if (!skp)
+        return 0;
+    if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
+                       RULE_NET, RULE_AUDIT_NET))
         return 0;
     short family = BPF_CORE_READ(skp, __sk_common.skc_family);
     if (family == 10)
@@ -2873,7 +3017,7 @@ int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, in
 {
     (void)size;
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_net || !sock || !msg)
+    if (!cfg || !sock || !msg)
         return 0;
     struct sockaddr *addr = BPF_CORE_READ(msg, msg_name);
     int addrlen = BPF_CORE_READ(msg, msg_namelen);
@@ -2881,6 +3025,9 @@ int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, in
         return enforce_connected_peer(sock, NET_OP_SENDMSG);
     struct scope_info si = {};
     if (!current_scope_info(&si))
+        return 0;
+    if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
+                       RULE_NET, RULE_AUDIT_NET))
         return 0;
     struct sock *skp = BPF_CORE_READ(sock, sk);
     if (!skp)
@@ -2895,8 +3042,9 @@ int BPF_PROG(enforce_socket_sendmsg, struct socket *sock, struct msghdr *msg, in
 
 static __always_inline int remember_socket_scope(struct socket *sock)
 {
+    const struct filter_config *cfg = get_cfg();
     struct scope_info si = {};
-    if (!sock || !current_scope_info(&si))
+    if (!cfg || !sock || !current_scope_info(&si))
         return 0;
     struct sock *sk = BPF_CORE_READ(sock, sk);
     if (!sk)
@@ -2905,14 +3053,21 @@ static __always_inline int remember_socket_scope(struct socket *sock)
     if (family != 2 && family != 10)
         return 0;
     __u64 inode = BPF_CORE_READ(sock, file, f_inode, i_ino);
-    if (!inode)
-        return -12;
+    bool net_active = !dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net,
+                                      cfg->audit_net, RULE_NET, RULE_AUDIT_NET);
+    if (!inode) {
+        count_check_failure(CHECK_SOCKET_OWNER);
+        if (cfg->enable_net && cfg->strict_mode && net_active)
+            return -12;
+        return 0;
+    }
+    /* 空规则时也保留 socket 归属，使后续发布的规则覆盖已有监听连接。 */
     struct socket_owner owner = { .scope_id = si.scope_id,
         .tgid = bpf_get_current_pid_tgid() >> 32 };
     bpf_get_current_comm(owner.comm, sizeof(owner.comm));
     if (bpf_map_update_elem(&socket_owners, &inode, &owner, BPF_ANY)) {
-        const struct filter_config *cfg = get_cfg();
-        if (cfg && cfg->enable_net)
+        count_check_failure(CHECK_SOCKET_OWNER);
+        if (cfg->enable_net && cfg->strict_mode && net_active)
             return -12;
     }
     return 0;
@@ -2940,7 +3095,7 @@ int BPF_PROG(enforce_inet_conn_request, struct sock *sk, struct sk_buff *skb,
 {
     (void)skb;
     const struct filter_config *cfg = get_cfg();
-    if (!cfg || !cfg->enable_net || !sk || !req)
+    if (!cfg || !sk || !req)
         return 0;
     struct socket *sock = BPF_CORE_READ(sk, sk_socket);
     if (!sock)
@@ -2953,6 +3108,9 @@ int BPF_PROG(enforce_inet_conn_request, struct sock *sk, struct sk_buff *skb,
     if (!binding)
         return 0;
     struct scope_info si = { .scope_id = owner->scope_id, .policy_slot = binding->policy_slot };
+    if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
+                       RULE_NET, RULE_AUDIT_NET))
+        return 0;
     short family = BPF_CORE_READ(sk, __sk_common.skc_family);
     if (family == 2) {
         struct sockaddr_in sin = {};
@@ -2995,8 +3153,8 @@ int BPF_PROG(forget_socket_inode, struct inode *inode)
  * 守护者自保 (台账 D1/D3, L3 路线图议题二; 对标 ActPlane
  * enforce_task_kill / enforce_ptrace_access_check / enforce_bpf_syscall)
  *
- * 与策略钩子不同: 不走 YAML enable_* 开关, always-on; scope 用
- * guard_scope ([pidtree] 进程树作用域, 空集 = 不生效, 见上文)。
+ * 自保护由 self_protection 独立启用，不受 enable_* 或失败模式控制；
+ * scope 限定为受管进程树。
  * 防护方向只有 "被管树 → daemon": 树外同 uid 攻击者按进程树
  * 区分不了, 属部署加固半区 (专用用户运行 daemon), 见 README 已知边界。
  * 守护事件与策略无关, 版本字段恒 0。
@@ -3102,7 +3260,7 @@ int BPF_PROG(enforce_bpf_guard, int cmd, union bpf_attr *attr,
  *
  * 照搬 AcTrail live_observation 的追踪集合维护机制 (设计文档
  * docs/design/多Agent域模型-进程树作用域设计.md §4.1 伪码)。
- * always-on (与守护钩同等待遇, 不走 YAML 开关)。
+ * 进程身份追踪独立于策略维度开关。
  * 与命令捕获用的 tracepoint/syscalls/sys_enter_execve 是不同的
  * attach 点, 互不冲突, 各自保留。
  * fork 只继承 scope_id；policy slot 每次判定时通过 scope_policies 解析。
