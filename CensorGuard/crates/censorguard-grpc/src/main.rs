@@ -230,6 +230,18 @@ fn pb_status(result: &censorguard_common::protocol::RpcResult) -> Result<pb::Sta
         ]),
         daemon_boot_id: response.daemon_boot_id,
         hooks_healthy: response.hooks_healthy.unwrap_or(false),
+        failure_mode: response
+            .failure_mode
+            .map(|mode| mode.to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        self_protection: response.self_protection,
+        check_failures: std::collections::HashMap::from([
+            ("file_walk".into(), response.check_failures.file_walk),
+            ("file_path".into(), response.check_failures.file_path),
+            ("exec_args".into(), response.check_failures.exec_args),
+            ("tail_call".into(), response.check_failures.tail_call),
+            ("socket_owner".into(), response.check_failures.socket_owner),
+        ]),
     })
 }
 

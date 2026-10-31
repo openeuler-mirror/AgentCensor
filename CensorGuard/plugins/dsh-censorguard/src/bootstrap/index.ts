@@ -55,8 +55,8 @@ export class BootstrapCore implements CensorguardReady {
 
   async waitForReady(timeoutMs = 10000): Promise<void> {
     if (this.disposed) throw new Error('censorguardReady 已 dispose');
-    const isReady = (state: ProtectionState): boolean => state.kind === 'protected'
-      || (state.kind === 'degraded' && !this.cfg.blockOnFailure);
+    const isReady = (state: ProtectionState): boolean => !this.cfg.blockOnFailure
+      || state.kind === 'protected';
     if (isReady(this.state)) return;
     return new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -89,10 +89,12 @@ export class BootstrapCore implements CensorguardReady {
     this.stateMachine.toAttaching();
     try {
       const result = await this.tryAttach();
+      if (this.disposed) return result;
       this.scheduleHeartbeat();
       this.resetRetry();
       return result;
     } catch (e) {
+      if (this.disposed) throw e;
       const reason = e instanceof AttachError ? `${e.kind}: ${e.message}` : String(e);
       this.stateMachine.toDegraded(reason);
       if (this.cfg.blockOnFailure) {
@@ -119,6 +121,7 @@ export class BootstrapCore implements CensorguardReady {
         heartbeatIntervalMs: this.cfg.heartbeatIntervalMs,
       });
       const result = await this.client.attachSelf();
+      if (this.disposed) return;
       this.stateMachine.toProtected({
         domainId: result.domainId,
         domain: result.domain,
@@ -155,6 +158,7 @@ export class BootstrapCore implements CensorguardReady {
       heartbeatIntervalMs: this.cfg.heartbeatIntervalMs,
     });
     const result = await this.client.attachSelf();
+    if (this.disposed) return result;
     this.stateMachine.toProtected({
       domainId: result.domainId,
       domain: result.domain,

@@ -151,6 +151,18 @@ fn doctor(
     match call(&config.control_socket, &request(Operation::Status)) {
         Ok(response) => {
             check(
+                "failure_mode",
+                true,
+                format!(
+                    "{}; self_protection={}",
+                    response
+                        .failure_mode
+                        .map(|mode| mode.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    response.self_protection
+                ),
+            );
+            check(
                 "daemon",
                 response.ok && response.daemon_ready,
                 response
@@ -165,12 +177,14 @@ fn doctor(
         }
         Err(error) => check("daemon", false, error.to_string()),
     }
-    for (name, path) in [
+    let mut channels = vec![
         ("events", &config.event_socket),
         ("launch", &config.launch_socket),
-        ("dsh", &config.dsh_socket),
-        ("ui", &config.ui_socket),
-    ] {
+    ];
+    if config.dsh_enabled {
+        channels.extend([("dsh", &config.dsh_socket), ("ui", &config.ui_socket)]);
+    }
+    for (name, path) in channels {
         match UnixStream::connect(path) {
             Ok(_) => check(name, true, path.display().to_string()),
             Err(error) => check(name, false, error.to_string()),

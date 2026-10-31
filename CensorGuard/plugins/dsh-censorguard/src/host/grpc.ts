@@ -16,6 +16,9 @@ export interface RequestContext {
 }
 
 export interface StatusReply {
+  failureMode: string;
+  selfProtection: boolean;
+  checkFailures: Record<string, number>;
   roots: number[];
   tracked: number;
   domains: DomainInfo[];
@@ -353,6 +356,9 @@ export class GrpcClient {
       config: (r.config ?? {}) as Record<string, boolean>,
       daemonBootId: String(r.daemonBootId ?? ''),
       hooksHealthy: Boolean(r.hooksHealthy ?? false),
+      failureMode: String(r.failureMode ?? 'unknown'),
+      selfProtection: Boolean(r.selfProtection ?? false),
+      checkFailures: Object.fromEntries(Object.entries((r.checkFailures ?? {}) as Record<string, unknown>).map(([key, value]) => [key, Number(value)])),
     };
   }
 }

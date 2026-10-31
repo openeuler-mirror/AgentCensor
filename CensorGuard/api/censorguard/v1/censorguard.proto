@@ -76,6 +76,9 @@ message StatusReply {
   // 以及策略 enforcement 是否就绪。
   string daemon_boot_id = 10;
   bool hooks_healthy = 11;
+  string failure_mode = 12;
+  bool self_protection = 13;
+  map<string, uint64> check_failures = 14;
 }
 
 message DomainInfo {
