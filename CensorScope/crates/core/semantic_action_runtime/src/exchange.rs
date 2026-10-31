@@ -5,9 +5,9 @@ use model_core::diagnostics::{CaptureDiagnostic, DiagnosticKind, DiagnosticSever
 use model_core::ids::CollectorName;
 use model_core::payload::{PayloadContentState, PayloadDirection, PayloadSegment};
 use semantic_action_contract::{
-    SemanticAction, SemanticActionCompleteness, SemanticActionKind, SemanticActionLink,
-    SemanticActionLinkConfidence, SemanticActionLinkRole, SemanticActionStatus, SemanticEvidence,
-    SemanticEvidenceKind,
+    LLM_ASSOCIATION_STATE_ATTRIBUTE, SemanticAction, SemanticActionCompleteness,
+    SemanticActionKind, SemanticActionLink, SemanticActionLinkConfidence, SemanticActionLinkRole,
+    SemanticActionStatus, SemanticEvidence, SemanticEvidenceKind,
 };
 use serde_json::Value;
 
@@ -92,9 +92,10 @@ impl LlmExchangeRuntime {
                                 "correlated".to_string(),
                             );
                         }
-                        action
-                            .attributes
-                            .insert("llm.association_state".to_string(), "matched".to_string());
+                        action.attributes.insert(
+                            LLM_ASSOCIATION_STATE_ATTRIBUTE.to_string(),
+                            "matched".to_string(),
+                        );
                         let call = make_call(&request, Some(&action));
                         output.links.push(link(
                             &call,
@@ -121,10 +122,10 @@ impl LlmExchangeRuntime {
                         };
                         let already_reported = action
                             .attributes
-                            .get("llm.association_state")
+                            .get(LLM_ASSOCIATION_STATE_ATTRIBUTE)
                             .is_some_and(|value| value == association_state);
                         action.attributes.insert(
-                            "llm.association_state".to_string(),
+                            LLM_ASSOCIATION_STATE_ATTRIBUTE.to_string(),
                             association_state.to_string(),
                         );
                         if !already_reported {
@@ -181,8 +182,10 @@ impl LlmExchangeRuntime {
                         "llm.call.finalized_on_trace_close".to_string(),
                         "true".to_string(),
                     );
-                    call.attributes
-                        .insert("llm.association_state".to_string(), "unclosed".to_string());
+                    call.attributes.insert(
+                        LLM_ASSOCIATION_STATE_ATTRIBUTE.to_string(),
+                        "unclosed".to_string(),
+                    );
                     call
                 }));
             }
@@ -799,7 +802,7 @@ fn make_call(request: &SemanticAction, response: Option<&SemanticAction>) -> Sem
         }
     }
     attributes.insert(
-        "llm.association_state".to_string(),
+        LLM_ASSOCIATION_STATE_ATTRIBUTE.to_string(),
         if response.is_some() {
             "matched"
         } else {
@@ -884,6 +887,10 @@ mod tests {
             operation_id: None,
             offset: None,
             completed: true,
+            operation_completion_state:
+                model_core::payload::PayloadOperationCompletionState::Success,
+            truncation: model_core::payload::PayloadTruncationState::Complete,
+            redaction: model_core::payload::PayloadRedactionState::NotRequired,
             original_size: bytes.len() as u64,
             captured_size: bytes.len() as u64,
             library: None,
@@ -1157,7 +1164,7 @@ mod tests {
                 .actions
                 .iter()
                 .find(|action| action.kind == SemanticActionKind::LlmResponse)
-                .and_then(|action| action.attributes.get("llm.association_state"))
+                .and_then(|action| action.attributes.get(LLM_ASSOCIATION_STATE_ATTRIBUTE))
                 .map(String::as_str),
             Some("orphan")
         );
@@ -1191,7 +1198,7 @@ mod tests {
                 .actions
                 .iter()
                 .find(|action| action.kind == SemanticActionKind::LlmResponse)
-                .and_then(|action| action.attributes.get("llm.association_state"))
+                .and_then(|action| action.attributes.get(LLM_ASSOCIATION_STATE_ATTRIBUTE))
                 .map(String::as_str),
             Some("provider_mismatch")
         );

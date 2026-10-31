@@ -16,6 +16,29 @@ pub enum PayloadContentState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PayloadOperationCompletionState {
+    Unknown = 0,
+    Success = 1,
+    Partial = 2,
+    Failed = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PayloadTruncationState {
+    Unknown = 0,
+    Complete = 1,
+    Truncated = 2,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PayloadRedactionState {
+    Unknown = 0,
+    NotRequired = 1,
+    Redacted = 2,
+    Unredacted = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PayloadDirection {
     Unknown = 0,
     Inbound = 1,
@@ -48,6 +71,9 @@ pub struct PayloadSegment {
     pub operation_id: Option<u64>,
     pub offset: Option<u64>,
     pub completed: bool,
+    pub operation_completion_state: PayloadOperationCompletionState,
+    pub truncation: PayloadTruncationState,
+    pub redaction: PayloadRedactionState,
     pub original_size: u64,
     pub captured_size: u64,
     pub library: Option<String>,
@@ -85,6 +111,9 @@ mod tests {
             operation_id: None,
             offset: None,
             completed: true,
+            operation_completion_state: PayloadOperationCompletionState::Success,
+            truncation: PayloadTruncationState::Complete,
+            redaction: PayloadRedactionState::NotRequired,
             original_size: 8,
             captured_size: 0,
             library: None,

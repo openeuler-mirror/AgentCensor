@@ -1270,6 +1270,10 @@ mod tests {
             operation_id: None,
             offset: None,
             completed: true,
+            operation_completion_state:
+                model_core::payload::PayloadOperationCompletionState::Success,
+            truncation: model_core::payload::PayloadTruncationState::Complete,
+            redaction: model_core::payload::PayloadRedactionState::NotRequired,
             original_size: 4,
             captured_size: 4,
             library: None,

@@ -102,6 +102,10 @@ mod tests {
             operation_id: None,
             offset: None,
             completed: true,
+            operation_completion_state:
+                model_core::payload::PayloadOperationCompletionState::Success,
+            truncation: model_core::payload::PayloadTruncationState::Complete,
+            redaction: model_core::payload::PayloadRedactionState::NotRequired,
             original_size: bytes.map_or(0, |value| value.len() as u64),
             captured_size: bytes.map_or(0, |value| value.len() as u64),
             library: None,

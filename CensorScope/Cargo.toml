@@ -27,6 +27,7 @@ members = [
     "crates/storage/adapters/sqlite",
 
     "crates/adapters/collectors/ebpf",
+    "crates/adapters/external_events",
 
     "crates/adapters/control/uds/client",
     "crates/adapters/control/uds/server",

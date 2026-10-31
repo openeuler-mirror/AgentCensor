@@ -1,0 +1,12 @@
+[package]
+name = "external_events_adapter"
+version.workspace = true
+edition = "2024"
+license = "MulanPSL-2.0"
+
+[dependencies]
+agentcensor-events = { path = "../../../../contracts/agentcensor-events" }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
