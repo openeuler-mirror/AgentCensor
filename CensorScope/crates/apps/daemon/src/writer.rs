@@ -130,13 +130,22 @@ pub struct CallCloseWrite {
     pub jobs: Vec<(BackfillJob, u64)>,
 }
 
-/// One normalized spool record and its durable sequence.
+/// One normalized spool record and its sequence within the current daemon
+/// lifetime.
 #[derive(Clone, Debug)]
 pub struct IngestBatchWrite {
     pub sequence: u64,
     pub ancillary: Vec<PersistWrite>,
     pub events: Vec<DomainEvent>,
     pub payloads: Vec<PayloadSegment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalEventWrite {
+    pub source_instance_id: String,
+    pub source_sequence: u64,
+    pub ancillary: Vec<PersistWrite>,
+    pub event: DomainEvent,
 }
 
 /// Values returned by acknowledged control operations.
@@ -154,6 +163,7 @@ enum ControlItem {
     CallClose(CallCloseWrite, ControlReply),
     PersistWrites(Vec<PersistWrite>, ControlReply),
     IngestBatch(IngestBatchWrite, ControlReply),
+    ExternalEvent(ExternalEventWrite, ControlReply),
     ReserveIdBlock {
         count: u64,
         reply: ControlReply,
@@ -453,6 +463,14 @@ impl WriterHandle {
         Ok(reply_rx)
     }
 
+    pub fn external_event(&self, write: ExternalEventWrite) -> Result<(), String> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.control
+            .send(ControlItem::ExternalEvent(write, reply_tx))
+            .map_err(|_| "writer channel closed".to_string())?;
+        wait_reply(reply_rx).map(|_| ())
+    }
+
     pub fn reserve_id_block(&self, count: u64) -> Result<(u64, u64), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control
@@ -680,6 +698,23 @@ impl Writer {
                         .map(|_| ControlValue::Unit),
                     reply,
                 )
+            }
+            ControlItem::ExternalEvent(write, reply) => {
+                self.flush_ancillary();
+                self.flush_accumulator();
+                let result = self
+                    .apply_writes_strict(write.ancillary)
+                    .and_then(|()| {
+                        self.storage
+                            .append_external_event(
+                                &write.source_instance_id,
+                                write.source_sequence,
+                                write.event,
+                            )
+                            .map_err(storage_stage("append_external_event"))
+                    })
+                    .map(|_| ControlValue::Unit);
+                (result, reply)
             }
             ControlItem::ReserveIdBlock { count, reply } => (
                 self.storage

@@ -647,6 +647,9 @@ function registerCallRoute(ctx) {
         const key = event.kind_name || 'unknown'
         counts[key] = (counts[key] || 0) + 1
       }
+      const interceptions = events.filter(
+        (event) => event?.kind_name === 'guard' && (event?.decision === 'deny' || event?.blocked === true),
+      ).length
       json(200, {
         ok: true,
         source,
@@ -654,6 +657,7 @@ function registerCallRoute(ctx) {
         call: callId,
         events,
         counts,
+        interceptions,
         segments: Array.isArray(payload.payload_segments) ? payload.payload_segments.length : 0,
       })
     } catch (error) {

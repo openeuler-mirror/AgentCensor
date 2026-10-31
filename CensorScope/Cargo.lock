@@ -301,6 +301,7 @@ dependencies = [
 name = "daemon"
 version = "0.1.0"
 dependencies = [
+ "agentcensor-events",
  "clap",
  "collector_binding",
  "collector_capability",
@@ -310,6 +311,7 @@ dependencies = [
  "config_core",
  "control_contract",
  "ebpf_collector",
+ "external_events_adapter",
  "ingest_runtime",
  "libc",
  "model_core",
