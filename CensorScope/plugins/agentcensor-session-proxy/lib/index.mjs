@@ -33,6 +33,7 @@
  *   ACASK\t<json>    approval/question ask forwarded by the worker: {id,kind,…payload}
  *   ACWITHDRAW\t<json> withdrawal of one forwarded ask: {id}
  *   ACSYNC\t<json>   worker accepted an existing host configuration event: {seq}
+ *   ACSTREAM\t<json> native transient assistant frame (never appended as a session event)
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
  *   {"type":"message","message":{content,source,id?,role?}}  original user message
@@ -95,6 +96,7 @@ import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
+import { AssistantStreamBridge } from './assistant-stream-bridge.mjs'
 
 // 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
 // Session.append cannot express that flag (its surface options are the only
@@ -119,6 +121,7 @@ const CANCEL_PREFIX = 'ACCANCEL\t'
 const SYNC_PREFIX = 'ACSYNC\t'
 const ASK_PREFIX = 'ACASK\t'
 const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
+const STREAM_PREFIX = 'ACSTREAM\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
 const STOP_GRACE_MS = 3000
 /**
@@ -319,6 +322,7 @@ export class WebDriverAgent {
     this.status = 'idle'
     this.inbox = { nextTurn: [], nextStep: [] }
     this.dispatch = agentEvents(rootCtx, this)
+    this.assistantStream = new AssistantStreamBridge(frame => this.dispatch.emit('agent/assistant-stream', { frame }))
     this.scope = createScope(rootCtx, this)
     this.ctx = this.scope.ctx
     this.rootCtx = rootCtx
@@ -560,6 +564,8 @@ export class WebDriverAgent {
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
     this.workerNextSeq = this.session.seq
+    this.workerEventSeqs = new Map()
+    this.assistantStream.startWorker()
     process.stdout.write(`[agentcensor] worker shares host home DSH_HOME=${hostHome} (no key/model env)\n`)
 
     const cwd = header.cwd ?? process.cwd()
@@ -667,7 +673,9 @@ export class WebDriverAgent {
     const consume = (async () => {
       const rl = createInterface({ input: child.stdout })
       for await (const line of rl) {
-        if (line.startsWith(EVT_PREFIX)) {
+        if (line.startsWith(STREAM_PREFIX)) {
+          this.assistantStream.accept(JSON.parse(line.slice(STREAM_PREFIX.length)), seq => this.workerEventSeqs.get(seq))
+        } else if (line.startsWith(EVT_PREFIX)) {
           let frame
           try {
             frame = JSON.parse(line.slice(EVT_PREFIX.length))
@@ -731,6 +739,7 @@ export class WebDriverAgent {
     child.once('close', (code, signal) => {
       state.alive = false
       state.stopping = true
+      this.assistantStream.close()
       ACTIVE_WORKERS.delete(child)
       consume.catch(() => undefined)
       state.closeResolve?.({ code, signal })
@@ -964,7 +973,12 @@ export class WebDriverAgent {
       this.workerNextSeq = event.seq
     }
     try {
+      const hostSeq = this.session.seq
       this.mirrorInto(this.session, event, stats, this.workerAuthoredSequences)
+      if (this.session.seq > hostSeq) {
+        this.workerEventSeqs?.set(event.seq, hostSeq)
+        if (this.workerEventSeqs?.size > 4096) this.workerEventSeqs.delete(this.workerEventSeqs.keys().next().value)
+      }
     } catch (error) {
       stats.failed += 1
       process.stdout.write(

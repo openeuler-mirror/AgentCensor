@@ -32,7 +32,7 @@ Web 端的原生 `ui-trajectory` 视图必须关闭，由 `censorscope-ui` 提�
 
 ```sh
 # 安装
-dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.5.tgz
+dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.6.tgz
 # 启动
 dsh --profile web
 ```
@@ -69,6 +69,10 @@ dsh plugin --profile web remove agentcensor-session-proxy
   boot 从自身持久化重放推导会话最近一次选型,仅在进程重建时发生)。
 - 常驻 worker 的权限、沙箱、审批及模型切换通过 `host-session-event` 同步；worker
   用原生 session fold 应用，发 `ACSYNC` 确认，不把同一配置事件再次写回宿主。
+- 模型切换同时更新原生请求选型引用，在下一次 prompt assembly 生效；已组装请求保持原选型。
+- 实时文本、推理和工具参数通过独立 `ACSTREAM` 控制帧传回宿主的原生
+  `agent/assistant-stream`，供原生 follow/reconnect 消费。worker 替换时关闭未完成流，
+  保持宿主 revision 连续并转换提交序号；不启用原生轨迹页。
 - goal / schedule / subagent / jobs 等工具在常驻 worker 内与原生语义一致地跨消息存活
   (后台任务不会因单轮结束被杀)。
 - **审批 / 提问（ask_user_question）桥**:浏览器是 dsh 里唯一的交互应答端,但它只挂在**宿主**的
@@ -107,7 +111,7 @@ agentcensor-session-proxy/              插件源码(可读/可改;安装请用�
 ├── lib/worker.mjs                        worker 侧:常驻 runner(原生 agent-loop + 双向帧协议)
 ├── lib/interaction-bridge.mjs            宿主侧:审批/提问的交互桥(控制面,只派发 waterfall,不写会话数据)
 ├── package.json / cordis.patch.yml       插件包元数据与 bundle patch
-agentcensor-session-proxy-0.1.5.tgz    可安装包(需自行打包)
+agentcensor-session-proxy-0.1.6.tgz    可安装包(需自行打包)
 README.md                              本文件
 ```
 

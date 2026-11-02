@@ -33,6 +33,7 @@
  *   ACCANCEL\t<json> cancel handed to the native agent: {cause,keepInbox,seq,applied}
  *   ACASK\t<json>    approval/question ask forwarded to the host: {id,kind,...payload}
  *   ACWITHDRAW\t<json> withdrawal of one forwarded ask: {id}
+ *   ACSTREAM\t<json> native transient assistant frame
  * Everything else on stdout/stderr is host log passthrough.
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
@@ -206,6 +207,9 @@ async function run(ctx) {
   // tree showing a child row that opened onto nothing. The child's metadata
   // rides on its first frame so the host can open a real session for it.
   const announcedChildren = new Set()
+  ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+    if (agent.session.id === sessionId) process.stdout.write(`ACSTREAM\t${JSON.stringify(frame)}\n`)
+  }, { global: true })
   ctx.on('session/event', (session, event) => {
     if (session.id === sessionId) {
       if (hostSyncedSequences.delete(event.seq)) {
@@ -250,7 +254,8 @@ async function run(ctx) {
   // rebuilt from the host seed: the newest `model/selection` or `request/header`
   // config in the conversation wins.
   const selection = durableSelection(agent.session) ?? fallback
-  installModelSelection(agent.ctx, { current: selection, assembled: undefined })
+  const selectionRef = { current: selection, assembled: undefined }
+  installModelSelection(agent.ctx, selectionRef)
 
   // Register the human-interaction answerers BEFORE any turn can run: a tool
   // call in the first message must already be able to reach the browser.
@@ -268,11 +273,11 @@ async function run(ctx) {
     model: { provider: selection.provider, model: selection.model },
   })}\n`)
 
-  return controlLoop(agent, sessions, asks, frames, rl)
+  return controlLoop(agent, sessions, asks, frames, rl, selectionRef)
 }
 
 /** Serve messages, cancellations, and interaction answers until shutdown or EOF. */
-async function controlLoop(agent, sessions, asks, frames, rl) {
+export async function controlLoop(agent, sessions, asks, frames, rl, selectionRef) {
   let chain = Promise.resolve()
   // Messages accepted but not yet finished: a cancel arriving while the agent is
   // still idle belongs to the turn one of these is about to open.
@@ -314,6 +319,13 @@ async function controlLoop(agent, sessions, asks, frames, rl) {
         ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
         ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
       })
+      if (event.type === 'model/selection') {
+        selectionRef.current = {
+          provider: event.data.provider,
+          model: event.data.model,
+          ...(event.data.reasoningEffort === undefined ? {} : { reasoningEffort: event.data.reasoningEffort }),
+        }
+      }
       continue
     }
     if (frame?.type === 'message') {
