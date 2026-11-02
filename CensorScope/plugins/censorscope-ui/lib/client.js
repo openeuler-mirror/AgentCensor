@@ -120,6 +120,12 @@ window.__ModuleLoader__.load({
       const rowsByCall = new Map(toolRows.map((row) => [row.callId, row]));
       const items = [];
       let pendingModel = null;
+      // Types this projection does not draw. Dropping them is correct -- the
+      // events stay in the session log and 0.2.1 marks extension events
+      // ignorable on purpose -- but dropping them *silently* is not: without
+      // this tally a future event type (workspace/changes, job/*, a whole new
+      // turn kind) disappears from the panel with nothing to notice.
+      const unrendered = new Map();
       const pushTurn = (ev, turn) => {
         items.push({
           kind: "turn",
@@ -218,8 +224,16 @@ window.__ModuleLoader__.load({
           case "permission/preset":
           case "sandbox/mode":
           case "approval/policy":
-          default:
             break;
+          default: {
+            if (typeof type === "string" && type !== "") {
+              const entry = unrendered.get(type) || { type, count: 0, seqs: [] };
+              entry.count += 1;
+              if (entry.seqs.length < 5) entry.seqs.push(ev.seq);
+              unrendered.set(type, entry);
+            }
+            break;
+          }
         }
       }
       // Assistant tool-call blocks without a tool/call event fall back to appended rows.
@@ -248,6 +262,14 @@ window.__ModuleLoader__.load({
       if (fallback.length > 0) {
         items.push({ kind: "fallback", rows: fallback });
       }
+      if (unrendered.size > 0) {
+        const types = Array.from(unrendered.values()).sort((a, b) => b.count - a.count);
+        items.push({
+          kind: "unrendered",
+          types,
+          total: types.reduce((sum, entry) => sum + entry.count, 0),
+        });
+      }
       return items;
     }
 
@@ -262,6 +284,11 @@ window.__ModuleLoader__.load({
       ".censorscope-sub{color:var(--dsw-alias-label-tertiary,#8f959e);font-size:12px}",
       ".censorscope-scroll{flex:1;min-height:0;overflow:auto;padding:6px 12px 18px}",
       ".censorscope-empty{padding:22px 14px;color:var(--dsw-alias-label-secondary,#646a73);font-size:13px;line-height:1.7}",
+      ".censorscope-unrendered{border:0.5px solid var(--dsw-alias-border-tertiary,#e5e6eb);border-radius:8px;padding:8px 10px;margin:8px 0}",
+      ".censorscope-unrenderedHead{cursor:pointer;color:var(--dsw-alias-label-secondary,#646a73);font-size:12px;line-height:1.6}",
+      ".censorscope-unrenderedBody{margin-top:8px;display:flex;flex-direction:column;gap:5px}",
+      ".censorscope-unrenderedRow{display:flex;gap:10px;font-size:12px;font-family:var(--ds-font-family-mono,ui-monospace,monospace);color:var(--dsw-alias-label-tertiary,#8f959e)}",
+      ".censorscope-unrenderedType{color:var(--dsw-alias-label-primary,#1f2329);min-width:190px}",
       ".censorscope-turn{display:flex;align-items:center;gap:10px;margin:14px 2px 4px;color:var(--dsw-alias-label-secondary,#646a73);font-size:12px;font-weight:600}",
       ".censorscope-turnMeta{display:inline-flex;gap:8px;font-weight:400;color:var(--dsw-alias-label-tertiary,#8f959e)}",
       ".censorscope-turnLine{flex:1;height:1px;background:var(--dsw-alias-border-l1,rgba(0,0,0,.08))}",
@@ -579,13 +606,26 @@ window.__ModuleLoader__.load({
           case "fallback":
             return react.createElement(react.Fragment, { key: "fallback" },
               item.rows.map((entry) => toolRow(entry.row)));
+          case "unrendered":
+            return react.createElement("details", { key: "unrendered", className: "censorscope-unrendered" },
+              react.createElement("summary", { className: "censorscope-unrenderedHead" },
+                "未渲染事件 " + item.total + " 条 · " + item.types.length +
+                  " 种类型（本视图不展示，原始事件仍在会话日志中）"),
+              react.createElement("div", { className: "censorscope-unrenderedBody" },
+                item.types.map((entry) =>
+                  react.createElement("div", { key: entry.type, className: "censorscope-unrenderedRow" },
+                    react.createElement("span", { className: "censorscope-unrenderedType" }, entry.type),
+                    react.createElement("span", null, entry.count + " 条"),
+                    react.createElement("span", null,
+                      "seq " + entry.seqs.join(", ") + (entry.count > entry.seqs.length ? " …" : ""))))));
           default:
             return null;
         }
       }
 
       const items = buildTimeline(events, toolRows);
-      const visible = items.filter((item) => item.kind !== "fallback").length;
+      const visible = items.filter((item) => item.kind !== "fallback" && item.kind !== "unrendered").length;
+      const hasUnrendered = items.some((item) => item.kind === "unrendered");
       return react.createElement("div", { className: "censorscope-root" },
         react.createElement("div", { className: "censorscope-head" },
           react.createElement("span", { className: "censorscope-title" }, "CensorScope · 轨迹"),
@@ -593,7 +633,7 @@ window.__ModuleLoader__.load({
             toolRows.length + " 次工具调用 · " + visible + " 个事件行 · 点击工具行展开系统调用"),
         ),
         react.createElement("div", { className: "censorscope-scroll" },
-          items.length === 0 || visible === 0
+          items.length === 0 || (visible === 0 && !hasUnrendered)
             ? react.createElement("div", { className: "censorscope-empty" },
                 "（暂无轨迹：请先在会话中执行任务，任务期间/结束后回到本 Tab）")
             : items.map((item) => itemView(item)),
