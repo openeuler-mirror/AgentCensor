@@ -93,6 +93,17 @@ Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权�
 
 无环境变量的事件按调用 span 时间窗做唯一回补，不确定时保持未归因。
 
+### dsh 集成的两个硬约束
+
+1. **确定的 SessionId 归因是硬要求，worker 不是硬要求。** 需要覆盖原本在 dsh 根进程内
+   执行的会话操作（例如原生文件读写），不能只覆盖 shell 子进程。当前通过每会话 worker
+   为这类操作建立进程身份。替代方案必须在并发情况下同样确定地关联真实观测事件与会话；
+   只记录工具调用的 SessionId 或用时间窗猜测，不能视为满足要求。
+2. **原生 dsh 轨迹视图必须关闭。** `censorscope-ui` 有意禁用 `ui-trajectory`，由
+   CensorScope 轨迹页替代；这是集成要求，不是待修复的原生体验差异。
+
+版本核查、原生能力及替代方案边界见 [dsh 集成设计约束与归因方案](plugins/DSH-INTEGRATION.md)。
+
 ## dsh 集成
 
 三个插件均为 dsh profile 级安装，详见 [`plugins/README.md`](plugins/README.md)：
@@ -103,11 +114,14 @@ Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权�
 | `censorscope-ui` | 浏览器会话「CensorScope」Tab（工具调用级观测视图） | web |
 | `agentcensor-session-proxy` | web 每会话 headless worker + `CENSORSCOPE_SESSION_ID` | web |
 
+`agentcensor-session-proxy` 的 worker 是当前实现确定归因的手段；是否保留它，应依据替代
+方案的事件归因能力决定，不能直接删除后接受会话身份缺失。
+
 安装（插件变更需重新打包安装，脚本按版本号刷新）：
 
 ```bash
 export DSH_HOME=<你的 dsh home>   # 不设置则默认 ~/.dsh，建议设置DSH_HOME
-./scripts/install-censorscope.sh all    # host+ui+proxy；host 模式只装 host
+./scripts/install-censorscope.sh all    # host+ui+proxy；host 模式安装 host+proxy，不安装 UI
 ```
 
 ## 数据访问

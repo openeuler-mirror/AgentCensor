@@ -2,6 +2,18 @@
 
 本目录包含三个随 dsh 预装的插件（不修改 dsh 源码，只做 profile 级插件安装）：
 
+## 设计约束
+
+- **SessionId 确定归因是硬要求，worker 不是硬要求。** 需要覆盖原本在 dsh 根进程内
+  执行的会话操作（包括原生文件读写），不能只覆盖 shell 子进程。每会话 worker 是当前
+  实现方式；其它方案只要能在并发情况下确定地关联真实观测事件与会话，也可替代它。
+- **原生 dsh 轨迹视图必须关闭。** `censorscope-ui` 明确禁用 `ui-trajectory`，CensorScope
+  轨迹页是预期的轨迹入口；这不是原生体验兼容缺陷。
+- **不修改 dsh 源码。** 适配和替代方案通过外部插件、profile/bundle、执行后端或
+  CensorScope 实现，不以修改 dsh 为前提。
+
+版本核查、原生接口、替代方案及验收边界见 [dsh 集成设计约束与归因方案](DSH-INTEGRATION.md)。
+
 | 包 | 版本 | 作用 | 装入 profile |
 |---|---|---|---|
 | `censorscope-host` | 0.1.2 | main 角色：单 trace track-add(trace-id 复用；显式传递自身 PID namespace，兼容 Guard 的 ptrace 限制) + per-call cache writer + `/censorscope/call` 路由；worker 角色：注入 `DSH_CENSORSCOPE_CALL_ID` + call-start/end span（真实起止时刻） | web + headless |
@@ -26,6 +38,9 @@ export DSH_HOME=/path/to/dsh/home     # 必填，脚本本身不设置
 
 - `all`：安装/刷新全部三个插件。
 - `host`：只装 `censorscope-host`（web+headless）与 `agentcensor-session-proxy`（web），不装 `censorscope-ui`。
+
+`host` 模式本身不保证关闭原生轨迹，也不卸载已有 UI 插件。完整集成应使用 `all`，并确认
+最终 profile 中 `ui-trajectory` 为禁用状态；其它 bundle 或 profile patch 不应重新启用它。
 
 其它要点：
 
