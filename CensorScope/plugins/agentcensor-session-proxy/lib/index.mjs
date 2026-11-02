@@ -242,12 +242,13 @@ function workerOverlay(privHome, compression = 'none') {
     '# Private writable roots: the worker shares the host DSH_HOME for config',
     '# but must never write the host session store / storages / attachments.',
     '# Compression follows the shared artifact we seeded from (stock dsh web',
-    '# persists .zstd; our none-packChunks overlays persist plain JSONL).',
+    '# persists .zstd). dsh 0.2.1 session-persistence-jsonl accepts only',
+    '# root/compression/listConcurrency -- the 0.1.x packChunks key is gone,',
+    '# and an unknown config key makes the worker bundle fail to load.',
     '- id: session-persistence-jsonl',
     '  config:',
     `    root: ${JSON.stringify(privRoot)}`,
     `    compression: ${compression === 'zstd' ? 'zstd' : 'none'}`,
-    ...(compression === 'zstd' ? [] : ['    packChunks: false']),
     '',
     '- id: storage-json',
     '  config:',
@@ -867,8 +868,14 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
   const detachAgent = rootCtx.agents.enter(agent, parentAgent ?? initiator)
   try {
     agent.ctx.sessions.announce(session)
-    rootCtx.agents.announce(agent)
-    agentEvents(rootCtx, agent).emit('agent/session-start', { source })
+    // dsh 0.2.1: `agents.announce(agent, source, signal?)` is async, takes the
+    // SessionStartSource positionally, and publishes the `agent/created`
+    // lifecycle edge itself through `ctx.serial` (agent/src/index.ts:539-561).
+    // 'agent/session-start' no longer exists in 0.2.1 at all -- cordis does not
+    // reject unknown event names, so the old emit was a silent no-op that also
+    // dropped the ordering guarantee ("release queued work only after every
+    // created listener settled").
+    await rootCtx.agents.announce(agent, source)
   } catch (error) {
     detachAgent?.()
     detachSession?.()
