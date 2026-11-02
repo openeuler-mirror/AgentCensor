@@ -890,7 +890,7 @@ async function seedLogCopy(realFile, privRoot) {
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle) {
+async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle, setup) {
   const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
   // dsh 0.1.5 removes the implicit ctx.agent accessor.
@@ -900,6 +900,15 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
   } catch {}
   const detachAgent = rootCtx.agents.enter(agent, parentAgent ?? initiator)
   try {
+    // dsh 0.2.1 publishes an agent through a setup transaction: `options.setup`
+    // composes the unpublished agent scope (the web face mounts the agent preset
+    // and the model selection there), and the returned commit must run after
+    // every setup await settles and immediately before publication
+    // (agent/src/index.ts:104-118). Ignoring it left the worker on whatever
+    // preset it booted with, so choosing a model or preset in the web UI never
+    // reached it.
+    const setupCommit = await setup?.(agent.ctx, agent)
+    setupCommit?.commit?.()
     agent.ctx.sessions.announce(session)
     // dsh 0.2.1: `agents.announce(agent, source, signal?)` is async, takes the
     // SessionStartSource positionally, and publishes the `agent/created`
@@ -989,7 +998,7 @@ export async function apply(ctx) {
           const seed = session.snapshotEvents()
           if (seed.length > 0) await handle.append(seed)
         }
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent, handle)
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent, handle, options.setup)
       } catch (error) {
         await handle?.close().catch(() => undefined)
         throw error
@@ -1010,7 +1019,7 @@ export async function apply(ctx) {
         })
         const suffix = session.snapshotEvents(snapshot.events.length)
         if (suffix.length > 0) await handle.append(suffix)
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent, handle)
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent, handle, options.setup)
       } catch (error) {
         await handle.close().catch(() => undefined)
         throw error
