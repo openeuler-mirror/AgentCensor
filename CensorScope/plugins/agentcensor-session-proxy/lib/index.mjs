@@ -80,7 +80,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, relative } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // The source CLI uses the TS graph; a built CLI uses package exports. Recognize
 // both the public tsx/esm specifier and its resolved tsx/dist/esm entry path.
@@ -120,6 +120,12 @@ const ASK_PREFIX = 'ACASK\t'
 const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
 const STOP_GRACE_MS = 3000
+/**
+ * Events per seed frame. The durable log reaches a new worker over stdin, and
+ * one frame per session would mean serializing the whole log into a single
+ * string; chunking keeps every frame bounded.
+ */
+const SEED_CHUNK_EVENTS = 500
 /** All live worker child processes, for host-exit cleanup. */
 const ACTIVE_WORKERS = new Set()
 /** Conventional exit codes for the host signals we reclaim workers on. */
@@ -224,7 +230,7 @@ async function resolveDshWorkerLauncher() {
  * per-worker private dir (it must never write the host's session store,
  * storages, or attachments).
  */
-function workerOverlay(privHome, compression = 'none') {
+function workerOverlay(privHome) {
   const runner = join(bundleDir(), 'worker.mjs')
   const privRoot = join(privHome, 'sessions')
   const lines = []
@@ -253,14 +259,13 @@ function workerOverlay(privHome, compression = 'none') {
     '',
     '# Private writable roots: the worker shares the host DSH_HOME for config',
     '# but must never write the host session store / storages / attachments.',
-    '# Compression follows the shared artifact we seeded from (stock dsh web',
-    '# persists .zstd). dsh 0.2.1 session-persistence-jsonl accepts only',
-    '# root/compression/listConcurrency -- the 0.1.x packChunks key is gone,',
-    '# and an unknown config key makes the worker bundle fail to load.',
+    '# The worker builds its own log from the seed frames the host streams in, so',
+    '# it no longer mirrors the host artifact format: plain JSONL is correct here',
+    '# and avoids depending on whatever compression the host happens to use.',
     '- id: session-persistence-jsonl',
     '  config:',
     `    root: ${JSON.stringify(privRoot)}`,
-    `    compression: ${compression === 'zstd' ? 'zstd' : 'none'}`,
+    '    compression: none',
     '',
     '- id: storage-json',
     '  config:',
@@ -474,25 +479,27 @@ class WebDriverAgent {
     this.workerStats = { mirrored: 0, skipped: 0, failed: 0, gapped: 0, unmirrored: 0 }
     this.pendingCancels = []
     const header = this.session.header
-    const located = persistence.locate?.(header)
-    const realFile = located?.path
-    if (typeof realFile !== 'string') {
-      throw new Error('agentcensor: session persistence must provide a JSONL artifact location')
+    // Read the durable log through the documented read side instead of asking
+    // the backend where its artifact lives. `locate()` is a private member and
+    // the JSONL layout is versioned (generation files, migration status), so
+    // copying the physical file was both unsupported and format-fragile.
+    const readHandle = await persistence.open(this.session.id, 'read')
+    let seedEvents
+    try {
+      const page = await readHandle.read(0)
+      seedEvents = page.events
+    } finally {
+      await readHandle.close().catch(() => undefined)
     }
-    await fsp.stat(realFile)
-    const resume = true
+    if (!Array.isArray(seedEvents)) {
+      throw new Error('agentcensor: session persistence returned no events for the seed')
+    }
 
     const privHome = await fsp.mkdtemp(join(tmpdir(), 'agentcensor-worker-'))
     const privRoot = join(privHome, 'sessions')
     await fsp.mkdir(privRoot, { recursive: true })
-    let seeded = false
-    if (resume && realFile !== undefined) {
-      await seedLogCopy(realFile, privRoot)
-      seeded = true
-    }
-    const compression = typeof realFile === 'string' && realFile.endsWith('.zstd') ? 'zstd' : 'none'
     const overlayPath = join(privHome, 'overlay.yml')
-    await fsp.writeFile(overlayPath, workerOverlay(privHome, compression), 'utf8')
+    await fsp.writeFile(overlayPath, workerOverlay(privHome), 'utf8')
 
     const hostHome = resolveDshHome(undefined, process.env)
     const childEnv = {
@@ -501,7 +508,7 @@ class WebDriverAgent {
       DSH_AGENTS_HOME: join(privHome, '.agents'),
       DSH_TELEMETRY_DISABLED: '1',
       AGENTCENSOR_SESSION_ID: this.session.id,
-      AGENTCENSOR_MODE: resume ? 'resume' : 'create',
+      AGENTCENSOR_MODE: 'seed',
       AGENTCENSOR_HOST_SEQ: String(this.session.seq),
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
@@ -510,7 +517,7 @@ class WebDriverAgent {
 
     const cwd = header.cwd ?? process.cwd()
     process.stdout.write(
-      `[agentcensor] worker spawn mode=${resume ? 'resume' : 'create'} session=${this.id} pid=PENDING\n`,
+      `[agentcensor] worker spawn mode=seed session=${this.id} pid=PENDING\n`,
     )
     process.stdout.write(`[agentcensor] worker launcher=${dshLauncher.label}\n`)
     const child = spawn(dshLauncher.command, [
@@ -521,7 +528,14 @@ class WebDriverAgent {
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    process.stdout.write(`[agentcensor] worker spawn ok mode=${resume ? "resume" : "create"} pid=${String(child.pid ?? "?")} seed=${seeded ? "copied" : "none"}\n`)
+    // The worker builds its session from these frames before creating anything,
+    // so they must arrive first: no file is copied and no artifact path is shared.
+    try {
+      writeSeed(child, seedEvents)
+    } catch (error) {
+      process.stdout.write(`[agentcensor] seed write failed: ${String(error)}\n`)
+    }
+    process.stdout.write(`[agentcensor] worker spawn ok mode=seed pid=${String(child.pid ?? "?")} seed=${String(seedEvents.length)}\n`)
     ACTIVE_WORKERS.add(child)
 
     let readyResolve = () => undefined
@@ -878,15 +892,23 @@ function normalizeCancelCause(cause) {
   return { kind: 'user' }
 }
 
-/** Copy the shared durable log into the worker's private root, same layout. */
-async function seedLogCopy(realFile, privRoot) {
-  const sessionDir = dirname(realFile)
-  const projectDir = dirname(sessionDir)
-  // e.g. <encId>/session.jsonl
-  const relFromProject = relative(projectDir, realFile)
-  const privFile = join(privRoot, basename(projectDir), relFromProject)
-  await fsp.mkdir(dirname(privFile), { recursive: true })
-  await fsp.copyFile(realFile, privFile)
+/**
+ * Stream the host's durable log to a freshly spawned worker as chunked seed
+ * frames, terminating with `{done:true}`. The worker rebuilds its own session
+ * from these events, so the two roots never share a file, a path, or a
+ * compression format.
+ */
+function writeSeed(child, events) {
+  if (events.length === 0) {
+    child.stdin.write(`${JSON.stringify({ type: 'seed', events: [], done: true })}\n`)
+    return
+  }
+  for (let offset = 0; offset < events.length; offset += SEED_CHUNK_EVENTS) {
+    const chunk = events.slice(offset, offset + SEED_CHUNK_EVENTS)
+    const last = offset + SEED_CHUNK_EVENTS >= events.length
+    const frame = { type: 'seed', events: chunk, ...(last ? { done: true } : {}) }
+    child.stdin.write(`${JSON.stringify(frame)}\n`)
+  }
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
