@@ -95,6 +95,18 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
 
+// 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
+// Session.append cannot express that flag (its surface options are the only
+// envelope metadata it writes), so appendPluginRecord is the one faithful
+// landing place for `plugin:*`. Keep it optional: a bundle that does not
+// resolve dsh-session still boots, and the mirror degrades to counting skips.
+let appendPluginRecord
+try {
+  ;({ appendPluginRecord } = await import('@deepseek-ai/dsh-session'))
+} catch {
+  appendPluginRecord = undefined
+}
+
 export const name = 'agentcensor-session-proxy'
 export const inject = ['agents', 'sessions', 'sessionPersistence', 'sessionProjections']
 
@@ -309,7 +321,7 @@ class WebDriverAgent {
     this.unwritten = 0
     this.idleWaiters = []
     this.endSeedInserted = false
-    this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
+    this.workerStats = { mirrored: 0, skipped: 0, failed: 0, gapped: 0, unmirrored: 0 }
     this.sendChain = Promise.resolve()
     this.closedByHost = false
     this.workerAuthoredSequences = new Set()
@@ -459,7 +471,7 @@ class WebDriverAgent {
 
     await sessions.flush(this.session)
     this.endSeedInserted = false
-    this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
+    this.workerStats = { mirrored: 0, skipped: 0, failed: 0, gapped: 0, unmirrored: 0 }
     this.pendingCancels = []
     const header = this.session.header
     const located = persistence.locate?.(header)
@@ -649,7 +661,7 @@ class WebDriverAgent {
       state.closeResolve?.({ code, signal })
       const codeText = code === null ? `signal=${signal ?? '?'}` : `code=${code}`
       process.stdout.write(
-        `[agentcensor] worker closed pid=${String(child.pid ?? '?')} ${codeText} mirrored=${this.workerStats.mirrored} skipped=${this.workerStats.skipped} failed=${this.workerStats.failed}\n`,
+        `[agentcensor] worker closed pid=${String(child.pid ?? '?')} ${codeText} mirrored=${this.workerStats.mirrored} skipped=${this.workerStats.skipped} gapped=${this.workerStats.gapped} unmirrored=${this.workerStats.unmirrored} failed=${this.workerStats.failed}\n`,
       )
       if (spawnError === undefined && !state.stoppingBeforeClose) {
         // Unexpected death (never asked to stop): a boot failure if READY was
@@ -781,44 +793,65 @@ class WebDriverAgent {
       return
     }
     if (event.seq > this.workerNextSeq) {
+      // A hole means frames were lost. Record it and realign on the current
+      // event instead of refusing this and every later frame: a refusal used to
+      // leave workerNextSeq behind forever, silently freezing the whole mirror
+      // until the worker restarted.
+      const lost = event.seq - this.workerNextSeq
+      stats.gapped += lost
       process.stdout.write(
-        `[agentcensor] mirror gap: worker seq ${String(event.seq)} > expected ${String(this.workerNextSeq)} (type=${event.type})\n`,
+        `[agentcensor] mirror gap: expected seq ${String(this.workerNextSeq)}, got ${String(event.seq)} ` +
+        `(+${String(lost)} lost, type=${event.type}); realigning\n`,
       )
-      stats.failed += 1
-      return
+      this.workerNextSeq = event.seq
     }
     try {
-      // The host assigns seq/time on append; retain every other envelope
-      // field and fail loudly if a future dsh event cannot be represented.
-      const { type, seq: _seq, time: _time, data, ...intent } = event
-      const unsupportedIntent = Object.keys(intent).filter(
-        (key) => key !== 'surfaceOp' && key !== 'sourceEventSeqs',
-      )
-      if (unsupportedIntent.length > 0) {
-        stats.failed += 1
-        process.stdout.write(
-          `[agentcensor] mirror refused unsupported event envelope fields: ${unsupportedIntent.join(', ')} (type=${type})\n`,
-        )
-        return
-      }
-      const hasSurface = intent.surfaceOp !== undefined || intent.sourceEventSeqs !== undefined
-      this.workerAuthoredSequences.add(this.session.seq)
-      if (hasSurface) {
-        this.session.append(type, data, {
-          ...(intent.surfaceOp === undefined ? {} : { surfaceOp: intent.surfaceOp }),
-          ...(intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs }),
-        })
-      } else {
-        this.session.append(type, data)
-      }
-      stats.mirrored += 1
-      this.workerNextSeq += 1
+      this.mirrorEvent(event, stats)
     } catch (error) {
       stats.failed += 1
       process.stdout.write(
         `[agentcensor] mirror append failed seq=${String(event.seq)} type=${event.type}: ${error?.message ?? String(error)}\n`,
       )
+    } finally {
+      // Advance regardless of outcome. The mirror is a follower: an event the
+      // host cannot represent must cost that one event, never the stream.
+      this.workerNextSeq += 1
     }
+  }
+
+  /**
+   * Mirror one worker event into the host session, routing by envelope kind.
+   * The host assigns `seq`/`time`; what remains is either surface intent or the
+   * `ignorable` marker 0.2.1 added for plugin records and extension events.
+   */
+  mirrorEvent(event, stats) {
+    const { type, data } = event
+    const surfaceOp = event.surfaceOp
+    const sourceEventSeqs = event.sourceEventSeqs
+    if (event.ignorable === true) {
+      // `ignorable` is a routing instruction, not metadata: Session.append
+      // cannot carry it, so only the plugin:* namespace has a faithful place.
+      if (type.startsWith('plugin:') && typeof appendPluginRecord === 'function') {
+        this.workerAuthoredSequences.add(this.session.seq)
+        appendPluginRecord(this.session, type, data)
+        stats.mirrored += 1
+        return
+      }
+      // Unknown extension events (an `external/*` type from a future build, for
+      // example) have no host-side representation at all. Count and continue.
+      stats.unmirrored += 1
+      process.stdout.write(
+        `[agentcensor] mirror skipped unmappable ignorable event type=${type} seq=${String(event.seq)}\n`,
+      )
+      return
+    }
+    const surface = {
+      ...(surfaceOp === undefined ? {} : { surfaceOp }),
+      ...(sourceEventSeqs === undefined ? {} : { sourceEventSeqs }),
+    }
+    this.workerAuthoredSequences.add(this.session.seq)
+    if (Object.keys(surface).length === 0) this.session.append(type, data)
+    else this.session.append(type, data, surface)
   }
 }
 
