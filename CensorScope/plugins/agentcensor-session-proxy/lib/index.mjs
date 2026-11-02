@@ -126,6 +126,10 @@ const STOP_GRACE_MS = 3000
  * string; chunking keeps every frame bounded.
  */
 const SEED_CHUNK_EVENTS = 500
+/** Consecutive spawn failures that trip the breaker. */
+const SPAWN_FAILURE_LIMIT = 3
+/** A failure older than this starts a fresh streak: an isolated crash is not a loop. */
+const SPAWN_FAILURE_WINDOW_MS = 60_000
 /** All live worker child processes, for host-exit cleanup. */
 const ACTIVE_WORKERS = new Set()
 /** Conventional exit codes for the host signals we reclaim workers on. */
@@ -319,6 +323,13 @@ class WebDriverAgent {
     this.workerState = undefined
     // In-flight spawn promise (ready).
     this.spawning = undefined
+    // Spawn breaker: a worker that fails to build every time (a bad overlay, a
+    // missing persistence face, an unwritable root) must not be retried once per
+    // message -- each retry pays a full seed replay and every message reports the
+    // same failure. Count consecutive failures inside one window and stop.
+    this.spawnFailures = 0
+    this.lastSpawnFailureAt = 0
+    this.spawnFailureReason = undefined
     // Messages forwarded to the worker, not yet answered by an IDLE.
     this.outstanding = 0
     // Messages accepted by the driver but not yet written to the worker's stdin;
@@ -449,10 +460,33 @@ class WebDriverAgent {
   /** Lazily spawn (once) the resident worker for this session; resolves ready. */
   ensureWorker() {
     if (this.workerState !== undefined && this.workerState.alive) return this.workerState.ready
+    if (this.spawnFailures >= SPAWN_FAILURE_LIMIT) {
+      return Promise.reject(new Error(
+        `worker unavailable: ${String(SPAWN_FAILURE_LIMIT)} consecutive spawn failures `
+        + `(last: ${this.spawnFailureReason ?? 'unknown'}); reopen the session to retry`,
+      ))
+    }
     if (this.spawning !== undefined) return this.spawning
     this.spawning = (async () => {
-      const state = await this.spawnWorker()
-      return state
+      try {
+        const state = await this.spawnWorker()
+        this.spawnFailures = 0
+        this.spawnFailureReason = undefined
+        return state
+      } catch (error) {
+        // Only a streak inside the window trips the breaker, so a worker that
+        // ran fine for an hour and then crashed still gets a normal retry.
+        const now = Date.now()
+        if (now - this.lastSpawnFailureAt > SPAWN_FAILURE_WINDOW_MS) this.spawnFailures = 0
+        this.spawnFailures += 1
+        this.lastSpawnFailureAt = now
+        this.spawnFailureReason = error?.message ?? String(error)
+        process.stdout.write(
+          `[agentcensor] worker spawn failed session=${this.id} `
+          + `(${String(this.spawnFailures)}/${String(SPAWN_FAILURE_LIMIT)}): ${this.spawnFailureReason}\n`,
+        )
+        throw error
+      }
     })().finally(() => {
       this.spawning = undefined
     })
@@ -460,10 +494,11 @@ class WebDriverAgent {
   }
 
   /**
-   * Spawn the per-session resident worker: private scratch dir with a seeded
-   * log copy + overlay + the writable roots the overlay redirects into it,
-   * DSH_HOME = the HOST home for config (credentials/settings/home patch/env
-   * are read like stock dsh — nothing is resolved or injected by the driver).
+   * Spawn the per-session resident worker: a private scratch dir holding only
+   * the overlay and the writable roots it redirects into it, plus the seed
+   * frames the host streams over stdin. DSH_HOME = the HOST home for config
+   * (credentials/settings/home patch/env are read like stock dsh — nothing is
+   * resolved or injected by the driver).
    * Resolves once the worker announces READY; rejects on spawn/boot failure.
    */
   async spawnWorker() {
