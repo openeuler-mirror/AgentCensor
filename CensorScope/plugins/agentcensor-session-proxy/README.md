@@ -32,7 +32,7 @@ Web 端的原生 `ui-trajectory` 视图必须关闭，由 `censorscope-ui` 提�
 
 ```sh
 # 安装
-dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.6.tgz
+dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.7.tgz
 # 启动
 dsh --profile web
 ```
@@ -63,6 +63,10 @@ dsh plugin --profile web remove agentcensor-session-proxy
 
 - 每个 web 会话 ↔ **一个常驻 worker 进程**;首条消息才 spawn(懒加载),后续消息经
   stdin 帧直接交给同一进程,不逐条重建、不逐条 resume。
+- 输入保留原生 `next-turn` / `next-step` 和 `wakeup`：follow-up 排下一轮、steer
+  进入最近一步、inject 只排队不唤醒。worker 收到后立即交给原生 inbox，取消时由
+  原生循环处理 `keepInbox`。宿主投影显示已镜像的 pending 消息，编辑/删除按消息 id
+  转发给 worker；传输期间若消息已被原生循环领取，编辑/删除可能成为无操作。
 - 事件回灌:worker 把会话事件实时打到 stdout(`ACEVT` 行协议),宿主逐条回放进宿主
   会话 → 浏览器 follow 流 / 投影 / JSONL 实时更新(共享日志始终连续、宿主唯一写者)。
 - 模型选择:默认选型读宿主 `settings.yaml` 的 `agent-default-model`(worker 每次
@@ -111,7 +115,7 @@ agentcensor-session-proxy/              插件源码(可读/可改;安装请用�
 ├── lib/worker.mjs                        worker 侧:常驻 runner(原生 agent-loop + 双向帧协议)
 ├── lib/interaction-bridge.mjs            宿主侧:审批/提问的交互桥(控制面,只派发 waterfall,不写会话数据)
 ├── package.json / cordis.patch.yml       插件包元数据与 bundle patch
-agentcensor-session-proxy-0.1.6.tgz    可安装包(需自行打包)
+agentcensor-session-proxy-0.1.7.tgz    可安装包(需自行打包)
 README.md                              本文件
 ```
 

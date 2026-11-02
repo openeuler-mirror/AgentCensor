@@ -97,6 +97,7 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
 import { AssistantStreamBridge } from './assistant-stream-bridge.mjs'
+import { inboxProjectionDefinition, ProxyInbox } from './inbox.mjs'
 
 // 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
 // Session.append cannot express that flag (its surface options are the only
@@ -320,7 +321,14 @@ export class WebDriverAgent {
     this.session = session
     this.options = options ?? {}
     this.status = 'idle'
-    this.inbox = { nextTurn: [], nextStep: [] }
+    this.inbox = new ProxyInbox(rootCtx.get('sessionProjections'), session, command => {
+      this.sendChain = this.sendChain.then(async () => {
+        const state = await this.ensureWorker()
+        this.writeFrame(state, { type: 'inbox', ...command })
+      }).catch(error => {
+        this.dispatch.emit('agent/error', { turn: this.turn, step: 0, error })
+      })
+    })
     this.dispatch = agentEvents(rootCtx, this)
     this.assistantStream = new AssistantStreamBridge(frame => this.dispatch.emit('agent/assistant-stream', { frame }))
     this.scope = createScope(rootCtx, this)
@@ -373,13 +381,13 @@ export class WebDriverAgent {
 
   /** Handle one user message: route it to this session's worker process. */
   followup(message) {
-    this.enqueueMessage(message)
+    this.send(message, 'next-turn', true)
     return undefined
   }
 
-  steer(message) { this.followup(message) }
-  send(message, _target, _wakeup) { this.followup(message) }
-  inject() {}
+  steer(message) { this.send(message, 'next-step', true) }
+  send(message, target, wakeup) { this.enqueueMessage(message, target, wakeup) }
+  inject(message) { this.send(message, 'next-step', false) }
 
   /**
    * Native-protocol cancellation (the stop button). Stock dsh aborts the live
@@ -435,16 +443,16 @@ export class WebDriverAgent {
   }
 
   /** Queue one user message for this session's worker (spawning it lazily). */
-  enqueueMessage(message) {
+  enqueueMessage(message, target = 'next-turn', wakeup = true) {
     const text = messageText(message)
     this.markBusy()
-    this.emitStatus('running')
+    if (wakeup) this.emitStatus('running')
     this.unwritten += 1
     this.sendChain = this.sendChain
       .then(async () => {
         const state = await this.ensureWorker()
         if (state === undefined || !state.alive) throw new Error('worker unavailable')
-        this.writeFrame(state, { type: 'message', message: forwardableMessage(message) })
+        this.writeFrame(state, { type: 'message', message: forwardableMessage(message), target, wakeup })
         this.unwritten = Math.max(0, this.unwritten - 1)
         process.stdout.write(
           `[agentcensor] message → worker session=${this.id} text=${JSON.stringify(text.slice(0, 80))}\n`,
@@ -1052,7 +1060,7 @@ function forwardableMessage(message) {
 function normalizeCancelCause(cause) {
   if (cause !== null && typeof cause === 'object') {
     const kind = cause.kind
-    if (kind === 'user' || kind === 'parent') return { kind }
+    if (kind === 'user' || kind === 'parent' || kind === 'disposed') return { kind }
     if (kind === 'hook' && typeof cause.reason === 'string') return { kind: 'hook', reason: cause.reason }
   }
   return { kind: 'user' }
@@ -1135,6 +1143,7 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
 
 export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
+  ctx.sessionProjections.register(inboxProjectionDefinition)
   interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
   // control stream (row is disabled by overlay). dsh 0.1.1 does not export

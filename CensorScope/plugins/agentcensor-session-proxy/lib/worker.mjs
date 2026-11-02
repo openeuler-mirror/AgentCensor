@@ -82,6 +82,7 @@ import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { applyInboxCommand } from './inbox.mjs'
 
 export const name = 'agentcensor-worker'
 export const inject = ['agentDefaultModel', 'agents', 'sessions']
@@ -273,145 +274,107 @@ async function run(ctx) {
     model: { provider: selection.provider, model: selection.model },
   })}\n`)
 
-  return controlLoop(agent, sessions, asks, frames, rl, selectionRef)
+  try {
+    return await controlLoop(agent, sessions, asks, frames, rl, selectionRef)
+  } finally {
+    await handle.dispose()
+  }
 }
 
 /** Serve messages, cancellations, and interaction answers until shutdown or EOF. */
 export async function controlLoop(agent, sessions, asks, frames, rl, selectionRef) {
-  let chain = Promise.resolve()
-  // Messages accepted but not yet finished: a cancel arriving while the agent is
-  // still idle belongs to the turn one of these is about to open.
-  let queuedMessages = 0
-  // A cancel that arrives before its message reaches the agent's driver; held
-  // only for the turn that message opens (a cancel must never arm later work).
-  const cancelLatch = { current: undefined }
-  const ackCancel = (cancel, applied) => {
-    process.stdout.write(`ACCANCEL\t${JSON.stringify({
-      cause: cancel.cause,
-      keepInbox: cancel.keepInbox,
-      seq: agent.session.seq,
-      applied,
-    })}\n`)
+  const pending = new Set()
+  const reportIdle = () => {
+    const activity = (async () => {
+      await agent.whenIdle()
+      await sessions.flush(agent.session)
+      process.stdout.write(`ACIDLE\t${JSON.stringify({ seq: agent.session.seq })}\n`)
+    })().catch(error => {
+      process.stdout.write(`ACERR\t${JSON.stringify({ message: error?.message ?? String(error) })}\n`)
+    })
+    pending.add(activity)
+    void activity.finally(() => pending.delete(activity))
   }
-  // The readline interface was opened before the agent existed (the seed frame
-  // arrives first), so consume the same iterator instead of opening a second one.
-  while (true) {
-    const next = await frames.next()
-    if (next.done) break
-    const raw = next.value
-    if (raw.trim() === '') continue
-    let frame
-    try {
-      frame = JSON.parse(raw)
-    } catch (error) {
-      process.stderr.write(`agentcensor-worker: unparsable stdin frame: ${String(error)}\n`)
-      continue
-    }
-    if (frame?.type === 'host-session-event') {
-      const event = frame.event
-      if (!event || !['permission/preset', 'sandbox/mode', 'approval/policy', 'model/selection'].includes(event.type)) {
-        throw new Error('invalid host session configuration event')
-      }
-      // Use the native event fold: shell and approval read these exact knobs.
-      // Echoed events are already present on the host and are skipped there.
-      hostSyncedSequences.add(agent.session.seq)
-      agent.session.append(event.type, event.data, {
-        ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
-        ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
-      })
-      if (event.type === 'model/selection') {
-        selectionRef.current = {
-          provider: event.data.provider,
-          model: event.data.model,
-          ...(event.data.reasoningEffort === undefined ? {} : { reasoningEffort: event.data.reasoningEffort }),
-        }
-      }
-      continue
-    }
-    if (frame?.type === 'message') {
-      const message = frame.message
-      if (!isUserMessage(message)) {
-        process.stdout.write(`ACERR\t${JSON.stringify({ message: 'invalid message frame' })}\n`)
+  try {
+    // The readline interface was opened before the agent existed (the seed frame
+    // arrives first), so consume the same iterator instead of opening a second one.
+    while (true) {
+      const next = await frames.next()
+      if (next.done) break
+      const raw = next.value
+      if (raw.trim() === '') continue
+      let frame
+      try {
+        frame = JSON.parse(raw)
+      } catch (error) {
+        process.stderr.write(`agentcensor-worker: unparsable stdin frame: ${String(error)}\n`)
         continue
       }
-      queuedMessages += 1
-      chain = chain
-        .then(() => runOneTurn(agent, sessions, message, cancelLatch))
-        .catch((error) => {
-          // Runner-level turn failure: report and stay alive for the next
-          // message. Model-level failures are handled natively inside the
-          // agent loop and surface as ordinary session events (replayed).
+      if (frame?.type === 'host-session-event') {
+        const event = frame.event
+        if (!event || !['permission/preset', 'sandbox/mode', 'approval/policy', 'model/selection'].includes(event.type)) {
+          throw new Error('invalid host session configuration event')
+        }
+        // Use the native event fold: shell and approval read these exact knobs.
+        // Echoed events are already present on the host and are skipped there.
+        hostSyncedSequences.add(agent.session.seq)
+        agent.session.append(event.type, event.data, {
+          ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
+          ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
+        })
+        if (event.type === 'model/selection') {
+          selectionRef.current = {
+            provider: event.data.provider,
+            model: event.data.model,
+            ...(event.data.reasoningEffort === undefined ? {} : { reasoningEffort: event.data.reasoningEffort }),
+          }
+        }
+        continue
+      }
+      if (frame?.type === 'message') {
+        const message = frame.message
+        if (!isUserMessage(message)) {
+          process.stdout.write(`ACERR\t${JSON.stringify({ message: 'invalid message frame' })}\n`)
+          continue
+        }
+        try {
+          const target = frame.target ?? 'next-turn'
+          if (target !== 'next-turn' && target !== 'next-step') throw new Error('invalid inbox target')
+          agent.send(message, target, frame.wakeup !== false)
+          reportIdle()
+        } catch (error) {
           process.stdout.write(`ACERR\t${JSON.stringify({ message: error?.message ?? String(error) })}\n`)
-        })
-        .finally(() => {
-          queuedMessages -= 1
-        })
-    } else if (frame?.type === 'cancel') {
-      // Native cancellation, applied outside the message chain so a busy turn is
-      // aborted the moment the frame is read. `agent.cancel` is a no-op with no
-      // active activity, so a cancel that races the message it belongs to is
-      // latched for that message's turn instead of being lost.
-      const cancel = {
-        cause: cancelCause(frame.cause),
-        keepInbox: frame.keepInbox === true,
-      }
-      if (agent.status === 'running') {
-        agent.cancel(cancel.cause, { keepInbox: cancel.keepInbox })
-        ackCancel(cancel, 'now')
-      } else if (queuedMessages > 0) {
-        cancelLatch.current = cancel
-        ackCancel(cancel, 'latched')
+        }
+      } else if (frame?.type === 'cancel') {
+        const cause = cancelCause(frame.cause)
+        const keepInbox = frame.keepInbox === true
+        agent.cancel(cause, { keepInbox })
+        process.stdout.write(`ACCANCEL\t${JSON.stringify({ cause, keepInbox, seq: agent.session.seq, applied: 'now' })}\n`)
+      } else if (frame?.type === 'inbox') {
+        applyInboxCommand(agent.inbox, frame)
+      } else if (frame?.type === 'answer') {
+        // Late or duplicate answers are discarded: the asker already settled.
+        asks.settle(frame)
+      } else if (frame?.type === 'shutdown') {
+        break
       } else {
-        ackCancel(cancel, 'noop')
+        process.stderr.write(`agentcensor-worker: unknown stdin frame type=${String(frame?.type)}\n`)
       }
-    } else if (frame?.type === 'answer') {
-      // Late or duplicate answers are discarded: the asker already settled.
-      asks.settle(frame)
-    } else if (frame?.type === 'shutdown') {
-      break
-    } else {
-      process.stderr.write(`agentcensor-worker: unknown stdin frame type=${String(frame?.type)}\n`)
     }
+  } finally {
+    rl.close()
+    asks.close()
+    agent.cancel({ kind: 'disposed' })
+    await Promise.all(pending)
+    await sessions.flush(agent.session)
   }
-  rl.close()
-  await chain.catch(() => undefined)
-  // The host is going away: every still-pending ask fails closed now instead of
-  // holding a turn open.
-  asks.close()
-  await sessions.flush(agent.session)
   return 0
-}
-
-/**
- * Execute one user message, then report idle (agent finished the turn). A cancel
- * latched before this message reached the agent is applied immediately after the
- * followup so the turn it starts is aborted, never left running; a cancel that
- * loses the race to this turn's own end stays a no-op instead of arming the next
- * turn (native semantics: no active activity, no cancellation).
- */
-async function runOneTurn(agent, sessions, message, cancelLatch) {
-  agent.followup(message)
-  const latched = cancelLatch.current
-  if (latched !== undefined) {
-    cancelLatch.current = undefined
-    agent.cancel(latched.cause, { keepInbox: latched.keepInbox })
-    process.stdout.write(`ACCANCEL\t${JSON.stringify({
-      cause: latched.cause,
-      keepInbox: latched.keepInbox,
-      seq: agent.session.seq,
-      applied: 'with-message',
-    })}\n`)
-  }
-  await agent.whenIdle()
-  cancelLatch.current = undefined
-  await sessions.flush(agent.session)
-  process.stdout.write(`ACIDLE\t${JSON.stringify({ seq: agent.session.seq })}\n`)
 }
 
 /** Normalize a stdin cancel cause to the closed set the native agent accepts. */
 function cancelCause(cause) {
   if (cause !== null && typeof cause === 'object') {
-    if (cause.kind === 'user' || cause.kind === 'parent') return { kind: cause.kind }
+    if (cause.kind === 'user' || cause.kind === 'parent' || cause.kind === 'disposed') return { kind: cause.kind }
     if (cause.kind === 'hook' && typeof cause.reason === 'string') return { kind: 'hook', reason: cause.reason }
   }
   return { kind: 'user' }

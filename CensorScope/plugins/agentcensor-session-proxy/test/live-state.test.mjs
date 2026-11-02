@@ -18,7 +18,7 @@ test('worker model changes affect native prompt assembly and the next request to
   await ctx.plugin(SystemPrompt)
   t.after(() => ctx.fiber.dispose())
   const session = Session.create('model-switch')
-  const agent = { session, ctx }
+  const agent = { session, ctx, cancel() {} }
   const selection = { current: { provider: 'alpha', model: 'a' }, assembled: undefined }
   installModelSelection(ctx, selection)
   const request = () => agentEvents(ctx, agent).waterfall(
