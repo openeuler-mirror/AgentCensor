@@ -32,7 +32,7 @@ Web 端的原生 `ui-trajectory` 视图必须关闭，由 `censorscope-ui` 提�
 
 ```sh
 # 安装
-dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.4.tgz
+dsh plugin --profile web add /path/to/agentcensor-session-proxy-0.1.5.tgz
 # 启动
 dsh --profile web
 ```
@@ -40,6 +40,19 @@ dsh --profile web
 没有全局 `dsh`、直接从源码运行时，在 DeepSeek Harness 根目录执行 `pnpm dsh --profile web`；插件会
 自动用同一源码入口启动 headless worker。也可在启动 Web 时设置 `DSH_ROOT`，或用
 `AGENTCENSOR_DSH_BIN` 指向独立的 `dsh` 可执行文件。
+
+worker 保留宿主 `DSH_AGENTS_HOME`（未设置时使用 dsh 原生默认目录），并在 headless
+配置中重新启用 `credentials`、`authorization`、`deepseek-account`。启动等待上限为
+60 秒；启动失败或超时会终止子进程并清理临时目录。
+
+使用本地 dsh 源码执行兼容测试：
+
+```sh
+DSH_ROOT=~/deepseek-harness npm test
+```
+
+测试在临时目录配置源码解析，不改写 dsh。启动测试使用原生 Context/Session 和测试
+子进程验证协议、配置继承与清理，不调用模型，不等同于完整浏览器端到端验收。
 
 ## 卸载
 ```sh
@@ -94,7 +107,7 @@ agentcensor-session-proxy/              插件源码(可读/可改;安装请用�
 ├── lib/worker.mjs                        worker 侧:常驻 runner(原生 agent-loop + 双向帧协议)
 ├── lib/interaction-bridge.mjs            宿主侧:审批/提问的交互桥(控制面,只派发 waterfall,不写会话数据)
 ├── package.json / cordis.patch.yml       插件包元数据与 bundle patch
-agentcensor-session-proxy-0.1.4.tgz    可安装包(安装即用)
+agentcensor-session-proxy-0.1.5.tgz    可安装包(需自行打包)
 README.md                              本文件
 ```
 

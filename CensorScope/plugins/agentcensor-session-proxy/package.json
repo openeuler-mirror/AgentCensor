@@ -1,9 +1,12 @@
 {
   "name": "agentcensor-session-proxy",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "main": "lib/index.mjs",
+  "scripts": {
+    "test": "node test/run-source-tests.mjs"
+  },
   "exports": {
     ".": "./lib/index.mjs",
     "./index.mjs": "./lib/index.mjs",

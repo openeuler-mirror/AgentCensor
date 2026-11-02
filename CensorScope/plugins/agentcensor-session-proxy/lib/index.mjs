@@ -63,7 +63,7 @@
  *
  * ── Worker env (host side injects at spawn: task-channel plumbing only) ──
  *   AGENTCENSOR_SESSION_ID    durable session identity (create or resume)
- *   AGENTCENSOR_MODE          'create' (fresh session) | 'resume' (existing durable log)
+ *   AGENTCENSOR_MODE          'seed' (rebuild from the host log)
  *   CENSORSCOPE_SESSION_ID  always = the worker's session id
  * No credential/model/configuration value is forwarded: the worker boots with
  * DSH_HOME = the HOST home, so settings.yaml, .credentials.yaml, the
@@ -81,7 +81,8 @@ import { createInterface } from 'node:readline'
 import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { once } from 'node:events'
 // The source CLI uses the TS graph; a built CLI uses package exports. Recognize
 // both the public tsx/esm specifier and its resolved tsx/dist/esm entry path.
 const { createScope } = await import(
@@ -234,7 +235,7 @@ async function resolveDshWorkerLauncher() {
  * per-worker private dir (it must never write the host's session store,
  * storages, or attachments).
  */
-function workerOverlay(privHome) {
+export function workerOverlay(privHome) {
   const runner = join(bundleDir(), 'worker.mjs')
   const privRoot = join(privHome, 'sessions')
   const lines = []
@@ -261,6 +262,14 @@ function workerOverlay(privHome) {
     '- id: headless-runner',
     '  disabled: true',
     '',
+    // The interactive account store is disabled by the headless bundle.
+    '- id: credentials',
+    '  disabled: false',
+    '- id: authorization',
+    '  disabled: false',
+    '- id: deepseek-account',
+    '  disabled: false',
+    '',
     '# Private writable roots: the worker shares the host DSH_HOME for config',
     '# but must never write the host session store / storages / attachments.',
     '# The worker builds its own log from the seed frames the host streams in, so',
@@ -282,7 +291,7 @@ function workerOverlay(privHome) {
     '- insert:',
   )
   lines.push('    - id: agentcensor-worker')
-  lines.push(`      name: ${JSON.stringify(pathToFileURLish(runner))}`)
+  lines.push(`      name: ${JSON.stringify(pathToFileURL(runner).href)}`)
   // The worker composes the BASE agent plane (the `standard` agent preset, which
   // owns `tool-ask-user` / `ask_user_question`, is only mounted by the web
   // surface), so the model would have no way to ask the human anything. Insert
@@ -290,10 +299,6 @@ function workerOverlay(privHome) {
   lines.push('    - id: tool-ask-user')
   lines.push("      name: '@deepseek-ai/dsh-tool-ask-user'")
   return `${lines.join('\n')}\n`
-}
-
-function pathToFileURLish(path) {
-  return `file://${path}`
 }
 
 /** Join the text blocks of a user message (for logs / failure notes). */
@@ -306,7 +311,7 @@ function messageText(message) {
 }
 
 /** Host driver agent: one session ↔ one resident worker process. */
-class WebDriverAgent {
+export class WebDriverAgent {
   constructor(rootCtx, session, options) {
     this.id = session.id
     this.session = session
@@ -535,16 +540,19 @@ class WebDriverAgent {
     }
 
     const privHome = await fsp.mkdtemp(join(tmpdir(), 'agentcensor-worker-'))
-    const privRoot = join(privHome, 'sessions')
-    await fsp.mkdir(privRoot, { recursive: true })
     const overlayPath = join(privHome, 'overlay.yml')
-    await fsp.writeFile(overlayPath, workerOverlay(privHome), 'utf8')
+    try {
+      await fsp.mkdir(join(privHome, 'sessions'), { recursive: true })
+      await fsp.writeFile(overlayPath, workerOverlay(privHome), 'utf8')
+    } catch (error) {
+      await fsp.rm(privHome, { recursive: true, force: true })
+      throw error
+    }
 
     const hostHome = resolveDshHome(undefined, process.env)
     const childEnv = {
       ...process.env,
       DSH_HOME: hostHome,
-      DSH_AGENTS_HOME: join(privHome, '.agents'),
       DSH_TELEMETRY_DISABLED: '1',
       AGENTCENSOR_SESSION_ID: this.session.id,
       AGENTCENSOR_MODE: 'seed',
@@ -559,20 +567,19 @@ class WebDriverAgent {
       `[agentcensor] worker spawn mode=seed session=${this.id} pid=PENDING\n`,
     )
     process.stdout.write(`[agentcensor] worker launcher=${dshLauncher.label}\n`)
-    const child = spawn(dshLauncher.command, [
+    let child
+    try {
+      child = spawn(dshLauncher.command, [
       ...dshLauncher.prefixArgs,
       '--profile', 'headless', '--patch', overlayPath,
     ], {
       cwd,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    // The worker builds its session from these frames before creating anything,
-    // so they must arrive first: no file is copied and no artifact path is shared.
-    try {
-      writeSeed(child, seedEvents)
+      })
     } catch (error) {
-      process.stdout.write(`[agentcensor] seed write failed: ${String(error)}\n`)
+      await fsp.rm(privHome, { recursive: true, force: true })
+      throw error
     }
     process.stdout.write(`[agentcensor] worker spawn ok mode=seed pid=${String(child.pid ?? "?")} seed=${String(seedEvents.length)}\n`)
     ACTIVE_WORKERS.add(child)
@@ -584,16 +591,18 @@ class WebDriverAgent {
       readyReject = rejectPromise
     })
     let readySettled = false
+    let readyTimer
     const settleReady = (ok, reason) => {
       if (readySettled) return
       readySettled = true
+      clearTimeout(readyTimer)
       if (ok) readyResolve(state)
       else readyReject(reason instanceof Error ? reason : new Error(String(reason)))
     }
     const state = {
       child,
       privHome,
-      mode: resume ? 'resume' : 'create',
+      mode: 'seed',
       alive: true,
       stopping: false,
       ready,
@@ -624,6 +633,12 @@ class WebDriverAgent {
           state.stopping = true
           /* already gone */
           try { child.kill(signal) } catch {}
+          if (signal !== 'SIGKILL') {
+            const kill = setTimeout(() => {
+              if (state.alive) child.kill('SIGKILL')
+            }, 1500)
+            kill.unref?.()
+          }
         }
       },
     }
@@ -633,7 +648,8 @@ class WebDriverAgent {
     // stderr passthrough (tail kept for boot-failure reporting).
     child.stderr.on('data', (chunk) => {
       const textChunk = String(chunk)
-      if (state.stderrTail.length < 64) state.stderrTail.push(textChunk)
+      state.stderrTail.push(textChunk)
+      if (state.stderrTail.length > 64) state.stderrTail.shift()
       process.stdout.write(textChunk)
     })
 
@@ -642,6 +658,10 @@ class WebDriverAgent {
       spawnError = error
       process.stdout.write(`[agentcensor] worker spawn error: ${String(error)}\n`)
       settleReady(false, error)
+    })
+    child.stdin.on('error', (error) => {
+      settleReady(false, error)
+      state.stop('SIGTERM')
     })
 
     const consume = (async () => {
@@ -704,6 +724,8 @@ class WebDriverAgent {
       }
     })().catch((error) => {
       process.stdout.write(`[agentcensor] worker stdout consume failed: ${String(error)}\n`)
+      settleReady(false, error)
+      state.stop('SIGTERM')
     })
 
     child.once('close', (code, signal) => {
@@ -716,19 +738,13 @@ class WebDriverAgent {
       process.stdout.write(
         `[agentcensor] worker closed pid=${String(child.pid ?? '?')} ${codeText} mirrored=${this.workerStats.mirrored} skipped=${this.workerStats.skipped} gapped=${this.workerStats.gapped} unmirrored=${this.workerStats.unmirrored} failed=${this.workerStats.failed}\n`,
       )
-      if (spawnError === undefined && !state.stoppingBeforeClose) {
-        // Unexpected death (never asked to stop): a boot failure if READY was
-        // never announced, otherwise the worker is gone mid-life.
-        const stderrTail = state.stderrTail.join('').slice(-2048)
-        settleReady(false, new Error(`worker exited ${codeText} before ready: ${stderrTail}`))
-      } else {
-        settleReady(true, undefined)
-      }
+      const stderrTail = state.stderrTail.join('').slice(-2048)
+      settleReady(false, spawnError ?? new Error(`worker exited ${codeText} before ready: ${stderrTail}`))
       // A worker that is gone can no longer answer prompts: withdraw anything
       // still pending so the browser panel is dismissed and no wait survives.
       interactionBridge?.disposeAgent(this, 'worker closed')
       // Only mirrored events are durable: a dead worker answers nothing.
-      if (this.outstanding > 0) this.markDone()
+      while (this.outstanding > this.unwritten) this.markDone()
       if (this.workerState === state) {
         this.workerState = undefined
         this.endSeedInserted = false
@@ -739,13 +755,16 @@ class WebDriverAgent {
         fsp.rm(privHome, { recursive: true, force: true }).catch(() => undefined)
       }
     })
-    state.stoppingBeforeClose = false
-    // stop() flips this so a close caused by stop() is not treated as a crash.
-    const origStop = state.stop
-    state.stop = (signal) => {
-      state.stoppingBeforeClose = true
-      origStop(signal)
-    }
+    readyTimer = setTimeout(() => {
+      settleReady(false, new Error('worker readiness timeout'))
+      state.stop('SIGTERM')
+    }, this.options.workerReadyTimeoutMs ?? 60_000)
+    readyTimer.unref?.()
+    // Install all error/close listeners before sending the seed to a new process.
+    void writeSeed(child, seedEvents).catch((error) => {
+      settleReady(false, error)
+      state.stop('SIGTERM')
+    })
 
     return state.ready.then(() => state)
   }
@@ -1031,7 +1050,7 @@ function normalizeCancelCause(cause) {
  * from these events, so the two roots never share a file, a path, or a
  * compression format.
  */
-function writeSeed(child, events) {
+async function writeSeed(child, events) {
   if (events.length === 0) {
     child.stdin.write(`${JSON.stringify({ type: 'seed', events: [], done: true })}\n`)
     return
@@ -1040,7 +1059,7 @@ function writeSeed(child, events) {
     const chunk = events.slice(offset, offset + SEED_CHUNK_EVENTS)
     const last = offset + SEED_CHUNK_EVENTS >= events.length
     const frame = { type: 'seed', events: chunk, ...(last ? { done: true } : {}) }
-    child.stdin.write(`${JSON.stringify(frame)}\n`)
+    if (!child.stdin.write(`${JSON.stringify(frame)}\n`)) await once(child.stdin, 'drain')
   }
 }
 
