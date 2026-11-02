@@ -33,12 +33,6 @@ import { join, resolve } from 'node:path'
 
 const CONTRIBUTOR = 'censorscope-host'
 const CALL_ID_KEY = 'DSH_CENSORSCOPE_CALL_ID'
-// Actual dispatch instant per tool call (ms), captured in the shellEnv
-// contributor's resolve() — the earliest in-process signal that the tool is
-// really starting. Call-start prefers it over event-arrival "now" because
-// batched step commits append tool/call events only after execution.
-const CALL_STARTS = new Map()
-
 /** Deterministic identity for the single host trace, persisted across restarts. */
 function traceIdFile(dshHome) {
   return resolve(dshHome, '.censorscope', 'trace.json')
@@ -304,9 +298,6 @@ function registerCallEnv(ctx) {
         const callId = execution?.callId
         if (callId === undefined) return {}
         const id = String(callId)
-        try {
-          CALL_STARTS.set(id, Date.now())
-        } catch {}
         return { [CALL_ID_KEY]: id }
       },
     })
@@ -319,36 +310,10 @@ function registerCallEnv(ctx) {
   }
 }
 
-/**
- * worker role: report tool-call spans to censorscoped (call-start / call-end).
- * Spans are strictly bound to one call id; the daemon uses them only as a
- * fallback for events that carry no DSH_CENSORSCOPE_CALL_ID env marker.
- *
- * Start rides the session/event 'tool/call' stream. End prefers the session
- * 'tool/result' row's OWN `time` (accurate commit instant, immune to late
- * delivery); the runtime 'tools/result' event remains only a fallback trigger
- * for paths that never produce a session row. A call-end without a matching
- * open span is a no-op daemon UPDATE, so sending it unconditionally is safe.
- */
-function registerSpanEmitter(ctx) {
+/** Report application-level tool boundaries without delaying tool execution. */
+export function registerSpanEmitter(ctx) {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  // Only an agent-loop host dispatches tools (worker under agentcensor, or the
-  // single-process deployment); a web host that only mirrors worker events
-  // never sees tools/result and therefore never opens spans, so its mirrored
-  // tool/call stream stays inactive until a real dispatch is seen.
-  let toolsSeen = false
-  const started = new Set()
-  // A process that executes tools under agentcensor is spawned with these
-  // session env vars (web mirror hosts never carry them), so the session-row
-  // end path can act from boot without waiting for the first runtime event.
-  const workerHost = Boolean(
-    process.env.CENSORSCOPE_SESSION_ID || process.env.AGENTCENSOR_SESSION_ID,
-  )
-  // Call id -> ended-at ns from the session 'tool/result' row's own `time`
-  // (the runtime's commit instant, stamped at append). Reused no matter how
-  // late the runtime 'tools/result' event is delivered, so a batch-deferred
-  // first-call result cannot stretch the span window.
-  const rowEnds = new Map()
+  const started = new Map()
   const closed = new Set()
   let record = null
   let resolving = null
@@ -389,22 +354,10 @@ function registerSpanEmitter(ctx) {
     }
   }
   const sessionIdOf = (session) =>
+    (typeof session?.id === 'string' && session.id) ||
     (typeof session?.header?.id === 'string' && session.header.id) ||
-    process.env.CENSORSCOPE_SESSION_ID ||
-    process.env.AGENTCENSOR_SESSION_ID ||
     null
-  const timeNs = () => String(Date.now() * 1_000_000)
-  // Prefer the real dispatch moment recorded by the shellEnv contributor;
-  // fall back to now when the call never went through a shell resolve (for
-  // example in-process file tools) or the record is already consumed.
-  const startNsFor = (callId) => {
-    const ms = CALL_STARTS.get(callId)
-    if (typeof ms === 'number') {
-      CALL_STARTS.delete(callId)
-      return String(ms * 1_000_000)
-    }
-    return timeNs()
-  }
+  const timeNs = () => String(BigInt(Date.now()) * 1_000_000n)
   // Generous deadline plus one short-backoff retry: one slow or transient
   // failure must not silently strip every tool call of its span (and of its
   // syscall attribution). call-start/call-end are idempotent daemon upserts,
@@ -423,111 +376,62 @@ function registerSpanEmitter(ctx) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 500))
     }
   }
-  const sendStart = async (session, event) => {
-    if (!toolsSeen) return
-    const callId = event?.data?.callId
-    if (typeof callId !== 'string' || callId === '') return
-    const sessionId = sessionIdOf(session)
-    await send('call-start', [
-      ...(sessionId ? ['--session-id', sessionId] : []),
-      '--call-id', callId,
-      '--pid', String(process.pid),
-      '--started-at', startNsFor(callId),
-    ])
-  }
-  // `endedNs` is authoritative: it is the session-row commit time when known
-  // (see rowEnds), so a late runtime event cannot overwrite a correct window
-  // with "now". A second close for the same call is a no-op.
-  const closeSpan = async (callId, sessionId, endedNs, isError) => {
-    if (typeof callId !== 'string' || callId === '') return
-    if (closed.has(callId)) {
-      debugSpan('close-skip', { callId, reason: 'already-closed' })
-      return
-    }
-    closed.add(callId)
-    debugSpan('close', { callId, endedNs, isError, hadStart: started.has(callId) })
-    const status = isError ? 'error' : 'success'
-    // Agent loops sometimes append all tool/call events only at step commit,
-    // after this process has seen its first result; emit a synthetic start so
-    // the span is closed instead of left dangling.
+  const startSpan = (callId, sessionId, startedNs) => {
+    if (typeof callId !== 'string' || callId === '' || closed.has(callId)) return
     if (!started.has(callId)) {
-      started.add(callId)
-      await send('call-start', [
+      const pending = send('call-start', [
         ...(sessionId ? ['--session-id', sessionId] : []),
         '--call-id', callId,
         '--pid', String(process.pid),
-        '--started-at', startNsFor(callId),
+        '--started-at', startedNs,
+      ]).catch(error => log(`span: start failed: ${error?.message ?? String(error)}`))
+      started.set(callId, pending)
+    }
+    return started.get(callId)
+  }
+  const closeSpan = async (callId, sessionId, endedNs, isError) => {
+    if (typeof callId !== 'string' || callId === '' || closed.has(callId)) return
+    // A result-only path has no observed start; keep its fallback window at the result boundary.
+    const pendingStart = startSpan(callId, sessionId, endedNs)
+    closed.add(callId)
+    if (closed.size > 4096) closed.delete(closed.values().next().value)
+    try {
+      await pendingStart
+      await send('call-end', [
+        ...(sessionId ? ['--session-id', sessionId] : []),
+        '--call-id', callId,
+        '--pid', String(process.pid),
+        '--ended-at', endedNs,
+        '--status', isError ? 'error' : 'success',
       ])
+    } catch (error) {
+      log(`span: end failed: ${error?.message ?? String(error)}`)
+    } finally {
+      started.delete(callId)
     }
-    started.delete(callId)
-    await send('call-end', [
-      ...(sessionId ? ['--session-id', sessionId] : []),
-      '--call-id', callId,
-      '--pid', String(process.pid),
-      '--ended-at', endedNs,
-      '--status', status,
-    ])
   }
-  const sendEnd = async (exec, result) => {
-    const callId = exec?.callId
-    if (typeof callId !== 'string' || callId === '') return
-    toolsSeen = true
-    const sessionId = sessionIdOf(exec?.agent)
-    const isError = result?.isError === true || exec?.result?.isError === true || exec?.error !== undefined
-    // Fallback only: prefer the row-derived ended-at (accurate) whenever the
-    // session 'tool/result' row has already been observed.
-    void closeSpan(callId, sessionId, rowEnds.get(callId) ?? timeNs(), isError)
-  }
-  ctx.on?.('session/event', (session, event) => {
-    if (event?.type === 'tool/result') {
-      if (!workerHost && !toolsSeen) return
-      const callId = (typeof event?.data?.callId === 'string' && event.data.callId !== '')
-        ? event.data.callId
-        : (typeof event?.data?.message?.callId === 'string' && event.data.message.callId !== '')
-            ? event.data.message.callId
-            : (typeof event?.data?.message?.source?.callId === 'string' && event.data.message.source.callId !== '')
-                ? event.data.message.source.callId
-                : ''
-      if (callId === '') return
-      toolsSeen = true
-      // The row's own time (ms, realtime) is the runtime's commit instant and
-      // is valid no matter when this handler runs; convert to ns to match the
-      // daemon's epoch-ns span/event clock (eBPF observed_at is realtime ns).
-      const endedNs = String((typeof event?.time === 'number' ? event.time : Date.now()) * 1_000_000)
-      rowEnds.set(callId, endedNs)
-      debugSpan('row-end', { callId, rowMs: event?.time, endedNs })
-      void closeSpan(callId, sessionIdOf(session), endedNs, event?.data?.message?.isError === true)
-      return
-    }
-    if (event?.type === 'tool/call') {
-      if (!toolsSeen) return
-      const callId = event?.data?.callId
-      if (typeof callId === 'string' && callId !== '') started.add(callId)
-      void sendStart(session, event)
-    }
-  })
-  ctx.on?.('tools/result', (execOrPayload, result) => {
-    const exec = execOrPayload?.exec ?? execOrPayload
-    debugSpan('runtime-end', { callId: exec?.callId })
-    void sendEnd(exec, result)
-  })
-  // Close at the tool body's real completion: the session 'tool/result' row
-  // and the 'tools/result' runtime event can both be held until a later commit
-  // boundary (observed for the first call of a turn), leaving the span open
-  // across a following short call. The closed guard makes a later row/runtime
-  // end a no-op — its accurate ended-at remains a fallback for paths that
-  // never reach the body.
   ctx.on?.('tools/execute', async (exec, next) => {
     const callId = exec?.callId
-    debugSpan('execute-enter', { callId })
-    const result = await next()
-    debugSpan('execute-after', { callId, isError: result?.isError === true })
-    if (typeof callId !== 'string' || callId === '' || closed.has(callId)) return result
-    toolsSeen = true
-    const endedNs = timeNs()
-    rowEnds.set(callId, endedNs)
-    void closeSpan(callId, sessionIdOf(exec?.agent), endedNs, result?.isError === true)
-    return result
+    const sessionId = sessionIdOf(exec?.agent?.session)
+    startSpan(callId, sessionId, timeNs())
+    let isError = true
+    try {
+      const result = await next()
+      isError = result?.isError === true
+      return result
+    } finally {
+      void closeSpan(callId, sessionId, timeNs(), isError)
+    }
+  })
+  ctx.on?.('tools/result', (exec, result) => {
+    void closeSpan(exec?.callId, sessionIdOf(exec?.agent?.session), timeNs(), result?.isError === true)
+  })
+  // Mirrored host events must never create spans for operations executed in a worker.
+  ctx.on?.('session/event', (session, event) => {
+    const callId = event?.data?.callId ?? event?.data?.message?.callId
+    if (event?.type !== 'tool/result' || !started.has(callId)) return
+    const endedNs = String(BigInt(event.time ?? Date.now()) * 1_000_000n)
+    void closeSpan(callId, sessionIdOf(session), endedNs, event?.data?.error !== undefined)
   })
   log('call-span emitter registered')
 }

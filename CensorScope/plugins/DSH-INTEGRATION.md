@@ -87,4 +87,16 @@ helper 可以比完整 dsh worker 更小，减少对会话流、模型切换和�
 - 应用层记录与 eBPF 记录分别标明来源；无法建立关联时明确报告，不静默降级为时间窗猜测。
 - 原生 `ui-trajectory` 保持关闭，CensorScope 轨迹页继续提供观测入口。
 
-上述内容是方案分析及后续验收约束，本次仅更新文档，不更改插件、配置或 dsh 源码。
+## 优化进展与验证范围
+
+- worker 启动修复：使用 `seed` 模式，保留原生用户 skills 目录，重新启用 headless
+  默认禁用的账户服务；增加启动超时、错误处理及临时目录清理。
+- 工具调用边界：通过 `ToolExecution.agent.session` 获取实际会话身份，在
+  `tools/execute` 调用前记录开始时间，正常返回、报错和取消均记录结束；逐调用保持
+  start/end 报告顺序，不等待观测服务再执行工具，忽略宿主镜像事件。
+- 这些调用 span 是应用层边界，不能修复 worker 中子会话文件 I/O 的进程级归因。
+  子会话 shell 还可能继承父会话 `CENSORSCOPE_SESSION_ID`；不能把调用 span 的
+  SessionId 修正宣称为子会话所有内核事件已经准确归因。
+
+测试命令和范围见插件 README；仍需按上面的条件完成替代方案及浏览器端到端验收。
+所有改动位于 CensorScope，dsh 源码保持不变。
