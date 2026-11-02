@@ -62,8 +62,11 @@ window.__ModuleLoader__.load({
             data.error !== undefined ||
             content.some((block) => block && block.isError === true);
           row.status = isError ? "error" : "success";
+          // tool/result.error is {name, code, reason?} -- `reason` is the
+          // user-facing sentence and `message` never existed, so reading it
+          // showed a bare "error" for every failure.
           row.resultError = isError
-            ? (data.error && data.error.message) || "error"
+            ? (data.error && (data.error.reason || data.error.code)) || "error"
             : null;
           row.resultSeq = ev.seq;
         }
