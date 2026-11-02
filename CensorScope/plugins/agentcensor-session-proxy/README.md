@@ -77,8 +77,9 @@ dsh plugin --profile web remove agentcensor-session-proxy
 - 实时文本、推理和工具参数通过独立 `ACSTREAM` 控制帧传回宿主的原生
   `agent/assistant-stream`，供原生 follow/reconnect 消费。worker 替换时关闭未完成流，
   保持宿主 revision 连续并转换提交序号；不启用原生轨迹页。
-- goal / schedule / subagent / jobs 等工具在常驻 worker 内与原生语义一致地跨消息存活
-  (后台任务不会因单轮结束被杀)。
+- goal / subagent 等 worker 内状态会跨消息存活；后台任务不会因单轮结束被杀。
+  jobs/schedule 的宿主 API 是独立的进程内注册表，目前没有通过代理暴露完整的
+  list/follow/kill 或 schedule 控制面，不能宣称与原生 Web 管理面等价。
 - **审批 / 提问（ask_user_question）桥**:浏览器是 dsh 里唯一的交互应答端,但它只挂在**宿主**的
   remote waterfall(`api-remotes` 的 `approval/request` / `user-questions/request`),worker 里既没有
   这条桥也没有客户端,所以原生 ask 会立刻 fail-closed(`unavailable` / `NO_PROVIDER`,日志表现为
@@ -100,7 +101,12 @@ dsh plugin --profile web remove agentcensor-session-proxy
 ## 已知限制
 
 - 图片/附件消息:消息对象会原样转发,但附件字节与宿主 attachment 库的对接未完成。
+- timed `ask_user_question` 的 wait 倒计时字段会转发给浏览器；宿主服务没有把 worker
+  的业务 wait 注册到自己的 `UserQuestions.attachWait`，因此需要完整端到端验证，不能把
+  普通问题桥当作 timed wait 等价实现。
 - worker 内 subagent 的**子会话**持久化日志暂不进宿主(父会话 tool/result 可见)。
+- 子会话 worker 内直接执行的根进程文件 I/O 仍可能继承父进程环境；应用层工具 span
+  已按 `ToolExecution.agent.session` 区分，但这不等于每条内核事件都完成子会话归因。
 - 宿主进程异常退出时,worker 靠 stdin 断开发起优雅退出;极端情况下残留的临时私有
   目录属可清理垃圾(不影响会话数据,宿主 durable 始终完整)。
 - worker 进程**崩溃**(非正常结束)时不会走协议取消:宿主会话里那一轮仍是未闭合状态,

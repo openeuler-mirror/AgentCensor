@@ -94,9 +94,16 @@ helper 可以比完整 dsh worker 更小，减少对会话流、模型切换和�
 - 工具调用边界：通过 `ToolExecution.agent.session` 获取实际会话身份，在
   `tools/execute` 调用前记录开始时间，正常返回、报错和取消均记录结束；逐调用保持
   start/end 报告顺序，不等待观测服务再执行工具，忽略宿主镜像事件。
+- 输入队列：代理保留 `next-turn`、`next-step`、`wakeup`、`keepInbox` 语义，宿主只镜像
+  pending 投影并将编辑/删除命令转发给 worker；命令与原生领取并发时允许返回无操作。
+- 实时流：worker 的 `agent/assistant-stream` 通过独立控制帧传递，宿主转换 worker
+  生命周期和 durable seq；丢帧、提交事件未镜像或重启中的未完成流会失败关闭，不能伪造
+  已完成 assistant 输出。
 - 这些调用 span 是应用层边界，不能修复 worker 中子会话文件 I/O 的进程级归因。
   子会话 shell 还可能继承父会话 `CENSORSCOPE_SESSION_ID`；不能把调用 span 的
   SessionId 修正宣称为子会话所有内核事件已经准确归因。
+- jobs/schedule、附件字节和 timed question wait 仍是未完成的独立兼容项；它们的宿主
+  API、附件存储和业务 wait 所属进程必须分别验收。
 
 测试命令和范围见插件 README；仍需按上面的条件完成替代方案及浏览器端到端验收。
 所有改动位于 CensorScope，dsh 源码保持不变。
