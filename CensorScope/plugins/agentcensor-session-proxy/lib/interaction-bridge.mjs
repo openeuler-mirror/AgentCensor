@@ -145,6 +145,9 @@ export function createInteractionBridge(ctx) {
           ...(typeof ask.toolName === 'string' ? { toolName: ask.toolName } : {}),
           ...(typeof ask.callId === 'string' ? { callId: ask.callId } : {}),
           ...(typeof ask.reason === 'string' ? { reason: ask.reason } : {}),
+          // 0.2.1: the worker forwards the localized sentence so the panel can
+          // show what is actually being approved instead of a generic prompt.
+          ...(ask.displayReason === undefined ? {} : { displayReason: ask.displayReason }),
           signal: entry.controller.signal,
         }, () => Promise.resolve('unavailable'))
         const normalized = APPROVAL_OUTCOMES.has(outcome) ? outcome : 'unavailable'
@@ -160,6 +163,9 @@ export function createInteractionBridge(ctx) {
         const questions = Array.isArray(ask.questions) ? ask.questions : []
         const value = await dispatch('user-questions/request', {
           questions,
+          // 0.2.1 `mode: timed` asks carry {callId, timed}; the browser panel
+          // needs both to attach the card and run its countdown.
+          ...(ask.wait === undefined ? {} : { wait: ask.wait }),
           agent,
           signal: entry.controller.signal,
         }, () => Promise.reject(new Error('no user-questions answerer accepted the request')))

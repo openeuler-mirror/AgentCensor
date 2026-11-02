@@ -468,6 +468,10 @@ function registerInteractionAnswerers(ctx, asks) {
       ...(typeof request.toolName === 'string' ? { toolName: request.toolName } : {}),
       ...(typeof request.callId === 'string' ? { callId: request.callId } : {}),
       ...(typeof request.reason === 'string' ? { reason: request.reason } : {}),
+      // 0.2.1 adds a localized display sentence (never persisted host-side). It is
+      // the only text meant for the person clicking approve, so pass it through
+      // instead of forcing the host panel back to a generic prompt.
+      ...(request.displayReason === undefined ? {} : { displayReason: request.displayReason }),
     }, request.signal)
     if (answer?.withdrawn === true) return 'cancelled'
     if (answer?.ok === true && typeof answer.outcome === 'string') return answer.outcome
@@ -477,6 +481,9 @@ function registerInteractionAnswerers(ctx, asks) {
   ctx.on('user-questions/request', async (request, next) => {
     const answer = await asks.ask('question', {
       questions: Array.isArray(request.questions) ? request.questions : [],
+      // 0.2.1 `mode: timed` asks carry {callId, timed}: the browser needs them to
+      // attach the card to its call and to run the local countdown.
+      ...(request.wait === undefined ? {} : { wait: request.wait }),
     }, request.signal)
     // A withdrawn question is an aborted ask: the service maps the rejection to
     // its own aborted-question error because the request signal is aborted.
