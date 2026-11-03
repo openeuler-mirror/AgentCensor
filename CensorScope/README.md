@@ -1,16 +1,16 @@
 # CensorScope
 
-CensorScope 是被动式主机可观测性系统（version 0.1.1）：在不修改、不要求被观测程序配合的前提下，通过 procfs、eBPF tracepoint 与运行时动态 uprobe 采集进程、文件、网络、IPC、stdio 与应用负载观测，并把观测投影为可查询事件、负载分段与语义动作，落库 SQLite 供只读消费。
+CensorScope 是被动式主机可观测性系统（version 0.1.1）：通过 procfs、eBPF tracepoint 与运行时动态 uprobe 采集进程、文件、网络、IPC、stdio 与应用负载观测，并把观测投影为可查询事件、负载分段与语义动作，落库 SQLite 供只读消费。
 
-CensorScope 不执行文件、网络或命令策略；没有 agent SDK、preload、插件运行时或主动上报协议。daemon 独占数据库，其它程序通过文档化的只读视图或导出命令读取数据。
+daemon 负责采集和数据库写入，其它程序通过文档化的只读视图或导出命令读取数据。
 
 ## 特性
 
-- **采集等级（--level）**：能力集合按等级 L1/L2/L3 选择，默认 L1；等级是本次运行属性，不写入配置文件。
+- **采集等级（--level）**：能力集合按等级 L1/L2/L3 选择，默认 L1；等级通过启动参数设置。
 - **TLS 明文被动采集**：运行时 uprobe 捕获 HTTPS 明文并按块落库（`payload_segments`），支持丢失审计重建；保留预算可配置。
 - **Tool Call 级调用归因(需插件配合)**：从进程环境识别会话与工具调用，事件可精确归属到会话/调用。
 - **dsh 集成**：仓库自带三个 dsh 插件（host / ui / agentcensor-session-proxy），一条脚本安装。
-- **只读数据面**：SQLite `*_read` 视图与 `censorscopectl export` 供查询/导出，不依赖 daemon 在线。
+- **只读数据面**：SQLite `*_read` 视图与 `censorscopectl export` 支持查询和导出已落库数据。
 
 ## 采集等级
 
@@ -37,7 +37,7 @@ scripts/             # install-censorscope.sh（dsh 插件安装）
 
 ## 快速开始
 
-依赖：Linux、Rust 1.90+、clang/libbpf（构建 eBPF）；eBPF 采集需要 root 与 BTF，不可用时 daemon 自动降级为进程树快照。
+依赖：Linux、Rust 1.90+、clang/libbpf（构建 eBPF）；eBPF 采集需要 root 与 BTF，daemon 在受限环境下使用进程树快照。
 
 ```bash
 # 构建
@@ -60,8 +60,8 @@ sudo ./target/release/censorscoped start --level L3      # 指定等级（run/st
 sudo ./target/release/censorscoped stop
 ```
 
-与 CensorGuard 同时运行时，`censorscoped` 必须在 Guard 受管进程树外启动；受管树内的
-`bpf()`、跨进程 ptrace 检查均会被拒绝，root 或加入 `censorguard` 组也不会豁免。
+与 CensorGuard 同时运行时，`censorscoped` 在 Guard 受管进程树外启动，以获得 eBPF 采集权限。
+Guard 的管控规则对受管树内的 `bpf()` 和跨进程 ptrace 操作同样适用于 root 与 `censorguard` 组用户。
 DSH host 插件 0.1.2 会显式传递自身 PID namespace，避免 ctl 子进程读取宿主
 `/proc/PID/ns/pid` 时触发 ptrace 限制，需要同步重建安装 `censorscopectl`。
 
@@ -73,8 +73,8 @@ pid_namespace=$(readlink /proc/self/ns/pid)
   --root-pid "$$" --root-pid-namespace "$pid_namespace"
 ```
 
-显式 namespace 时，`--root-pid` 是该 namespace 中的 PID，客户端不读取目标 procfs。
-Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权；此参数不授予额外权限。
+显式 namespace 时，`--root-pid` 是该 namespace 中的 PID，客户端直接传递这组进程坐标。
+Scope daemon 负责解析目标并校验 socket peer 的 UID、namespace 和授权。
 
 ## 配置
 
@@ -91,18 +91,7 @@ Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权�
 - 会话：`CENSORSCOPE_SESSION_ID`（主），`DSH_SESSION_ID`（兜底，与 `[session] env_name` 一致）
 - 工具调用：`DSH_CENSORSCOPE_CALL_ID`
 
-无环境变量的事件按调用 span 时间窗做唯一回补，不确定时保持未归因。
-
-### dsh 集成的两个硬约束
-
-1. **确定的 SessionId 归因是硬要求，worker 不是硬要求。** 需要覆盖原本在 dsh 根进程内
-   执行的会话操作（例如原生文件读写），不能只覆盖 shell 子进程。当前通过每会话 worker
-   为这类操作建立进程身份。替代方案必须在并发情况下同样确定地关联真实观测事件与会话；
-   只记录工具调用的 SessionId 或用时间窗猜测，不能视为满足要求。
-2. **原生 dsh 轨迹视图必须关闭。** `censorscope-ui` 有意禁用 `ui-trajectory`，由
-   CensorScope 轨迹页替代；这是集成要求，不是待修复的原生体验差异。
-
-版本核查、原生能力及替代方案边界见 [dsh 集成设计约束与归因方案](plugins/DSH-INTEGRATION.md)。
+缺少环境变量的事件按调用 span 时间窗做唯一回补；存在多个候选时保留原始归因状态。
 
 ## dsh 集成
 
@@ -114,14 +103,16 @@ Scope daemon 仍解析目标并校验 socket peer 的 UID、namespace 和授权�
 | `censorscope-ui` | 浏览器会话「CensorScope」Tab（工具调用级观测视图） | web |
 | `agentcensor-session-proxy` | web 每会话 headless worker + `CENSORSCOPE_SESSION_ID` | web |
 
-`agentcensor-session-proxy` 的 worker 是当前实现确定归因的手段；是否保留它，应依据替代
-方案的事件归因能力决定，不能直接删除后接受会话身份缺失。
+`agentcensor-session-proxy` 为每个 Web 会话启动独立 worker，通过进程环境中的
+`CENSORSCOPE_SESSION_ID` 关联该 worker 内执行的文件读写与子进程操作。
+宿主同步根会话和子代理会话事件，浏览器通过 CensorScope 轨迹页查看工具调用及观测数据。
+`censorscope-ui` 的 profile patch 将轨迹入口切换为 CensorScope 页面。
 
 安装（插件变更需重新打包安装，脚本按版本号刷新）：
 
 ```bash
-export DSH_HOME=<你的 dsh home>   # 不设置则默认 ~/.dsh，建议设置DSH_HOME
-./scripts/install-censorscope.sh all    # host+ui+proxy；host 模式安装 host+proxy，不安装 UI
+export DSH_HOME=<你的 dsh home>   # dsh 配置目录，通常为 ~/.dsh
+./scripts/install-censorscope.sh all    # 安装 host、ui 和 proxy；host 模式安装 host 和 proxy
 ```
 
 ## 数据访问
