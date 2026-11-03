@@ -175,6 +175,7 @@ fn required_policy_groups(policy: &CompiledPolicy) -> BTreeSet<String> {
 
 pub struct NativeKernel {
     handle: NonNull<ffi::KernelHandle>,
+    user_hz: u32,
 }
 
 // SAFETY: after construction the C session's object metadata and links are immutable. Runtime
@@ -197,6 +198,7 @@ impl NativeKernel {
         if !object.is_file() {
             return Err(KernelError::MissingObject(object.to_path_buf()));
         }
+        let user_hz = user_clock_hz()?;
         let path = CString::new(object.as_os_str().as_bytes())
             .map_err(|_| KernelError::EmbeddedNul(object.display().to_string()))?;
         let names: Result<Vec<_>, _> = manifest
@@ -240,7 +242,7 @@ impl NativeKernel {
                 message
             })
         })?;
-        Ok(Self { handle })
+        Ok(Self { handle, user_hz })
     }
 
     pub fn map_fd(&self, name: &str) -> Result<RawFd, KernelError> {
@@ -352,6 +354,7 @@ impl NativeKernel {
                 audit_net: u32::from(audits[2]),
                 strict_mode: u32::from(failure_mode == FailureMode::Strict),
                 self_protection: u32::from(self_protection),
+                user_hz: self.user_hz,
             },
         )
     }
@@ -751,6 +754,19 @@ impl NativeKernel {
         };
         native_result(result, &error)
     }
+}
+
+fn user_clock_hz() -> Result<u32, KernelError> {
+    // SAFETY: sysconf reads a process-independent scalar and takes no pointers.
+    let frequency = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u32::try_from(frequency)
+        .ok()
+        .filter(|hz| (1..=1_000_000_000).contains(hz))
+        .ok_or_else(|| {
+            KernelError::Native(format!(
+                "sysconf(_SC_CLK_TCK) returned invalid frequency: {frequency}"
+            ))
+        })
 }
 
 impl EventReader {

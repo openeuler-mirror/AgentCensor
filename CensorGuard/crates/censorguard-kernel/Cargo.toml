@@ -9,6 +9,7 @@ build = "build.rs"
 [dependencies]
 censorguard-common = { path = "../censorguard-common" }
 censorguard-policy = { path = "../censorguard-policy" }
+libc.workspace = true
 thiserror.workspace = true
 
 [lints.rust]

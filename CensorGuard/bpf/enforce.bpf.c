@@ -47,6 +47,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_endian.h>
 #include "path_walk.h"
+#include "pid_generation.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -305,6 +306,7 @@ struct filter_config {
     __u32 audit_net;
     __u32 strict_mode;
     __u32 self_protection;
+    __u32 user_hz;
 };
 
 struct {
@@ -314,7 +316,9 @@ struct {
     __type(value, struct filter_config);
 } filter_config_map SEC(".maps");
 
-_Static_assert(sizeof(struct filter_config) == 48, "filter_config ABI");
+_Static_assert(sizeof(struct filter_config) == 52, "filter_config ABI");
+_Static_assert(__builtin_offsetof(struct filter_config, user_hz) == 48,
+               "filter_config user_hz offset");
 
 static __always_inline const struct filter_config *get_cfg(void)
 {
@@ -370,10 +374,15 @@ struct {
     __type(value, __u64);
 } pid_start_times SEC(".maps");
 
-/* /proc/<pid>/stat 的 starttime 使用 USER_HZ tick；Linux 常量 USER_HZ=100。
- * 用户态 root/seed 写入该单位，fork 路径也把 task_struct.start_boottime
- * 纳秒转换为同一单位，使每个 hook 可以真正校验 PID generation。 */
-#define NS_PER_USER_TICK 10000000ULL
+/* /proc starttime 使用 _SC_CLK_TCK 对应的 USER_HZ, 与 CONFIG_HZ 独立。
+ * fork 继承和 generation 校验使用同一频率, 与用户态读出的 tick 保持一致。 */
+static __always_inline __u64 start_ticks(__u64 start_ns)
+{
+    const struct filter_config *cfg = get_cfg();
+    if (!cfg || cfg->user_hz == 0)
+        return 0;
+    return proc_start_ticks(start_ns, cfg->user_hz);
+}
 
 static __always_inline __u64 task_start_ticks(struct task_struct *task)
 {
@@ -385,7 +394,7 @@ static __always_inline __u64 task_start_ticks(struct task_struct *task)
     struct task_struct *leader = BPF_CORE_READ(task, group_leader);
     if (!leader)
         return 0;
-    return BPF_CORE_READ(leader, start_boottime) / NS_PER_USER_TICK;
+    return start_ticks(BPF_CORE_READ(leader, start_boottime));
 }
 
 static __always_inline bool generation_matches(__u32 tgid,
@@ -3285,7 +3294,7 @@ int handle_sched_process_fork(struct bpf_raw_tracepoint_args *ctx)
         return 0;
     if (child_tgid == 0 || child_tgid == parent_tgid)
         return 0;
-    __u64 child_start_ticks = child_start / NS_PER_USER_TICK;
+    __u64 child_start_ticks = start_ticks(child_start);
     __u64 inherited_scope = parent_scope.scope_id;
     struct track_val tv = {
         .scope_id = inherited_scope,

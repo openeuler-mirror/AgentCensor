@@ -20,7 +20,7 @@ PNPM ?= pnpm
 
 .NOTPARALLEL: install package integration-install integration
 
-.PHONY: all deps help setup plugin plugin-test plugin-install check test bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-audit-filter integration-exec-arguments integration-grpc integration-network-ops integration-failure-mode
+.PHONY: all deps help setup plugin plugin-test plugin-install check test test-pid-generation bpf vmlinux build install install-files uninstall package startup-test clean integration-ctl-output integration-audit-config integration-audit-filter integration-exec-arguments integration-grpc integration-network-ops integration-failure-mode
 
 all: check bpf build $(if $(filter 1,$(WITH_DSH)),plugin)
 
@@ -65,8 +65,13 @@ check:
 		$(CC) -O2 -Wall -Wextra -Werror -fsyntax-only "$$source"; \
 	done
 
-test:
+test: test-pid-generation
 	cargo test --workspace --offline
+
+test-pid-generation:
+	mkdir -p target/tests
+	$(CC) -std=c11 -O2 -Wall -Wextra -Werror tools/pid_generation_probe.c -o target/tests/pid-generation-probe
+	./target/tests/pid-generation-probe
 
 bpf: vmlinux
 	clang -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -O2 -g -Wall -Werror \

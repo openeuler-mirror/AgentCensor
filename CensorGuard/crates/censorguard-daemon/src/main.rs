@@ -809,7 +809,7 @@ mod tests {
         fs::create_dir_all(state.join("revisions"))?;
         fs::write(
             &config,
-            "daemon:\n  failure_mode: strict\n  self_protection: true\nrules:\n  - exec deny /bin/false\n",
+            "daemon:\n  failure_mode: permissive\n  self_protection: true\nrules:\n  - exec deny /bin/false\n",
         )?;
         let saved = load(&config)?
             .replace_group_yaml_from(
@@ -840,7 +840,7 @@ mod tests {
         assert_eq!(restored.group_sources, saved.group_sources);
         assert!(restored.daemon.audit_exec);
         assert!(!restored.daemon.enable_net);
-        assert_eq!(restored.daemon.failure_mode, FailureMode::Permissive);
+        assert_eq!(restored.daemon.failure_mode, FailureMode::Strict);
         assert!(restored.daemon.self_protection);
         assert!(restored.groups.contains_key("a+b"));
         // A stale snapshot never overrides a newer public baseline.

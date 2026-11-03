@@ -18,7 +18,7 @@ daemon:
   audit_file: false
   audit_exec: false
   audit_net: false
-  failure_mode: permissive
+  failure_mode: strict
   self_protection: true
   dns_refresh_seconds: 60
   spawn_grpc: true

@@ -29,7 +29,7 @@ rules:
 ```
 
 `enable_*` / `audit_*` 放在启动配置的 `daemon` 段，省略时 enable 全开、audit 全关；
-仓库 `config/base.yaml` 保持空基线规则、`failure_mode: permissive`、`self_protection: true`，三个 audit 全关。
+`failure_mode` 省略时采用 `strict`；仓库 `config/base.yaml` 同样使用 `strict`，保持空基线规则、`self_protection: true`，三个 audit 全关。
 `allow+audit` 的规则审计独立于 enable；只有命中 deny 且对应 enable 开启才主动阻断。
 `strict` 保留路径/参数检查失败后的拒绝，`permissive` 对检查失败放行并累计诊断计数。
 基线规则为空，部署后需通过 `policy apply` + `bind` 显式下发拒绝策略。
