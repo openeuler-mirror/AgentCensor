@@ -76,9 +76,6 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
-# ALLOW auditing is a runtime switch now: enable global file allow auditing
-# (the daemon internally runs it at full rate).
-
 "${runtime_dir}/event-stress-probe" drain "${runtime_dir}/events.sock" \
     >"${runtime_dir}/drain.log" 2>&1 &
 drain_pid=$!

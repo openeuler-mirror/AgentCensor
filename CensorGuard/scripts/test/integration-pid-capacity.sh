@@ -116,7 +116,7 @@ def hex_bytes(value, size):
 
 with open(fill_path, "w", encoding="ascii") as fill, \
      open(delete_path, "w", encoding="ascii") as delete:
-    # tracked_pids now stores only the runtime scope ID; policy-slot binding lives in
+    # tracked_pids stores only the runtime scope ID; policy-slot binding lives in
     # scope_policies and is intentionally decoupled so multiple scopes can share a group.
     value = hex_bytes(domain, 8)
     for offset in range(count):

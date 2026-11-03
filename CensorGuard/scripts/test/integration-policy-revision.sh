@@ -45,8 +45,7 @@ install -d -m 0700 "${runtime_dir}"
 rm -rf -- "${runtime_dir}/state"
 : >"${runtime_dir}/daemon.log"
 
-# Revision 1 must deny /usr/bin/id in lab-policy so the rollback assertions hold;
-# config/base.yaml no longer carries that rule.
+# Revision 1 must deny /usr/bin/id in lab-policy so the rollback assertions hold.
 cat >"${runtime_dir}/policy-initial.yaml" <<'YAML'
 groups:
   lab-policy:

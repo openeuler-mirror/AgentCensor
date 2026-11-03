@@ -398,7 +398,7 @@ pub struct GroupDump {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domains: Vec<String>,
     pub definition: PolicyDefinition,
-    /// Missing for snapshots created before source tracking was introduced.
+    /// Optional provenance; absence means the policy source is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PolicySource>,
 }

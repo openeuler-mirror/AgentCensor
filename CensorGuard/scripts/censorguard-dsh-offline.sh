@@ -125,7 +125,7 @@ done
 # 官方 subprocess 不得被 disable (整树包裹模式保留官方 entry); 匹配 yaml 键,
 # 不匹配注释里的 "disable" 字样
 if grep -qE '^\s*disabled:' "$PATCH"; then
-    fail "patch 仍含 disabled: 行 (旧设计残留)"; O5_OK=0
+    fail "patch 含 disabled: 行, 会禁用官方插件入口"; O5_OK=0
 fi
 [ "$O5_OK" -eq 1 ] && pass "cordis.patch.yml 与 dump-config.mjs 一致, 无 disable 残留"
 

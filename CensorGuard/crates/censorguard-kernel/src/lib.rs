@@ -334,8 +334,7 @@ impl NativeKernel {
         failure_mode: FailureMode,
         self_protection: bool,
     ) -> Result<(), KernelError> {
-        // The ABI keeps the legacy allow_sample_rate field: any enabled audit switch turns on
-        // full ALLOW reporting so the global audit switches take effect in should_report_allow().
+        // Any enabled audit switch needs full ALLOW reporting in should_report_allow().
         self.update_map(
             "filter_config_map",
             &0_u32,

@@ -1,45 +1,13 @@
 /*
- * enforce.bpf.c —— 进程树作用域 (pidtree) + 多域策略 (map-in-map) eBPF 拦截
+ * 进程树作用域内的文件、命令和网络策略强制执行。
+ * scope_policies 将进程身份与策略槽解耦, 使多个作用域可共享策略组,
+ * 并让整棵进程树通过一次绑定更新切换策略。基线 slot 0 与域策略共同生效。
  *
- * [pidtree] P1: 作用域从 cgroup 换成自建进程树 (tracked_pids, 照搬
- * AcTrail 追踪集合维护机制), cgroup 路径已停用、代码以注释保留待回溯。
+ * 文件钩子受非 sleepable LSM 约束, 不能依赖 bpf_d_path;
+ * 因此以 (dev, ino) 为主键, 以 path_walk.h 路径走链覆盖文件重建的 inode 变化。
+ * 定长路径 key 尾部必须补零, 才能与编译器生成的 key 一致。
  *
- * [P2] 多域策略: 策略从全局扁平 map 换成 map-in-map 域索引:
- *   进程 → tracked_pids 拿 scope_id → scope_policies 拿 policy_slot
- *        → 7 张 outer (ARRAY_OF_MAPS) 按 slot 拿 inner 指针
- *        → inner 查规则。slot 0 固定为全局基线 (__base__), 与域 slot 并查。
- * 热更新 = 构建新 inner → 灌入 → outer 槽位原子替换 → 更新 slot_meta,
- * 无"清表重灌"中间态; 内容相同的策略组共享同一 inner (多 slot 同 fd);
- * 每条规则 value 与 slot_meta 携带策略版本, 事件上报版本供审计对账。
- *
- * 三个策略：文件 / 命令(含参数级) / 网络
- * 必需 programs: lsm/file_open (按 f_flags 区分读/写),
- *              lsm/file_permission (预打开 fd 实际读写时重新授权),
- *              lsm/path_truncate (写), lsm/path_unlink (删),
- *              lsm/path_rmdir (删目录), lsm/path_rename (改名/移动),
- *              等 18 个文件钩子 + lsm/bprm_check_security,
- *              tracepoint/syscalls/sys_enter_execve/execveat (取 argv 暂存),
- *              网络八钩（含监听身份/入站请求/收发/释放）+ 守护四钩 + 进程树追踪三钩
- *
- * 注意: path_truncate/unlink/rmdir/rename 不在内核 sleepable LSM
- * 钩子名单里 (inode 锁上下文), 只能用非 sleepable lsm/ 挂载;
- * 而 bpf_d_path 在非 sleepable 程序里被禁
- * ("helper call is not allowed in probe"), 所以文件策略的主判定
- * 用 (dev,ino) 身份匹配: 受害者自身 inode 查
- * file_ino 维, 祖先目录走链查 dir_ino 维。
- * (dev,ino) miss 时的兜底是 path_walk.h 的手工 d_path 走链
- * 解析出命名空间绝对路径查 file_str 维 —— 这盖住"策略加载后文件
- * 被删除重建/新建, inode 变化逃逸"的场景 (编译器对每条文件规则
- * 恒双写字符串身份)。
- * file_open 同样用走链兜底 (非 sleepable): bpf_d_path 已弃用,
- * 其 d_path 右对齐写入 + memmove(len) 的实现会在缓冲尾部残留
- * 字符串副本, 直接当定长 key 用会恒 miss。
- *
- * 加载方式: Rust kernel crate 经 libbpf C shim 按严格 manifest 加载并 attach，
- * 任一必需 program 失败都不进入 READY。
- *
- * 循环: 全部用 #pragma unroll + 编译期常量边界, 运行时上界写成条件分支
- * (避免 break 让 clang 放弃 unroll)。
+ * 必需程序由 kernel crate 的 manifest 统一声明; 任一加载或挂载失败均不进入 READY。
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -50,20 +18,7 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-#define PATH_MAX_LEN       256
-#define DIR_MAX_LEN        32
-#define CMD_MAX_LEN        16
-#define PATH_STR_MAX       16
-#define PATH_LENS_MAX      8
-#define FIXED_MAX          8
-#define BUILTIN_ALLOW_N    33
-
-/* ============ 规则 key 定义 ============
- *
- * P1 的扁平 hash map (file_blacklist / cmd_blacklist / net_rules 等)
- * 已在 P2 废弃, 改为下方 "多域策略 map-in-map" 一节的 inner/outer 结构;
- * key 结构原样保留, 作为各维度 inner map 的 key。
- */
+/* ============ 规则 key 定义 ============ */
 
 /* 文件路径 key: 完整路径 (最长 255 字节 + NUL, NAME_MAX) */
 struct path_key {
@@ -96,8 +51,7 @@ struct net_lpm_key {
  * 为什么需要第二张表、且 port 必须在前: "网段+端口" (CIDR:port) 规则
  * 要匹配 "addr 前 N 位 (N<32) + 端口 16 位"。若 port 放在 32 位 addr 之后
  * (net_lpm_key 布局), 这两段中间隔着 addr 的低位, trie 只支持连续前缀,
- * 表达不了 (曾按 prefixlen=N+16 实现, 实际匹配 "addr 前 N+16 位",
- * 语义完全错误)。port 在前则 "端口 16 位 + addr 前 N 位" 天然连续:
+ * 无法表达所需匹配。port 在前则 "端口 16 位 + addr 前 N 位" 天然连续:
  *   prefixlen = 16+N  -> CIDR 单端口   ("10.0.0.0/8:443" -> 24)
  *   prefixlen = 16+32 -> 单 IP 单端口  ("1.2.3.4:8080"   -> 48)
  * port: 主机字节序; addr: 内存字节序 (同 net_lpm_key 约定)。 */
@@ -169,10 +123,10 @@ struct exec_args {
 #define ARG_CHECK_MATCH    1
 #define ARG_CHECK_UNAVAILABLE 2
 
-/* ============ 规则 value 定义 (P2: 全部携带策略版本) ============
+/* ============ 规则 value 定义 ============
  *
  * version 由控制面构建 inner map 时烧入, 事件上报带回用户态,
- * 支撑审计对账 ("这次判定依据的是哪一版策略") 与旧 inner 精确回收。 */
+ * 使审计事件可关联到判定所用的策略版本。 */
 
 /* ino 类规则 value: 掩码 + 版本 */
 struct ino_rule_val {
@@ -199,19 +153,12 @@ struct net_rule_val {
     __u8  audit;
     __u8  pad[2];
     __u32 forbid_labels;   /* IFC 预留, 当前恒 0 不参与判定 */
-    __u32 version;         /* P2 新增 */
+    __u32 version;
 };
-
-/* 文件策略模式 */
-#define FILE_MODE_ALLOW    0  /* 白名单模式: 只允许指定路径 */
-#define FILE_MODE_DENY     1  /* 黑名单模式: 只拦截指定路径 */
 
 /* ============ 文件操作权限掩码 (file_str/file_ino/dir_ino 维规则 value 的 mask) ============
  *
- * 旧语义: value 存在即全拦 (任何 open 都拒)。
- * 新语义: value 是按位掩码, 各 LSM hook 按操作类型取对应位判定。
- * Rust 策略编译器把 file_rules[].deny 翻译成掩码;
- * 旧字段 file_blacklist 一律展开为 DENY_ALL (向后兼容)。
+ * 各 LSM hook 按操作类型检查掩码, 使同一路径可分别限制读写、删除和属性修改。
  */
 #define DENY_READ    0x1   /* file_open 只读打开 */
 #define DENY_WRITE   0x2   /* file_open 写意图 + path_truncate/file_truncate +
@@ -278,25 +225,18 @@ struct net_rule_val {
 
 /* ============ 运行时可热更的过滤配置 (array map) ============
  *
- * 之前这些值放在 .rodata (const volatile), 加载后不可改, 改策略必须重启。
- * 为了支持 SIGHUP 热加载, 挪到 BPF_MAP_TYPE_ARRAY (max_entries=1),
- * 用户态随时 m.Update 覆盖, BPF 端每次 hook 触发时 lookup 读最新值。
+ * 使用单项 array map 支持控制面原子更新, 无需重新加载 BPF 程序。
  *
  * array map 的 entry 0 创建后恒存在, lookup 不会 miss;
  * 返回值判空仅为过 verifier。
  *
- * P2 说明: enable_* 是全局开关, 不做 per-domain 开关 map ——
- * "某域不启用某维度" 用空 inner 表达 (空槽/空表 = 该维度无规则,
- * 判定走默认动作), 语义已覆盖 (设计文档 §2.7)。
+ * enable_* 是全局开关; 域内某维度无规则时使用空 inner, 判定走默认动作。
  */
 struct filter_config {
-    /* [pidtree] cgroup scope 已停用, 保留待回溯 (原字段):
-     * __u64 cgroup_id;     // 目标 cgroup id, 0 = 不过滤
-     */
     __u32 enable_file;   /* 文件策略开关 */
     __u32 enable_exec;   /* 命令策略开关 */
     __u32 enable_net;    /* 网络策略开关 */
-    __u32 file_mode;     /* 0=白名单(暂禁用), 1=黑名单 */
+    __u32 file_mode;     /* ABI 保留字段, 控制面固定写 1, 判定不读取 */
     __u32 active_bank;   /* 双 bank 热更: 0/1, 单次 ARRAY update 原子切换 */
     __u32 policy_version;/* 当前全量策略版本, 审计/状态用 */
     __u32 allow_sample_rate; /* 0=关闭 ALLOW, 1=全量, N=每 N 个取 1 个 */
@@ -322,13 +262,12 @@ static __always_inline const struct filter_config *get_cfg(void)
     return bpf_map_lookup_elem(&filter_config_map, &k);
 }
 
-/* ============ 守护者注册表 (台账 D1/D3) ============
+/* ============ 守护者注册表 ============
  *
  * key = tgid, value = 1。仅 Rust daemon 启动时写入自身 pid;
  * SIGHUP 策略热更无权碰这张表 (策略通道被攻破 ≠ 守护者缴械)。
  * 不做进程退出清理: map 不 pin, 随 daemon 生灭, 只注册 daemon 自己,
- * 无 pid 复用残留面 (ActPlane 需要 exit 清理是因为它还注册运行态
- * agent 的 pid)。 */
+ * 无 pid 复用残留面。 */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 64);
@@ -336,10 +275,8 @@ struct {
     __type(value, __u8);
 } protected_pids SEC(".maps");
 
-/* ============ 进程树追踪集合 (pidtree P1 + runtime scope) ============
+/* ============ 进程树追踪集合 (runtime scope) ============
  *
- * 照搬 AcTrail 追踪集合维护机制 (设计文档
- * docs/design/多Agent域模型-进程树作用域设计.md §2/§4.1):
  * fork 立即继承 tracked，主表写失败时 pending 为全部 hook 提供降级 scope，exit 清理；
  * 追踪根由用户态 (ctl spawn/attach) 写入。
  *
@@ -404,8 +341,7 @@ struct pending_proc_op {
 };
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    /* 主表满时 pending 是完整的降级 tracking 层，而不再只保护首次 exec。
-     * 与主表同容量可覆盖一次完整的并发峰值；若两层都满，stats 显式告警。 */
+    /* 与主表同容量, 使主表写入失败时仍能承接一次完整的并发峰值。 */
     __uint(max_entries, PID_TRACKED_CAPACITY);
     __type(key, __u32);
     __type(value, struct pending_proc_op);
@@ -559,21 +495,14 @@ static __always_inline bool in_scope_exec(struct scope_info *si)
     return current_scope_info(si);
 }
 
-/* 守护钩子的 scope: [pidtree] 已切换为进程树作用域 —— actor 在追踪集 =
- * scope 内, 空集 = 不生效, 语义不变。与原 "cgroup_id==0 = 不生效" 一样
- * 不会自锁: 守护钩子没有 enable_* 开关, attach 后立即生效, 而 daemon
- * 自己不在追踪集, 策略 map 更新 (bpf() 调用) 不会被拒。
- *
- * [pidtree] cgroup scope 已停用, 保留待回溯 (原实现):
- *     return cfg->cgroup_id != 0 &&
- *            bpf_get_current_cgroup_id() == cfg->cgroup_id;
- */
+/* 守护钩子仅约束追踪集内的进程; daemon 自身不入追踪集,
+ * 因此策略 map 更新所需的 bpf() 调用不会被自保护拒绝。 */
 static __always_inline bool guard_scope(const struct filter_config *cfg)
 {
     return cfg->self_protection && in_scope();
 }
 
-/* ============ 多域策略 map-in-map (P2 核心) ============
+/* ============ 多域策略 map-in-map ============
  *
  * slot 是稳定的身份, inner map 是可换的内容:
  *   tracked_pids[tgid].scope_id ──> scope_policies[scope_id].policy_slot
@@ -665,12 +594,8 @@ struct net6_port_lpm_inner {
     __type(value, struct net_rule_val);
 };
 
-/* 空 inner 实体: file_policy_setup 把空槽指针归一化到这两张表。
- * 查它们恒 miss (永不写入条目), 与"空槽"语义相同 (默认放行),
- * 但给 verifier 一个统一的非空 PTR_TO_MAP 类型 —— 六个槽位各自的
- * "NULL | PTR_TO_MAP" 组合 (2^6=64 种栈类型) 沿下游全程传播且永不
- * 合并, 是指令数爆炸的头号来源 (enforce_path_rename 实测冲破 100 万
- * 上限)。归一化后所有组合坍缩成单一状态。 */
+/* 空 inner 永不写入条目, 查询恒 miss, 保持空槽的默认放行语义。
+ * 用统一的非空 PTR_TO_MAP 类型代替可空指针组合, 避免 verifier 状态数膨胀。 */
 struct ino_hash_inner empty_ino_inner SEC(".maps");
 struct str_hash_inner empty_str_inner SEC(".maps");
 
@@ -812,85 +737,15 @@ static __always_inline bool file_denied(const struct filter_config *cfg,
     return cfg->strict_mode && (result & FILE_CHECK_FAILED);
 }
 
-/* 白名单相关变量 - 暂时不用, 保留占位
-const volatile char   filter_allow_dir[DIR_MAX_LEN];
-const volatile __u32  filter_allow_dir_len  = 0;
-
-struct cmd_entry { char s[CMD_MAX_LEN]; };
-const volatile __u32  filter_deny_cmds[FIXED_MAX] = { {0} };
-const volatile __u32  filter_deny_cmds_n = 0;
-
-struct path_entry { char s[PATH_STR_MAX]; };
-const volatile struct path_entry filter_allow_paths[PATH_LENS_MAX] = { {0} };
-const volatile __u32 filter_allow_paths_n = 0;
-*/
-
-#if 0  /* 白名单路径 - 暂时禁用 */
-/* 黑名单单一长路径 */
-const volatile char   filter_deny_dir[DIR_MAX_LEN];
-const volatile __u32  filter_deny_dir_len  = 0;
-#endif
-
-#if 0
-/* 内置放通前缀 —— 编译期常量, 永不变化。
- *
- * 用途: cgroup 内的进程跑 bash / sleep / cat / 动态链接器 / locale 查表
- * 这些操作都会触发 file_open。-allow-dir 和 -allow-paths 用户给的
- * 是"业务路径" (e.g. /opt/agent/workspace), 不会包括 /usr/lib、
- * /usr/share/locale、/dev 之类。如果不在内置放通里, cgroup 内
- * 任何基础命令都跑不起来。
- *
- * 注意: 每条最长 PATH_STR_MAX-1 = 15 字符, 用完要换 "/usr/lib64" ->
- * "/usr/lib" 这种缩写。
- *
- * 顺序无所谓: BPF 按数组线性扫, 命中即返。
- */
-static const char builtin_allow_prefixes[BUILTIN_ALLOW_N][PATH_STR_MAX] = {
-    "/lib",
-    "/lib64",
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/share/loc",
-    "/usr/share/ter",
-    "/etc/ld.so.",
-    "/dev/",
-    "/usr/bin/bash",
-    "/usr/bin/sh",
-    "/usr/bin/sleep",
-    "/usr/bin/cat",
-    "/usr/bin/ls",
-    "/usr/bin/echo",
-    "/usr/bin/python",
-    "/usr/bin/cp",
-    "/usr/bin/mv",
-    "/usr/bin/rm",
-    "/usr/bin/mkdir",
-    "/usr/bin/head",
-    "/usr/bin/tail",
-    "/usr/bin/grep",
-    "/usr/bin/awk",
-    "/usr/bin/sed",
-    "/usr/bin/sort",
-    "/usr/bin/wc",
-    "/usr/bin/uname",
-    "/usr/bin/which",
-    "/usr/bin/curl",
-    "/usr/bin/wget",
-    "/usr/bin/nc",
-    "/proc/",
-    "/sys/fs/cgrou",  /* /sys/fs/cgroup + 子目录 */
-};
-#endif
-
 /* ============ ringbuf event ============ */
 struct event {
     __u64 cgroup_id;
     __u64 ts_ns;
     __u32 pid, tgid, kind;
     __u32 allowed;
-    __u32 op;            /* kind=1 时为 FILE_OP_*; 其余 kind 恒 0 */
-    __u32 policy_version; /* P2: 判定依据的策略版本 (slot_meta, 兜底) */
-    __u32 rule_version;   /* P2: 命中规则自身的版本, 未命中 = 0 */
+    __u32 op;            /* kind=1/3/4 分别使用文件、网络、守护操作码 */
+    __u32 policy_version; /* 判定依据的策略版本 (slot_meta, 兜底) */
+    __u32 rule_version;   /* 命中规则自身的版本, 未命中 = 0 */
     __u64 domain_id;      /* Web 控制台: 事件域归属 (tracked_pids; 未追踪 = 0) */
     char  comm[16];
     char  detail[160];
@@ -1008,7 +863,7 @@ struct {
 
 /* is_args_in_blacklist 的 scratch key 缓冲。
  * BPF 栈只有 512B, arg_key(1024B) 不能放在 bprm hook 栈上,
- * 按 clang 建议放 per-cpu array (单 CPU 独占, 无需锁)。
+ * 因此放 per-cpu array (单 CPU 独占, 无需锁)。
  * 与域无关 (查询 key 的构造不碰策略表), 全组共享一个。 */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1019,8 +874,8 @@ struct {
 
 /* path_fallback_mask 的 scratch key 缓冲。同样的 512B 栈理由:
  * 走链调用链是 钩子 -> path_fallback_mask -> bpf_loop -> walk_step,
- * 三层帧合并计账, path_key(256B) 内联进兜底子程序会顶爆上限
- * (实测 combined stack 544 > 512)。非 sleepable 钩子独占 CPU,
+ * 多层帧合并计账, path_key(256B) 会使合并栈帧超过上限。
+ * 非 sleepable 钩子独占 CPU,
  * per-cpu array 无并发问题。 */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1029,8 +884,8 @@ struct {
     __type(value, struct path_key);
 } path_key_scratch SEC(".maps");
 
-/* is_cmd_in_blacklist 的 scratch key 缓冲: cmd_key 扩到 256B 后
- * 不能再放栈上 (exec 钩子的合并栈帧余量不足)。同上, per-cpu 独占。 */
+/* cmd_key 的 256B 缓冲会耗尽 exec 钩子的合并栈帧余量,
+ * 因此使用 per-cpu scratch, 由非 sleepable 钩子独占。 */
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
@@ -1038,169 +893,8 @@ struct {
     __type(value, struct cmd_key);
 } cmd_key_scratch SEC(".maps");
 
-#if 0
-/* ============ 公共: 单条 allow_paths[i] 与 path 前缀比较 ============
- *
- * j 是循环变量 (编译期常量 0..15), 运行时 want/path[j] 比较。
- * 命中/失败不能 early-return (会破 unroll), 用 fail 标志记录,
- * 循环结束后统一判断。
- */
-static __always_inline bool path_matches_allow_entry(int idx, const char *path)
-{
-    /* matched: -1 = 待定, 0 = 失败, 1 = 命中 */
-    int matched = -1;
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        char want = filter_allow_paths[idx].s[j];
-        if (matched == 0) continue;          /* 已失败, 不再更新 */
-        if (want == '\0') {
-            matched = 1;                      /* 规则读完, 算匹配 */
-        } else if (path[j] != want) {
-            matched = 0;                      /* 不匹配 */
-        }
-    }
-    return matched == 1;
-}
-
-/* ============ 公共: 单条 deny_paths[i] 与 path 前缀比较 ============
- *
- * 与 path_matches_allow_entry 结构相同, 但从 filter_deny_paths 读取。
- * 分开两个函数是为了避免在循环中动态选择数组(verifier 会拒)。
- */
-static __always_inline bool path_matches_deny_entry(int idx, const char *path)
-{
-    /* matched: -1 = 待定, 0 = 失败, 1 = 命中 */
-    int matched = -1;
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        char want = filter_deny_paths[idx].s[j];
-        if (matched == 0) continue;
-        if (want == '\0') {
-            matched = 1;                      /* 规则读完, 算匹配 */
-        } else if (path[j] != want) {
-            matched = 0;                      /* 不匹配 */
-        }
-    }
-    return matched == 1;
-}
-
-/* ============ 公共: 内置前缀与 path 前缀比较 ============
- * builtin_allow_prefixes[][] 是编译期 const, 数组长度 BUILTIN_ALLOW_N
- * 是编译期常量, #pragma unroll 可展开。
- */
-static __always_inline bool builtin_matches(int idx, const char *path)
-{
-    int matched = -1;
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        char want = builtin_allow_prefixes[idx][j];
-        if (matched == 0) continue;
-        if (want == '\0') {
-            matched = 1;                      /* 规则读完, 算匹配 */
-        } else if (path[j] != want) {
-            matched = 0;                      /* 不匹配 */
-        }
-    }
-    return matched == 1;
-}
-
-/* ============ 公共: 多目录前缀匹配 (用户 + 内置) ============ */
-static __always_inline bool has_allowed_path(const char *path)
-{
-    int matched = 0;
-    /* 先查用户白名单 (filter_allow_paths[]) */
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if (matched) continue;
-        if (i < filter_allow_paths_n && path_matches_allow_entry(i, path))
-            matched = 1;
-    }
-    /* 再查内置放通 (builtin_allow_prefixes[][]) */
-    #pragma unroll
-    for (int i = 0; i < 33; i++) {
-        if (matched) continue;
-        if (builtin_matches(i, path))
-            matched = 1;
-    }
-    return matched;
-}
-
-/* ============ 公共: 检查路径是否在黑名单中 ============
- *
- * 用于黑名单模式：只有命中黑名单的路径才被拦截。
- *
- * 注意：内置白名单 (builtin_allow_prefixes) 不适用于黑名单模式，
- * 因为黑名单默认允许所有路径，除非显式命中黑名单规则。
- */
-static __always_inline bool has_denied_path(const char *path)
-{
-    int matched = 0;
-    /* 查用户黑名单 (filter_deny_paths[]) */
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        if (matched) continue;
-        if (i < filter_deny_paths_n && path_matches_deny_entry(i, path))
-            matched = 1;
-    }
-    return matched;
-}
-
-/* ============ 公共: 单 filter_deny_dir 前缀匹配 ============ */
-static __always_inline bool has_denied_dir(const char *path)
-{
-    int len = filter_deny_dir_len;
-    if (len <= 0 || len >= 32)
-        return false;
-    int matched = 1;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        if (j < len && matched && path[j] != filter_deny_dir[j])
-            matched = 0;
-    }
-    return matched;
-}
-
-/* ============ 公共: 单 filter_allow_dir 前缀匹配 ============ */
-static __always_inline bool has_allowed_dir(const char *path)
-{
-    int len = filter_allow_dir_len;
-    if (len <= 0 || len >= 32)
-        return false;
-    int matched = 1;
-    #pragma unroll
-    for (int j = 0; j < 32; j++) {
-        /* 用条件分支代替 break, 让 clang 能 unroll */
-        if (j < len && matched && path[j] != filter_allow_dir[j])
-            matched = 0;
-    }
-    return matched;
-}
-
-/* ============ 路径前缀匹配总入口 ============ */
-static __always_inline bool path_has_allowed_prefix(const char *path)
-{
-    if (has_allowed_path(path))
-        return true;
-    if (filter_allow_dir_len > 0 && filter_allow_dir_len < 32
-        && has_allowed_dir(path))
-        return true;
-    return false;
-}
-#endif /* 白名单相关函数 - 暂时禁用 */
-
-/* ============ 公共: detail 拷到 ringbuf event ============
- *
- * 关键设计: 不在 BPF 程序里做字节循环复制。改用 bpf_probe_read_kernel_str
- * (helper, verifier-trusted, 无循环展开) 一次性把 src 拷到 dst,
- * 然后显式把 dst[copy_max..159] 清零。
- *
- * verifier 看到的是:
- *   1. helper 调用 (不展开)
- *   2. 一个简单 for 循环写 '\0' 到 dst[i], 循环边界 159 (编译期常量),
- *      body 只有 1 条 store 指令
- *
- * 实测这种写法 single program 几百条指令, 三个 program 总和远低于 100 万。
- */
+/* 使用字符串读取 helper 避免复制循环展开带来的 verifier 成本;
+ * 尾部补零防止复用 ringbuf 槽位时泄露上一条事件的数据。 */
 static __always_inline void copy_to_detail(char *dst, int dst_max, const char *src)
 {
     /* helper: 把 src (kernel ptr, 含 NUL 终止) 截断拷到 dst, 返回总字节数 (含 NUL) */
@@ -1274,14 +968,8 @@ static __always_inline __u8 file_ino_mask(struct inode *inode,
     return ino_mask_lookup(base, dom, &k, rule_ver);
 }
 
-/* 祖先走链预算。保持 32 层语义不变, 但实现从 #pragma unroll 静态展开
- * 改为 bpf_loop 回调 (与 path_walk.h 的 walk_step 同款):
- *  1. 根治 6.6 verifier 在 bounded-loop 回边把 dentry 指针降级成
- *     scalar 的老问题 (当时被迫静态展开的原因) —— 回调里指针经 ctx
- *     内存传递、全部 probe_read 访问, 与 walk_step 同理;
- *  2. 每层 2 次 hash 查询 + 多个分支的状态隔离在回调子程序内,
- *     不再与调用方状态相乘 —— enforce_path_rename 双侧判定冲破
- *     100 万指令上限的修复 (诊断记录 8 同类: 展开循环 × 分支 = 爆炸)。 */
+/* bpf_loop 回调将每层查询和分支的 verifier 状态与调用方隔离。
+ * dentry 通过 ctx 传递并经 probe_read 访问, 避免依赖循环回边的指针类型推导。 */
 #define DENTRY_WALK_MAX  32
 
 struct dir_walk_state {
@@ -1291,7 +979,7 @@ struct dir_walk_state {
                       * 不一); 只放标量 slot, 回调内用全局 outer 引用现场
                       * lookup —— ldimm64 重取是 verifier 天然干净的形态 */
     __u32 dom_slot;
-    __u32 rule_ver;  /* 沿途最后一次命中的版本 (根侧覆盖叶侧, 与原语义一致) */
+    __u32 rule_ver;  /* 沿途最后一次命中的版本 (根侧覆盖叶侧) */
     __u8  mask;
     bool  stop;
     bool  invalid;
@@ -1410,15 +1098,14 @@ static __always_inline bool file_policy_setup(const struct filter_config *cfg,
     fp->dom_fino  = bpf_map_lookup_elem(&dom_file_ino, &domain);
     fp->base_dino = bpf_map_lookup_elem(&dom_dir_ino, &base);
     fp->dom_dino  = bpf_map_lookup_elem(&dom_dir_ino, &domain);
-    /* verifier 状态坍缩 (rename 冲破 100 万指令上限的主因):
+    /* 归一化 inner 指针, 避免 rename 判定的 verifier 状态数超过指令预算:
      * 四个 inner 槽在 verifier 眼里各有 "NULL | PTR_TO_MAP" 两种类型,
      * 组合沿下游全程传播、且因各不相同永不合并。
      * 对策: 判空只聚成布尔 any (不用位图 —— have=5 与 have=9 也是
      * 两种状态); 随后把空槽归一化到 empty_*_inner (恒 miss, 与空槽
      * 同为默认放行, 语义不变), 所有组合坍缩成单一类型状态。
      * 判空仍逐条独立 if, 绝不合并写 !a && !b: clang if-convert 成
-     * (a|b|...)==0 即对指针做位或, verifier 明令禁止直接拒载
-     * (P2 实测教训, 见设计文档附B)。
+     * (a|b|...)==0 即对指针做位或, verifier 会拒载。
      * file_str 维不经 fp 携带 (path_fallback_mask 内现场查 outer),
      * 也不参与 any 判定: 槽位一旦 install 过, ino 两维 inner 必同时
      * 存在 (replace_rule_set 全量替换), any==false 只意味着从未配置。 */
@@ -1453,12 +1140,8 @@ static __always_inline bool file_policy_setup(const struct filter_config *cfg,
  * dentry->d_inode 允许为 NULL (rename 目标不存在时), 自身查询跳过,
  * 祖先走链照常 —— 在受保护目录里新建文件也能被目录规则拦住。
  *
- * __noinline 是 verifier 成本控制: dir_ancestor_mask 的 32 层展开循环
- * 是状态大户, inline 时其分支状态会与后续兜底调用的分支相乘,
- * 双侧判定的 enforce_path_rename 因此冲破 100 万指令上限
- * (诊断记录 8 同类)。子程序边界把循环状态留在内部验证, 钩子本体
- * 只剩 调用→判掩码 的直线结构。子程序不做任何 sleepable 操作,
- * sleepable 的 file_open 与非 sleepable 的 path_* 钩子都能共享。 */
+ * __noinline 隔离祖先走链与后续路径兜底的 verifier 分支状态,
+ * 使 rename 双侧判定等复杂钩子保持在验证预算内。 */
 static __noinline __u8 victim_mask(struct dentry *dentry,
                                    const struct file_policy *fp,
                                    __u32 *rule_ver)
@@ -1521,11 +1204,8 @@ static __always_inline __u8 file_str_key_lookup(const struct path_key *key,
  * 终止路径, 仅供事件展示; 完整匹配走下方 per-cpu scratch, 两者解耦,
  * 钩子的栈帧不随 key 上限膨胀。未解析时 path_out[0]=='\0' 即无效。
  *
- * __noinline 是 verifier 成本控制的关键 (诊断记录 8 的同类坑):
- * 本函数 inline 进 12 个钩子时, 其内部分支会与 dir_ancestor_mask
- * 32 次展开循环累积的状态做组合爆炸 (实测 enforce_path_unlink
- * 冲破 100 万指令上限)。改成 BPF-to-BPF 调用后, 调用边界把调用方
- * 状态抽象化, 子程序按调用点独立验证, 每个都很小。 */
+ * __noinline 将路径解析的 verifier 状态隔离在子程序内,
+ * 避免与各文件钩子的分支状态形成组合。 */
 static __noinline __u8 path_fallback_mask(struct dentry *dentry,
                                           struct vfsmount *mnt,
                                           const struct file_policy *fp,
@@ -1545,11 +1225,8 @@ static __noinline __u8 path_fallback_mask(struct dentry *dentry,
     }
     if (len > 255)
         return 0;
-    /* verifier 教训: 上面的分支只收窄了比较用的 (u32) 截断副本,
-     * 64 位 len 本身的范围不会回传 (实测 6.6: probe_read size 仍按
-     * 上限 4096 算, 栈目标直接拒); 纯 C 的 len &= 255 会被 clang 当作
-     * 无操作删除。asm barrier 强制在寄存器上执行与操作, tnum 值域
-     * 钉死在 [0,255]。 */
+    /* verifier 不一定把 32 位比较的范围传回 64 位寄存器;
+     * asm 保证掩码操作不会被 clang 消除, 将读取长度限制在 [0,255]。 */
     asm volatile("%[len] &= 0xff;\n" : [len] "+r"(len));
 
     /* 展示副本: 定长 read_str 进调用方已零初始化的 64B 栈缓冲, 路径在
@@ -1815,7 +1492,7 @@ static __always_inline void fmt_dec7(char *dst, __u32 v)
     dst[6] = '0' + v % 10;
 }
 
-/* ============ 公共: 上报 (P2 起携带策略版本) ============
+/* ============ 公共: 上报 ============
  *
  * rule_ver 的最高位仅在 BPF 内部作为逐规则 audit 标志使用。写入 ringbuf
  * 前会清除该位，因此用户态仍收到原始 u32 规则版本；命中 allow+audit 时
@@ -1936,8 +1613,7 @@ static __always_inline void report_file_op(__u32 op, __u32 allowed,
  * file_ino 维并查 (基线+域), 祖先目录走链在 dir_ino 维并查, 取并集;
  * miss 时再 path_fallback_mask —— path_walk.h 手工走链解析全路径,
  * 在 file_str 维精确匹配 (编译器对每条文件规则恒双写字符串身份,
- * 重建/新建文件的 inode 变化不再逃逸)。file_open 也是同一套
- * (非 sleepable, bpf_d_path 已弃用, 见钩子注释)。
+ * 覆盖重建/新建文件的 inode 变化)。file_open 也使用此非 sleepable 判定。
  * =================================================================== */
 
 /* 规则审计与策略阻断共享 scope 和文件策略上下文。 */
@@ -1952,12 +1628,8 @@ static __always_inline void report_file_op(__u32 op, __u32 allowed,
 /* lsm/file_open: 按 f_flags 区分读/写意图。
  * 注意: open(O_TRUNC) / ">" 重定向 / cp 覆盖 / 编辑器写 都走这里。
  *
- * 非 sleepable + 手工走链 (与其他文件钩子同一套): 曾经用 sleepable +
- * bpf_d_path 拿路径, 但 6.6 的 bpf_d_path 是 d_path 右对齐写入 +
- * memmove(len), 缓冲尾部 [len, sz) 残留字符串副本不清零 —— 256B key
- * 直接强转 buffer 会因残留字节与编译器零填充 key 不等而恒 miss
- * (实测 phase A 回归)。走链方案缓冲/key 全在 per-cpu map, 无此问题,
- * 且只在 inode miss 时触发, 比每次 open 都 bpf_d_path 更便宜。 */
+ * 与其他文件钩子共用非 sleepable 走链, 缓冲/key 放在 per-cpu map;
+ * 仅在 inode 未命中时解析路径, 并保证定长 key 尾部补零。 */
 SEC("lsm/file_open")
 int BPF_PROG(enforce_file_open, struct file *file)
 {
@@ -2067,7 +1739,7 @@ int BPF_PROG(enforce_path_truncate, const struct path *path)
     return 0;
 }
 
-/* lsm/path_unlink: rm 删文件。不触发 file_open —— 这是旧实现的大缺口。
+/* lsm/path_unlink: 删除不触发 file_open, 需要独立检查删除权限。
  * 非 sleepable (同 path_truncate) */
 SEC("lsm/path_unlink")
 int BPF_PROG(enforce_path_unlink, const struct path *dir,
@@ -2340,8 +2012,7 @@ int BPF_PROG(enforce_path_chown, const struct path *path,
 /* lsm/inode_setxattr: setxattr 改扩展属性。查 DENY_ATTR。
  * 不接路径兜底: 钩子签名只有 dentry 没有 vfsmount, 走链无法跨挂载,
  * partial 语义下不表态 (inode 维判定仍然有效)。
- * 签名注意: 内核 6.x (idmapped mounts 改造后) 首参是 mnt_idmap*,
- * 旧 5 参签名 (dentry 打头) BTF 对不上, attach 直接失败。 */
+ * 签名必须与目标内核 BTF 一致; 内核 6.x 的首参为 mnt_idmap*。 */
 SEC("lsm/inode_setxattr")
 int BPF_PROG(enforce_inode_setxattr, struct mnt_idmap *idmap,
              struct dentry *dentry, const char *name,
@@ -2459,8 +2130,8 @@ int BPF_PROG(enforce_mmap_file, struct file *file, unsigned long reqprot,
 }
 
 /* lsm/file_mprotect: mprotect/pkey_mprotect 把已有映射升级为可写时触发,
- * 堵 "先 mmap(PROT_READ) 再 mprotect(+PROT_WRITE)" 的逃逸 —— mmap_file
- * 只查建立映射一刻, 升级路径原来无任何钩子。非 sleepable, 判定纯 inode。
+ * 覆盖 "先 mmap(PROT_READ) 再 mprotect(+PROT_WRITE)" 的写入授权;
+ * mmap_file 只检查建立映射的时刻。非 sleepable, 判定纯 inode。
  * 与 mmap_file 职责互补: 建立即 PROT_WRITE 的归 mmap_file, 事后提权的归这里。 */
 SEC("lsm/file_mprotect")
 int BPF_PROG(enforce_file_mprotect, struct vm_area_struct *vma,
@@ -2506,7 +2177,7 @@ int BPF_PROG(enforce_file_mprotect, struct vm_area_struct *vma,
  * 参数 token。ea 非空时展示用 tok[0] 也统一覆盖成解析后路径。
  * domain_id 由调用方从 in_scope_exec 的 scope_info 传入: exec 判定
  * 有 pending 兜底 (fork→exec 窗口内 tracked_pids 还没落表), 上报时刻
- * 再查 tracked 会错归属, 必须直接用判定时刻的域身份 (Web 控制台设计 §5)。 */
+ * 再查 tracked 会错归属, 必须直接用判定时刻的域身份。 */
 static __always_inline void report_exec(__u32 allowed, const char *fn,
                                         struct exec_args *ea,
                                         __u32 policy_ver, __u32 rule_ver,
@@ -2608,9 +2279,7 @@ int BPF_PROG(enforce_bprm_check, struct linux_binprm *bprm)
         return -1;
     }
 
-    /* 参数级黑名单: 从 capture_exec_args 暂存的 argv 匹配。
-     * 注意 bprm->p 路线已证伪 (见 docs/archive/命令参数拦截调研.md §2.1):
-     * bprm->p 是新 mm 的用户地址, 本 hook 触发时新 mm 未安装, 读不到,
+    /* bprm->p 是新 mm 的用户地址, 本 hook 触发时新 mm 未安装, 无法读取,
      * 所以参数只能从 sys_enter_execve 提前暂存。
      * tok[0] 不用 argv[0] (可伪造/随敲法变化), 统一用 bprm->filename。 */
     {
@@ -2753,7 +2422,7 @@ int capture_execveat_args(struct trace_event_raw_sys_enter *ctx)
 /* ===================================================================
  * 网络策略: lsm/socket_connect
  *
- * allow/deny 名单模式, 两级判定 (P2 map-in-map):
+ * allow/deny 名单模式, map-in-map 两级判定:
  *   相位 1 端口规则 (dom_net_port): 域 inner → 基线 inner
  *   相位 2 无端口规则 (dom_net):    域 inner → 基线 inner
  * 基线/组分别执行端口优先、地址最长前缀查询，然后合并；任一层 deny 即拒绝。
@@ -2888,11 +2557,11 @@ static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
 
     /* 基线与组独立按端口优先查找，再合并；任一层 deny 均拒绝。
      *
-     * verifier 红线 (沿用旧版的教训): 不能把 lookup/比较结果合成 bool
+     * verifier 约束: 不能把 lookup/比较结果合成 bool
      * 再 "if (x) return -1" —— clang if-convert 出的算术选择会让出口
      * R0 变成 unknown scalar, LSM 程序要求 R0 ∈ [-4095,0], 直接拒载。
      * goto 形式让 deny/allow 各走常量 return。
-     * 另一红线 (P2 实测): 多指针判空不得合并写 (!a && b), 会被
+     * 多指针判空不得合并写 (!a && b), 会被
      * if-convert 成指针位运算遭拒; 一律嵌套分支。 */
     struct net_port_lpm_key pkey = { .prefixlen = 48, .port = dport };
     __builtin_memcpy(pkey.addr, &daddr, 4);
@@ -3150,8 +2819,7 @@ int BPF_PROG(forget_socket_inode, struct inode *inode)
 }
 
 /* ===================================================================
- * 守护者自保 (台账 D1/D3, L3 路线图议题二; 对标 ActPlane
- * enforce_task_kill / enforce_ptrace_access_check / enforce_bpf_syscall)
+ * 守护者自保
  *
  * 自保护由 self_protection 独立启用，不受 enable_* 或失败模式控制；
  * scope 限定为受管进程树。
@@ -3230,12 +2898,10 @@ int BPF_PROG(enforce_ptrace_traceme, struct task_struct *parent)
     return -1;
 }
 
-/* bpf(): 被管树内一刀切全拒 (L3 文档: "agent 无任何合法 bpf 需求")。
+/* bpf(): 拒绝受管进程调用 bpf(), 防止干扰强制执行面。
  * daemon 自身不在追踪集, 其 map 更新/事件读取不受影响。
  *
- * 签名必须是 3 参 —— 本机 6.6 lsm_hook_defs.h 已核实;
- * ActPlane 的 bool privileged 第 4 参是更新内核的钩子形态,
- * 照抄会 attach 失败。 */
+ * 三参签名与目标 Linux 6.6 的 LSM BTF 对齐。 */
 SEC("lsm/bpf")
 int BPF_PROG(enforce_bpf_guard, int cmd, union bpf_attr *attr,
              unsigned int size)
@@ -3256,10 +2922,7 @@ int BPF_PROG(enforce_bpf_guard, int cmd, union bpf_attr *attr,
 }
 
 /* ===================================================================
- * 进程树追踪 (pidtree P1): fork 主表/降级落表 → exec/reconcile 提升 → exit 清理
- *
- * 照搬 AcTrail live_observation 的追踪集合维护机制 (设计文档
- * docs/design/多Agent域模型-进程树作用域设计.md §4.1 伪码)。
+ * 进程树追踪: fork 主表/降级落表 → exec/reconcile 提升 → exit 清理
  * 进程身份追踪独立于策略维度开关。
  * 与命令捕获用的 tracepoint/syscalls/sys_enter_execve 是不同的
  * attach 点, 互不冲突, 各自保留。
@@ -3354,9 +3017,8 @@ int handle_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx)
     return 0;
 }
 
-/* 3) exit 清理: pending 直接删除 (fork 后未 exec 就退出的 child 丢弃,
- * 与 AcTrail flush 进表发事件不同 —— 将死进程无需纳入强制范围, §2.3);
- * leader (pid==tgid) 退出才删 tracked, 非 leader 线程退出不管 (§7-2)。 */
+/* 退出进程无需继续强制执行, pending 可直接删除。
+ * tracked 以 TGID 为键, 非 leader 线程退出不能删除整个进程的身份。 */
 SEC("tracepoint/sched/sched_process_exit")
 int handle_sched_process_exit(void *ctx)
 {
