@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Actual IPv4/IPv6 connect, bind, UDP sendto and accept, including enable_net."""
+"""Actual IPv4, IPv6 and mapped IPv6 network operations, including enable_net."""
 import errno
+import ctypes
 import json
 import os
 from pathlib import Path
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -13,13 +15,17 @@ import time
 
 REPO = Path(__file__).resolve().parents[2]
 BIN = REPO / 'target/debug'
+ENDPOINTS = (
+    (socket.AF_INET, '127.0.0.1'),
+    (socket.AF_INET6, '::1'),
+    (socket.AF_INET6, '::ffff:127.0.0.1'),
+)
 
 
-def probe(action, family, port, ready_path):
+def probe(action, family, address, port, ready_path):
     family = int(family)
     port = int(port)
-    address = '127.0.0.1' if family == socket.AF_INET else '::1'
-    kind = socket.SOCK_DGRAM if action == 'udp' else socket.SOCK_STREAM
+    kind = socket.SOCK_DGRAM if action in ('udp', 'udp4') else socket.SOCK_STREAM
     with socket.socket(family, kind) as stream:
         stream.settimeout(2)
         result = 0
@@ -30,6 +36,15 @@ def probe(action, family, port, ready_path):
                 stream.bind((address, port))
             elif action == 'udp':
                 stream.sendto(b'network-probe', (address, port))
+            elif action == 'udp4':
+                sendto = ctypes.CDLL(None, use_errno=True).sendto
+                sendto.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t,
+                                   ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+                sendto.restype = ctypes.c_ssize_t
+                target = struct.pack('=HH4s8x', socket.AF_INET, socket.htons(port),
+                                     socket.inet_aton('127.0.0.1'))
+                if sendto(stream.fileno(), b'network-probe', 13, 0, target, len(target)) < 0:
+                    result = ctypes.get_errno()
             elif action == 'accept':
                 stream.bind((address, 0))
                 stream.listen()
@@ -41,9 +56,8 @@ def probe(action, family, port, ready_path):
         print(json.dumps({'errno': result}), flush=True)
 
 
-def held_listener(family):
+def held_listener(family, address):
     family = int(family)
-    address = '127.0.0.1' if family == socket.AF_INET else '::1'
     connection = None
     with socket.socket(family) as listener:
         listener.bind((address, 0))
@@ -82,15 +96,18 @@ def main():
     cases = []
     rules = []
     inherited_peers = []
-    for family in (socket.AF_INET, socket.AF_INET6):
-        address = '127.0.0.1' if family == socket.AF_INET else '::1'
+    for family, address in ENDPOINTS:
+        mapped = address.startswith('::ffff:')
+        peer_family = socket.AF_INET if mapped else family
+        peer_address = '127.0.0.1' if mapped else address
         peers = {}
-        for action in ('connect', 'bind', 'udp', 'accept'):
-            stream = socket.socket(family, socket.SOCK_DGRAM if action == 'udp' else socket.SOCK_STREAM)
+        actions = ('connect', 'bind', 'udp', 'accept', 'udp4') if mapped else ('connect', 'bind', 'udp', 'accept')
+        for action in actions:
+            stream = socket.socket(peer_family, socket.SOCK_DGRAM if action in ('udp', 'udp4') else socket.SOCK_STREAM)
             stream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            stream.bind((address, 0))
+            stream.bind((peer_address, 0))
             port = stream.getsockname()[1]
-            target = f'{address}:{port}' if family == socket.AF_INET else f'[{address}]:{port}'
+            target = f'{peer_address}:{port}' if peer_family == socket.AF_INET else f'[{peer_address}]:{port}'
             rules.append(f'  - net deny {target}')
             if action == 'connect':
                 stream.listen(128)
@@ -101,11 +118,11 @@ def main():
                 peers[action] = stream
             cases.append((family, action, address, port, peers))
         for _ in range(2):
-            peer = socket.socket(family)
-            peer.bind((address, 0))
+            peer = socket.socket(peer_family)
+            peer.bind((peer_address, 0))
             peer.settimeout(0.8)
             port = peer.getsockname()[1]
-            target = f'{address}:{port}' if family == socket.AF_INET else f'[{address}]:{port}'
+            target = f'{peer_address}:{port}' if peer_family == socket.AF_INET else f'[{peer_address}]:{port}'
             rules.append(f'  - net deny {target}')
             resources.append(peer)
             inherited_peers.append((family, address, peer))
@@ -142,11 +159,11 @@ rules:
 
     def exercise(enabled):
         for family, action, address, port, peers in cases:
-            ready_path = directory / f'accept-ready-{family}'
+            ready_path = directory / f'accept-ready-{address}'
             ready_path.unlink(missing_ok=True)
             process = subprocess.Popen([str(BIN / 'censorguardctl'), '--config', str(config),
                                         'spawn', '--domain', 'network-ops', '--', sys.executable,
-                                        str(Path(__file__).resolve()), '--probe', action, str(family), str(port), str(ready_path)],
+                                        str(Path(__file__).resolve()), '--probe', action, str(family), address, str(port), str(ready_path)],
                                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             processes.append(process)
             if action == 'accept':
@@ -157,31 +174,32 @@ rules:
                 peer = peers['accept']
                 peer.settimeout(0.8)
                 try:
-                    peer.connect((address, int(ready_path.read_text())))
+                    peer.connect((peer.getsockname()[0], int(ready_path.read_text())))
                     assert not enabled, 'denied inbound handshake unexpectedly completed'
                 except OSError:
                     assert enabled, 'allowed inbound handshake failed'
             stdout, stderr = process.communicate(timeout=12)
-            (directory / f'{family}-{action}-{enabled}.log').write_text(stdout + stderr)
+            (directory / f'{address}-{action}-{enabled}.log').write_text(stdout + stderr)
             assert process.returncode == 0, (stdout, stderr)
             result = json.loads(next(line for line in stdout.splitlines() if line.startswith('{')))
             expected = 0 if not enabled else (errno.ETIMEDOUT if action == 'accept' else errno.EPERM)
             assert result['errno'] == expected, (family, action, enabled, result, stderr)
-            if not enabled and action == 'udp':
-                peers['udp'].settimeout(3)
-                assert peers['udp'].recv(100) == b'network-probe'
-            print(f'PASS family={family} {action}: enable_net={enabled}, errno={expected}', flush=True)
+            if not enabled and action in ('udp', 'udp4'):
+                peers[action].settimeout(3)
+                assert peers[action].recv(100) == b'network-probe'
+            print(f'PASS address={address} {action}: enable_net={enabled}, errno={expected}', flush=True)
 
     def existing_sockets():
-        for family in (socket.AF_INET, socket.AF_INET6):
+        for family, address in ENDPOINTS:
             process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
-                                        '--held-listener', str(family)], stdin=subprocess.PIPE,
+                                        '--held-listener', str(family), address], stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             processes.append(process)
             port = json.loads(process.stdout.readline())['port']
-            peers = [(address, peer) for candidate, address, peer in inherited_peers if candidate == family]
+            peers = [(candidate_address, peer) for candidate, candidate_address, peer in inherited_peers
+                     if candidate == family and candidate_address == address]
             address, connected = peers[0]
-            connected.connect((address, port))  # Established before process registration.
+            connected.connect((connected.getsockname()[0], port))  # Established before process registration.
             def command(action, expected):
                 process.stdin.write(action + '\n')
                 process.stdin.flush()
@@ -194,12 +212,12 @@ rules:
             command('send', errno.EPERM)
             address, incoming = peers[1]
             try:
-                incoming.connect((address, port))
+                incoming.connect((incoming.getsockname()[0], port))
                 raise AssertionError('existing listener accepted a denied new handshake')
             except OSError:
                 pass
             command('accept', errno.ETIMEDOUT)
-            print(f'PASS family={family}: attached existing listener rejects inbound; pre-existing connection send/recv denied', flush=True)
+            print(f'PASS address={address}: attached existing listener rejects inbound; pre-existing connection send/recv denied', flush=True)
             # Reload destroys old BPF ownership. Reattachment must seed the same listening fd.
             if family == socket.AF_INET:
                 event_stream.shutdown(socket.SHUT_RDWR)
@@ -237,7 +255,7 @@ rules:
         assert len(denied) >= 8, denied
         assert all(event['domain'] in ('network-ops', 'existing-2', 'existing-10') for event in denied), denied
         assert all(event['tgid'] != os.getpid() for event in denied), denied
-        print('PASS actual NET DENY events for connect/bind/sendmsg/accept on both families', flush=True)
+        print('PASS actual NET DENY events for connect/bind/sendmsg/accept on IPv4, IPv6 and mapped IPv6', flush=True)
         event_stream.shutdown(socket.SHUT_RDWR)
         event_stream.close()
         write_config(False)
@@ -245,10 +263,11 @@ rules:
         # Recreate accept peers: the earlier TCP connections have been consumed/refused.
         for family, action, address, port, peers in cases:
             if action == 'accept':
+                peer_family = peers['accept'].family
                 peers['accept'].close()
-                peer = socket.socket(family, socket.SOCK_STREAM)
+                peer = socket.socket(peer_family, socket.SOCK_STREAM)
                 peer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                peer.bind((address, port))
+                peer.bind(('127.0.0.1' if peer_family == socket.AF_INET else address, port))
                 peers['accept'] = peer
                 resources.append(peer)
         checkpoint = len(events)
@@ -280,6 +299,6 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '--probe':
         probe(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == '--held-listener':
-        held_listener(sys.argv[2])
+        held_listener(*sys.argv[2:])
     else:
         main()

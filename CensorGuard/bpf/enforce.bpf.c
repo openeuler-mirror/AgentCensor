@@ -2428,93 +2428,15 @@ int capture_execveat_args(struct trace_event_raw_sys_enter *ctx)
  * 基线/组分别执行端口优先、地址最长前缀查询，然后合并；任一层 deny 即拒绝。
  * 命中条目的 action 决定放行/拒绝; 都未命中 = 默认允许。
  * 默认拒绝应在同一层配置 deny CIDR 和更具体的端口 allow；组不能覆盖基线 deny。
- * IPv4/IPv6 分别使用独立 LPM 维度，优先级与默认动作完全一致。
+ * IPv4-mapped IPv6 统一查 IPv4 表；原生 IPv6 使用独立 LPM 维度。
  * loopback 也走规则检查 (白名单模式下需自行 allow)。
  * =================================================================== */
-static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
-                                                const struct scope_info *si,
-                                                struct sockaddr *addr,
-                                                int addrlen,
-                                                __u32 op,
-                                                const struct socket_owner *owner)
+static __always_inline int enforce_ipv4_endpoint(const struct filter_config *cfg,
+                                                   const struct scope_info *si,
+                                                   __u32 daddr, __u16 dport,
+                                                   __u32 op,
+                                                   const struct socket_owner *owner)
 {
-    /* sockaddr_in6: family(2), port(2), flowinfo(4), addr(16), scope(4)。
-     * 只读取到 address 末尾，因此 24 字节是本程序需要的最小可信长度。 */
-    if (addrlen < 24)
-        return 0;
-
-    __u32 base = physical_slot(cfg, BASE_SLOT);
-    __u32 domain = physical_slot(cfg, si->policy_slot);
-    struct bpf_map *base_port = bpf_map_lookup_elem(&dom_net6_port, &base);
-    struct bpf_map *dom_port = bpf_map_lookup_elem(&dom_net6_port, &domain);
-    struct bpf_map *base_addr = bpf_map_lookup_elem(&dom_net6, &base);
-    struct bpf_map *dom_addr = bpf_map_lookup_elem(&dom_net6, &domain);
-    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
-    __u32 policy_ver = sm ? sm->version : 0;
-    __u32 rule_ver = 0;
-
-    __u8 daddr[16] = {};
-    long ret = bpf_probe_read_kernel(daddr, sizeof(daddr),
-                                     (const void *)addr + 8);
-    if (ret < 0)
-        return 0;
-    __u16 dport_be = 0;
-    bpf_probe_read_kernel(&dport_be, sizeof(dport_be),
-                          (const void *)addr + 2);
-    __u16 dport = __bpf_ntohs(dport_be);
-
-    char detail[40] = {};
-    fmt_ipv6_hex(detail, daddr);
-    detail[32] = ':';
-    fmt_port5(detail + 33, dport);
-    detail[38] = '\0';
-
-    struct net6_port_lpm_key pkey = { .prefixlen = 144, .port = dport };
-    __builtin_memcpy(pkey.addr, daddr, sizeof(pkey.addr));
-    struct net_rule_val *v = 0;
-    struct net_rule_val *base_v = base_port ? bpf_map_lookup_elem(base_port, &pkey) : 0;
-    struct net_rule_val *dom_v = dom_port ? bpf_map_lookup_elem(dom_port, &pkey) : 0;
-    struct net6_lpm_key key = { .prefixlen = 128 };
-    __builtin_memcpy(key.addr, daddr, sizeof(key.addr));
-    if (!base_v)
-        base_v = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
-    if (!dom_v)
-        dom_v = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
-    if (base_v && base_v->action == 0) { rule_ver = base_v->version | (base_v->audit ? 0x80000000u : 0); goto deny6; }
-    if (dom_v && dom_v->action == 0) { rule_ver = dom_v->version | (dom_v->audit ? 0x80000000u : 0); goto deny6; }
-    v = dom_v ? dom_v : base_v;
-    if (v)
-        rule_ver = v->version;
-    if (base_v && base_v->audit)
-        rule_ver |= 0x80000000u;
-    if (dom_v && dom_v->audit)
-        rule_ver |= 0x80000000u;
-
-    report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
-    return 0;
-
-deny6:
-    if (!cfg->enable_net) {
-        report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
-        return 0;
-    }
-    report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);
-    return -1;
-}
-
-static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
-                                               const struct scope_info *si,
-                                               struct sockaddr *addr,
-                                               int addrlen, __u32 op,
-                                               const struct socket_owner *owner)
-{
-    /* addrlen 防御性检查: LSM socket_connect 在协议层地址长度校验
-     * 之前触发, AF_INET 但 addrlen 过短时 sockaddr_storage 里残余
-     * 的是栈上旧数据, 读出的 daddr/dport 不可信, 直接放行
-     * (这种 connect 随后会被协议层 EINVAL 拒掉, 无放行风险) */
-    if (addrlen < 8)
-        return 0;
-
     /* 两维 outer: 基线 slot + 域 slot 各查一次, 拿到 inner 指针 */
     __u32 base = physical_slot(cfg, BASE_SLOT);
     __u32 domain = physical_slot(cfg, si->policy_slot);
@@ -2525,21 +2447,6 @@ static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
     struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
     __u32 policy_ver = sm ? sm->version : 0;
     __u32 rule_ver = 0;
-
-    /* 注意: LSM hook 里 addr 是内核地址 (move_addr_to_kernel 已拷贝),
-     * 必须用 bpf_probe_read_kernel; probe_read_user 会返回 -EFAULT */
-    __u32 daddr = 0;
-    long ret = bpf_probe_read_kernel(&daddr, sizeof(daddr),
-                                     (const void *)addr + 4);
-    if (ret < 0)
-        return 0;
-
-    /* sin_port 在偏移 2, 网络字节序; 转成主机序再作 map key
-     * (Rust 网络编译器直接存端口号数值) */
-    __u16 dport_be = 0;
-    bpf_probe_read_kernel(&dport_be, sizeof(dport_be),
-                          (const void *)addr + 2);
-    __u16 dport = __bpf_ntohs(dport_be);
 
     /* detail: 格式化成 ASCII "008.008.004.004:00443" (定宽, 全常量
      * 偏移, daddr 按内存字节序, b0 在第一段) */
@@ -2593,6 +2500,119 @@ deny:
         return 0;
     }
     report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);  /* DENY */
+    return -1;
+}
+
+static __always_inline int enforce_ipv4_addr(const struct filter_config *cfg,
+                                               const struct scope_info *si,
+                                               struct sockaddr *addr,
+                                               int addrlen, __u32 op,
+                                               const struct socket_owner *owner)
+{
+    if (addrlen < 8)
+        return 0;
+    __u16 family = 0;
+    if (bpf_probe_read_kernel(&family, sizeof(family), addr) < 0 || family != 2)
+        return 0;
+
+    __u32 daddr = 0;
+    if (bpf_probe_read_kernel(&daddr, sizeof(daddr), (const void *)addr + 4) < 0)
+        return 0;
+    __u16 dport_be = 0;
+    if (bpf_probe_read_kernel(&dport_be, sizeof(dport_be), (const void *)addr + 2) < 0)
+        return 0;
+    return enforce_ipv4_endpoint(cfg, si, daddr, __bpf_ntohs(dport_be), op, owner);
+}
+
+static __always_inline int enforce_ipv6_connect(const struct filter_config *cfg,
+                                                const struct scope_info *si,
+                                                struct sockaddr *addr,
+                                                int addrlen,
+                                                __u32 op,
+                                                const struct socket_owner *owner)
+{
+    if (addrlen < 2)
+        return 0;
+    __u16 family = 0;
+    if (bpf_probe_read_kernel(&family, sizeof(family), addr) < 0)
+        return 0;
+    /* Dual-stack UDP sockets can carry an explicit AF_INET destination. */
+    if (family == 2)
+        return enforce_ipv4_addr(cfg, si, addr, addrlen, op, owner);
+    if (family != 10)
+        return 0;
+
+    /* sockaddr_in6: family(2), port(2), flowinfo(4), addr(16), scope(4)。
+     * 只读取到 address 末尾，因此 24 字节是本程序需要的最小可信长度。 */
+    if (addrlen < 24)
+        return 0;
+
+    __u8 daddr[16] = {};
+    long ret = bpf_probe_read_kernel(daddr, sizeof(daddr),
+                                     (const void *)addr + 8);
+    if (ret < 0)
+        return 0;
+    __u16 dport_be = 0;
+    if (bpf_probe_read_kernel(&dport_be, sizeof(dport_be),
+                              (const void *)addr + 2) < 0)
+        return 0;
+    __u16 dport = __bpf_ntohs(dport_be);
+
+    /* Mapped addresses share IPv4 policy keys and audit formatting. */
+    if (daddr[0] == 0 && daddr[1] == 0 && daddr[2] == 0 && daddr[3] == 0 &&
+        daddr[4] == 0 && daddr[5] == 0 && daddr[6] == 0 && daddr[7] == 0 &&
+        daddr[8] == 0 && daddr[9] == 0 && daddr[10] == 0xff && daddr[11] == 0xff) {
+        __u32 address4 = 0;
+        __builtin_memcpy(&address4, daddr + 12, sizeof(address4));
+        return enforce_ipv4_endpoint(cfg, si, address4, dport, op, owner);
+    }
+
+    __u32 base = physical_slot(cfg, BASE_SLOT);
+    __u32 domain = physical_slot(cfg, si->policy_slot);
+    struct bpf_map *base_port = bpf_map_lookup_elem(&dom_net6_port, &base);
+    struct bpf_map *dom_port = bpf_map_lookup_elem(&dom_net6_port, &domain);
+    struct bpf_map *base_addr = bpf_map_lookup_elem(&dom_net6, &base);
+    struct bpf_map *dom_addr = bpf_map_lookup_elem(&dom_net6, &domain);
+    struct slot_meta *sm = bpf_map_lookup_elem(&slot_meta_map, &domain);
+    __u32 policy_ver = sm ? sm->version : 0;
+    __u32 rule_ver = 0;
+
+    char detail[40] = {};
+    fmt_ipv6_hex(detail, daddr);
+    detail[32] = ':';
+    fmt_port5(detail + 33, dport);
+    detail[38] = '\0';
+
+    struct net6_port_lpm_key pkey = { .prefixlen = 144, .port = dport };
+    __builtin_memcpy(pkey.addr, daddr, sizeof(pkey.addr));
+    struct net_rule_val *v = 0;
+    struct net_rule_val *base_v = base_port ? bpf_map_lookup_elem(base_port, &pkey) : 0;
+    struct net_rule_val *dom_v = dom_port ? bpf_map_lookup_elem(dom_port, &pkey) : 0;
+    struct net6_lpm_key key = { .prefixlen = 128 };
+    __builtin_memcpy(key.addr, daddr, sizeof(key.addr));
+    if (!base_v)
+        base_v = base_addr ? bpf_map_lookup_elem(base_addr, &key) : 0;
+    if (!dom_v)
+        dom_v = dom_addr ? bpf_map_lookup_elem(dom_addr, &key) : 0;
+    if (base_v && base_v->action == 0) { rule_ver = base_v->version | (base_v->audit ? 0x80000000u : 0); goto deny6; }
+    if (dom_v && dom_v->action == 0) { rule_ver = dom_v->version | (dom_v->audit ? 0x80000000u : 0); goto deny6; }
+    v = dom_v ? dom_v : base_v;
+    if (v)
+        rule_ver = v->version;
+    if (base_v && base_v->audit)
+        rule_ver |= 0x80000000u;
+    if (dom_v && dom_v->audit)
+        rule_ver |= 0x80000000u;
+
+    report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
+    return 0;
+
+deny6:
+    if (!cfg->enable_net) {
+        report_scoped(3, op, 1, detail, policy_ver, rule_ver, si, owner);
+        return 0;
+    }
+    report_scoped(3, op, 0, detail, policy_ver, rule_ver, si, owner);
     return -1;
 }
 
@@ -2780,7 +2800,8 @@ int BPF_PROG(enforce_inet_conn_request, struct sock *sk, struct sk_buff *skb,
     if (dimension_idle(slot_rule_flags(cfg, &si), cfg->enable_net, cfg->audit_net,
                        RULE_NET, RULE_AUDIT_NET))
         return 0;
-    short family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    /* A dual-stack listener can receive an IPv4 request. */
+    short family = BPF_CORE_READ(req, __req_common.skc_family);
     if (family == 2) {
         struct sockaddr_in sin = {};
         sin.sin_family = 2;

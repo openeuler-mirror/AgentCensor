@@ -206,6 +206,7 @@ fn address_decision(
     address: IpAddr,
     port: Option<u16>,
 ) -> Option<(NetworkAction, String)> {
+    let address = address.to_canonical();
     for rules in [group, baseline].into_iter().flatten() {
         if let Some(port) = port {
             let matched = match address {
@@ -360,6 +361,85 @@ mod tests {
     use crate::{PolicyError, compile_yaml};
 
     const ENABLES: [bool; 3] = [true, true, true];
+
+    #[test]
+    fn mapped_intents_share_ipv4_priority_and_layer_decisions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let policy = compile_yaml(
+            br#"rules:
+  - net deny 192.0.2.0/24
+  - net allow 192.0.2.7:443
+groups:
+  restricted:
+    rules:
+      - net deny [::ffff:192.0.2.7]:443
+      - net allow 192.0.2.0/24:80
+"#,
+        )?;
+        for (group, address, port, expected) in [
+            ("", "192.0.2.7", None, false),
+            ("", "192.0.2.7", Some(443), true),
+            ("", "192.0.2.8", Some(443), false),
+            ("", "192.0.3.7", Some(443), true),
+            ("restricted", "192.0.2.7", Some(443), false),
+            ("restricted", "192.0.2.7", Some(80), false),
+        ] {
+            let ipv4 = evaluate_network(&policy, group, ENABLES, address, port);
+            for mapped in [
+                format!("::ffff:{address}"),
+                address.parse::<Ipv4Addr>()?.to_ipv6_mapped().to_string(),
+            ] {
+                assert_eq!(
+                    evaluate_network(&policy, group, ENABLES, &mapped, port),
+                    ipv4
+                );
+                assert_eq!(ipv4.allowed, expected, "{group} {mapped} {port:?}");
+            }
+            assert!(
+                evaluate_network(
+                    &policy,
+                    group,
+                    [true, true, false],
+                    &format!("::ffff:{address}"),
+                    port
+                )
+                .allowed
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_rules_merge_denies_and_preserve_native_ipv6() -> Result<(), PolicyError> {
+        let policy = compile_yaml(
+            br#"rules:
+  - net deny ::ffff:192.0.2.7/120
+  - net allow [::ffff:192.0.2.7]:443
+  - net deny 192.0.2.7:443
+  - net deny ::/0
+  - net allow [::1]:443
+"#,
+        )?;
+        for (host, port, expected) in [
+            ("192.0.2.7", Some(443), false),
+            ("::ffff:192.0.2.7", Some(443), false),
+            ("192.0.2.8", None, false),
+            ("::ffff:192.0.2.8", None, false),
+            ("192.0.3.7", None, true),
+            ("::ffff:192.0.3.7", None, true),
+            ("::1", Some(443), true),
+            ("::1", Some(80), false),
+            ("::192.0.3.7", None, false),
+            ("64:ff9b::c000:307", None, false),
+        ] {
+            assert_eq!(
+                evaluate_network(&policy, "", ENABLES, host, port).allowed,
+                expected,
+                "{host} {port:?}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn composite_network_maps_preserve_independent_layer_decisions()

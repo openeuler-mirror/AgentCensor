@@ -71,6 +71,14 @@ pub(crate) fn parse_network_rule(rule: &str) -> Result<ParsedNetworkRule, Policy
     if target.starts_with('[') && !matches!(parsed, Some((IpAddr::V6(_), _))) {
         return network_error(rule, "bracketed host must be an IPv6 address or CIDR");
     }
+    let parsed = parsed.map(|(address, prefix_len)| match address {
+        IpAddr::V6(address) if prefix_len >= 96 => address
+            .to_ipv4_mapped()
+            .map_or((IpAddr::V6(address), prefix_len), |address| {
+                (IpAddr::V4(address), prefix_len - 96)
+            }),
+        _ => (address, prefix_len),
+    });
     match parsed {
         Some((IpAddr::V4(address), prefix_len)) => {
             if let Some(port) = port {
@@ -250,6 +258,42 @@ fn network_error<T>(rule: &str, reason: impl Into<String>) -> Result<T, PolicyEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_rules_share_ipv4_keys() -> Result<(), PolicyError> {
+        for (mapped, ipv4) in [
+            ("deny ::ffff:192.0.2.7", "deny 192.0.2.7"),
+            (
+                "allow+audit [::ffff:c000:207]:443",
+                "allow+audit 192.0.2.7:443",
+            ),
+            ("deny ::ffff:192.0.2.7/120", "deny 192.0.2.0/24"),
+            ("deny [::ffff:192.0.2.7/120]:53", "deny 192.0.2.0/24:53"),
+            ("deny ::ffff:0:0/96", "deny 0.0.0.0/0"),
+            ("deny [::ffff:0:0/96]:443", "deny 0.0.0.0/0:443"),
+            ("allow ::ffff:192.0.2.7/128", "allow 192.0.2.7/32"),
+        ] {
+            assert_eq!(parse_network_rule(mapped)?, parse_network_rule(ipv4)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_mapped_ipv6_rules_keep_ipv6_keys() -> Result<(), PolicyError> {
+        for target in [
+            "::/0",
+            "::ffff:192.0.2.7/95",
+            "::192.0.2.7",
+            "64:ff9b::c000:207",
+            "::1",
+        ] {
+            assert!(matches!(
+                parse_network_rule(&format!("deny {target}"))?,
+                ParsedNetworkRule::Address6 { .. }
+            ));
+        }
+        Ok(())
+    }
 
     #[test]
     fn cidr_port_uses_port_first_prefix() -> Result<(), PolicyError> {

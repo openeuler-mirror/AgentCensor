@@ -87,7 +87,7 @@ fn apply_cache(rules: &mut CompiledRules, cache: &DnsCache) {
             continue;
         };
         for address in addresses {
-            match (address, rule.port) {
+            match (address.to_canonical(), rule.port) {
                 (IpAddr::V4(address), Some(port)) => {
                     rules
                         .network_ports
@@ -162,8 +162,40 @@ fn apply_cache(rules: &mut CompiledRules, cache: &DnsCache) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile_yaml;
+    use crate::{NetworkAction, compile_yaml};
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn mapped_dns_addresses_merge_into_ipv4_rules() -> Result<(), Box<dyn std::error::Error>> {
+        let policy = compile_yaml(
+            br#"rules:
+  - net deny 192.0.2.7
+  - net deny 192.0.2.7:443
+  - net allow+audit example.test
+  - net allow+audit example.test:443
+"#,
+        )?;
+        let mut rules = policy.baseline.clone().ok_or("missing baseline")?;
+        let cache = DnsCache::from([(
+            "example.test".into(),
+            vec!["192.0.2.7".parse()?, "::ffff:192.0.2.7".parse()?],
+        )]);
+        apply_cache(&mut rules, &cache);
+        assert!(rules.network6.is_empty());
+        assert!(rules.network6_ports.is_empty());
+        for values in [
+            rules.network.values().collect::<Vec<_>>(),
+            rules.network_ports.values().collect(),
+        ] {
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].action, NetworkAction::Deny as u8);
+            assert!(values[0].audit);
+        }
+        apply_cache(&mut rules, &DnsCache::new());
+        assert_eq!(rules.network, rules.network_static);
+        assert_eq!(rules.network_ports, rules.network_ports_static);
+        Ok(())
+    }
 
     #[test]
     fn dns_refresh_preserves_static_rules_and_merges_conflicting_denies()
