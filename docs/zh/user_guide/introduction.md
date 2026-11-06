@@ -30,7 +30,7 @@ Agent Runtime
 | --- | --- | --- |
 | **CensorPivot** | 统一接入层和批次事务编排；把多个工具调用收束为一个可恢复的提交或放弃决定 | [组件 README](../../../CensorPivot/README.md) · [安装与使用](../../../CensorPivot/docs/INSTALL.zh-CN.md) · [完整运行流程](../../../CensorPivot/docs/flow.md) · [设计与状态机](../../../CensorPivot/docs/DESIGN.zh-CN.md) |
 | **CensorFS** | 分支式、可回滚、可恢复的文件系统；为每个批次提供隔离的 `/workspace` | [组件 README](../../../CensorFs/README.md) · [架构](../../../CensorFs/docs/ARCHITECTURE.md) · [CLI 指南](../../../CensorFs/docs/CensorFS_CLI_GUIDE.md) |
-| **CensorGuard** | eBPF LSM 进程级安全强制；策略覆盖文件、执行和网络，并沿进程树继承 | [组件 README](../../../CensorGuard/README.md) · [使用手册](../../../CensorGuard/docs/使用手册.md) · [构建指南](../../../CensorGuard/docs/构建指南.md) · [DSH 插件指南](../../../CensorGuard/docs/DSH插件指南.md) |
+| **CensorGuard** | eBPF LSM 进程级安全强制；策略覆盖文件、执行和网络，并沿进程树继承 | [组件 README](../../../CensorGuard/README.md) |
 | **CensorScope** | 无需被观测程序链接 SDK 的被动式主机观测和只读导出 | [组件 README](../../../CensorScope/README.md) · [插件说明](../../../CensorScope/plugins/README.md) |
 
 组件接口和 Pivot 责任边界的逐项核对见 [组件功能与接口说明](../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
@@ -174,7 +174,7 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 - CensorFS 当前明确不支持 symlink、hardlink、xattr、ACL、设备节点、FIFO、socket、chown、共享可写 mmap、在线 GC 和跨分支原子提交。
 - 组件 daemon 和控制面依赖 Unix socket、合适的 UID/GID、`/dev/fuse`、cgroup v2、BTF 与 BPF LSM；缺少这些条件时应先看 `doctor` 输出和 [部署文档](../../../CensorPivot/docs/INSTALL.zh-CN.md)。
 
-更完整的崩溃矩阵、信任边界和接口约束见 [CensorPivot 设计文档](../../../CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](../../../CensorPivot/docs/flow.md) 和 [代码审查记录](../../../CensorPivot/docs/REVIEW.zh-CN.md)。
+更完整的设计文档、运行流程见 [CensorPivot 设计文档](../../../CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](../../../CensorPivot/docs/flow.md)。
 
 ## 开发与测试
 
