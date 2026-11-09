@@ -1,0 +1,35 @@
+# 阶段 02：在观察基线之上增加文件拒绝。本文件可直接使用。
+#
+# 相对阶段 01 的变化：把凭据文件的观察项改为 deny。不带掩码表示拒绝全部支持的
+# 文件操作（读、写、删除、改名、属性修改）；deny 优先于 allow。执行与网络部分
+# 继续保持观察，便于对照。
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  control_socket: /run/censorguard/ctl.sock
+  event_socket: /run/censorguard/events.sock
+  launch_socket: /run/censorguard/launch.sock
+  state_dir: /var/lib/censorguard
+  socket_group: censorguard
+  dsh_enabled: false
+  dsh_self_groups: []
+  spawn_grpc: false
+  failure_mode: permissive
+  self_protection: false
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
+  dns_refresh_seconds: 60
+rules:
+  # 凭据文件：读、写、删除、改名、属性修改全部拒绝
+  - file deny+audit /etc/shadow
+  - file deny+audit /etc/gshadow
+  # 仅拒绝读取，写入交给软件包管理
+  - file deny+audit /etc/sudoers [read]
+  # 保留阶段 01 的执行与网络观察项
+  - exec allow+audit /usr/bin/ssh
+  - exec allow+audit /usr/bin/scp
+  - net allow+audit 0.0.0.0/0:22
+  - net allow+audit 0.0.0.0/0:443

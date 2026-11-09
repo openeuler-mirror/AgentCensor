@@ -1,0 +1,44 @@
+# 阶段 04：在文件、网络拒绝之上增加执行拒绝。本文件可直接使用。
+#
+# 相对阶段 03 的变化：禁止纳管进程树启动常用网络探测与传输工具，并阻止
+# rm -rf / 这种明确的危险参数前缀。exec 参数规则按 token 位置比较，不做
+# 通配符和选项归一化，只覆盖写明的前缀。
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  control_socket: /run/censorguard/ctl.sock
+  event_socket: /run/censorguard/events.sock
+  launch_socket: /run/censorguard/launch.sock
+  state_dir: /var/lib/censorguard
+  socket_group: censorguard
+  dsh_enabled: false
+  dsh_self_groups: []
+  spawn_grpc: false
+  failure_mode: permissive
+  self_protection: false
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
+  dns_refresh_seconds: 60
+rules:
+  # 保留凭据文件保护
+  - file deny+audit /etc/shadow
+  - file deny+audit /etc/gshadow
+  - file deny+audit /etc/sudoers [read]
+  # 保留明文管理与文件传输端口限制
+  - net deny+audit 0.0.0.0/0:23
+  - net deny+audit 0.0.0.0/0:21
+  # 禁止在纳管进程树中启动网络探测与传输工具
+  - exec deny+audit /usr/bin/nc
+  - exec deny+audit /usr/bin/ncat
+  - exec deny+audit /usr/bin/socat
+  - exec deny+audit /usr/bin/telnet
+  # 禁止清空根目录（前置 token 完全一致才命中）
+  - exec deny+audit /usr/bin/rm -rf /
+  # 保留执行观察项
+  - exec allow+audit /usr/bin/ssh
+  - exec allow+audit /usr/bin/scp
+  - net allow+audit 0.0.0.0/0:22
+  - net allow+audit 0.0.0.0/0:443

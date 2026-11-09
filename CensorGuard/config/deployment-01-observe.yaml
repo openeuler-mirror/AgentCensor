@@ -1,0 +1,38 @@
+# 阶段 01：观察。
+#
+# 全部规则为 allow+audit：命中时上报事件，但不拒绝任何操作；failure_mode 为
+# permissive、self_protection 关闭、三个 audit_* 保持 false，审计由规则内的
+# +audit 触发。确认业务行为后按阶段顺序加载下一份文件。
+#
+# 需要观察更多路径、程序或端点时，按同样格式追加到 rules；每行一条规则，
+# 行内不要再写说明文字（说明写在上一行），规则的空白分词会把它当成参数。
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  control_socket: /run/censorguard/ctl.sock
+  event_socket: /run/censorguard/events.sock
+  launch_socket: /run/censorguard/launch.sock
+  state_dir: /var/lib/censorguard
+  socket_group: censorguard
+  dsh_enabled: false
+  dsh_self_groups: []
+  spawn_grpc: false
+  failure_mode: permissive
+  self_protection: false
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
+  dns_refresh_seconds: 60
+rules:
+  # 观察凭据文件读取
+  - file allow+audit /etc/shadow [read]
+  - file allow+audit /etc/gshadow [read]
+  - file allow+audit /etc/sudoers [read]
+  # 观察远程登录与文件传输程序
+  - exec allow+audit /usr/bin/ssh
+  - exec allow+audit /usr/bin/scp
+  # 观察出站 SSH 与 HTTPS 连接
+  - net allow+audit 0.0.0.0/0:22
+  - net allow+audit 0.0.0.0/0:443

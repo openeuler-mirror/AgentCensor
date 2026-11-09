@@ -1,0 +1,20 @@
+daemon:
+  bpf_object: /usr/lib/censorguard/enforce.bpf.o
+  control_socket: /run/censorguard/ctl.sock
+  event_socket: /run/censorguard/events.sock
+  launch_socket: /run/censorguard/launch.sock
+  state_dir: /var/lib/censorguard
+  socket_group: censorguard
+  dsh_enabled: false
+  dsh_self_groups: []
+  spawn_grpc: false
+  failure_mode: permissive
+  self_protection: false
+  enable_file: true
+  enable_exec: true
+  enable_net: true
+  audit_file: false
+  audit_exec: false
+  audit_net: false
+  dns_refresh_seconds: 60
+rules: []
