@@ -80,7 +80,7 @@ import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { promises as fsp } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, relative } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 // The source CLI uses the TS graph; a built CLI uses package exports. Recognize
 // both the public tsx/esm specifier and its resolved tsx/dist/esm entry path.
@@ -95,6 +95,18 @@ import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
 
+// 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
+// Session.append cannot express that flag (its surface options are the only
+// envelope metadata it writes), so appendPluginRecord is the one faithful
+// landing place for `plugin:*`. Keep it optional: a bundle that does not
+// resolve dsh-session still boots, and the mirror degrades to counting skips.
+let appendPluginRecord
+try {
+  ;({ appendPluginRecord } = await import('@deepseek-ai/dsh-session'))
+} catch {
+  appendPluginRecord = undefined
+}
+
 export const name = 'agentcensor-session-proxy'
 export const inject = ['agents', 'sessions', 'sessionPersistence', 'sessionProjections']
 
@@ -108,6 +120,16 @@ const ASK_PREFIX = 'ACASK\t'
 const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
 const STOP_GRACE_MS = 3000
+/**
+ * Events per seed frame. The durable log reaches a new worker over stdin, and
+ * one frame per session would mean serializing the whole log into a single
+ * string; chunking keeps every frame bounded.
+ */
+const SEED_CHUNK_EVENTS = 500
+/** Consecutive spawn failures that trip the breaker. */
+const SPAWN_FAILURE_LIMIT = 3
+/** A failure older than this starts a fresh streak: an isolated crash is not a loop. */
+const SPAWN_FAILURE_WINDOW_MS = 60_000
 /** All live worker child processes, for host-exit cleanup. */
 const ACTIVE_WORKERS = new Set()
 /** Conventional exit codes for the host signals we reclaim workers on. */
@@ -212,7 +234,7 @@ async function resolveDshWorkerLauncher() {
  * per-worker private dir (it must never write the host's session store,
  * storages, or attachments).
  */
-function workerOverlay(privHome, compression = 'none') {
+function workerOverlay(privHome) {
   const runner = join(bundleDir(), 'worker.mjs')
   const privRoot = join(privHome, 'sessions')
   const lines = []
@@ -241,13 +263,13 @@ function workerOverlay(privHome, compression = 'none') {
     '',
     '# Private writable roots: the worker shares the host DSH_HOME for config',
     '# but must never write the host session store / storages / attachments.',
-    '# Compression follows the shared artifact we seeded from (stock dsh web',
-    '# persists .zstd; our none-packChunks overlays persist plain JSONL).',
+    '# The worker builds its own log from the seed frames the host streams in, so',
+    '# it no longer mirrors the host artifact format: plain JSONL is correct here',
+    '# and avoids depending on whatever compression the host happens to use.',
     '- id: session-persistence-jsonl',
     '  config:',
     `    root: ${JSON.stringify(privRoot)}`,
-    `    compression: ${compression === 'zstd' ? 'zstd' : 'none'}`,
-    ...(compression === 'zstd' ? [] : ['    packChunks: false']),
+    '    compression: none',
     '',
     '- id: storage-json',
     '  config:',
@@ -301,6 +323,13 @@ class WebDriverAgent {
     this.workerState = undefined
     // In-flight spawn promise (ready).
     this.spawning = undefined
+    // Spawn breaker: a worker that fails to build every time (a bad overlay, a
+    // missing persistence face, an unwritable root) must not be retried once per
+    // message -- each retry pays a full seed replay and every message reports the
+    // same failure. Count consecutive failures inside one window and stop.
+    this.spawnFailures = 0
+    this.lastSpawnFailureAt = 0
+    this.spawnFailureReason = undefined
     // Messages forwarded to the worker, not yet answered by an IDLE.
     this.outstanding = 0
     // Messages accepted by the driver but not yet written to the worker's stdin;
@@ -308,7 +337,7 @@ class WebDriverAgent {
     this.unwritten = 0
     this.idleWaiters = []
     this.endSeedInserted = false
-    this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
+    this.workerStats = { mirrored: 0, skipped: 0, failed: 0, gapped: 0, unmirrored: 0 }
     this.sendChain = Promise.resolve()
     this.closedByHost = false
     this.workerAuthoredSequences = new Set()
@@ -431,10 +460,33 @@ class WebDriverAgent {
   /** Lazily spawn (once) the resident worker for this session; resolves ready. */
   ensureWorker() {
     if (this.workerState !== undefined && this.workerState.alive) return this.workerState.ready
+    if (this.spawnFailures >= SPAWN_FAILURE_LIMIT) {
+      return Promise.reject(new Error(
+        `worker unavailable: ${String(SPAWN_FAILURE_LIMIT)} consecutive spawn failures `
+        + `(last: ${this.spawnFailureReason ?? 'unknown'}); reopen the session to retry`,
+      ))
+    }
     if (this.spawning !== undefined) return this.spawning
     this.spawning = (async () => {
-      const state = await this.spawnWorker()
-      return state
+      try {
+        const state = await this.spawnWorker()
+        this.spawnFailures = 0
+        this.spawnFailureReason = undefined
+        return state
+      } catch (error) {
+        // Only a streak inside the window trips the breaker, so a worker that
+        // ran fine for an hour and then crashed still gets a normal retry.
+        const now = Date.now()
+        if (now - this.lastSpawnFailureAt > SPAWN_FAILURE_WINDOW_MS) this.spawnFailures = 0
+        this.spawnFailures += 1
+        this.lastSpawnFailureAt = now
+        this.spawnFailureReason = error?.message ?? String(error)
+        process.stdout.write(
+          `[agentcensor] worker spawn failed session=${this.id} `
+          + `(${String(this.spawnFailures)}/${String(SPAWN_FAILURE_LIMIT)}): ${this.spawnFailureReason}\n`,
+        )
+        throw error
+      }
     })().finally(() => {
       this.spawning = undefined
     })
@@ -442,10 +494,11 @@ class WebDriverAgent {
   }
 
   /**
-   * Spawn the per-session resident worker: private scratch dir with a seeded
-   * log copy + overlay + the writable roots the overlay redirects into it,
-   * DSH_HOME = the HOST home for config (credentials/settings/home patch/env
-   * are read like stock dsh — nothing is resolved or injected by the driver).
+   * Spawn the per-session resident worker: a private scratch dir holding only
+   * the overlay and the writable roots it redirects into it, plus the seed
+   * frames the host streams over stdin. DSH_HOME = the HOST home for config
+   * (credentials/settings/home patch/env are read like stock dsh — nothing is
+   * resolved or injected by the driver).
    * Resolves once the worker announces READY; rejects on spawn/boot failure.
    */
   async spawnWorker() {
@@ -458,28 +511,30 @@ class WebDriverAgent {
 
     await sessions.flush(this.session)
     this.endSeedInserted = false
-    this.workerStats = { mirrored: 0, skipped: 0, failed: 0 }
+    this.workerStats = { mirrored: 0, skipped: 0, failed: 0, gapped: 0, unmirrored: 0 }
     this.pendingCancels = []
     const header = this.session.header
-    const located = persistence.locate?.(header)
-    const realFile = located?.path
-    if (typeof realFile !== 'string') {
-      throw new Error('agentcensor: session persistence must provide a JSONL artifact location')
+    // Read the durable log through the documented read side instead of asking
+    // the backend where its artifact lives. `locate()` is a private member and
+    // the JSONL layout is versioned (generation files, migration status), so
+    // copying the physical file was both unsupported and format-fragile.
+    const readHandle = await persistence.open(this.session.id, 'read')
+    let seedEvents
+    try {
+      const page = await readHandle.read(0)
+      seedEvents = page.events
+    } finally {
+      await readHandle.close().catch(() => undefined)
     }
-    await fsp.stat(realFile)
-    const resume = true
+    if (!Array.isArray(seedEvents)) {
+      throw new Error('agentcensor: session persistence returned no events for the seed')
+    }
 
     const privHome = await fsp.mkdtemp(join(tmpdir(), 'agentcensor-worker-'))
     const privRoot = join(privHome, 'sessions')
     await fsp.mkdir(privRoot, { recursive: true })
-    let seeded = false
-    if (resume && realFile !== undefined) {
-      await seedLogCopy(realFile, privRoot)
-      seeded = true
-    }
-    const compression = typeof realFile === 'string' && realFile.endsWith('.zstd') ? 'zstd' : 'none'
     const overlayPath = join(privHome, 'overlay.yml')
-    await fsp.writeFile(overlayPath, workerOverlay(privHome, compression), 'utf8')
+    await fsp.writeFile(overlayPath, workerOverlay(privHome), 'utf8')
 
     const hostHome = resolveDshHome(undefined, process.env)
     const childEnv = {
@@ -488,7 +543,7 @@ class WebDriverAgent {
       DSH_AGENTS_HOME: join(privHome, '.agents'),
       DSH_TELEMETRY_DISABLED: '1',
       AGENTCENSOR_SESSION_ID: this.session.id,
-      AGENTCENSOR_MODE: resume ? 'resume' : 'create',
+      AGENTCENSOR_MODE: 'seed',
       AGENTCENSOR_HOST_SEQ: String(this.session.seq),
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
@@ -497,7 +552,7 @@ class WebDriverAgent {
 
     const cwd = header.cwd ?? process.cwd()
     process.stdout.write(
-      `[agentcensor] worker spawn mode=${resume ? 'resume' : 'create'} session=${this.id} pid=PENDING\n`,
+      `[agentcensor] worker spawn mode=seed session=${this.id} pid=PENDING\n`,
     )
     process.stdout.write(`[agentcensor] worker launcher=${dshLauncher.label}\n`)
     const child = spawn(dshLauncher.command, [
@@ -508,7 +563,14 @@ class WebDriverAgent {
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     })
-    process.stdout.write(`[agentcensor] worker spawn ok mode=${resume ? "resume" : "create"} pid=${String(child.pid ?? "?")} seed=${seeded ? "copied" : "none"}\n`)
+    // The worker builds its session from these frames before creating anything,
+    // so they must arrive first: no file is copied and no artifact path is shared.
+    try {
+      writeSeed(child, seedEvents)
+    } catch (error) {
+      process.stdout.write(`[agentcensor] seed write failed: ${String(error)}\n`)
+    }
+    process.stdout.write(`[agentcensor] worker spawn ok mode=seed pid=${String(child.pid ?? "?")} seed=${String(seedEvents.length)}\n`)
     ACTIVE_WORKERS.add(child)
 
     let readyResolve = () => undefined
@@ -648,7 +710,7 @@ class WebDriverAgent {
       state.closeResolve?.({ code, signal })
       const codeText = code === null ? `signal=${signal ?? '?'}` : `code=${code}`
       process.stdout.write(
-        `[agentcensor] worker closed pid=${String(child.pid ?? '?')} ${codeText} mirrored=${this.workerStats.mirrored} skipped=${this.workerStats.skipped} failed=${this.workerStats.failed}\n`,
+        `[agentcensor] worker closed pid=${String(child.pid ?? '?')} ${codeText} mirrored=${this.workerStats.mirrored} skipped=${this.workerStats.skipped} gapped=${this.workerStats.gapped} unmirrored=${this.workerStats.unmirrored} failed=${this.workerStats.failed}\n`,
       )
       if (spawnError === undefined && !state.stoppingBeforeClose) {
         // Unexpected death (never asked to stop): a boot failure if READY was
@@ -780,44 +842,65 @@ class WebDriverAgent {
       return
     }
     if (event.seq > this.workerNextSeq) {
+      // A hole means frames were lost. Record it and realign on the current
+      // event instead of refusing this and every later frame: a refusal used to
+      // leave workerNextSeq behind forever, silently freezing the whole mirror
+      // until the worker restarted.
+      const lost = event.seq - this.workerNextSeq
+      stats.gapped += lost
       process.stdout.write(
-        `[agentcensor] mirror gap: worker seq ${String(event.seq)} > expected ${String(this.workerNextSeq)} (type=${event.type})\n`,
+        `[agentcensor] mirror gap: expected seq ${String(this.workerNextSeq)}, got ${String(event.seq)} ` +
+        `(+${String(lost)} lost, type=${event.type}); realigning\n`,
       )
-      stats.failed += 1
-      return
+      this.workerNextSeq = event.seq
     }
     try {
-      // The host assigns seq/time on append; retain every other envelope
-      // field and fail loudly if a future dsh event cannot be represented.
-      const { type, seq: _seq, time: _time, data, ...intent } = event
-      const unsupportedIntent = Object.keys(intent).filter(
-        (key) => key !== 'surfaceOp' && key !== 'sourceEventSeqs',
-      )
-      if (unsupportedIntent.length > 0) {
-        stats.failed += 1
-        process.stdout.write(
-          `[agentcensor] mirror refused unsupported event envelope fields: ${unsupportedIntent.join(', ')} (type=${type})\n`,
-        )
-        return
-      }
-      const hasSurface = intent.surfaceOp !== undefined || intent.sourceEventSeqs !== undefined
-      this.workerAuthoredSequences.add(this.session.seq)
-      if (hasSurface) {
-        this.session.append(type, data, {
-          ...(intent.surfaceOp === undefined ? {} : { surfaceOp: intent.surfaceOp }),
-          ...(intent.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: intent.sourceEventSeqs }),
-        })
-      } else {
-        this.session.append(type, data)
-      }
-      stats.mirrored += 1
-      this.workerNextSeq += 1
+      this.mirrorEvent(event, stats)
     } catch (error) {
       stats.failed += 1
       process.stdout.write(
         `[agentcensor] mirror append failed seq=${String(event.seq)} type=${event.type}: ${error?.message ?? String(error)}\n`,
       )
+    } finally {
+      // Advance regardless of outcome. The mirror is a follower: an event the
+      // host cannot represent must cost that one event, never the stream.
+      this.workerNextSeq += 1
     }
+  }
+
+  /**
+   * Mirror one worker event into the host session, routing by envelope kind.
+   * The host assigns `seq`/`time`; what remains is either surface intent or the
+   * `ignorable` marker 0.2.1 added for plugin records and extension events.
+   */
+  mirrorEvent(event, stats) {
+    const { type, data } = event
+    const surfaceOp = event.surfaceOp
+    const sourceEventSeqs = event.sourceEventSeqs
+    if (event.ignorable === true) {
+      // `ignorable` is a routing instruction, not metadata: Session.append
+      // cannot carry it, so only the plugin:* namespace has a faithful place.
+      if (type.startsWith('plugin:') && typeof appendPluginRecord === 'function') {
+        this.workerAuthoredSequences.add(this.session.seq)
+        appendPluginRecord(this.session, type, data)
+        stats.mirrored += 1
+        return
+      }
+      // Unknown extension events (an `external/*` type from a future build, for
+      // example) have no host-side representation at all. Count and continue.
+      stats.unmirrored += 1
+      process.stdout.write(
+        `[agentcensor] mirror skipped unmappable ignorable event type=${type} seq=${String(event.seq)}\n`,
+      )
+      return
+    }
+    const surface = {
+      ...(surfaceOp === undefined ? {} : { surfaceOp }),
+      ...(sourceEventSeqs === undefined ? {} : { sourceEventSeqs }),
+    }
+    this.workerAuthoredSequences.add(this.session.seq)
+    if (Object.keys(surface).length === 0) this.session.append(type, data)
+    else this.session.append(type, data, surface)
   }
 }
 
@@ -844,19 +927,27 @@ function normalizeCancelCause(cause) {
   return { kind: 'user' }
 }
 
-/** Copy the shared durable log into the worker's private root, same layout. */
-async function seedLogCopy(realFile, privRoot) {
-  const sessionDir = dirname(realFile)
-  const projectDir = dirname(sessionDir)
-  // e.g. <encId>/session.jsonl
-  const relFromProject = relative(projectDir, realFile)
-  const privFile = join(privRoot, basename(projectDir), relFromProject)
-  await fsp.mkdir(dirname(privFile), { recursive: true })
-  await fsp.copyFile(realFile, privFile)
+/**
+ * Stream the host's durable log to a freshly spawned worker as chunked seed
+ * frames, terminating with `{done:true}`. The worker rebuilds its own session
+ * from these events, so the two roots never share a file, a path, or a
+ * compression format.
+ */
+function writeSeed(child, events) {
+  if (events.length === 0) {
+    child.stdin.write(`${JSON.stringify({ type: 'seed', events: [], done: true })}\n`)
+    return
+  }
+  for (let offset = 0; offset < events.length; offset += SEED_CHUNK_EVENTS) {
+    const chunk = events.slice(offset, offset + SEED_CHUNK_EVENTS)
+    const last = offset + SEED_CHUNK_EVENTS >= events.length
+    const frame = { type: 'seed', events: chunk, ...(last ? { done: true } : {}) }
+    child.stdin.write(`${JSON.stringify(frame)}\n`)
+  }
 }
 
 /** Publish one agent around a session, replicating the agent-loop order. */
-async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle) {
+async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle, setup) {
   const agent = new WebDriverAgent(rootCtx, session, options)
   const detachSession = agent.ctx.sessions.enter(session)
   // dsh 0.1.5 removes the implicit ctx.agent accessor.
@@ -866,9 +957,24 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
   } catch {}
   const detachAgent = rootCtx.agents.enter(agent, parentAgent ?? initiator)
   try {
+    // dsh 0.2.1 publishes an agent through a setup transaction: `options.setup`
+    // composes the unpublished agent scope (the web face mounts the agent preset
+    // and the model selection there), and the returned commit must run after
+    // every setup await settles and immediately before publication
+    // (agent/src/index.ts:104-118). Ignoring it left the worker on whatever
+    // preset it booted with, so choosing a model or preset in the web UI never
+    // reached it.
+    const setupCommit = await setup?.(agent.ctx, agent)
+    setupCommit?.commit?.()
     agent.ctx.sessions.announce(session)
-    rootCtx.agents.announce(agent)
-    agentEvents(rootCtx, agent).emit('agent/session-start', { source })
+    // dsh 0.2.1: `agents.announce(agent, source, signal?)` is async, takes the
+    // SessionStartSource positionally, and publishes the `agent/created`
+    // lifecycle edge itself through `ctx.serial` (agent/src/index.ts:539-561).
+    // 'agent/session-start' no longer exists in 0.2.1 at all -- cordis does not
+    // reject unknown event names, so the old emit was a silent no-op that also
+    // dropped the ordering guarantee ("release queued work only after every
+    // created listener settled").
+    await rootCtx.agents.announce(agent, source)
   } catch (error) {
     detachAgent?.()
     detachSession?.()
@@ -949,7 +1055,7 @@ export async function apply(ctx) {
           const seed = session.snapshotEvents()
           if (seed.length > 0) await handle.append(seed)
         }
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent, handle)
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'startup', options.parentAgent, handle, options.setup)
       } catch (error) {
         await handle?.close().catch(() => undefined)
         throw error
@@ -970,7 +1076,7 @@ export async function apply(ctx) {
         })
         const suffix = session.snapshotEvents(snapshot.events.length)
         if (suffix.length > 0) await handle.append(suffix)
-        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent, handle)
+        return await publish(ctx, ownerCtx, session, options.agentOptions, 'resume', options.parentAgent, handle, options.setup)
       } catch (error) {
         await handle.close().catch(() => undefined)
         throw error

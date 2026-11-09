@@ -3,23 +3,30 @@
  *
  * Runs INSIDE a per-session dsh process (`dsh --profile headless` + overlay)
  * spawned lazily by the host WebDriverAgent. The worker is a FULL dsh agent
- * process for ONE session: it boots once (create for a brand-new session,
- * resume for an existing one) through the NATIVE agent-loop (agent-loop is NOT
- * disabled in the worker profile), then serves every subsequent user message
- * of that session as a followup on the SAME live agent. The process is NOT
- * destroyed when a turn ends — it stays alive until the host asks it to shut
- * down (or stdin closes because the host died).
+ * process for ONE session: it rebuilds that session from the host's durable
+ * log (delivered as the first stdin frame) through the NATIVE agent-loop
+ * (agent-loop is NOT disabled in the worker profile), then serves every
+ * subsequent user message of that session as a followup on the SAME live
+ * agent. The process is NOT destroyed when a turn ends — it stays alive until
+ * the host asks it to shut down (or stdin closes because the host died).
  *
- * The worker's persistence root is PRIVATE (the host seeds a snapshot copy of
- * the durable log into a per-worker private persistence root), so the worker
- * never writes the shared JSONL — the HOST is the single durable writer of the
- * shared log (why: the persistence coordinator auto-persists every live append
- * and the JSONL backend has no cross-process lock; see the host plugin header).
- * The host replays the worker's event stream transparently.
+ * The worker's persistence root is PRIVATE: it owns only the log it builds
+ * from the seed, so it never writes the shared JSONL — the HOST is the single
+ * durable writer of the shared log (why: the persistence coordinator
+ * auto-persists every live append and the JSONL backend has no cross-process
+ * lock; see the host plugin header). The host replays the worker's event stream
+ * transparently.
+ *
+ * Nothing is copied between the two roots. The host reads its own log through
+ * `sessionPersistence.open(id,'read')` and streams the events in, so the worker
+ * never needs to know where the host artifact lives, what it is called, or how
+ * it is compressed — all of which the JSONL backend is free to change.
  *
  * ── Stdout protocol (worker → host) ──
- *   ACEVT\t<json>    one appended session event {type,seq,data,surfaceOp?,sourceEventSeqs?}
- *   ACREADY\t<json>  booted & ready: {mode,firstSeq,model:{provider,model}}
+ *   ACEVT\t<json>    one appended session event: the full envelope, `ignorable`
+ *                    and surface metadata included (seq/time are host-assigned
+ *                    and dropped on arrival)
+ *   ACREADY\t<json>  booted & ready: {mode,firstSeq,seed,model:{provider,model}}
  *   ACIDLE\t<json>   one turn finished (agent idle, session flushed): {seq}
  *   ACERR\t<json>    runner-level turn failure (worker stays alive): {message}
  *   ACCANCEL\t<json> cancel handed to the native agent: {cause,keepInbox,seq,applied}
@@ -28,6 +35,7 @@
  * Everything else on stdout/stderr is host log passthrough.
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
+ *   {"type":"seed","events":[…]}                              durable log replay (always first)
  *   {"type":"message","message":{content,source,id?,role?}}   original user message
  *   {"type":"cancel","cause":{kind},"keepInbox":bool}         native turn cancellation
  *   {"type":"answer","kind":"approval","id":…,"ok":true,"outcome":"allowed-once"}
@@ -60,8 +68,11 @@
  *
  * Env contract (set by the host driver — task-channel plumbing only, no
  * credential/model/configuration values):
- *   AGENTCENSOR_SESSION_ID   durable session identity to create or resume
- *   AGENTCENSOR_MODE         'create' (fresh) | 'resume' (existing durable log)
+ *   AGENTCENSOR_SESSION_ID   durable session identity to rebuild from the seed
+ *   AGENTCENSOR_MODE         transport label only ('seed'); the worker always
+ *                            creates the session from the seed frame
+ *   AGENTCENSOR_HOST_SEQ     host log length at spawn: only later events are
+ *                            re-sent after the rebuild
  * The worker runs with DSH_HOME = the HOST's home (config/credentials are read
  * in place, like stock dsh); only its writable data roots are private.
  */
@@ -119,6 +130,30 @@ function durableSelection(session) {
   return undefined
 }
 
+/**
+ * Collect the durable-log seed the host streams as the first stdin frames.
+ * Frames are chunked and the last one carries `done`, so a long session never
+ * has to be one enormous line.
+ * @param frames - iterator over the stdin readline interface.
+ * @returns the host session events, in log order.
+ * @throws when stdin closes first or a frame is not a seed.
+ */
+async function readSeedFrame(frames) {
+  const events = []
+  while (true) {
+    const next = await frames.next()
+    if (next.done === true) {
+      throw new Error('agentcensor-worker: stdin closed before the seed completed')
+    }
+    const frame = JSON.parse(next.value)
+    if (frame?.type !== 'seed') {
+      throw new Error(`agentcensor-worker: expected a seed frame, got ${String(frame?.type)}`)
+    }
+    if (Array.isArray(frame.events)) events.push(...frame.events)
+    if (frame.done === true) return events
+  }
+}
+
 async function run(ctx) {
   const agents = ctx.get('agents')
   const defaultModel = ctx.get('agentDefaultModel')
@@ -131,11 +166,19 @@ async function run(ctx) {
   if (loader !== undefined) await loader.await()
 
   const sessionId = process.env.AGENTCENSOR_SESSION_ID
-  const mode = process.env.AGENTCENSOR_MODE === 'resume' ? 'resume' : 'create'
+  const mode = process.env.AGENTCENSOR_MODE ?? 'create'
   if (!sessionId) {
     process.stderr.write('agentcensor-worker: AGENTCENSOR_SESSION_ID is required\n')
     return 1
   }
+
+  // The host streams the durable log as the first stdin frame. Nothing is
+  // copied and no artifact path is shared, so the worker rebuilds the session
+  // from the host's own event list -- seq numbers included, which is what keeps
+  // the mirror aligned.
+  const rl = createInterface({ input: process.stdin })
+  const frames = rl[Symbol.asyncIterator]()
+  const seedEvents = await readSeedFrame(frames)
 
   // Subscribe BEFORE create/resume so publish-time boot appends (permission/
   // preset, sandbox/mode, approval/policy) are streamed too; the listener
@@ -151,22 +194,18 @@ async function run(ctx) {
     process.stdout.write(`ACEVT\t${line}\n`)
   }, { global: true })
 
-  // Model selection is not forwarded via env: the worker shares the host
-  // DSH_HOME (credentials, settings.yaml, machine-level cordis.patch.yml, env
-  // layers), so the agent is constructed with this profile's default selection
-  // (host settings `agent-default-model:` section when present)…
+  // Model selection is not forwarded via env: the agent is built from the host
+  // log below, and its newest `model/selection` or `request/header` config wins
+  // (see durableSelection). This fallback only covers a session that never
+  // recorded one.
   const fallback = defaultModel.currentSelection()
   const agentOptions = { provider: fallback.provider, model: fallback.model }
-  const handle = mode === 'resume'
-    ? await agents.resume({
-        resumeSessionId: brandString(sessionId),
-        agentOptions,
-      })
-    : await agents.create({
-        sessionId: brandString(sessionId),
-        meta: { cwd: process.cwd() },
-        agentOptions,
-      })
+  const handle = await agents.create({
+    sessionId: brandString(sessionId),
+    meta: { cwd: process.cwd() },
+    seed: seedEvents,
+    agentOptions,
+  })
   const agent = handle.agent
   const firstSeq = agent.session.seq
   const hostSeq = Number(process.env.AGENTCENSOR_HOST_SEQ)
@@ -177,10 +216,9 @@ async function run(ctx) {
     process.stdout.write(`ACEVT\t${JSON.stringify(event)}\n`)
   }
 
-  // …then the session's current choice is derived from this worker's own
-  // durable log replay (the seed the host copied into its private persistence
-  // root): the newest `model/selection` or `request/header` config in the
-  // conversation wins.
+  // …then the session's current choice is derived from the log this worker just
+  // rebuilt from the host seed: the newest `model/selection` or `request/header`
+  // config in the conversation wins.
   const selection = durableSelection(agent.session) ?? fallback
   installModelSelection(agent.ctx, { current: selection, assembled: undefined })
 
@@ -196,14 +234,15 @@ async function run(ctx) {
   process.stdout.write(`ACREADY\t${JSON.stringify({
     mode,
     firstSeq,
+    seed: seedEvents.length,
     model: { provider: selection.provider, model: selection.model },
   })}\n`)
 
-  return controlLoop(agent, sessions, asks)
+  return controlLoop(agent, sessions, asks, frames, rl)
 }
 
 /** Serve messages, cancellations, and interaction answers until shutdown or EOF. */
-async function controlLoop(agent, sessions, asks) {
+async function controlLoop(agent, sessions, asks, frames, rl) {
   let chain = Promise.resolve()
   // Messages accepted but not yet finished: a cancel arriving while the agent is
   // still idle belongs to the turn one of these is about to open.
@@ -219,8 +258,12 @@ async function controlLoop(agent, sessions, asks) {
       applied,
     })}\n`)
   }
-  const rl = createInterface({ input: process.stdin })
-  for await (const raw of rl) {
+  // The readline interface was opened before the agent existed (the seed frame
+  // arrives first), so consume the same iterator instead of opening a second one.
+  while (true) {
+    const next = await frames.next()
+    if (next.done) break
+    const raw = next.value
     if (raw.trim() === '') continue
     let frame
     try {
@@ -288,6 +331,7 @@ async function controlLoop(agent, sessions, asks) {
       process.stderr.write(`agentcensor-worker: unknown stdin frame type=${String(frame?.type)}\n`)
     }
   }
+  rl.close()
   await chain.catch(() => undefined)
   // The host is going away: every still-pending ask fails closed now instead of
   // holding a turn open.
