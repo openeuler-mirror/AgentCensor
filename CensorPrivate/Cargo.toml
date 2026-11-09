@@ -25,6 +25,8 @@ ipnet = "2"
 num-bigint = "0.4"
 num-integer = "0.1"
 num-traits = "0.2"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic"] }
+tokenizers = { version = "=0.21.4", default-features = false, features = ["fancy-regex"] }
 regex = "1"
 reqwest = { version = "=0.12.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
