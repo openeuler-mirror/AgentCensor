@@ -1,9 +1,6 @@
 // 浏览器半控制器: 组件不接触 ctx, 数据经控制器进出。
 // 控制器在 slot 注册的 inject 回调里创建 (那里可以碰 ctx), 组件只拿
 // controller 实例 + 用 useSyncExternalStore 订阅状态。
-//
-// 规则部分为 MOCK (见 policyEditor.ts): 编辑器展示/提交的都是服务端
-// 返回的策略原文 (GetPolicyReply.policyYaml), 不做格式转换。
 
 import { PolicyEditor } from '../ui/policyEditor.js';
 import { SECTION_NOTICE, type ProtectionStatusView } from '../ui/securitySection.js';
@@ -35,7 +32,7 @@ interface StatusReply {
 interface GetPolicyReply {
   name: string;
   version: number;
-  policyYaml: string; // 组 YAML 片段原文 (mock 编辑器直接展示/编辑)
+  policyYaml: string;
 }
 
 interface ValidatePolicyReply {
@@ -105,7 +102,6 @@ export class SecurityController extends Store<SecurityState> {
         callRead<StatusReply>(this.conn, 'status'),
         callRead<GetPolicyReply>(this.conn, 'policy'),
       ]);
-      // MOCK: 编辑器直接展示服务端 YAML 原文, 不拆 rules[]
       this.editor.loadCurrent(policy.policyYaml, policy.version);
       const dom = status.domains.find((d) =>
         (d.policies ?? d.group.split('+')).includes(policy.name));
@@ -163,11 +159,10 @@ export class SecurityController extends Store<SecurityState> {
         });
         return;
       }
-      // MOCK: 草稿原文直接送服务端校验, 不做格式转换
       const r = await callAdmin<ValidatePolicyReply>(this.conn, 'policy/validate', {
         policyYaml: draft,
       });
-      // 防御: 过滤空串错误项 (旧版 gRPC 成功时会带 [""] 空串, 会永久禁用保存)
+      // 空白诊断不应阻止保存。
       this.editor.setRuleDiagnostics(r.errors.filter((e) => e.trim() !== ''));
       this.set({
         ...this.snapshot,

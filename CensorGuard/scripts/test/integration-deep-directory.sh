@@ -63,7 +63,7 @@ make_deep_file() {
     printf '%s\n' "${path}/payload.txt"
 }
 
-# 16 levels proves the old eight-level limit is gone. 40 levels exceeds the new 32-step budget
+# 16 levels exercises ancestor matching. 40 levels exceeds the 32-step budget
 # even after accounting for an early filesystem root and therefore exercises fail-closed.
 protected_file=$(make_deep_file "${protected_root}" 16)
 allowed_file=$(make_deep_file "${allowed_root}" 16)

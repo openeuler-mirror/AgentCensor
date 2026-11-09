@@ -88,7 +88,7 @@ rules:
         assert 'no running daemon' in daemon_cmd('stop', ok=False).stderr
         print('PASS versions and missing-daemon diagnostics', flush=True)
 
-        # Legacy instances might not have a lock file: refuse to steal a live socket anyway.
+        # A live socket must be preserved even when its owner has no lock file.
         with socket.socket(socket.AF_UNIX) as legacy:
             legacy.bind(str(directory / 'ctl.sock'))
             legacy.listen()

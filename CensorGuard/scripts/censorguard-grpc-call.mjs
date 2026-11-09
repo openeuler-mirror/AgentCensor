@@ -10,7 +10,7 @@
 
 import { createRequire } from 'node:module';
 
-// 从插件包的依赖里解析 grpc 库 (不新增任何依赖)
+// 与插件共享 gRPC 依赖, 避免单独安装不同版本。
 const require = createRequire(
   new URL('../plugins/dsh-censorguard/package.json', import.meta.url),
 );
