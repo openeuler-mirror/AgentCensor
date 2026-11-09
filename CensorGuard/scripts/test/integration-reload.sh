@@ -72,8 +72,6 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
-# ALLOW auditing is a runtime switch now: enable global exec allow auditing.
-
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!
 

@@ -2,6 +2,8 @@ use crate::runtime::Runtime;
 use censorguard_common::abi::RawEvent;
 use censorguard_common::protocol::Event;
 use censorguard_kernel::NativeKernel;
+use nix::sys::time::TimeValLike;
+use nix::time::{ClockId, clock_gettime};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -131,6 +133,9 @@ pub fn start_event_pump(
     hub: Arc<EventHub>,
 ) -> Result<thread::JoinHandle<()>, censorguard_kernel::KernelError> {
     let mut reader = kernel.event_reader()?;
+    let mut clock = EventClock::sample().map_err(|error| {
+        censorguard_kernel::KernelError::Native(format!("sample audit clock: {error}"))
+    })?;
     Ok(thread::spawn(move || {
         let mut stats_at = Instant::now();
         loop {
@@ -141,7 +146,15 @@ pub fn start_event_pump(
                 stats_at = Instant::now();
             }
             match result {
-                Ok(Some(raw)) => hub.broadcast(to_event(&runtime, &raw)),
+                Ok(Some(raw)) => {
+                    match EventClock::sample() {
+                        Ok(sample) => clock = sample,
+                        Err(error) => {
+                            eprintln!("audit clock refresh failed; retaining last offset: {error}");
+                        }
+                    }
+                    hub.broadcast(to_event(&raw, runtime.name_by_id(raw.domain_id), &clock));
+                }
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("ringbuf reader stopped: {error}");
@@ -152,10 +165,47 @@ pub fn start_event_pump(
     }))
 }
 
-fn to_event(runtime: &Runtime, raw: &RawEvent) -> Event {
+struct EventClock {
+    monotonic_ns: u64,
+    unix_ns: u64,
+}
+
+impl EventClock {
+    fn sample() -> Result<Self, nix::errno::Errno> {
+        // bpf_ktime_get_ns uses CLOCK_MONOTONIC, which excludes suspended time.
+        // Refresh the correlation so suspend and wall-clock changes cannot leave a stale offset.
+        let before = monotonic_nanos()?;
+        let unix_ns = unix_nanos();
+        let after = monotonic_nanos()?;
+        Ok(Self {
+            monotonic_ns: before + after.saturating_sub(before) / 2,
+            unix_ns,
+        })
+    }
+
+    fn unix_timestamp(&self, monotonic_ns: u64) -> u64 {
+        if monotonic_ns <= self.monotonic_ns {
+            self.unix_ns
+                .saturating_sub(self.monotonic_ns - monotonic_ns)
+        } else {
+            self.unix_ns
+                .saturating_add(monotonic_ns - self.monotonic_ns)
+        }
+    }
+}
+
+fn monotonic_nanos() -> Result<u64, nix::errno::Errno> {
+    Ok(
+        u64::try_from(clock_gettime(ClockId::CLOCK_MONOTONIC)?.num_nanoseconds())
+            .unwrap_or_default(),
+    )
+}
+
+fn to_event(raw: &RawEvent, domain: String, clock: &EventClock) -> Event {
+    let occurred_at_ns = clock.unix_timestamp(raw.ts_ns);
     Event {
-        ts: now_rfc3339(),
-        occurred_at_ns: unix_nanos(),
+        ts: rfc3339_from_unix_nanos(occurred_at_ns),
+        occurred_at_ns,
         kind: raw.kind,
         op: raw.op,
         pid: raw.pid,
@@ -164,7 +214,7 @@ fn to_event(runtime: &Runtime, raw: &RawEvent) -> Event {
         policy_version: raw.policy_version,
         rule_version: raw.rule_version,
         domain_id: raw.domain_id,
-        domain: runtime.name_by_id(raw.domain_id),
+        domain,
         comm: c_string(&raw.comm),
         detail: c_string(&raw.detail),
         args: raw
@@ -188,10 +238,8 @@ fn c_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-fn now_rfc3339() -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+fn rfc3339_from_unix_nanos(timestamp_ns: u64) -> String {
+    let duration = Duration::from_nanos(timestamp_ns);
     let seconds = duration.as_secs();
     let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
     let second_of_day = seconds % 86_400;
@@ -231,6 +279,61 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_events_keep_their_occurrence_time() {
+        let raw = RawEvent {
+            ts_ns: 10_123_456_789,
+            ..RawEvent::default()
+        };
+        let consumed = EventClock {
+            monotonic_ns: 15_000_000_000,
+            unix_ns: 1_000_000_000_000,
+        };
+        let consumed_later = EventClock {
+            monotonic_ns: 20_000_000_000,
+            unix_ns: 1_005_000_000_000,
+        };
+        let event = to_event(&raw, "test".into(), &consumed);
+        let later = to_event(&raw, "test".into(), &consumed_later);
+        assert_eq!(event.occurred_at_ns, 995_123_456_789);
+        assert_eq!(event.ts, "1970-01-01T00:16:35.123Z");
+        assert_eq!(event.occurred_at_ns, later.occurred_at_ns);
+        assert_eq!(event.ts, later.ts);
+    }
+
+    #[test]
+    fn refreshed_clock_accounts_for_suspend_or_wall_clock_steps() {
+        let raw = RawEvent {
+            ts_ns: 10_000_000_000,
+            ..RawEvent::default()
+        };
+        let before = EventClock {
+            monotonic_ns: 10_000_000_000,
+            unix_ns: 1_000_000_000_000,
+        };
+        let after = EventClock {
+            monotonic_ns: 10_000_000_000,
+            unix_ns: 1_060_000_000_000,
+        };
+        let event = to_event(&raw, String::new(), &before);
+        let adjusted = to_event(&raw, String::new(), &after);
+        assert_eq!(
+            adjusted.occurred_at_ns - event.occurred_at_ns,
+            60_000_000_000
+        );
+        assert_eq!(adjusted.ts, "1970-01-01T00:17:40.000Z");
+    }
+
+    #[test]
+    fn sampled_clock_matches_realtime() -> Result<(), nix::errno::Errno> {
+        let before = unix_nanos();
+        let clock = EventClock::sample()?;
+        let after = unix_nanos();
+        assert!(clock.monotonic_ns > 0);
+        assert!((before..=after).contains(&clock.unix_timestamp(clock.monotonic_ns)));
+        Ok(())
+    }
 
     #[test]
     fn unix_epoch_calendar_conversion_is_stable() {

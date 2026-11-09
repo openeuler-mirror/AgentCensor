@@ -118,19 +118,33 @@ pub fn process_info(pid: u32) -> Result<ProcessInfo, io::Error> {
 }
 
 fn direct_children(pid: u32) -> Result<Vec<u32>, io::Error> {
-    let path = format!("/proc/{pid}/task/{pid}/children");
-    let data = match fs::read_to_string(path) {
-        Ok(data) => data,
+    let tasks = match fs::read_dir(format!("/proc/{pid}/task")) {
+        Ok(tasks) => tasks,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
-    data.split_whitespace()
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| invalid_data(format!("invalid child pid {value:?}")))
-        })
-        .collect()
+    let mut children = BTreeSet::new();
+    // Linux records children on their creating thread, including non-leader threads.
+    for task in tasks {
+        let task = match task {
+            Ok(task) => task,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let data = match fs::read_to_string(task.path().join("children")) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for value in data.split_whitespace() {
+            children.insert(
+                value
+                    .parse()
+                    .map_err(|_| invalid_data(format!("invalid child pid {value:?}")))?,
+            );
+        }
+    }
+    Ok(children.into_iter().collect())
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -140,6 +154,42 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command};
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn descendants_include_children_created_by_non_leader_threads() -> Result<(), io::Error> {
+        let (child_sender, child_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        thread::scope(|scope| -> Result<(), io::Error> {
+            let worker = scope.spawn(move || -> Result<(), io::Error> {
+                let child = ChildGuard(Command::new("sleep").arg("30").spawn()?);
+                child_sender.send(child.0.id()).map_err(io::Error::other)?;
+                let _ = release_receiver.recv();
+                Ok(())
+            });
+            let child_pid = child_receiver.recv().map_err(io::Error::other)?;
+            let children = direct_children(std::process::id());
+            let descendants = descendants(std::process::id());
+            let _ = release_sender.send(());
+            worker
+                .join()
+                .map_err(|_| io::Error::other("child creator thread panicked"))??;
+            assert!(children?.contains(&child_pid));
+            assert!(descendants?.contains(&child_pid));
+            Ok(())
+        })
+    }
 
     #[test]
     fn current_process_has_a_start_time() -> Result<(), io::Error> {

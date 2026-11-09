@@ -61,7 +61,7 @@ censorguardctl --policy config/base.yaml --pid PID
 censorguard-audit launch
 ```
 
-0.4.0 最小启动验证：
+0.5.0 最小启动验证：
 
 ```bash
 cargo build --workspace --release --offline
