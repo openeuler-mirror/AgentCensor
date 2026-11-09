@@ -1,11 +1,4 @@
-// PolicyEditor 客户端编辑器逻辑 (MOCK)
-//
-// 规则解析/打包后期要换成另一种格式, 本文件只做状态机占位:
-//   - 保留 dirty/version/诊断/大小上限/乐观锁 等视图契约 (SecuritySection 依赖)
-//   - 规则文本不做结构化解析: 不拆行、不校验 file/exec/net 头、不打包
-//     rules: YAML 片段, buildApplyRequest 原样透传草稿
-// TODO(rules): 新规则格式落地后, 替换 staticYamlSyntaxCheck / buildApplyRequest
-// 的透传实现, 并恢复编辑器侧的行级诊断。
+// 策略 YAML 由 Host/daemon 统一解析和校验, 避免客户端维护另一套规则语法。
 
 import { MAX_POLICY_DOC_BYTES, type PolicyDiff } from './securitySection.js';
 
@@ -27,7 +20,6 @@ export interface PolicyEditorState {
   overDocLimit: boolean;
 }
 
-// PolicyEditor 客户端编辑器逻辑 (mock: 纯状态机, 无规则格式解析)
 export class PolicyEditor {
   private state: PolicyEditorState;
 
@@ -92,16 +84,13 @@ export class PolicyEditor {
     );
   }
 
-  // 保存前静态语法检查 (MOCK: 只查非空; 真实规则校验在 Host/daemon 端)
-  // TODO(rules): 新格式落地后恢复编辑器侧语法预检
+  // 此处仅检查非空; YAML 语法和规则校验交给 Host/daemon。
   staticYamlSyntaxCheck(plain: string): string | null {
     if (!plain.trim()) return '策略为空';
     return null;
   }
 
-  // 构造保存请求体 (MOCK: 草稿原样透传, 不做 rules: 打包;
-  // group 不传 —— Host 路由层默认当前绑定组, Client 不需要知道组名)
-  // TODO(rules): 新格式落地后在此做格式转换
+  // group 由 Host 路由层取当前绑定组, 客户端只提交原文和乐观锁版本。
   buildApplyRequest(): { policyYaml: string; expectedVersion: number } | null {
     if (!this.canSave()) return null;
     return {

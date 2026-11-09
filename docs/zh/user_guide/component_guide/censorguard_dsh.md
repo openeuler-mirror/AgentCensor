@@ -1,9 +1,7 @@
 # DSH 插件指南
 
-本文档描述 Censorguard DSH 插件的架构、安装、使用与故障排查。该插件为
-DeepSeek Harness(DSH)提供**整树包裹模式**的安全保护:DSH 主进程启动时
-自动 attach 到 daemon,此后整棵进程树(包括不经任何插件通道启动的子进程)
-都在 eBPF LSM 强制之下。
+本文档描述 Censorguard DSH 插件的架构、安装、使用与故障排查。
+该插件为DeepSeek Harness(DSH)提供**整树包裹模式**的安全保护:DSH 主进程启动时自动 attach 到 daemon,此整棵进程树(包括不经任何插件通道启动的子进程)都在 eBPF LSM 强制之下。
 
 系统构建见 [构建指南](../../../../CensorGuard/docs/构建指南.md);Censorguard 整体使用见 [使用手册](../../../../CensorGuard/docs/使用手册.md)。
 
@@ -60,7 +58,7 @@ attach 失败则 DSH 启动失败)。
 
 | 条件 | 验证方法 |
 |---|---|
-| daemon 已运行且带 `--spawn-grpc` | `systemctl status censorguardd`;`ss -tln | grep 50051` |
+| daemon 已运行且带 `--spawn-grpc` | `systemctl status censorguardd`;`ss -tln \| grep 50051` |
 | gRPC 适配器已安装 | `ls /usr/bin/censorguard-grpc` |
 | DSH 策略组已由 root 下发 | `sudo censorguardctl policy-dump \| grep censorguard` |
 | 当前用户在 `censorguard` 组 | `id \| grep censorguard`(**加入后需重新登录才生效**) |

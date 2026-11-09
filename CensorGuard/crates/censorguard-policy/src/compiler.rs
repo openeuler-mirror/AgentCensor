@@ -970,7 +970,6 @@ mod tests {
     #[test]
     fn compiles_long_file_rule_paths_up_to_name_max() -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempdir()?;
-        // 100-byte path: above the old 63-byte key limit, below NAME_MAX.
         let file = directory
             .path()
             .join("abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.txt");

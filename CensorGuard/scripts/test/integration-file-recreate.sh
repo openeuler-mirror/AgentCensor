@@ -241,7 +241,7 @@ for op in read write rm mv chmod; do
 done
 echo "phase A passed: recreated file still fully denied"
 
-# ---------- Phase B: [write] mask + in-scope recreate (original bug) ----------
+# ---------- Phase B: [write] mask + in-scope recreate ----------
 lab_b=/tmp/censorguard-recreate-b
 rm -rf "${lab_b}"
 install -d -m 0700 "${lab_b}"
@@ -287,7 +287,7 @@ if [[ -f "${lab_b}/target.txt" ]] && grep -q payload "${lab_b}/target.txt"; then
 fi
 echo "phase B passed: in-scope recreate+write denied"
 
-# ---------- Phase C: path longer than the old 63-byte key limit ----------
+# ---------- Phase C: long-path rules within the 255-byte key limit ----------
 lab_c=/tmp/censorguard-recreate-c
 rm -rf "${lab_c}"
 install -d -m 0700 "${lab_c}/subdir-with-a-fairly-long-name-0123456789"

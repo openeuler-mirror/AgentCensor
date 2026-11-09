@@ -79,8 +79,6 @@ for _ in $(seq 1 1200); do
 done
 grep -q '^\[READY\]' "${runtime_dir}/daemon.log"
 
-# ALLOW 事件现在由运行时开关控制（替代旧 allow_sample_rate）
-
 "${repo_dir}/target/debug/censorguardctl" --config "${runtime_dir}/config.yaml" audit \
     --kind 2 >"${runtime_dir}/audit.log" 2>&1 &
 audit_pid=$!

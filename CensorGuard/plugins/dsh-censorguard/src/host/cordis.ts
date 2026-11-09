@@ -10,15 +10,10 @@
 //       /censorguard-admin  仅 loopback (Host 头为 127/8、localhost、[::1])
 //                           (validate/apply/switches 写)
 //     trust fence 复用 Connection 的 requestRejection (公共 API); loopback
-//     限定由本文件的 Host 头检查执行 (0.1.5 起 Connection 不再提供
-//     按通道 authority), HostCore 侧另有组白名单兜底
+//     限定由本文件的 Host 头检查执行, HostCore 侧另有组白名单兜底
 //
-// 传输形态说明 (dsh 0.1.5+): 上游 Connection 重构后, rpc.handle() 注册独立
-// 通道的路径对第三方插件不可用 (其内部经 shadow ctx 访问 webServer, 而
-// Connection 自身已不再 inject webServer), 共享 /api 通道的 intercept 又被
-// api-gateway 独占。因此按第一方插件 (api-gateway WebSocket 路由) 的同款
-// 模式, 直接在 webServer 上注册前缀路由, 并自行实现 RPC 信封 (与浏览器半
-// conn.rpc.call 的请求/响应格式保持兼容)。
+// 独立 HTTP 前缀避免占用 api-gateway 的共享 /api 通道;
+// RPC 信封与浏览器 conn.rpc.call 的请求/响应格式一致。
 //
 // ctx/connection/webServer 用最小结构化接口声明 (运行时是 DSH vendored
 // cordis 与 @deepseek-ai/dsh-client-connection / dsh-host-webserver),

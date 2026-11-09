@@ -137,7 +137,7 @@ export class HostCore {
     }
   }
 
-  /** Legacy endpoint: daemon settings are read-only through DSH. */
+  /** Daemon settings are read-only through DSH. */
   async setSwitches(_update: SwitchUpdate, clientIp: string): Promise<SetSwitchesReply> {
     this.assertLoopback(clientIp);
     throw new Error("开关由 base.yaml 的 daemon 配置管理，请重启 daemon 生效");

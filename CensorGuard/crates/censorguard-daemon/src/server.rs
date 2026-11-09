@@ -1251,7 +1251,6 @@ mod tests {
         ] {
             assert!(!role_allows(SocketRole::Ui, &method));
         }
-        // The admin socket keeps the full legacy op set except self-serve/launcher ops.
         assert!(role_allows(SocketRole::Admin, &RpcMethod::ApplyPolicy));
         assert!(role_allows(SocketRole::Admin, &RpcMethod::EvaluateIntent));
         assert!(!role_allows(SocketRole::Admin, &RpcMethod::RegisterSelf));
