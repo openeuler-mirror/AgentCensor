@@ -342,6 +342,10 @@ class WebDriverAgent {
     this.closedByHost = false
     this.workerAuthoredSequences = new Set()
     this.workerNextSeq = undefined
+    // Host-side stand-ins for the subagent sessions the worker spawns. Their
+    // logs exist only inside the worker, so the driver owns a real session per
+    // child to keep the tree navigable.
+    this.childSessions = new Map()
     // Permission changes are authored by the host UI. A resident worker must
     // receive the same events before the next message, otherwise the browser
     // shows one mode while tools keep enforcing the previous mode.
@@ -644,14 +648,14 @@ class WebDriverAgent {
       const rl = createInterface({ input: child.stdout })
       for await (const line of rl) {
         if (line.startsWith(EVT_PREFIX)) {
-          let event
+          let frame
           try {
-            event = JSON.parse(line.slice(EVT_PREFIX.length))
+            frame = JSON.parse(line.slice(EVT_PREFIX.length))
           } catch (error) {
             process.stdout.write(`[agentcensor] unparsable worker event: ${String(error)}\n`)
             continue
           }
-          this.appendMirrored(event, this.workerStats)
+          this.appendMirroredFrame(frame, this.workerStats)
         } else if (line.startsWith(READY_PREFIX)) {
           let payload = {}
           /* keep {} */
@@ -831,6 +835,92 @@ class WebDriverAgent {
     this.workerState = undefined
   }
 
+  /**
+   * Route one `ACEVT` frame. Frames carry their session id because a worker runs
+   * more than one session: its root session plus any subagent child it spawned.
+   * @param frame - `{sessionId, event, header?}`, or a bare event from a build
+   *   that predates the session id.
+   * @param stats - mirror counters.
+   */
+  appendMirroredFrame(frame, stats) {
+    const event = frame?.event ?? frame
+    const sessionId = frame?.sessionId
+    if (sessionId === undefined || sessionId === this.id) {
+      this.appendMirrored(event, stats)
+      return
+    }
+    this.appendChildMirrored(String(sessionId), frame?.header, event, stats)
+  }
+
+  /**
+   * Mirror a subagent child session. Its log lives only inside the worker, so
+   * without this the session tree showed a child row that opened onto nothing.
+   * @param sessionId - the child's session id, as the worker named it.
+   * @param header - child metadata, sent on the child's first frame.
+   * @param event - one of the child's events.
+   * @param stats - mirror counters.
+   */
+  appendChildMirrored(sessionId, header, event, stats) {
+    let child = this.childSessions.get(sessionId)
+    if (child === undefined) {
+      if (header === undefined) {
+        // Without a header the child's cwd and lineage are unknown, and a
+        // session built from guesses is worse than a counted gap.
+        stats.unmirrored += 1
+        process.stdout.write(
+          `[agentcensor] child session ${sessionId}: event before header, not mirrored\n`,
+        )
+        return
+      }
+      child = this.openChildSession(sessionId, header)
+      if (child === undefined) {
+        stats.unmirrored += 1
+        return
+      }
+      this.childSessions.set(sessionId, child)
+    }
+    try {
+      this.mirrorInto(child.session, event, stats, undefined)
+    } catch (error) {
+      stats.failed += 1
+      process.stdout.write(
+        `[agentcensor] child mirror failed session=${sessionId} type=${String(event?.type)}: ${error?.message ?? String(error)}\n`,
+      )
+    }
+  }
+
+  /**
+   * Open the host session that stands in for one worker-internal subagent.
+   * @param sessionId - the child's session id.
+   * @param header - `{cwd?, delegationDepth?}` reported by the worker.
+   * @returns the entry, or undefined when the host cannot own that id.
+   */
+  openChildSession(sessionId, header) {
+    const sessions = this.rootCtx.get('sessions')
+    if (sessions === undefined) return undefined
+    try {
+      const session = sessions.prepare(sessionId, {
+        meta: {
+          ...(typeof header.cwd === 'string' ? { cwd: header.cwd } : {}),
+          parentSession: this.id,
+          origin: 'subagent',
+          ...(Number.isSafeInteger(header.delegationDepth)
+            ? { delegationDepth: header.delegationDepth }
+            : {}),
+        },
+      })
+      const detach = sessions.enter(session)
+      sessions.announce(session)
+      process.stdout.write(`[agentcensor] child session ${sessionId} opened (parent=${this.id})\n`)
+      return { session, detach }
+    } catch (error) {
+      process.stdout.write(
+        `[agentcensor] child session ${sessionId} not opened: ${error?.message ?? String(error)}\n`,
+      )
+      return undefined
+    }
+  }
+
   appendMirrored(event, stats) {
     if (event === undefined || typeof event.seq !== 'number' || typeof event.type !== 'string') {
       stats.failed += 1
@@ -855,7 +945,7 @@ class WebDriverAgent {
       this.workerNextSeq = event.seq
     }
     try {
-      this.mirrorEvent(event, stats)
+      this.mirrorInto(this.session, event, stats, this.workerAuthoredSequences)
     } catch (error) {
       stats.failed += 1
       process.stdout.write(
@@ -869,20 +959,27 @@ class WebDriverAgent {
   }
 
   /**
-   * Mirror one worker event into the host session, routing by envelope kind.
+   * Mirror one worker event into one host session, routing by envelope kind.
    * The host assigns `seq`/`time`; what remains is either surface intent or the
    * `ignorable` marker 0.2.1 added for plugin records and extension events.
+   * @param session - host session to append into: the root session, or a
+   *   subagent child this driver opened for a session it discovered in the worker.
+   * @param event - the worker event, envelope intact.
+   * @param stats - mirror counters.
+   * @param authored - host-authored seq bookkeeping (root session only).
    */
-  mirrorEvent(event, stats) {
+  mirrorInto(session, event, stats, authored) {
     const { type, data } = event
-    const surfaceOp = event.surfaceOp
-    const sourceEventSeqs = event.sourceEventSeqs
+    if (typeof type !== 'string' || type === '') {
+      stats.failed += 1
+      return
+    }
     if (event.ignorable === true) {
       // `ignorable` is a routing instruction, not metadata: Session.append
       // cannot carry it, so only the plugin:* namespace has a faithful place.
       if (type.startsWith('plugin:') && typeof appendPluginRecord === 'function') {
-        this.workerAuthoredSequences.add(this.session.seq)
-        appendPluginRecord(this.session, type, data)
+        authored?.add(session.seq)
+        appendPluginRecord(session, type, data)
         stats.mirrored += 1
         return
       }
@@ -895,12 +992,13 @@ class WebDriverAgent {
       return
     }
     const surface = {
-      ...(surfaceOp === undefined ? {} : { surfaceOp }),
-      ...(sourceEventSeqs === undefined ? {} : { sourceEventSeqs }),
+      ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
+      ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
     }
-    this.workerAuthoredSequences.add(this.session.seq)
-    if (Object.keys(surface).length === 0) this.session.append(type, data)
-    else this.session.append(type, data, surface)
+    authored?.add(session.seq)
+    if (Object.keys(surface).length === 0) session.append(type, data)
+    else session.append(type, data, surface)
+    stats.mirrored += 1
   }
 }
 
@@ -983,6 +1081,11 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
   const dispose = (async () => {
     // Fire-and-forget: the process exits on stdin EOF anyway.
     agent.stopWorker()
+    // Subagent stand-ins die with the driver that owned them.
+    for (const child of agent.childSessions.values()) {
+      try { child.detach?.() } catch {}
+    }
+    agent.childSessions.clear()
     try {
       detachAgent?.()
     } finally {

@@ -23,9 +23,10 @@
  * it is compressed — all of which the JSONL backend is free to change.
  *
  * ── Stdout protocol (worker → host) ──
- *   ACEVT\t<json>    one appended session event: the full envelope, `ignorable`
- *                    and surface metadata included (seq/time are host-assigned
- *                    and dropped on arrival)
+ *   ACEVT\t<json>    one appended session event: {sessionId, event, header?}.
+ *                    `event` is the full envelope, `ignorable` and surface
+ *                    metadata included (seq/time are host-assigned on arrival);
+ *                    `header` appears only on a child session's first frame.
  *   ACREADY\t<json>  booted & ready: {mode,firstSeq,seed,model:{provider,model}}
  *   ACIDLE\t<json>   one turn finished (agent idle, session flushed): {seq}
  *   ACERR\t<json>    runner-level turn failure (worker stays alive): {message}
@@ -154,6 +155,23 @@ async function readSeedFrame(frames) {
   }
 }
 
+/**
+ * The child metadata the host needs to open a stand-in session: where it ran and
+ * how deep it sits in the delegation tree. That it is a child is implied by the
+ * frame carrying a session id other than the root one.
+ * @param session - a subagent child session created inside this worker.
+ * @returns the header fields the host's session creation accepts.
+ */
+function childHeader(session) {
+  const header = session.header
+  return {
+    ...(typeof header.cwd === 'string' ? { cwd: header.cwd } : {}),
+    ...(Number.isSafeInteger(header.delegationDepth)
+      ? { delegationDepth: header.delegationDepth }
+      : {}),
+  }
+}
+
 async function run(ctx) {
   const agents = ctx.get('agents')
   const defaultModel = ctx.get('agentDefaultModel')
@@ -183,15 +201,27 @@ async function run(ctx) {
   // Subscribe BEFORE create/resume so publish-time boot appends (permission/
   // preset, sandbox/mode, approval/policy) are streamed too; the listener
   // stays registered for the whole process life (multi-turn).
+  // Every session this worker owns streams to the host, not just the root one: a
+  // subagent's log exists only in this process, so dropping it left the session
+  // tree showing a child row that opened onto nothing. The child's metadata
+  // rides on its first frame so the host can open a real session for it.
+  const announcedChildren = new Set()
   ctx.on('session/event', (session, event) => {
-    if (session.id !== sessionId) return
-    if (hostSyncedSequences.delete(event.seq)) {
-      process.stdout.write(`ACSYNC\t${JSON.stringify({ seq: event.seq })}\n`)
+    if (session.id === sessionId) {
+      if (hostSyncedSequences.delete(event.seq)) {
+        process.stdout.write(`ACSYNC\t${JSON.stringify({ seq: event.seq })}\n`)
+        return
+      }
+      // Preserve the complete Session V3 event envelope across the wire.
+      process.stdout.write(`ACEVT\t${JSON.stringify({ sessionId, event })}\n`)
       return
     }
-    // Preserve the complete Session V3 event envelope across the wire.
-    const line = JSON.stringify(event)
-    process.stdout.write(`ACEVT\t${line}\n`)
+    const frame = { sessionId: session.id, event }
+    if (!announcedChildren.has(session.id)) {
+      announcedChildren.add(session.id)
+      frame.header = childHeader(session)
+    }
+    process.stdout.write(`ACEVT\t${JSON.stringify(frame)}\n`)
   }, { global: true })
 
   // Model selection is not forwarded via env: the agent is built from the host
@@ -468,6 +498,10 @@ function registerInteractionAnswerers(ctx, asks) {
       ...(typeof request.toolName === 'string' ? { toolName: request.toolName } : {}),
       ...(typeof request.callId === 'string' ? { callId: request.callId } : {}),
       ...(typeof request.reason === 'string' ? { reason: request.reason } : {}),
+      // 0.2.1 adds a localized display sentence (never persisted host-side). It is
+      // the only text meant for the person clicking approve, so pass it through
+      // instead of forcing the host panel back to a generic prompt.
+      ...(request.displayReason === undefined ? {} : { displayReason: request.displayReason }),
     }, request.signal)
     if (answer?.withdrawn === true) return 'cancelled'
     if (answer?.ok === true && typeof answer.outcome === 'string') return answer.outcome
@@ -477,6 +511,9 @@ function registerInteractionAnswerers(ctx, asks) {
   ctx.on('user-questions/request', async (request, next) => {
     const answer = await asks.ask('question', {
       questions: Array.isArray(request.questions) ? request.questions : [],
+      // 0.2.1 `mode: timed` asks carry {callId, timed}: the browser needs them to
+      // attach the card to its call and to run the local countdown.
+      ...(request.wait === undefined ? {} : { wait: request.wait }),
     }, request.signal)
     // A withdrawn question is an aborted ask: the service maps the rejection to
     // its own aborted-question error because the request signal is aborted.
