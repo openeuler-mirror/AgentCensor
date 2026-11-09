@@ -1,0 +1,699 @@
+{
+  "patterns": [
+    {
+      "name": "email",
+      "entity_type": "EMAIL_ADDRESS",
+      "expression": "(?a:(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?(?:\\.[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+(?![A-Z0-9-]))",
+      "score": 0.9,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "china_mobile",
+      "entity_type": "PHONE_NUMBER",
+      "expression": "(?<![0-9A-Za-z])(?:(?:\\+?86|0086)[ -]?)?1[3-9][0-9](?:[ -]?[0-9]{4}){2}(?![0-9])",
+      "score": 0.8,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "china_id_format",
+      "entity_type": "CHINA_ID",
+      "expression": "(?<![A-Za-z0-9])(?:[0-9]{6}[ \\t]+[0-9]{8}[ \\t]+[0-9]{3}[0-9Xx]|[0-9]{17}[0-9Xx])(?![0-9A-Za-z])",
+      "score": 0.6,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "bank_card_luhn",
+      "entity_type": "CREDIT_CARD",
+      "expression": "(?<![A-Za-z0-9])[0-9](?:[ -]?[0-9]){12,18}(?![A-Za-z0-9]|[ -][0-9])",
+      "score": 0.8,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "china_landline",
+      "entity_type": "PHONE_NUMBER",
+      "expression": "(?<![0-9])(?:\\+86[ -]?)?(?:0[0-9]{2,3}[ -]|\\(0[0-9]{2,3}\\)[ -]?)[0-9]{7,8}(?:[ -](?:转|ext\\.?)[ -]?[0-9]{1,6})?(?![0-9])",
+      "score": 0.8,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "international_phone",
+      "entity_type": "PHONE_NUMBER",
+      "expression": "(?<![A-Za-z0-9])\\+[1-9][0-9]{0,2}[ -](?:\\([0-9]{1,4}\\)|[0-9]{1,4})(?:[ -][0-9]{2,4}){1,4}(?![0-9])",
+      "score": 0.7,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "international_phone_compact",
+      "entity_type": "PHONE_NUMBER",
+      "expression": "(?<![A-Za-z0-9])\\+[1-9][0-9]{7,14}(?![0-9])",
+      "score": 0.7,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "secret_prefix",
+      "entity_type": "SECRET",
+      "expression": "(?<![A-Za-z0-9])(?:sk|pk|api|token|key|secret|bearer)[-_][A-Za-z0-9_-]{8,}",
+      "score": 0.95,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "private_key",
+      "entity_type": "SECRET",
+      "expression": "-----BEGIN (?P<kind>(?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY)-----[\\s\\S]*?(?:-----END (?P=kind)-----|\\Z)",
+      "score": 0.99,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "aws_access_key",
+      "entity_type": "SECRET",
+      "expression": "(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Za-z0-9])",
+      "score": 0.95,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "github_token",
+      "entity_type": "SECRET",
+      "expression": "(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})(?![A-Za-z0-9])",
+      "score": 0.95,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "jwt",
+      "entity_type": "SECRET",
+      "expression": "(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+(?![A-Za-z0-9_-])",
+      "score": 0.9,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "money_prefix",
+      "entity_type": "MONEY",
+      "expression": "(?<![A-Za-z])(?:人民币|美元|欧元|英镑|日元|港币|CNY|RMB|USD|EUR|GBP|JPY|HKD|AUD|CAD|CHF|[￥¥$€£])\\s*[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?:万|亿|[kKmM])?(?![0-9])",
+      "score": 0.85,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "money_suffix",
+      "entity_type": "MONEY",
+      "expression": "(?<![A-Za-z0-9_.])[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\s*(?:万|亿)?(?:元|人民币|美元|欧元|英镑|日元|港币|CNY|RMB|USD|EUR|GBP|JPY|HKD)(?![A-Za-z])",
+      "score": 0.85,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "date",
+      "entity_type": "DATE_TIME",
+      "expression": "(?<![0-9])[0-9]{4}(?:[-/][0-9]{1,2}[-/][0-9]{1,2}|年[0-9]{1,2}月[0-9]{1,2}日?)(?:[T ][0-9]{1,2}:[0-9]{2}(?::[0-9]{2}(?:\\.[0-9]+)?)?(?:Z|[+-][0-9]{2}:?[0-9]{2})?)?(?![0-9])",
+      "score": 0.75,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "month_day",
+      "entity_type": "DATE_TIME",
+      "expression": "(?<![0-9])[0-9]{1,2}月[0-9]{1,2}日(?![0-9])",
+      "score": 0.7,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "clock_time",
+      "entity_type": "DATE_TIME",
+      "expression": "(?<![0-9:])[0-2]?[0-9]:[0-5][0-9](?::[0-5][0-9])?(?![0-9:])",
+      "score": 0.65,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "ipv4",
+      "entity_type": "IP_ADDRESS",
+      "expression": "(?<![0-9.])(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?![0-9.])",
+      "score": 0.6,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "mac",
+      "entity_type": "MAC_ADDRESS",
+      "expression": "(?<![0-9A-F])(?:[0-9A-F]{2}:){5}[0-9A-F]{2}(?![0-9A-F])",
+      "score": 0.8,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "ipv6",
+      "entity_type": "IP_ADDRESS",
+      "expression": "(?<![A-Za-z0-9:])(?:[0-9A-F]{0,4}:){2,7}[0-9A-F]{0,4}(?![A-Za-z0-9:])",
+      "score": 0.75,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "number",
+      "entity_type": "NUMBER",
+      "expression": "(?<![A-Za-z0-9_.])[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?![0-9]|\\.[0-9])",
+      "score": 0.4,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "mainland_plate",
+      "entity_type": "LICENSE_PLATE",
+      "expression": "(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][ ·]?(?:[DF][A-HJ-NP-Z0-9][0-9]{4}|[0-9]{5}[DF]|[A-HJ-NP-Z0-9]{5})(?![A-Za-z0-9挂学警港澳领使])",
+      "score": 0.85,
+      "group": 0,
+      "evidence": []
+    },
+    {
+      "name": "structured_address",
+      "entity_type": "ADDRESS",
+      "expression": "(?P<value>(?:(?:北京|上海|天津|重庆)市|(?:(?:河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海)省|(?:内蒙古|广西壮族|西藏|宁夏回族|新疆维吾尔)自治区)(?:[\\u3400-\\u9fff]{2,12}?(?:市|自治州|地区))?)(?:[\\u3400-\\u9fff]{1,12}?(?:区|县|旗))?(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+      "score": 0.85,
+      "group": "value",
+      "evidence": [
+        "address_structure"
+      ]
+    },
+    {
+      "name": "cued_address",
+      "entity_type": "ADDRESS",
+      "expression": "(?:寄到|送到|寄往|送往|地址[ \\t]*(?:[:：]|是|为)?)[ \\t]*(?P<value>[\\u3400-\\u9fff]{2,32}?[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+      "score": 0.85,
+      "group": "value",
+      "evidence": [
+        "address_structure"
+      ]
+    },
+    {
+      "name": "short_address",
+      "entity_type": "ADDRESS",
+      "expression": "(?:住在|位于|在)[ \\t]*(?P<value>(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+      "score": 0.85,
+      "group": "value",
+      "evidence": [
+        "address_structure"
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "pattern": {
+        "name": "labelled_password",
+        "entity_type": "PASSWORD",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:passphrase|passwords|password|passcode|pin[ \\t_-]*code|passwd|pwd|pin)(?![A-Za-z0-9_])|(?:个人识别码|通行口令|通行码|解锁码|密码|口令))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"(?:[^\"\\\\\\r\\n]|\\\\[^\\r\\n])+\"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])+'|[^\\s\"'`,，;；。}\\]\\)<>&]+(?:[ \\t]+(?!(?:[\\w.-]{1,64}[\"']?[ \\t]*[:：=]|(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|primary[ \\t_-]*account[ \\t_-]*number|social[ \\t_-]*security[ \\t_-]*number|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|payment[ \\t_-]*card[ \\t_-]*number|residential[ \\t_-]*address|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|credit[ \\t_-]*card[ \\t_-]*number|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|debit[ \\t_-]*card[ \\t_-]*number|login[ \\t_-]*credential|auth[ \\t_-]*credentials|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|shipping[ \\t_-]*address|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|mailing[ \\t_-]*address|medical[ \\t_-]*history|passport[ \\t_-]*number|encryption[ \\t_-]*key|security[ \\t_-]*token|credit[ \\t_-]*card[ \\t_-]*no|medical[ \\t_-]*record|account[ \\t_-]*number|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|license[ \\t_-]*plate|customer[ \\t_-]*name|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|payment[ \\t_-]*card|number[ \\t_-]*plate|contact[ \\t_-]*name|patient[ \\t_-]*name|home[ \\t_-]*address|organization|organisation|bank[ \\t_-]*account|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|credit[ \\t_-]*card|card[ \\t_-]*number|test[ \\t_-]*result|passport[ \\t_-]*no|passphrase|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|debit[ \\t_-]*card|mastercard|medication|account[ \\t_-]*id|account[ \\t_-]*no|passwords|api[ \\t_-]*token|bank[ \\t_-]*card|full[ \\t_-]*name|diagnosis|password|passcode|pin[ \\t_-]*code|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|unionpay|china[ \\t_-]*id|employer|passport|api[ \\t_-]*key|secrets|card[ \\t_-]*no|address|company|balance|account|passwd|secret|tokens|salary|amount|token|bonus|price|card|visa|amex|name|iban|pwd|pin|pan|ssn)(?![A-Za-z0-9_])|(?:个人识别码|信用卡号码|身份证号码|居民身份证|新能源车牌|社会安全号|通行口令|访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|身份证号|车牌号码|患者姓名|员工姓名|客户姓名|家庭住址|收货地址|联系地址|通讯地址|通信地址|居住地址|邮寄地址|检查结果|诊疗记录|既往病史|工作单位|银行账号|银行账户|账户号码|护照号码|证件号码|通行码|解锁码|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|身份证|车牌号|联系人|收件人|护照号|证件号|密码|口令|密钥|秘钥|私钥|令牌|凭据|凭证|卡号|车牌|牌照|姓名|住址|地址|诊断|疾病|病史|病历|用药|公司|单位|机构|组织|雇主|工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪|账号|账户))[\"']?[ \\t]*[:：=]))[^\\s\"'`,，;；。}\\]\\)<>&]+)*)",
+        "score": 0.95,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "china_id_checksum",
+        "entity_type": "CHINA_ID",
+        "expression": "(?<![0-9])[1-9][0-9]{5}(?:19|20)[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx](?![0-9A-Za-z])",
+        "score": 0.99,
+        "group": 0,
+        "evidence": []
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_china_id",
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "bank_card",
+        "entity_type": "CREDIT_CARD",
+        "expression": "(?<![A-Za-z0-9])[0-9](?:[ -]?[0-9]){12,18}(?![A-Za-z0-9]|[ -][0-9])",
+        "score": 0.8,
+        "group": 0,
+        "evidence": []
+      },
+      "context": "(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))",
+      "context_window": 32,
+      "validator": "valid_credit_card",
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_card",
+        "entity_type": "CREDIT_CARD",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[0-9](?:[ -]?[0-9]){0,31})(?![0-9])",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_credit_card",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "cued_card",
+        "entity_type": "CREDIT_CARD",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))[\"']?[ \\t]*(?:[:：=]|是|为|发你了|发给你了)?[ \\t]*[\"']?(?P<value>[0-9](?:[ -]?[0-9]){12,18})(?![A-Za-z0-9]|[ -][0-9])",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_credit_card",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "suffix_card",
+        "entity_type": "CREDIT_CARD",
+        "expression": "(?<![A-Za-z0-9])(?P<value>[0-9](?:[ -]?[0-9]){12,18})(?![A-Za-z0-9]|[ -][0-9])[ \\t]*(?:[\\u3400-\\u9fff]{2,5}的)?(?:(?<![A-Za-z0-9_])(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))(?![ \\t]*(?:[:：=]|是|为)?[ \\t]*[\"']?[A-Za-z0-9])",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_credit_card",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "transfer_card",
+        "entity_type": "CREDIT_CARD",
+        "expression": "(?:转账|打款|汇款|打钱)(?:到|至|给)[ \\t]*(?:[\\u3400-\\u9fff]{2,5}的)?卡[ \\t]*(?P<value>[0-9](?:[ -]?[0-9]){12,18})(?![A-Za-z0-9]|[ -][0-9])",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_credit_card",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_china_id",
+        "entity_type": "CHINA_ID",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:china[ \\t_-]*id)(?![A-Za-z0-9_])|(?:身份证号码|居民身份证|身份证号|身份证))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>(?:[0-9]{6}[ \\t]+[0-9]{8}[ \\t]+[0-9]{3}[0-9Xx]|[0-9]{17}[0-9Xx])|[0-9][0-9Xx]{5,31}(?![ \\t]+[0-9]))(?![A-Za-z0-9])",
+        "score": 0.99,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_china_id",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "cued_china_id",
+        "entity_type": "CHINA_ID",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:china[ \\t_-]*id)(?![A-Za-z0-9_])|(?:身份证号码|居民身份证|身份证号|身份证))[\"']?[ \\t]*(?:[:：=]|是|为|发你了|发给你了)?[ \\t]*[\"']?(?P<value>(?:[0-9]{6}[ \\t]+[0-9]{8}[ \\t]+[0-9]{3}[0-9Xx]|[0-9]{17}[0-9Xx]))(?![A-Za-z0-9])",
+        "score": 0.99,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_china_id",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "cued_passport",
+        "entity_type": "ID_NUMBER",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:social[ \\t_-]*security[ \\t_-]*number|passport[ \\t_-]*number|passport[ \\t_-]*no|passport|ssn)(?![A-Za-z0-9_])|(?:社会安全号|护照号码|证件号码|护照号|证件号|护照))[\"']?[ \\t]*(?:[:：=]|是|为|发你了|发给你了)?[ \\t]*[\"']?(?P<value>(?:[EG][0-9]{8}|E[A-HJ-NP-Z][0-9]{7}))(?![A-Za-z0-9])",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "field",
+          "passport_format"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_passport",
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "mainland_plate",
+        "entity_type": "LICENSE_PLATE",
+        "expression": "(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][ ·]?(?:[DF][A-HJ-NP-Z0-9][0-9]{4}|[0-9]{5}[DF]|[A-HJ-NP-Z0-9]{5})(?![A-Za-z0-9挂学警港澳领使])",
+        "score": 0.9,
+        "group": 0,
+        "evidence": []
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_plate",
+        "entity_type": "LICENSE_PLATE",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:license[ \\t_-]*plate|number[ \\t_-]*plate)(?![A-Za-z0-9_])|(?:新能源车牌|车牌号码|车牌号|车牌|牌照))[\"']?[ \\t]*(?:[:：=]|是|为)?[ \\t]*[\"']?(?P<value>(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Z][ ·]?[A-Z0-9]{5,6}(?![A-Za-z0-9挂学警港澳领使]))",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "plate_context"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_license_plate",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "vehicle_plate",
+        "entity_type": "LICENSE_PLATE",
+        "expression": "(?:车辆|车子|车号|停车场)[\"']?[ \\t]*(?:[:：=]|是|为)?[ \\t]*[\"']?(?P<value>(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Z][ ·]?[A-Z0-9]{5,6}(?![A-Za-z0-9挂学警港澳领使]))",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "plate_context"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_license_plate",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "suffixed_plate",
+        "entity_type": "LICENSE_PLATE",
+        "expression": "(?P<value>(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-Z][ ·]?[A-Z0-9]{5,6}(?![A-Za-z0-9挂学警港澳领使]))(?=[ \\t]*(?:这[辆个]车|的车牌|的牌照))",
+        "score": 0.9,
+        "group": "value",
+        "evidence": [
+          "plate_context"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": "valid_license_plate",
+      "failure_score": 0.6,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "structured_address",
+        "entity_type": "ADDRESS",
+        "expression": "(?P<value>(?:(?:北京|上海|天津|重庆)市|(?:(?:河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海)省|(?:内蒙古|广西壮族|西藏|宁夏回族|新疆维吾尔)自治区)(?:[\\u3400-\\u9fff]{2,12}?(?:市|自治州|地区))?)(?:[\\u3400-\\u9fff]{1,12}?(?:区|县|旗))?(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "address_structure"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "cued_address",
+        "entity_type": "ADDRESS",
+        "expression": "(?:寄到|送到|寄往|送往|地址[ \\t]*(?:[:：]|是|为)?)[ \\t]*(?P<value>[\\u3400-\\u9fff]{2,32}?[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "address_structure"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "short_address",
+        "entity_type": "ADDRESS",
+        "expression": "(?:住在|位于|在)[ \\t]*(?P<value>(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "address_structure"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "secret_assignment",
+        "entity_type": "SECRET",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|tokens|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"(?:[^\"\\\\\\r\\n]|\\\\[^\\r\\n])+\"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])+'|[^\\s\"'`,，;；。}\\]\\)<>&]+)",
+        "score": 0.95,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "authorization",
+        "entity_type": "SECRET",
+        "expression": "\\b(?:authorization|proxy-authorization)[\"']?\\s*[:：=]\\s*[\"']?(?:Bearer|Basic|Token)\\s+(?P<value>[^\\s\"',，;；。}\\]<>&]+)",
+        "score": 0.99,
+        "group": "value",
+        "evidence": []
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "bearer_token",
+        "entity_type": "SECRET",
+        "expression": "\\bBearer\\s+(?P<value>[^\\s\"',，;；。}\\]<>&]+)",
+        "score": 0.95,
+        "group": "value",
+        "evidence": []
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_person",
+        "entity_type": "PERSON",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name|name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[\\u3400-\\u9fff·]{2,12}|[A-Za-z][A-Za-z.'’-]*(?:[ \\t]+[A-Za-z][A-Za-z.'’-]*){0,4})",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_money",
+        "entity_type": "MONEY",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:balance|salary|amount|bonus|price)(?![A-Za-z0-9_])|(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪))[\"']?\\s*[:：=]?\\s*[\"']?(?P<value>[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?:万|亿|[kKmM])?)(?![0-9])",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_address",
+        "entity_type": "ADDRESS",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:residential[ \\t_-]*address|shipping[ \\t_-]*address|mailing[ \\t_-]*address|home[ \\t_-]*address|address)(?![A-Za-z0-9_])|(?:家庭住址|收货地址|联系地址|通讯地址|通信地址|居住地址|邮寄地址|住址|地址))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"(?:[^\"\\\\\\r\\n]|\\\\[^\\r\\n])+\"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])+'|(?:(?!(?:[,， \\t]+[\\w.-]{1,64}[\"']?[ \\t]*[:：=]|(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|primary[ \\t_-]*account[ \\t_-]*number|social[ \\t_-]*security[ \\t_-]*number|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|payment[ \\t_-]*card[ \\t_-]*number|residential[ \\t_-]*address|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|credit[ \\t_-]*card[ \\t_-]*number|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|debit[ \\t_-]*card[ \\t_-]*number|login[ \\t_-]*credential|auth[ \\t_-]*credentials|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|shipping[ \\t_-]*address|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|mailing[ \\t_-]*address|medical[ \\t_-]*history|passport[ \\t_-]*number|encryption[ \\t_-]*key|security[ \\t_-]*token|credit[ \\t_-]*card[ \\t_-]*no|medical[ \\t_-]*record|account[ \\t_-]*number|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|license[ \\t_-]*plate|customer[ \\t_-]*name|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|payment[ \\t_-]*card|number[ \\t_-]*plate|contact[ \\t_-]*name|patient[ \\t_-]*name|home[ \\t_-]*address|organization|organisation|bank[ \\t_-]*account|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|credit[ \\t_-]*card|card[ \\t_-]*number|test[ \\t_-]*result|passport[ \\t_-]*no|passphrase|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|debit[ \\t_-]*card|mastercard|medication|account[ \\t_-]*id|account[ \\t_-]*no|passwords|api[ \\t_-]*token|bank[ \\t_-]*card|full[ \\t_-]*name|diagnosis|password|passcode|pin[ \\t_-]*code|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|unionpay|china[ \\t_-]*id|employer|passport|api[ \\t_-]*key|secrets|card[ \\t_-]*no|address|company|balance|account|passwd|secret|tokens|salary|amount|token|bonus|price|phone|email|card|visa|amex|name|iban|note|pwd|pin|pan|ssn)(?![A-Za-z0-9_])|(?:个人识别码|信用卡号码|身份证号码|居民身份证|新能源车牌|社会安全号|通行口令|访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|身份证号|车牌号码|患者姓名|员工姓名|客户姓名|家庭住址|收货地址|联系地址|通讯地址|通信地址|居住地址|邮寄地址|检查结果|诊疗记录|既往病史|工作单位|银行账号|银行账户|账户号码|护照号码|证件号码|通行码|解锁码|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|身份证|车牌号|联系人|收件人|护照号|证件号|手机号|密码|口令|密钥|秘钥|私钥|令牌|凭据|凭证|卡号|车牌|牌照|姓名|住址|地址|诊断|疾病|病史|病历|用药|公司|单位|机构|组织|雇主|工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪|账号|账户|电话|手机|邮箱|备注))[\"']?[ \\t]*[:：=]|[,， \\t]+(?:联系人|收件人|联系电话|电话|手机号|手机|邮箱)(?=[\\u3400-\\u9fff0-9])))[^\\r\\n;；。!?！？}\\]])+)",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "url_credentials",
+        "entity_type": "SECRET",
+        "expression": "\\b[a-z][a-z0-9+.-]*://(?P<value>[^\\s/@:]+:[^\\s/@]+)@",
+        "score": 0.95,
+        "group": "value",
+        "evidence": []
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_medical",
+        "entity_type": "MEDICAL_INFO",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:medical[ \\t_-]*history|medical[ \\t_-]*record|test[ \\t_-]*result|medication|diagnosis)(?![A-Za-z0-9_])|(?:检查结果|诊疗记录|既往病史|诊断|疾病|病史|病历|用药))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"[^\"\\r\\n]+\"|'[^'\\r\\n]+'|[^\\r\\n;；。]+)",
+        "score": 0.8,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_organization",
+        "entity_type": "ORGANIZATION",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|单位|机构|组织|雇主))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"[^\"\\r\\n]+\"|'[^'\\r\\n]+'|[^\\r\\n,，;；。]+)",
+        "score": 0.8,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_account",
+        "entity_type": "ACCOUNT",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:account[ \\t_-]*number|bank[ \\t_-]*account|account[ \\t_-]*id|account[ \\t_-]*no|account|iban)(?![A-Za-z0-9_])|(?:银行账号|银行账户|账户号码|账号|账户))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[A-Za-z0-9][A-Za-z0-9-]{2,33})",
+        "score": 0.8,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    },
+    {
+      "pattern": {
+        "name": "labelled_id",
+        "entity_type": "ID_NUMBER",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:social[ \\t_-]*security[ \\t_-]*number|passport[ \\t_-]*number|passport[ \\t_-]*no|passport|ssn)(?![A-Za-z0-9_])|(?:社会安全号|护照号码|证件号码|护照号|证件号))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[A-Za-z0-9][A-Za-z0-9-]{3,24})(?![A-Za-z0-9]|[ \\t]+[0-9])",
+        "score": 0.85,
+        "group": "value",
+        "evidence": [
+          "field"
+        ]
+      },
+      "context": null,
+      "context_window": 32,
+      "validator": null,
+      "failure_score": null,
+      "failure_entity_type": null
+    }
+  ],
+  "fields": {
+    "PASSWORD": "(?:(?<![A-Za-z0-9_])(?:passphrase|passwords|password|passcode|pin[ \\t_-]*code|passwd|pwd|pin)(?![A-Za-z0-9_])|(?:个人识别码|通行口令|通行码|解锁码|密码|口令))",
+    "SECRET": "(?:(?<![A-Za-z0-9_])(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|tokens|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))",
+    "CREDIT_CARD": "(?:(?<![A-Za-z0-9_])(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))",
+    "CHINA_ID": "(?:(?<![A-Za-z0-9_])(?:china[ \\t_-]*id)(?![A-Za-z0-9_])|(?:身份证号码|居民身份证|身份证号|身份证))",
+    "LICENSE_PLATE": "(?:(?<![A-Za-z0-9_])(?:license[ \\t_-]*plate|number[ \\t_-]*plate)(?![A-Za-z0-9_])|(?:新能源车牌|车牌号码|车牌号|车牌|牌照))",
+    "PERSON": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name|name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))",
+    "ADDRESS": "(?:(?<![A-Za-z0-9_])(?:residential[ \\t_-]*address|shipping[ \\t_-]*address|mailing[ \\t_-]*address|home[ \\t_-]*address|address)(?![A-Za-z0-9_])|(?:家庭住址|收货地址|联系地址|通讯地址|通信地址|居住地址|邮寄地址|住址|地址))",
+    "MEDICAL_INFO": "(?:(?<![A-Za-z0-9_])(?:medical[ \\t_-]*history|medical[ \\t_-]*record|test[ \\t_-]*result|medication|diagnosis)(?![A-Za-z0-9_])|(?:检查结果|诊疗记录|既往病史|诊断|疾病|病史|病历|用药))",
+    "ORGANIZATION": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|单位|机构|组织|雇主))",
+    "MONEY": "(?:(?<![A-Za-z0-9_])(?:balance|salary|amount|bonus|price)(?![A-Za-z0-9_])|(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪))",
+    "ACCOUNT": "(?:(?<![A-Za-z0-9_])(?:account[ \\t_-]*number|bank[ \\t_-]*account|account[ \\t_-]*id|account[ \\t_-]*no|account|iban)(?![A-Za-z0-9_])|(?:银行账号|银行账户|账户号码|账号|账户))",
+    "ID_NUMBER": "(?:(?<![A-Za-z0-9_])(?:social[ \\t_-]*security[ \\t_-]*number|passport[ \\t_-]*number|passport[ \\t_-]*no|passport|ssn)(?![A-Za-z0-9_])|(?:社会安全号|护照号码|证件号码|护照号|证件号))"
+  },
+  "addresses": [
+    "(?P<value>(?:(?:北京|上海|天津|重庆)市|(?:(?:河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海)省|(?:内蒙古|广西壮族|西藏|宁夏回族|新疆维吾尔)自治区)(?:[\\u3400-\\u9fff]{2,12}?(?:市|自治州|地区))?)(?:[\\u3400-\\u9fff]{1,12}?(?:区|县|旗))?(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+    "(?:寄到|送到|寄往|送往|地址[ \\t]*(?:[:：]|是|为)?)[ \\t]*(?P<value>[\\u3400-\\u9fff]{2,32}?[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)",
+    "(?:住在|位于|在)[ \\t]*(?P<value>(?:[\\u3400-\\u9fff]{1,16}?(?:街道|镇|乡))?[\\u3400-\\u9fff]{1,24}?(?:大道|大街|路|街|巷|弄)[0-9一二三四五六七八九十百零〇-]+号(?:院)?(?:[ \\t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:号楼|栋|幢|座|单元|楼|层|室|户|弄))*)"
+  ],
+  "plate": "(?<![A-Za-z0-9])[京津沪渝冀豫云辽黑湘皖鲁新苏浙赣鄂桂甘晋蒙陕吉闽贵粤青藏川宁琼][A-HJ-NP-Z][ ·]?(?:[DF][A-HJ-NP-Z0-9][0-9]{4}|[0-9]{5}[DF]|[A-HJ-NP-Z0-9]{5})(?![A-Za-z0-9挂学警港澳领使])",
+  "number": "[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?",
+  "passport": "(?:[EG][0-9]{8}|E[A-HJ-NP-Z][0-9]{7})"
+}
