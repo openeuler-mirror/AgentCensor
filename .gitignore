@@ -7,8 +7,9 @@ CLAUDE.md
 .codex/
 .codex
 .agents/
+.aws
 .workbuddy
-
+AGENTS.md
 # Build outputs and dependency caches (all components)
 target/
 dist/

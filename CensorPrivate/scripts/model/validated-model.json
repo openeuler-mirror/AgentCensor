@@ -1,0 +1,50 @@
+{
+  "model_id": "shibing624/bert4ner-base-chinese",
+  "source_url": "https://huggingface.co/shibing624/bert4ner-base-chinese",
+  "source_revision": "5d660ed2aa9da482bf2d99c6bc8cf2ce66758f6a",
+  "source_revision_note": "Recovered from local Hugging Face download metadata; all five hashed source files share this revision.",
+  "source_sha256": {
+    "config.json": "c5b24a4a4b825b01ebe7b101b80826091a5a03b688383d9261a60964747778df",
+    "tokenizer_config.json": "b3f04f2616f87193e161c6bdaede772e16e2f4672ad3d9f60a0861e5be9e474e",
+    "special_tokens_map.json": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
+    "vocab.txt": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+    "model.safetensors": "1d2f0ea479431c1907bbaa75f872c26267ce3c19ea78e4266980b0d49b5a825a"
+  },
+  "validated_manifest": {
+    "model_id": "shibing624/bert4ner-base-chinese",
+    "precision": "float32",
+    "max_length": 512,
+    "stride": 64,
+    "labels": [
+      "I-ORG",
+      "B-LOC",
+      "O",
+      "B-ORG",
+      "I-LOC",
+      "I-PER",
+      "B-TIME",
+      "I-TIME",
+      "B-PER"
+    ],
+    "sha256": {
+      "model.onnx": "fbbde7cf3b3ab18d3f643a9f614438db8ced21adb6d408c43ef2d8f5ec3aa07b",
+      "tokenizer.json": "e772e5fead29ba73cc246dc3f35ff14a844d9919a7dec1821360bdc4b6677352",
+      "config.json": "13c9922e3e69643db2bf9462beb56956a0ecfcb4e2ad6ee1118a8fa6e98a3671"
+    }
+  },
+  "export_validation": {
+    "windows": 63,
+    "token_labels_identical": true,
+    "max_logit_error": 9.775161743164062e-06,
+    "max_probability_error": 2.2649765014648438e-06,
+    "torch": "2.14.1+cpu",
+    "onnx": "1.23.2",
+    "onnxruntime": "1.31.1"
+  },
+  "python": "3.11.6",
+  "transformers": "5.21.0",
+  "tokenizers": "0.23.3",
+  "numpy": "2.4.6",
+  "corpus": "tests/fixtures/native-detector-reference.jsonl",
+  "corpus_sha256": "03cdcb8999d8175eb53ff90e6f77250db5e32ee2a55a0423b55fb134a76a3858"
+}

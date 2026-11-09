@@ -19,3 +19,13 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
+
+# Local migration references; model build tools and regression tests stay versioned.
+/offline/
+
+# Downloaded source weights and exported model bundles.
+/models/
+
+# documents.
+/docs/validation.md

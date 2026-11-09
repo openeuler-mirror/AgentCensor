@@ -1,0 +1,4 @@
+Model: shibing624/bert4ner-base-chinese, by shibing624 (Apache-2.0).
+Source: https://huggingface.co/shibing624/bert4ner-base-chinese
+Revision: 5d660ed2aa9da482bf2d99c6bc8cf2ce66758f6a
+Changes: export unchanged weights to FP32 ONNX, opset 17.
