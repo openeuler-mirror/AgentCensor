@@ -712,3 +712,354 @@ impl Rules {
         Ok(output)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn structural_reference_requires_no_python_or_model() {
+        let rules = Rules::new().unwrap();
+        let mut checked = 0;
+        for line in include_str!("../../tests/fixtures/native-detector-reference.jsonl").lines() {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row["request"]["structural"] != true {
+                continue;
+            }
+            let text = row["request"]["text"].as_str().unwrap().to_owned();
+            row["request"].as_object_mut().unwrap().remove("text");
+            let options: AnalyzeOptions = serde_json::from_value(row["request"].clone()).unwrap();
+            let actual = rules.analyze(&text, &options, None).unwrap();
+            let mut actual = serde_json::to_value(actual).unwrap();
+            let expected = &mut row["results"];
+            for values in [&mut actual, expected] {
+                for item in values.as_array_mut().unwrap() {
+                    for key in ["sources", "evidence"] {
+                        item[key]
+                            .as_array_mut()
+                            .unwrap()
+                            .sort_by_key(|v| v.as_str().unwrap().to_owned());
+                    }
+                }
+            }
+            assert_eq!(actual, row["results"], "structural oracle row {checked}");
+            checked += 1;
+        }
+        assert_eq!(checked, 25);
+    }
+    #[test]
+    fn bundled_rules_compile() {
+        assert!(Rules::new().is_ok());
+    }
+    #[test]
+    fn validation_checks() {
+        assert!(china_id("11010519491231002X"));
+        assert!(china_id("110105 19491231 002X"));
+        assert!(china_id("110105\t19491231\t002X"));
+        assert!(!china_id("1101 0519491231002X"));
+        assert!(!china_id(" 110105 19491231 002X"));
+        assert!(!china_id("110105194912310021"));
+        assert!(!china_id("11010519990230002X"));
+        assert!(!china_id("11010500000101001X")); // Valid checksum, invalid year.
+        assert!(credit_card("4111 1111 1111 1111"));
+        assert!(!credit_card("0000000000000000"));
+    }
+
+    fn structural(text: &str) -> Vec<Prediction> {
+        static RULES: std::sync::LazyLock<Rules> =
+            std::sync::LazyLock::new(|| Rules::new().unwrap());
+        RULES
+            .analyze(
+                text,
+                &AnalyzeOptions {
+                    structural: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn typed_cards_ids_and_passports_preserve_complete_values() {
+        for (text, kind, value, validation, score) in [
+            (
+                "还款卡号4111111111111112；普通数量42",
+                "ACCOUNT",
+                "4111111111111112",
+                "failed",
+                0.6,
+            ),
+            (
+                "转账到张三的卡 4111111111111112",
+                "ACCOUNT",
+                "4111111111111112",
+                "failed",
+                0.6,
+            ),
+            (
+                "4111111111111112 张三的银行卡",
+                "ACCOUNT",
+                "4111111111111112",
+                "failed",
+                0.6,
+            ),
+            (
+                "4111 1111 1111 1111",
+                "ACCOUNT",
+                "4111 1111 1111 1111",
+                "passed",
+                0.8,
+            ),
+            (
+                "🛡️身份证号110105 19491231 002X",
+                "ID",
+                "110105 19491231 002X",
+                "passed",
+                0.99,
+            ),
+            (
+                "身份证：110105 19491231 0021",
+                "ID",
+                "110105 19491231 0021",
+                "failed",
+                0.6,
+            ),
+            ("护照E12345678", "ID", "E12345678", "passed", 0.85),
+            ("护照发你了 EA1234567", "ID", "EA1234567", "passed", 0.85),
+            (
+                "passport number: EB1234567",
+                "ID",
+                "EB1234567",
+                "passed",
+                0.85,
+            ),
+        ] {
+            let results = structural(text);
+            let found: Vec<_> = results.iter().filter(|p| p.entity_type == kind).collect();
+            assert_eq!(found.len(), 1, "{text}");
+            let p = found[0];
+            assert_eq!(
+                (&text[p.start..p.end], p.validation.as_str(), p.score),
+                (value, validation, score),
+                "{text}"
+            );
+        }
+        for text in [
+            "库存4111111111111112",
+            "信用卡不是4111111111111112",
+            "银行卡\n4111111111111112",
+            "护照E123456789",
+            "护照EI1234567",
+            "订单E12345678",
+        ] {
+            assert!(
+                structural(text)
+                    .iter()
+                    .all(|p| !["ID", "ACCOUNT"].contains(&p.entity_type.as_str())),
+                "{text}"
+            );
+        }
+        // A generic ID field must not create a truncated second candidate.
+        let text = "证件号码：110105 19491231 002X";
+        let results = structural(text);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            &text[results[0].start..results[0].end],
+            "110105 19491231 002X"
+        );
+        assert_eq!(results[0].validation, "passed");
+    }
+
+    #[test]
+    fn plate_context_protects_typos_without_validating_them() {
+        for value in [
+            "京A12345",
+            "粤B12C34",
+            "沪AD12345",
+            "粤B12345F",
+            "浙A·12345",
+            "苏A d12345",
+        ] {
+            let results = structural(value);
+            let p = results
+                .iter()
+                .find(|p| p.entity_type == "LICENSE_PLATE")
+                .unwrap();
+            assert_eq!(
+                (&value[p.start..p.end], p.validation.as_str(), p.score),
+                (value, "passed", 0.9)
+            );
+        }
+        for (text, value) in [
+            ("🛡️车牌号码：\"京A12I45\"，电话13800138000", "京A12I45"),
+            ("名下车辆京AABCDE", "京AABCDE"),
+            ("京A12I45这个车剐蹭了", "京A12I45"),
+        ] {
+            let results = structural(text);
+            let found: Vec<_> = results
+                .iter()
+                .filter(|p| p.entity_type == "LICENSE_PLATE")
+                .collect();
+            assert_eq!(found.len(), 1);
+            let p = found[0];
+            assert_eq!(
+                (&text[p.start..p.end], p.validation.as_str(), p.score),
+                (value, "failed", 0.6)
+            );
+            assert!(p.evidence.iter().any(|e| e == "plate_context"));
+        }
+        for text in [
+            "京AABCDE",
+            "产品编号京AABCDE",
+            "车牌待登记；产品编号京AABCDE",
+            "车牌号京AABCDE123",
+            "京A12345警",
+            "车牌不是京AABCDE",
+            "京AABCDE；这辆车暂未登记",
+        ] {
+            assert!(
+                structural(text)
+                    .iter()
+                    .all(|p| p.entity_type != "LICENSE_PLATE"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn addresses_stop_before_following_contact_fields() {
+        for (prefix, address, suffix) in [
+            (
+                "收货地址：",
+                "北京市海淀区中关村大街27号2号楼3单元301室",
+                "，联系人：张三，电话：13800138000。",
+            ),
+            (
+                "配送地址：",
+                "广东省广州市荔湾区人民路68号27栋1442室",
+                "，联系人张三（13800138000）",
+            ),
+            (
+                "地址：",
+                "杭州市西湖区文三路90号1单元301室",
+                "电话：13800138000",
+            ),
+            ("外卖送到", "海淀南京东路73号", " 联系张三13800138000"),
+            ("地址", "南山中关村117号", " 联系张三13800138000"),
+            ("我住在", "天河西溪路187号", " 联系张三13800138000"),
+            ("寄到", "东城文昌巷8号2栋301室", " 联系张三13800138000"),
+            (
+                "address: \"",
+                "123 Example Street, London",
+                "\" phone: 13800138000",
+            ),
+        ] {
+            let text = format!("🛡️{prefix}{address}{suffix}");
+            let results = structural(&text);
+            let addresses: Vec<_> = results
+                .iter()
+                .filter(|p| p.entity_type == "ADDRESS")
+                .map(|p| &text[p.start..p.end])
+                .collect();
+            assert_eq!(addresses, [address], "{text}");
+        }
+        for text in [
+            "我在会议室3号开会",
+            "现在任务42个",
+            "地址待登记；计划42号任务",
+        ] {
+            assert!(
+                structural(text).iter().all(|p| p.entity_type != "ADDRESS"),
+                "{text}"
+            );
+        }
+    }
+
+    fn candidate(kind: &str, start: usize, end: usize) -> Prediction {
+        Prediction {
+            entity_type: kind.into(),
+            start,
+            end,
+            score: 0.9,
+            sources: vec!["ner".into()],
+            validation: "not_checked".into(),
+            evidence: vec!["ner".into()],
+            unit: None,
+        }
+    }
+
+    #[test]
+    fn ner_context_rejects_mailbox_names_and_completes_addresses() {
+        let rules = Rules::new().unwrap();
+        let text = "张三的邮箱 alice@example.com";
+        assert!(rules
+            .process(text, candidate("PERSON", 0, "张三".len()), None)
+            .unwrap()
+            .is_some());
+        let start = text.find("alice").unwrap();
+        assert!(rules
+            .process(text, candidate("PERSON", start, start + 5), None)
+            .unwrap()
+            .is_none());
+        let address = "广东省广州市荔湾区人民路68号27栋1442室";
+        let text = format!("配送地址：{address}，联系人张三");
+        let start = text.find("荔湾区").unwrap();
+        let p = rules
+            .process(
+                &text,
+                candidate("LOCATION", start, start + "荔湾区".len()),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(&text[p.start..p.end], address);
+        assert!(p.evidence.iter().any(|e| e == "address_structure"));
+    }
+
+    #[test]
+    fn validation_merge_is_independent_of_score_and_order() {
+        let mut items = [
+            candidate("ID", 0, 3),
+            candidate("ID", 0, 3),
+            candidate("ID", 0, 3),
+        ];
+        items[1].score = 0.8;
+        items[1].validation = "passed".into();
+        items[2].score = 0.6;
+        items[2].validation = "failed".into();
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut p = items[order[0]].clone();
+            merge(&mut p, items[order[1]].clone());
+            merge(&mut p, items[order[2]].clone());
+            assert_eq!((p.score, p.validation.as_str()), (0.9, "failed"));
+        }
+    }
+
+    #[test]
+    fn explicit_card_evidence_resolves_numbers_that_pass_both_checks() {
+        // Synthetic value satisfies both the national-ID checksum and Luhn.
+        let value = "110105194912310150";
+        assert!(china_id(value) && credit_card(value));
+        for (text, kind) in [
+            (value.to_owned(), "ID"),
+            (format!("证件号码：{value}"), "ID"),
+            (format!("银行卡：{value}"), "ACCOUNT"),
+        ] {
+            let results = structural(&text);
+            assert_eq!(results.len(), 1, "{text}");
+            assert_eq!(
+                (
+                    results[0].entity_type.as_str(),
+                    results[0].validation.as_str()
+                ),
+                (kind, "passed")
+            );
+        }
+    }
+}

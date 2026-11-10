@@ -130,7 +130,7 @@ fn certificates(directory: &Path) {
     .unwrap();
 }
 async fn ready(client: &reqwest::Client, base: &str, process: &mut Process) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             assert!(
                 process.0.try_wait().unwrap().is_none(),
@@ -154,6 +154,7 @@ async fn ready(client: &reqwest::Client, base: &str, process: &mut Process) -> V
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires local ONNX bundle and ONNX Runtime"]
 async fn https_process_reloads_policy_and_runs_private_calculation() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let temporary = Temp::new();
@@ -222,6 +223,15 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .envs(
+                [
+                    "CP_DETECTOR_MODEL_DIR",
+                    "CP_DETECTOR_ORT_LIBRARY",
+                    "ORT_DYLIB_PATH",
+                ]
+                .into_iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| (name, value))),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
