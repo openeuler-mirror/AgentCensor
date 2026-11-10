@@ -15,14 +15,14 @@ process.umask(0o077);
 const positionals = []; const flags = {};
 for (let i = 2; i < process.argv.length; i++) {
   if (process.argv[i] === '--') { positionals.push(...process.argv.slice(i + 1)); break; }
-  if (['--root', '--bin-dir', '--config-dir', '--dsh-root', '--native-library'].includes(process.argv[i])) flags[process.argv[i].slice(2)] = process.argv[++i];
+  if (['--root', '--bin-dir', '--config-dir', '--dsh-root', '--native-library', '--web-port'].includes(process.argv[i])) flags[process.argv[i].slice(2)] = process.argv[++i];
   else positionals.push(process.argv[i]);
 }
 const [operation, action, ...taskParts] = positionals;
 const root = flags.root; const bin = flags['bin-dir']; const configDir = flags['config-dir'];
 const children = new Set(); const servers = new Set(); const temporaries = new Set();
 const customer = 'DemoCustomerOrchid'; const secret = 'DEMO_SECRET_DO_NOT_SEND';
-const input = `Customer=${customer}; amountA=100.00元; amountB=200.00元; secret=${secret}.`;
+const input = `Customer=${customer}; amountA=100.00元; amountB=200.00元; secret=${secret}. 联系人张三在清华大学工作，电话13800138000。`;
 const task = `Use private_compute exactly once to sum the two amount references. Reply with the customer name and total, without code or links. ${input}`;
 const log = message => console.log(message);
 const assertion = (condition, message) => { if (!condition) throw new Error(message); };
@@ -136,7 +136,7 @@ async function mock(directory, tls, agent) {
   return { server, captured, origin: `${tls ? 'https' : 'http'}://127.0.0.1:${port}` };
 }
 async function ready(base, token, child, runFile) {
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < 2400; i++) {
     assertion(!child.cpLaunchFailed && child.exitCode === null && child.signalCode === null, 'rust_gateway_exited');
     try {
       const response = await fetch(`${base}/ready`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(500) });
@@ -149,8 +149,12 @@ async function ready(base, token, child, runFile) {
 }
 async function nativeLibrary() {
   let library = flags['native-library'];
+  const bundled = join(bin, '../lib/censorprivacy/libcp_tls_guard.so');
+  // A standalone bundle must pair its binary with its own hook, even when
+  // this account has an install.json from an older system installation.
+  if (!library && await exists(join(root, 'BUNDLE.json')) && await exists(bundled)) library = bundled;
   if (!library && await exists(join(configDir, 'install.json'))) library = JSON.parse(await privateText(join(configDir, 'install.json'))).native_library;
-  if (!library && await exists(join(bin, '../lib/censorprivacy/libcp_tls_guard.so'))) library = join(bin, '../lib/censorprivacy/libcp_tls_guard.so');
+  if (!library && await exists(bundled)) library = bundled;
   library ||= join(root, 'native/libcp_tls_guard.so');
   if (!await exists(library)) throw new Error('native_library_missing_run_cpctl_install_--tls');
   return resolve(library);
@@ -181,34 +185,43 @@ async function fixture(mode, agent, actual) {
   const send = body => mode === 'tls' ? tlsJSON(config, body) : requestJSON(`${base}/v1/chat/completions`, body, { token });
   return { directory, workspace, provider, token, base, config, send };
 }
-function assertProtected(captured) {
+function assertProtected(captured, values = [customer, secret, '100.00', '200.00', '张三', '清华大学', '13800138000']) {
   assertion(captured.length > 0, 'provider_received_no_requests');
   const wire = JSON.stringify(captured);
-  for (const value of [customer, secret, '100.00', '200.00']) assertion(!wire.includes(value), 'raw_value_reached_mock_provider');
+  for (const value of values) assertion(!wire.includes(value), 'raw_value_reached_mock_provider');
 }
 async function directDemo(mode) {
   log(`本机 ${mode} 演示：启动真实 Rust 网关和本机模拟上游（无云调用）`);
   const f = await fixture(mode, false);
   const body = content => ({ model: 'cp-demo', messages: [{ role: 'user', content }], stream: false });
-  const response = await f.send(body(input));
+  const businessInput = (await readFile(join(root, 'examples/privacy-business.txt'), 'utf8')).trim();
+  const protectedValues = ['张三', '李四', '清华大学', '北京大学', '13800138000', '13900139000',
+    'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '12800.00', '3200.00'];
+  const response = await f.send(body(businessInput));
   const displayed = response.choices[0].message.content;
-  assertProtected(f.provider.captured);
-  assertion(displayed.includes(customer) && displayed.includes('100.00') && displayed.includes('200.00') && !displayed.includes(secret), 'display_restore_failed');
-  log(`原始输入（虚构）：${input}`);
+  assertProtected(f.provider.captured, [...protectedValues, secret]);
+  const upstreamText = f.provider.captured[0].messages[0].content;
+  for (const value of protectedValues) {
+    assertion(displayed.split(value).length === businessInput.split(value).length, `business_privacy_not_restored:${value}`);
+  }
+  assertion(!displayed.includes(secret), 'secret_displayed');
+  log(`原始输入（虚构）：\n${businessInput}`);
   log(`上游收到：${f.provider.captured[0].messages[0].content}`);
   log(`本机显示：${displayed}`);
-  const amounts = fields(f.provider.captured[0].messages[0].content).amounts;
+  const amounts = ['首期服务费', '后续支持费'].map(label =>
+    upstreamText.match(new RegExp(`${label}：([^；。\\n]+)`))?.[1].trim().replace(/元$/, ''));
+  assertion(amounts.every(value => typeof value === 'string' && value.length > 0), 'business_amount_references_missing');
   const result = await requestJSON(`${f.base}/v1/private_compute`, { operation: 'sum', refs: amounts }, { token: f.token });
   assertion(/^<CP_/.test(result.results?.sum), 'compute_did_not_return_reference');
   log(`私密计算返回：${JSON.stringify(result)}`);
   const derived = await f.send(body(`Total ${result.results.sum}`));
-  assertion(derived.choices[0].message.content.includes('300'), 'derived_display_failed');
+  assertion(derived.choices[0].message.content.includes('16000'), 'derived_display_failed');
   log(`派生结果本机显示：${derived.choices[0].message.content}`);
   assertion((await fetch(`${f.base}/ready`)).status === 401, 'authentication_not_enforced');
   const before = f.provider.captured.length;
   await assert.rejects(f.send({ ...body('test'), metadata: { salary: 123 } }));
   assertion(f.provider.captured.length === before, 'blocked_request_reached_provider');
-  assertProtected(f.provider.captured);
+  assertProtected(f.provider.captured, [...protectedValues, secret]);
   if (mode === 'tls') {
     const status = await fetch(`${f.base}/v1/tls/status`, { headers: { authorization: `Bearer ${f.token}` } }).then(response => response.json());
     log(`TLS broker 决策计数：${JSON.stringify(status.counts)}`);
@@ -237,20 +250,25 @@ function dshEnvironment(home, token, runID) {
   return { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: homedir(), LANG: process.env.LANG ?? 'C.UTF-8',
     DSH_HOME: home, CENSORPRIVACY_TOKEN: token, CENSORPRIVACY_RUN_ID: runID };
 }
-async function dshProfile(directory, config, token, dshRoot, persistent = false) {
+async function prepareDsh(directory, config, token, dshRoot, surface = 'headless') {
   const home = join(directory, 'dsh-home'); await mkdir(home, { recursive: true, mode: 0o700 });
   const command = await dshCommand(dshRoot);
   const patch = await overlay(directory, config);
   const env = dshEnvironment(home, token, JSON.parse(await privateText(config.runStateFile)).run_id);
-  const profile = 'censorprivacy'; const manifest = join(home, 'profiles', profile, 'package.json');
+  const profile = surface === 'web' ? 'censorprivacy-web' : 'censorprivacy';
+  const manifest = join(home, 'profiles', profile, 'package.json');
   if (!await exists(manifest)) {
-    const result = await run(command[0], [...command.slice(1), '--profile', profile, '--from-default-profile', 'headless', '--patch', patch, '--dump-config'], { env, cwd: config.workspace });
+    const result = await run(command[0], [...command.slice(1), '--profile', profile, '--from-default-profile', surface, '--patch', patch, '--dump-config'], { env, cwd: config.workspace });
     await writeFile(join(directory, 'dsh-composed.yaml'), result.stdout, { mode: 0o600 });
   }
+  return { command, args: [...command.slice(1), '--profile', profile, '--patch', patch], env };
+}
+async function dshProfile(directory, config, token, dshRoot, persistent = false) {
+  const { command, args, env } = await prepareDsh(directory, config, token, dshRoot);
   const invoke = async prompt => {
     // Both the DSH launcher and the headless app parse argv. End each one's
     // options so arbitrary task text cannot select a profile or print help.
-    const result = await run(command[0], [...command.slice(1), '--profile', profile, '--patch', patch, '--', '--', prompt], { env, cwd: config.workspace, allowFailure: true, timeout: 180000 });
+    const result = await run(command[0], [...args, '--', '--', prompt], { env, cwd: config.workspace, allowFailure: true, timeout: 180000 });
     await writeFile(join(directory, 'dsh-stdout.txt'), result.stdout, { mode: 0o600 });
     await writeFile(join(directory, 'dsh-stderr.txt'), result.stderr, { mode: 0o600 });
     assertion(result.code === 0, `dsh_agent_failed_see_${join(directory, 'dsh-stderr.txt')}`);
@@ -274,10 +292,16 @@ async function dshDemo(mode) {
   log('通过：实际 DSH 插件加载、模型适配、private_compute 调用和受保护结果显示。');
 }
 async function managedDsh() {
-  assertion(['setup', 'run', 'cloud'].includes(action), 'use_dsh_setup_run_or_cloud');
+  assertion(['setup', 'run', 'cloud', 'web'].includes(action), 'use_dsh_web_setup_run_or_cloud');
+  if (action === 'web') {
+    assertion(taskParts.length === 0, 'web_takes_no_task');
+    assertion(/^(?:0|[1-9][0-9]{3,4})$/.test(flags['web-port'] ?? '3080') &&
+      (Number(flags['web-port'] ?? 3080) === 0 || Number(flags['web-port'] ?? 3080) >= 1024) &&
+      Number(flags['web-port'] ?? 3080) <= 65535, 'web_port_invalid');
+  }
   await privateDirectory(configDir);
   const config = JSON.parse(await privateText(join(configDir, 'config.json')));
-  const directory = join(configDir, 'dsh'); await privateDirectory(directory);
+  const directory = join(configDir, action === 'web' ? 'dsh-web' : 'dsh'); await privateDirectory(directory);
   const workspace = join(directory, 'workspace'); await privateDirectory(workspace);
   const base = `http://127.0.0.1:${config.port}`;
   const token = (await privateText(join(configDir, 'gateway.token'))).trim();
@@ -297,7 +321,7 @@ async function managedDsh() {
       const f = await fixture(config.mode, true, config);
       const invoke = await dshProfile(f.directory, f.config, f.token, flags['dsh-root'] ||
         (await exists(join(directory, 'setup.json')) ? JSON.parse(await privateText(join(directory, 'setup.json'))).dshRoot : ''));
-      const reply = await invoke(task + ' You must call private_compute with operation sum and only the two provided amount references. Echo the protected customer reference exactly and the derived sum reference exactly in your final plain text. Do not guess values.');
+      const reply = await invoke(task + ' You must call private_compute with operation sum and only the two provided amount references. Copy each complete reference exactly, including its leading < and trailing > delimiters. Echo the protected customer reference exactly and the derived sum reference exactly in your final plain text. Do not guess values.');
       const receipts = (await privateText(f.config.receiptFile)).trim().split('\n').map(line => JSON.parse(line));
       assertion(receipts.filter(event => event.event === 'model_response').length >= 2 && receipts.some(event => event.event === 'private_compute' && event.operation === 'sum' && event.ref_count === 2), 'cloud_private_compute_not_confirmed');
       assertion(reply.includes(customer) && /\b300(?:\.00)?\b/.test(reply) && !reply.includes(secret), 'cloud_authorized_display_not_confirmed');
@@ -314,13 +338,26 @@ async function managedDsh() {
   const transport = { mode: config.mode, baseURL: config.mode === 'tls' ? config.upstream : base, model: config.model,
     broker: base, tlsRun: join(bin, 'tls-run'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
     runStateFile, upstreamKeyFile: config.has_key ? join(configDir, 'upstream.key') : '', caFile: config.ca_file ?? '', workspace,
-    timeoutMs: 90000, contextWindow: 32768, maxTokens: 512 };
+    timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512 };
   let dshRoot = flags['dsh-root'];
   if (!dshRoot && await exists(join(directory, 'setup.json'))) dshRoot = JSON.parse(await privateText(join(directory, 'setup.json'))).dshRoot;
+  if (!dshRoot && await exists(join(configDir, 'dsh/setup.json'))) dshRoot = JSON.parse(await privateText(join(configDir, 'dsh/setup.json'))).dshRoot;
+  if (action === 'web') {
+    const { command, args, env } = await prepareDsh(directory, transport, token, dshRoot, 'web');
+    await writeFile(join(directory, 'setup.json'), JSON.stringify({ dshRoot, workspace }));
+    log('DSH Web：复用当前网关；打开下方带 token 的完整网址。按 Ctrl+C 停止 Web，网关继续运行。');
+    const child = start(command[0], [...args, '--', '--no-open', '--port', flags['web-port'] ?? '3080'],
+      { env, cwd: workspace, stdio: 'inherit' });
+    await new Promise((ok, no) => {
+      child.once('error', () => no(new Error('dsh_web_command_unavailable')));
+      child.once('close', code => code === 0 ? ok() : no(new Error('dsh_web_exited')));
+    });
+    return;
+  }
   const invoke = await dshProfile(directory, transport, token, dshRoot, true);
   if (action === 'setup') { log(`DSH 独立 profile 就绪：${directory}；./cpctl dsh run '任务'`); return; }
   if (action === 'run') { assertion(taskParts.length > 0, 'task_required'); log(await invoke(taskParts.join(' '))); return; }
-  throw new Error('use_dsh_setup_run_or_cloud');
+  throw new Error('use_dsh_web_setup_run_or_cloud');
 }
 let cleanupPromise;
 function cleanup() { return cleanupPromise ??= cleanupAll(); }

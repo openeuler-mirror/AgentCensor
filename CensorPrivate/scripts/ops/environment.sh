@@ -14,19 +14,30 @@ doctor() {
     version=$(rustc --version | awk '{print $2}')
     if [[ $(printf '%s\n' 1.85.0 "$version" | sort -V | head -n 1) != 1.85.0 ]]; then note '需要 Rust >= 1.85'; missing=1; fi
   fi
+  local model_dir=${CP_DETECTOR_MODEL_DIR:-$CP_REPO_ROOT/models/bert4ner-base-chinese}
+  if [[ -f $model_dir/manifest.json && -f $model_dir/model.onnx && -f $model_dir/tokenizer.json && -f $model_dir/config.json ]]; then
+    note 'OK 本地 FP32 ONNX BERT4NER（启动时验证哈希、标签和推理）'
+  else
+    note '缺失：本地 ONNX 模型包；配置 CP_DETECTOR_MODEL_DIR，参见 docs/rust-detector.md'
+    missing=1
+  fi
+  local ort_library=${CP_DETECTOR_ORT_LIBRARY:-${ORT_DYLIB_PATH:-$CP_DEFAULT_BIN_DIR/../lib/censorprivacy/libonnxruntime.so}}
+  if [[ -f $ort_library ]]; then note 'OK 本地 ONNX Runtime'; else
+    note '缺失：ONNX Runtime；配置 CP_DETECTOR_ORT_LIBRARY'; missing=1
+  fi
   if $demo || $dsh; then
     if command -v node >/dev/null && ! node -e 'let [a,b]=process.versions.node.split(".").map(Number);process.exit(a===22&&b>=19||a>=24?0:1)'; then note '需要 Node ^22.19 或 >=24'; missing=1; fi
   fi
   if $tls; then
     if [[ ! -f $CP_REPO_ROOT/Cargo.toml ]] || pkg-config --exists openssl 2>/dev/null; then note 'OK OpenSSL'; else note '缺失：OpenSSL 开发库'; missing=1; fi
-    if [[ -x /usr/bin/curl ]] && /usr/bin/curl --version | head -n 1 | grep -q OpenSSL; then note 'OK /usr/bin/curl 动态 OpenSSL 候选（演示还会实际验证）';
+    if command -v curl >/dev/null && curl --version | head -n 1 | grep -q OpenSSL; then note 'OK curl 动态 OpenSSL 候选（演示还会实际验证）';
     else note '缺失：TLS 演示需要 OpenSSL curl'; missing=1; fi
   fi
   if $dsh; then
     if [[ -n $dsh_root && -f $dsh_root/apps/cli/lib/bin.js ]]; then note 'OK DSH 已构建源码';
     elif command -v dsh >/dev/null; then note 'OK DSH CLI'; else note '缺失：DSH CLI 或 --dsh-root 已构建目录'; missing=1; fi
   fi
-  note "磁盘剩余：$(df -h "$CP_REPO_ROOT" | awk 'NR==2 {print $4}')（首次 Rust 构建建议数 GB）"
+  note "磁盘剩余：$(df -h "$CP_REPO_ROOT" | awk 'NR==2 {print $4}')"
   (( missing == 0 )) || fail '检查未通过；./cpctl deps 可安装系统包，Rust/DSH 按手册准备'
 }
 deps() {

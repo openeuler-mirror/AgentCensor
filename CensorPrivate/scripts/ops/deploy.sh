@@ -74,7 +74,10 @@ op_init() {
 }
 op_start() {
   load_config; find_bins; need curl
-  process_matches && fail '本实例已经运行'
+  if process_matches; then
+    if service_ready; then fail '本实例已经运行且就绪；可执行 ./cpctl check'; fi
+    fail "本实例进程仍在运行；$readiness_error"
+  fi
   local args=(serve --policy "$config_dir/policy.yaml" --upstream "$upstream" --model "$model"
     --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port")
   [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || args+=(--upstream-key-file "$config_dir/upstream.key")
@@ -87,7 +90,7 @@ op_start() {
   pid=$!
   ticks=$(awk '{print $22}' "/proc/$pid/stat")
   jq -n --argjson pid "$pid" --arg ticks "$ticks" '{pid:$pid,start_ticks:$ticks}' > "$config_dir/process.json"
-  for _ in {1..80}; do
+  for _ in {1..1200}; do
     if ! kill -0 "$pid" 2>/dev/null; then fail "服务启动失败，查看 $config_dir/service.log 中固定错误码"; fi
     code=$(auth_curl --max-time 1 --output "$config_dir/ready.json" --write-out '%{http_code}' "http://127.0.0.1:$port/ready" 2>/dev/null) || code=000
     if [[ $code == 200 ]] && process_matches && jq -e --arg previous "$previous_run" --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id and .run_id != $previous' "$config_dir/ready.json" >/dev/null; then note "已启动：http://127.0.0.1:$port（$mode）；./cpctl check"; return; fi
@@ -111,9 +114,10 @@ op_stop() {
 op_check() {
   load_config; find_bins; need curl
   "$bin_dir/censorprivacy" --version
-  private_file "$config_dir/gateway.token"; private_file "$config_dir/run.json"
+  private_file "$config_dir/gateway.token"
   [[ $(stat -c %a "$config_dir") == 700 ]] || fail '配置目录应为 0700'
-  auth_curl --fail "http://127.0.0.1:$port/ready" > "$config_dir/ready.json"
+  service_ready || fail "$readiness_error"
+  printf '%s\n' "$ready_response" > "$config_dir/ready.json"
   jq -e --arg version "$("$bin_dir/censorprivacy" --version | awk '{print $2}')" --slurpfile run "$config_dir/run.json" '.status == "ready" and .version == $version and .run_id == $run[0].run_id' "$config_dir/ready.json" >/dev/null || fail 'run ID 或服务版本不匹配'
   local code
   code=$(curl --noproxy '*' --silent --show-error --max-time 5 --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/ready")
@@ -121,7 +125,10 @@ op_check() {
   note '通过：安装版本、0600 凭据/状态、0700 目录、认证、run ID（未验证真实上游）'
   if $probe_model; then
     [[ $mode == gateway ]] || fail 'TLS 模式请运行 ./cpctl demo tls 或 ./cpctl dsh cloud'
-    jq -n --arg model "$model" '{model:$model,messages:[{role:"user",content:"Please reply OK."}],stream:false}' > "$config_dir/probe.json"
+    jq -n --arg model "$model" '
+      {model:$model,messages:[{role:"user",content:"Please reply OK."}],stream:false}
+      + (if ($model | startswith("deepseek-")) then {thinking:{type:"disabled"}} else {} end)
+    ' > "$config_dir/probe.json"
     code=$(auth_curl --header 'Content-Type: application/json' --data-binary "@$config_dir/probe.json" --output "$config_dir/probe-response.json" --write-out '%{http_code}' "http://127.0.0.1:$port/v1/chat/completions")
     if [[ $code != 200 ]]; then jq -c '{error:.error}' "$config_dir/probe-response.json"; fail "模型请求失败 HTTP $code"; fi
     note '通过：实际模型请求（回复保存在私有 probe-response.json）'
@@ -174,6 +181,12 @@ op_systemd() (
   id -u censorprivacy >/dev/null 2>&1 || admin useradd --system --gid censorprivacy --home-dir /var/lib/censorprivacy --no-create-home --shell /sbin/nologin censorprivacy
   admin install -d -o root -g censorprivacy -m 0750 /etc/censorprivacy
   admin install -d -o censorprivacy -g censorprivacy -m 0700 /var/lib/censorprivacy
+  for detector_variable in CP_DETECTOR_MODEL_DIR CP_DETECTOR_ORT_LIBRARY ORT_DYLIB_PATH; do
+    if [[ -n ${!detector_variable:-} ]]; then
+      [[ ${!detector_variable} != *$'\n'* && ${!detector_variable} != *'"'* && ${!detector_variable} != *'\'* ]] || fail '检测器路径含无效字符'
+      printf '%s="%s"\n' "$detector_variable" "${!detector_variable}" >> "$stage/config.env"
+    fi
+  done
   admin install -o root -g censorprivacy -m 0640 "$stage/config.env" "/etc/censorprivacy/$instance.env"
   admin install -o root -g censorprivacy -m 0640 "$config_dir/policy.yaml" "/etc/censorprivacy/$instance.policy.yaml"
   admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/gateway.token" "/etc/censorprivacy/$instance.token"
