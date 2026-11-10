@@ -195,6 +195,9 @@ rules:
 ```
 
 裸 IPv6/CIDR 表示无端口规则；带端口必须使用 `[IPv6/CIDR]:PORT`，避免冒号歧义。
+IPv4-mapped IPv6（如 `::ffff:127.0.0.1`）统一匹配 IPv4 规则；mapped 规则的
+`/96`～`/128` 前缀对应 IPv4 的 `/0`～`/32`。同时限制 IPv4 和原生 IPv6 时，
+需分别配置 `0.0.0.0/0` 与 `::/0`。
 
 更完整的手工实验策略见 [`config/standard-dev.yaml`](config/standard-dev.yaml)，
 包含文件、命令和 IPv4/IPv6 网络统一规则；PID 绑定与审计步骤见
