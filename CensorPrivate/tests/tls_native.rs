@@ -104,13 +104,19 @@ async fn real_tls_fragments_retries_curl_and_local_compute_never_send_raw_data()
             .await
             .unwrap();
     });
-    let gate = PrivacyGate::new(
-        PrivacyPolicy::from_json(
-            r#"{"mask_all_numbers":true,"dictionaries":{"PERSON":["Alice","张三"]}}"#,
-        )
-        .unwrap(),
-        GateOptions::default(),
+    let policy = PrivacyPolicy::from_json(
+        r#"{"mask_all_numbers":true,"dictionaries":{"PERSON":["Alice","张三"]}}"#,
     )
+    .unwrap();
+    let gate = if std::env::var_os("CP_TEST_REAL_DETECTOR").is_some() {
+        PrivacyGate::with_professional_detector(
+            policy,
+            GateOptions::default(),
+            censorprivacy::professional::ProfessionalConfig::default(),
+        )
+    } else {
+        PrivacyGate::new(policy, GateOptions::default())
+    }
     .unwrap();
     let run = gate.run_id().to_owned();
     let mut config = GatewayConfig::new(

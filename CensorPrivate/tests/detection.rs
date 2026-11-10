@@ -186,3 +186,19 @@ fn supplied_local_analyzer_converts_unicode_character_ranges_and_validates_resul
     .detect(text)
     .is_err());
 }
+
+#[test]
+fn overlapping_dictionary_literals_protect_the_complete_unicode_union() {
+    for (literal, text) in [("abcab", "abcabcab"), ("甲乙甲", "甲乙甲乙甲")] {
+        let policy = PrivacyPolicy::from_json(
+            &serde_json::json!({"dictionaries":{"ORG":[literal]}}).to_string(),
+        )
+        .unwrap();
+        let spans = DetectionEngine::new(policy)
+            .unwrap()
+            .detect(text, false)
+            .unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, text.len()));
+    }
+}
