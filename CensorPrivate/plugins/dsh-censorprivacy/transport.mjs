@@ -2,8 +2,9 @@
 import http from 'node:http';
 import https from 'node:https';
 import { spawn } from 'node:child_process';
-import { constants } from 'node:fs';
+import { constants, existsSync } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 
 async function privateKey(path) {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -41,7 +42,13 @@ export function requestJSON(url, body, { token, timeoutMs = 90000, signal } = {}
       });
       response.on('error', () => fail(new Error('transport_failed')));
       response.on('end', () => {
-        if (response.statusCode !== 200) return fail(new Error(`upstream_http_${response.statusCode}`));
+        if (response.statusCode !== 200) {
+          let code;
+          try { code = JSON.parse(Buffer.concat(chunks)).error?.code; } catch { /* Non-JSON errors retain only the HTTP status. */ }
+          const localCode = target.hostname === '127.0.0.1' && ['protocol_blocked', 'sensitive_structure', 'invalid_reference',
+            'private_number_requires_compute', 'compute_invalid', 'detection_failed', 'vault_denied', 'release_denied', 'upstream_status', 'upstream_unavailable'].includes(code);
+          return fail(new Error(`upstream_http_${response.statusCode}${localCode ? '_' + code : ''}`));
+        }
         if (response.headers['content-encoding'] && response.headers['content-encoding'] !== 'identity') return fail(new Error('response_encoding_invalid'));
         try { succeed(JSON.parse(Buffer.concat(chunks))); } catch { fail(new Error('response_invalid')); }
       });
@@ -61,7 +68,8 @@ export async function tlsJSON(config, body, signal) {
     '--run-state-file', config.runStateFile, '--native-library', config.nativeLibrary,
     '--workspace', config.workspace, '--timeout', String(Math.ceil(timeoutMs / 1000) + 5)];
   if (config.upstreamKeyFile) args.push('--upstream-key-file', config.upstreamKeyFile);
-  args.push('--', '/usr/bin/curl', '--config', '-');
+  const bundledCurl = resolve(dirname(config.tlsRun), '../runtime/bin/curl');
+  args.push('--', existsSync(bundledCurl) ? bundledCurl : '/usr/bin/curl', '--config', '-');
   // curl config travels through stdin, so neither body nor credential enters argv.
   const lines = ['silent', 'show-error', 'fail', 'http1.1', 'noproxy = "*"',
     `max-time = ${Math.ceil(timeoutMs / 1000)}`, `url = ${JSON.stringify(`${target.origin}/v1/chat/completions`)}`,

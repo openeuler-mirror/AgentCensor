@@ -410,7 +410,20 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
     {
         return Err(Failure::bad("version_not_supported"));
     }
-    let payload = body(request, &state).await?;
+    let mut payload = body(request, &state).await?;
+    // This gateway supports visible text and tools, not opaque reasoning.
+    // Some OpenAI-compatible clients (including xiaoO) omit DeepSeek's
+    // provider-specific switch even when their reasoning setting is off.
+    // Set the default before protection so the approved bytes include it;
+    // an explicitly enabled/invalid thinking value still fails validation.
+    if api == Api::Chat
+        && payload["model"]
+            .as_str()
+            .is_some_and(|model| model.starts_with("deepseek-"))
+        && payload.get("thinking").is_none()
+    {
+        payload["thinking"] = serde_json::json!({"type": "disabled"});
+    }
     let target = state
         .config
         .upstream

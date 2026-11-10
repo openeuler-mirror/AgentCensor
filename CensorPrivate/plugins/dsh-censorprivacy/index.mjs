@@ -10,6 +10,22 @@ const operations = ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const keys = (value, allowed) => object(value) && Object.keys(value).every(key => allowed.includes(key));
 
+function validateComputeArguments(args) {
+  if (!keys(args, ['operation', 'refs', 'options']) || !operations.includes(args.operation) ||
+      !Array.isArray(args.refs) || !args.refs.length || args.refs.length > 256 ||
+      args.refs.some(value => typeof value !== 'string' || !ref.test(value))) throw error('REFERENCES_REQUIRED');
+  const options = args.options === undefined ? {} : args.options;
+  if (!object(options)) throw error('COMPUTE_OPTIONS_INVALID');
+  if (args.operation === 'date_diff') {
+    if (args.refs.length !== 2) throw error('DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES');
+    if (!keys(options, ['unit']) || (options.unit !== undefined && options.unit !== 'days')) throw error('COMPUTE_OPTIONS_INVALID');
+  } else if (args.operation === 'aggregate') {
+    if (!keys(options, ['operations']) || (options.operations !== undefined &&
+        (!Array.isArray(options.operations) || !options.operations.length || options.operations.length > 256 ||
+         options.operations.some(value => !['sum', 'mean', 'min', 'max'].includes(value))))) throw error('COMPUTE_OPTIONS_INVALID');
+  } else if (Object.keys(options).length) throw error('COMPUTE_OPTIONS_INVALID');
+}
+
 async function receipt(config, event) {
   if (!config.receiptFile) return;
   const file = await open(config.receiptFile, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
@@ -62,8 +78,12 @@ export function serialize(options, config) {
       flush();
     }
   }
+  // DSH may add agent-scoped tools after the global restriction was applied.
+  // Keep the actual model-facing catalog consistent with the execution guard.
+  const tools = config.privateToolsOnly ? options.tools?.filter(tool => tool.name === 'private_compute') : options.tools;
   return { model: options.model, messages, stream: false,
-    ...(options.tools?.length ? { tools: options.tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) } : {}),
+    ...(typeof options.model === 'string' && options.model.startsWith('deepseek-') ? { thinking: { type: 'disabled' } } : {}),
+    ...(tools?.length ? { tools: tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) } : {}),
     max_tokens: options.maxTokens ?? config.maxTokens,
     ...(options.temperature === undefined ? {} : { temperature: options.temperature }),
     ...(options.stop === undefined ? {} : { stop: options.stop }) };
@@ -90,7 +110,7 @@ export class PrivacyAdapter {
           { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: options.signal });
     } catch (failure) {
       if (['UNSUPPORTED_CONTENT', 'UNSUPPORTED_OPTION'].includes(failure?.code)) throw failure;
-      throw error(/^upstream_http_[0-9]{3}$/.test(failure?.message) ? failure.message.toUpperCase() : 'PRIVACY_TRANSPORT_FAILED');
+      throw error(/^upstream_http_[0-9]{3}(?:_[a-z_]+)?$/.test(failure?.message) ? failure.message.toUpperCase() : 'PRIVACY_TRANSPORT_FAILED');
     }
     const choice = result?.choices?.[0]; const message = choice?.message;
     if (!Array.isArray(result?.choices) || result.choices.length !== 1 ||
@@ -102,7 +122,8 @@ export class PrivacyAdapter {
         !['stop', 'tool_calls', 'length'].includes(choice.finish_reason)) throw error('UNSUPPORTED_RESPONSE');
     if (result.usage !== undefined && (!object(result.usage) || ['prompt_tokens', 'completion_tokens'].some(key => result.usage[key] !== undefined && (!Number.isSafeInteger(result.usage[key]) || result.usage[key] < 0)))) throw error('UNSUPPORTED_RESPONSE');
     for (const call of message.tool_calls ?? []) {
-      if (!keys(call, ['id', 'type', 'function']) || call.type !== 'function' || typeof call.id !== 'string' ||
+      if (!keys(call, ['id', 'type', 'function', 'index']) || call.type !== 'function' || typeof call.id !== 'string' ||
+          (call.index !== undefined && (!Number.isSafeInteger(call.index) || call.index < 0)) ||
           !keys(call.function, ['name', 'arguments']) || typeof call.function.name !== 'string' || typeof call.function.arguments !== 'string') throw error('UNSUPPORTED_RESPONSE');
     }
     await receipt(config, { event: 'model_response', mode: config.mode, tool_calls: message.tool_calls?.length ?? 0 });
@@ -133,15 +154,18 @@ export function apply(ctx, supplied) {
   ctx.llm.registerAdapter(['censorprivacy'], new PrivacyAdapter(config));
   ctx.tools.register({
     name: 'private_compute',
-    description: 'Compute using current private references only. Preserve references exactly; never send raw operands. Results remain private references.',
+    description: 'Compute only when the user requests arithmetic. Use current private references only; copy each complete reference, including leading < and trailing >. date_diff requires exactly two DATE references and returns the second date minus the first in days. There is no implicit today/current-date operand: if a date is missing, ask the user instead of guessing. sum/mean/min/max accept numeric references and no options; aggregate optionally accepts operations. Never invent references or send raw operands. Results remain private references.',
     parameters: { type: 'object', properties: {
       operation: { type: 'string', enum: ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'] },
-      refs: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 256 },
-      options: { type: 'object', additionalProperties: true },
+      refs: { type: 'array', items: { type: 'string', pattern: ref.source }, minItems: 1, maxItems: 256 },
+      options: { type: 'object', description: 'Omit for sum/mean/min/max. date_diff: optional unit days only. aggregate: optional operations only. No other keys are supported.',
+        properties: { unit: { type: 'string', enum: ['days'] },
+          operations: { type: 'array', items: { type: 'string', enum: ['sum', 'mean', 'min', 'max'] }, minItems: 1, maxItems: 256 } },
+        additionalProperties: false },
     }, required: ['operation', 'refs'], additionalProperties: false },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args, exec) {
-      if (!keys(args, ['operation', 'refs', 'options']) || !operations.includes(args.operation) || !Array.isArray(args.refs) || !args.refs.length || args.refs.length > 256 || args.refs.some(value => typeof value !== 'string' || !ref.test(value))) throw error('REFERENCES_REQUIRED');
+      validateComputeArguments(args);
       const result = privateResult(await requestJSON(`${config.broker}/v1/private_compute`, args,
         { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: exec.signal }), args.operation);
       await receipt(config, { event: 'private_compute', operation: args.operation, ref_count: args.refs.length, result_count: Object.keys(result.results).length, arguments_are_references: true, results_are_references: true });
