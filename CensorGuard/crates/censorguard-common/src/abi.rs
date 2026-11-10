@@ -69,6 +69,8 @@ pub struct FilterConfig {
     pub audit_net: u32,
     pub strict_mode: u32,
     pub self_protection: u32,
+    /// /proc starttime ticks per second, obtained from sysconf(_SC_CLK_TCK).
+    pub user_hz: u32,
 }
 
 /// Fixed path key.
@@ -293,7 +295,8 @@ mod tests {
 
     #[test]
     fn abi_sizes_match_c() {
-        assert_eq!(size_of::<FilterConfig>(), 48);
+        assert_eq!(size_of::<FilterConfig>(), 52);
+        assert_eq!(offset_of!(FilterConfig, user_hz), 48);
         assert_eq!(size_of::<PathKey>(), 256);
         assert_eq!(size_of::<InodeKey>(), 16);
         assert_eq!(size_of::<ArgKey>(), 1024);

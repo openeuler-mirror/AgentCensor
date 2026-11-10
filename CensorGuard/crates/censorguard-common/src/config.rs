@@ -126,6 +126,15 @@ mod tests {
 
     #[test]
     fn omitted_failure_mode_is_strict_with_self_protection() -> Result<(), serde_yaml::Error> {
+        for yaml in [
+            "rules: []",
+            "daemon: {}\nrules: []",
+            "daemon:\n  audit_exec: true\nrules: []",
+            include_str!("../../../config/base.yaml"),
+        ] {
+            let document: ConfigDocument = serde_yaml::from_str(yaml)?;
+            assert_eq!(document.daemon.failure_mode, FailureMode::Strict);
+        }
         let document: ConfigDocument = serde_yaml::from_str("rules: []")?;
         assert_eq!(document.daemon.failure_mode, FailureMode::Strict);
         assert!(document.daemon.self_protection);
