@@ -2,6 +2,7 @@ use censorprivacy::{
     error::{Error, Result},
     gate::{GateOptions, PrivacyGate},
     policy::PrivacyPolicy,
+    professional::ProfessionalConfig,
     server::{GatewayConfig, GatewayService},
 };
 use clap::{Parser, Subcommand};
@@ -27,7 +28,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Serve(Serve),
+    Serve(Box<Serve>),
 }
 #[derive(clap::Args)]
 struct Serve {
@@ -53,6 +54,12 @@ struct Serve {
     allow_http_test_upstream: bool,
     #[arg(long)]
     tls_direct: bool,
+    /// Local FP32 ONNX bert4ner-base-chinese bundle (no downloads).
+    #[arg(long)]
+    detector_model_dir: Option<PathBuf>,
+    /// Local ONNX Runtime shared library, never downloaded at runtime.
+    #[arg(long)]
+    detector_ort_library: Option<PathBuf>,
     #[arg(long)]
     sensitive_path: Vec<String>,
     #[arg(long)]
@@ -132,7 +139,14 @@ async fn serve(args: Serve) -> Result<()> {
         public_identifiers: args.model,
         ..Default::default()
     };
-    let gate = PrivacyGate::new(policy, options)?;
+    let mut detector = ProfessionalConfig::default();
+    if let Some(path) = args.detector_ort_library {
+        detector.runtime_library = Some(path);
+    }
+    if let Some(path) = args.detector_model_dir {
+        detector.model_directory = Some(path);
+    }
+    let gate = PrivacyGate::with_professional_detector(policy, options, detector)?;
     let run_id = gate.run_id().to_owned();
     let token = read_file(&args.token_file, true, 8192)?;
     let upstream_key = args
@@ -234,7 +248,7 @@ async fn main() {
     }));
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Serve(args) => serve(args).await,
+        Command::Serve(args) => serve(*args).await,
     };
     if let Err(error) = result {
         eprintln!("{{\"error\":{{\"code\":\"{}\"}}}}", error.code());

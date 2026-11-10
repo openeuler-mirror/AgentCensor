@@ -6,5 +6,5 @@ if [[ $# -gt 0 ]]; then
   exit 2
 fi
 cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --all-targets
