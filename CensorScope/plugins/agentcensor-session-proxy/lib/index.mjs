@@ -33,6 +33,7 @@
  *   ACASK\t<json>    approval/question ask forwarded by the worker: {id,kind,…payload}
  *   ACWITHDRAW\t<json> withdrawal of one forwarded ask: {id}
  *   ACSYNC\t<json>   worker accepted an existing host configuration event: {seq}
+ *   ACSTREAM\t<json> native transient assistant frame (never appended as a session event)
  *
  * ── Stdin protocol (host → worker, one JSON per line) ──
  *   {"type":"message","message":{content,source,id?,role?}}  original user message
@@ -95,6 +96,8 @@ import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
+import { AssistantStreamBridge } from './assistant-stream-bridge.mjs'
+import { inboxProjectionDefinition, ProxyInbox } from './inbox.mjs'
 
 // 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
 // Session.append cannot express that flag (its surface options are the only
@@ -119,6 +122,7 @@ const CANCEL_PREFIX = 'ACCANCEL\t'
 const SYNC_PREFIX = 'ACSYNC\t'
 const ASK_PREFIX = 'ACASK\t'
 const WITHDRAW_PREFIX = 'ACWITHDRAW\t'
+const STREAM_PREFIX = 'ACSTREAM\t'
 /** Grace granted to a resident worker after a shutdown frame before SIGTERM. */
 const STOP_GRACE_MS = 3000
 /**
@@ -317,8 +321,16 @@ export class WebDriverAgent {
     this.session = session
     this.options = options ?? {}
     this.status = 'idle'
-    this.inbox = { nextTurn: [], nextStep: [] }
+    this.inbox = new ProxyInbox(rootCtx.get('sessionProjections'), session, command => {
+      this.sendChain = this.sendChain.then(async () => {
+        const state = await this.ensureWorker()
+        this.writeFrame(state, { type: 'inbox', ...command })
+      }).catch(error => {
+        this.dispatch.emit('agent/error', { turn: this.turn, step: 0, error })
+      })
+    })
     this.dispatch = agentEvents(rootCtx, this)
+    this.assistantStream = new AssistantStreamBridge(frame => this.dispatch.emit('agent/assistant-stream', { frame }))
     this.scope = createScope(rootCtx, this)
     this.ctx = this.scope.ctx
     this.rootCtx = rootCtx
@@ -369,13 +381,13 @@ export class WebDriverAgent {
 
   /** Handle one user message: route it to this session's worker process. */
   followup(message) {
-    this.enqueueMessage(message)
+    this.send(message, 'next-turn', true)
     return undefined
   }
 
-  steer(message) { this.followup(message) }
-  send(message, _target, _wakeup) { this.followup(message) }
-  inject() {}
+  steer(message) { this.send(message, 'next-step', true) }
+  send(message, target, wakeup) { this.enqueueMessage(message, target, wakeup) }
+  inject(message) { this.send(message, 'next-step', false) }
 
   /**
    * Native-protocol cancellation (the stop button). Stock dsh aborts the live
@@ -431,16 +443,16 @@ export class WebDriverAgent {
   }
 
   /** Queue one user message for this session's worker (spawning it lazily). */
-  enqueueMessage(message) {
+  enqueueMessage(message, target = 'next-turn', wakeup = true) {
     const text = messageText(message)
     this.markBusy()
-    this.emitStatus('running')
+    if (wakeup) this.emitStatus('running')
     this.unwritten += 1
     this.sendChain = this.sendChain
       .then(async () => {
         const state = await this.ensureWorker()
         if (state === undefined || !state.alive) throw new Error('worker unavailable')
-        this.writeFrame(state, { type: 'message', message: forwardableMessage(message) })
+        this.writeFrame(state, { type: 'message', message: forwardableMessage(message), target, wakeup })
         this.unwritten = Math.max(0, this.unwritten - 1)
         process.stdout.write(
           `[agentcensor] message → worker session=${this.id} text=${JSON.stringify(text.slice(0, 80))}\n`,
@@ -560,6 +572,8 @@ export class WebDriverAgent {
       CENSORSCOPE_SESSION_ID: this.session.id,
     }
     this.workerNextSeq = this.session.seq
+    this.workerEventSeqs = new Map()
+    this.assistantStream.startWorker()
     process.stdout.write(`[agentcensor] worker shares host home DSH_HOME=${hostHome} (no key/model env)\n`)
 
     const cwd = header.cwd ?? process.cwd()
@@ -667,7 +681,9 @@ export class WebDriverAgent {
     const consume = (async () => {
       const rl = createInterface({ input: child.stdout })
       for await (const line of rl) {
-        if (line.startsWith(EVT_PREFIX)) {
+        if (line.startsWith(STREAM_PREFIX)) {
+          this.assistantStream.accept(JSON.parse(line.slice(STREAM_PREFIX.length)), seq => this.workerEventSeqs.get(seq))
+        } else if (line.startsWith(EVT_PREFIX)) {
           let frame
           try {
             frame = JSON.parse(line.slice(EVT_PREFIX.length))
@@ -731,6 +747,7 @@ export class WebDriverAgent {
     child.once('close', (code, signal) => {
       state.alive = false
       state.stopping = true
+      this.assistantStream.close()
       ACTIVE_WORKERS.delete(child)
       consume.catch(() => undefined)
       state.closeResolve?.({ code, signal })
@@ -964,7 +981,12 @@ export class WebDriverAgent {
       this.workerNextSeq = event.seq
     }
     try {
+      const hostSeq = this.session.seq
       this.mirrorInto(this.session, event, stats, this.workerAuthoredSequences)
+      if (this.session.seq > hostSeq) {
+        this.workerEventSeqs?.set(event.seq, hostSeq)
+        if (this.workerEventSeqs?.size > 4096) this.workerEventSeqs.delete(this.workerEventSeqs.keys().next().value)
+      }
     } catch (error) {
       stats.failed += 1
       process.stdout.write(
@@ -1038,7 +1060,7 @@ function forwardableMessage(message) {
 function normalizeCancelCause(cause) {
   if (cause !== null && typeof cause === 'object') {
     const kind = cause.kind
-    if (kind === 'user' || kind === 'parent') return { kind }
+    if (kind === 'user' || kind === 'parent' || kind === 'disposed') return { kind }
     if (kind === 'hook' && typeof cause.reason === 'string') return { kind: 'hook', reason: cause.reason }
   }
   return { kind: 'user' }
@@ -1121,6 +1143,7 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
 
 export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
+  ctx.sessionProjections.register(inboxProjectionDefinition)
   interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
   // control stream (row is disabled by overlay). dsh 0.1.1 does not export
