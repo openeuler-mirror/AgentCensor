@@ -6,18 +6,21 @@ config_dir=${CP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/censorprivacy/mana
 prefix=${CP_INSTALL_PREFIX:-$HOME/.local}
 tls=false; demo=false; dsh=false; runtime=false; dry_run=false; probe_model=false; no_key=false
 dsh_root=${DSH_ROOT:-}; mode=gateway; upstream=; model=; key_file=; port=8775
-native_library=; ca_file=; rest=(); options_seen=()
+xiaoo_root=${XIAOO_ROOT:-}; xiaoo_bin=
+native_library=; ca_file=; web_port=3080; rest=(); options_seen=()
 while [[ $# -gt 0 ]]; do
   [[ $1 != --* || $1 == -- ]] || options_seen+=("$1")
   case "$1" in
     --config-dir) config_dir=${2:?需要目录}; shift 2 ;;
     --prefix) prefix=${2:?需要绝对路径}; shift 2 ;;
     --dsh-root) dsh_root=${2:?需要 DSH 源码目录}; shift 2 ;;
+    --xiaoo-root) xiaoo_root=${2:?需要 xiaoO 源码目录}; shift 2 ;;
+    --xiaoo-bin) xiaoo_bin=${2:?需要 xiaoo 可执行文件}; shift 2 ;;
     --mode) mode=${2:?需要 gateway 或 tls}; shift 2 ;;
     --upstream) upstream=${2:?需要 origin}; shift 2 ;;
     --model-id) model=${2:?需要模型 ID}; shift 2 ;;
     --key-file) key_file=${2:?需要凭据文件}; shift 2 ;;
-    --port) port=${2:?需要端口}; shift 2 ;;
+    --port) port=${2:?需要端口}; web_port=$port; shift 2 ;;
     --native-library) native_library=${2:?需要库路径}; shift 2 ;;
     --ca-file) ca_file=${2:?需要 CA 文件路径}; shift 2 ;;
     --no-key) no_key=true; shift ;;
@@ -36,10 +39,12 @@ done
 for option in "${options_seen[@]}"; do
   case "$operation:$option" in
     *:--config-dir|*:--prefix|doctor:--tls|doctor:--demo|doctor:--dsh|doctor:--runtime|doctor:--dsh-root|deps:--tls|deps:--demo|deps:--dsh|deps:--runtime|deps:--dry-run|install:--tls|install:--dry-run|init:--mode|init:--upstream|init:--model-id|init:--key-file|init:--no-key|init:--port|init:--native-library|init:--ca-file|check:--model|systemd:--dry-run|demo:--dsh-root|demo:--native-library|dsh:--dsh-root) ;;
+    dsh:--port) [[ ${rest[0]:-} == web ]] || fail '--port 仅用于 dsh web' ;;
+    xiaoo:--xiaoo-root|xiaoo:--xiaoo-bin) ;;
     *) fail "$operation 不接受 $option" ;;
   esac
 done
-case "$operation" in demo|dsh|systemd|help|-h|--help) ;; *) [[ ${#rest[@]} == 0 ]] || fail '存在多余位置参数' ;; esac
+case "$operation" in demo|dsh|xiaoo|systemd|help|-h|--help) ;; *) [[ ${#rest[@]} == 0 ]] || fail '存在多余位置参数' ;; esac
 case "$operation" in
   help|-h|--help)
     cat <<'HELP'
@@ -52,11 +57,15 @@ Rust 运维与演示：./cpctl <命令> [选项]
   check [--model]        检查版本、认证、权限；可选真实模型请求
   systemd install|start|stop|check
                          系统服务部署与管理；install --dry-run 仅预览
-  demo gateway | tls     本机功能演示，无需模型或云凭据
+  demo gateway | tls     真实本地检测器 + 模拟上游，无需云凭据
   demo dsh-gateway | dsh-tls [--dsh-root 路径]
                          真实 DSH agent + 模拟模型服务
+  dsh web [--dsh-root 路径] [--port 3080]
+                         启动浏览器聊天界面，复用当前网关与凭据
   dsh setup | run | cloud [--dsh-root 路径]
                          当前配置的 DSH 接入与真实模型验收
+  xiaoo setup | tui | run | demo [--xiaoo-root 路径 | --xiaoo-bin 文件]
+                         xiaoO 独立配置、终端交互、任务与文件读取演示
 通用：--config-dir 私有目录（默认 ~/.config/censorprivacy/managed）
 init：--mode gateway|tls --upstream origin --model-id ID --key-file 文件
       --port 8775；缺少连接配置时交互输入
@@ -65,6 +74,11 @@ init：--mode gateway|tls --upstream origin --model-id ID --key-file 文件
 HELP
     ;;
   doctor|deps) source "$CP_REPO_ROOT/scripts/ops/environment.sh"; "$operation" ;;
+  xiaoo)
+    need jq; need curl
+    source "$CP_REPO_ROOT/scripts/ops/xiaoo.sh"
+    op_xiaoo
+    ;;
   install|init|start|stop|check|systemd)
     source "$CP_REPO_ROOT/scripts/ops/deploy.sh"
     need jq; need flock
@@ -88,7 +102,7 @@ HELP
     [[ $operation != demo || ${#rest[@]} == 1 ]] || fail 'demo 需要 gateway|tls|dsh-gateway|dsh-tls 中的一项'
     exec node "$CP_REPO_ROOT/scripts/ops/demo.mjs" \
       --root "$CP_REPO_ROOT" --bin-dir "$bin_dir" --config-dir "$config_dir" \
-      --dsh-root "$dsh_root" --native-library "$native_library" -- "$operation" "${rest[@]}"
+      --dsh-root "$dsh_root" --native-library "$native_library" --web-port "$web_port" -- "$operation" "${rest[@]}"
     ;;
   *) fail "未知命令：$operation；运行 ./cpctl help" ;;
 esac

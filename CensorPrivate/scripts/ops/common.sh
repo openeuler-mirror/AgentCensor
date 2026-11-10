@@ -46,7 +46,9 @@ load_config() {
   if [[ -n $ca_file ]]; then [[ $ca_file == /* ]] || fail 'CA 文件需要绝对路径'; private_file "$ca_file"; fi
 }
 find_bins() {
-  if [[ -f $config_dir/install.json ]]; then
+  if [[ -f $CP_REPO_ROOT/BUNDLE.json && -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then
+    bin_dir=$CP_DEFAULT_BIN_DIR
+  elif [[ -f $config_dir/install.json ]]; then
     private_file "$config_dir/install.json"
     bin_dir=$(jq -er .bin_dir "$config_dir/install.json")
   elif [[ -x $prefix/bin/censorprivacy ]]; then bin_dir=$prefix/bin
@@ -57,6 +59,39 @@ find_bins() {
 }
 auth_curl() {
   curl --noproxy '*' --silent --show-error --connect-timeout 2 --max-time 90 --header "@$config_dir/curl.headers" "$@"
+}
+# A live process can hold an expired run. Keep the HTTP diagnosis separate from
+# process ownership, which is still required before sending any signal.
+service_ready() {
+  local response code
+  readiness_error=; ready_response=
+  if ! response=$(auth_curl --max-time 5 --write-out $'\n%{http_code}' "http://127.0.0.1:$port/ready" 2>/dev/null); then
+    readiness_error='无法连接当前服务；请执行 ./cpctl start；若进程仍在运行，先 ./cpctl stop 再启动'
+    return 1
+  fi
+  code=${response##*$'\n'}
+  ready_response=${response%$'\n'*}
+  if [[ $code == 401 ]]; then
+    readiness_error='网关认证失败（HTTP 401）；请核对 --config-dir 与当前服务的凭据'
+    return 1
+  fi
+  if [[ $code == 400 ]] && jq -e '.error.code == "vault_denied"' <<< "$ready_response" >/dev/null 2>&1; then
+    readiness_error='当前 run 已失效（vault_denied；请检查 policy.yaml 的 ttl_seconds）；执行 ./cpctl stop 后 ./cpctl start，并新建 Agent 会话'
+    return 1
+  fi
+  if [[ $code != 200 ]] || ! jq -e '.status == "ready"' <<< "$ready_response" >/dev/null 2>&1; then
+    readiness_error="服务尚未就绪（HTTP $code）；请检查 $config_dir/service.log"
+    return 1
+  fi
+  if [[ ! -f $config_dir/run.json ]]; then
+    readiness_error='缺少本实例 run.json；请核对 --config-dir；系统服务请先 ./cpctl systemd check'
+    return 1
+  fi
+  private_file "$config_dir/run.json"
+  if ! jq -e --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id' <<< "$ready_response" >/dev/null 2>&1; then
+    readiness_error='本地与服务的 run ID 不匹配；请核对 --config-dir；系统服务请先 ./cpctl systemd check'
+    return 1
+  fi
 }
 process_matches() {
   [[ -f $config_dir/process.json ]] || return 1
