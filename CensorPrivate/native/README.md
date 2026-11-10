@@ -10,7 +10,7 @@
 make -C native
 ```
 
-输出为 `native/libcp_tls_guard.so`。通过 [tls-run](../README.md#tls-direct) 的 `--native-library` 指定它；库文件及其所在目录应由可信控制面管理，文件不能被组或其他用户写入。
+输出为 `native/libcp_tls_guard.so`。通过 [tls-run](../docs/usage.md#tls-direct) 的 `--native-library` 指定它；库文件及其所在目录应由可信控制面管理，文件不能被组或其他用户写入。
 
 ## 接入
 
@@ -33,6 +33,7 @@ make -C native
 - 单个 JSON 正文最多 256 KiB，头部和连接缓冲另有上限。
 - 请求分片先留在本机，完整保护通过后才写入原连接；响应分片先交给 broker，完整安全响应形成后才返回应用。
 - 短别名按敏感 span 的原始 JSON wire 字节预算分配，包括转义；不是按字符数或模型 token 数分配。1–2 字节 span 使用不可恢复遮盖。
+- 本机 broker RPC 最多等待 60 秒，与同步 BERT 检测及 broker 的事务预算一致；超时拒绝放行。旧版的 2 秒预算不适合模型检测。
 
 HTTP/2、SSE、gzip、chunked、Upgrade、Expect、流水线、早期数据、sendfile 和 peek 等未支持入口拒绝处理。静态链接、其他 TLS 后端、自定义未暴露入口和通用非阻塞 readiness 兼容不在支持范围内。
 

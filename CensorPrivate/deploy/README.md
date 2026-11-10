@@ -1,5 +1,8 @@
 # systemd deployment
 
+生产网关与 TLS broker 使用同一 Rust 检测器。部署前按 [检测器说明](../docs/rust-detector.md) 准备唯一 `bert4ner-base-chinese` 的 FP32 ONNX 包和 ONNX Runtime 原生库，在服务环境文件中配置 `CP_DETECTOR_MODEL_DIR`、`CP_DETECTOR_ORT_LIBRARY`。`ProtectHome=yes` 的 systemd 服务应使用 `/opt` 或 `/usr/local/share` 下的可读路径。无需生产 Python 环境；安装脚本不复制模型与运行库，启动时校验资源并实际推理，失败则不开放服务。
+
+
 首次部署可按 [构建部署教程](../docs/build-and-deploy.md) 操作。
 
 自动部署入口见 [Rust 运维与使用手册](../docs/usage.md)：`./cpctl systemd install`、`./cpctl systemd start`、`./cpctl systemd check`。它从当前私有配置生成独立 unit，使用配置路径散列区分实例；不会覆盖此处手工维护的模板实例。
@@ -26,6 +29,8 @@ CP_UPSTREAM=https://model.example
 CP_BIND=127.0.0.1
 CP_PORT=8765
 CP_MODEL=MODEL_ID
+CP_DETECTOR_MODEL_DIR=/opt/censorprivacy-models/bert4ner-base-chinese
+CP_DETECTOR_ORT_LIBRARY=/opt/onnxruntime/lib/libonnxruntime.so
 ```
 
 token 和 upstream-key 为服务账户可读的私有普通文件，权限 `0600`；配置和凭据放在 agent workspace 之外，不允许 agent 修改。上游和模型 ID 应替换为实际配置。

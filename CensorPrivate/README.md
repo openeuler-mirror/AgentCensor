@@ -1,139 +1,180 @@
 # CensorPrivate
 
-CensorPrivate 是 AgentCensor 的模型数据隐私子项目，提供本机策略检测、CP 引用、私密计算、HTTP/HTTPS 网关、SSE、MCP、Linux 运行域和 TLS direct。Rust 1.85+ 实现核心与服务；核心 crate 禁止 `unsafe`，Linux syscall/FFI 集中在独立 `runtime-sys` crate，C OpenSSL hook 负责动态 ABI 接入。产品命令与 Cargo 包名使用 `censorprivacy`。
+**在本机识别隐私，保护发给模型的内容。**
 
-架构及与 AgentCensor 其他组件的职责关系见 [架构说明](docs/architecture.md)，验证入口和实际结果见 [验收记录](docs/validation.md)。项目构建、测试与运行不依赖 Python。
+CensorPrivate 是 AgentCensor 的模型数据隐私组件。它在本地检测敏感信息，将原文替换为随机引用后发送给模型，再在授权的回复显示位置恢复；密码、密钥等 SECRET 始终遮盖。核心与服务使用 Rust，NER 使用本地 ONNX，生产运行无需 Python。
 
-从源码构建、本机验证到 systemd 部署，参阅 [构建部署教程](docs/build-and-deploy.md)。代码评审、分批提交与 PR 组织参阅 [贡献指南](CONTRIBUTING.md)。
+[快速开始](#快速开始) · [隐私检测台](#隐私检测台) · [模型网关](#模型网关) · [Agent 接入](#agent-接入) · [完整文档](docs/README.md)
 
-希望用短命令操作时，从 [Rust 部署与使用手册](docs/usage.md) 开始：`./cpctl doctor` → `./cpctl deps` → `./cpctl install --tls` → `./cpctl demo gateway` / `./cpctl demo tls`。手册接着介绍策略与凭据、DSH 插件的两种演示和真实云验收。安装后也可使用 `~/.local/bin/cpctl`，无需保留源码目录或上一终端的变量。
+## 快速开始
 
-CensorPrivacy 是本机模型隐私网关。它按本地策略检查完整请求，将敏感文本替换为当前 run 的引用，并在返回的被动显示文本中恢复授权内容。SECRET 原值不恢复；未知格式或保护失败时拒绝处理。
+| 使用方式 | 准备内容 |
+| --- | --- |
+| [源码构建](#从源码构建) | Linux、Rust ≥1.85、C 链接器、模型与运行库，适合开发和自行部署 |
+| [完整包](#使用完整包) | standalone 归档与 SHA-256，包含模型和运行库，适合在已验收平台直接运行 |
 
-客户端通过已有 base URL 和工具配置接入，无需修改 harness 源码。一个服务实例维护一个 run，映射保存在服务内存中。
+### 从源码构建
 
-## 安装
-
-需要 Rust 1.85 或以上版本及 C 链接器。常规网关使用 Rustls，无需 OpenSSL 开发库。
+**1. 下载并编译**
 
 ```bash
+git clone https://gitcode.com/coco12373/AgentCensor.git
+cd AgentCensor/CensorPrivate
+export CARGO_BUILD_JOBS=1
+./cpctl deps --dry-run
+./cpctl deps
 cargo build --locked --release --bins
-# 安装到用户指定的暂存目录；正式安装可使用 /usr/local。
-bash scripts/install.sh --prefix "$HOME/.local"
 ```
 
-可用 `bash scripts/package.sh --with-native` 生成带 SHA-256 校验文件的 Linux 发布归档。systemd 模板使用 `/usr/local/bin`；自定义 prefix 时同步调整模板路径及 `tls-run --native-library`。
+先安装 [Rust 工具链](https://www.rust-lang.org/tools/install)。`deps` 按系统选择 apt/dnf，安装系统包时可能使用 sudo；`--dry-run` 只预览。后续源码命令均在 `CensorPrivate/` 目录执行。
 
-五个入口：`censorprivacy`、`privacy-run`、`privcalc`、`censorprivacy-mcp`、`tls-run`。也可通过 `target/release/` 直接运行。
+**2. 准备检测模型与运行库**
+
+按 [模型下载与 ONNX 导出步骤](docs/build-and-deploy.md#4-准备检测资源) 准备资源，已有可信 ONNX 包时可以直接使用。将下面的路径替换为实际位置：
 
 ```bash
-bash scripts/test/run-all.sh
-# 207 组固定检测/计算样例包含在常规 Rust 测试中
-# 需要 Linux root、namespace/mount/nft 能力
-bash scripts/test/runtime.sh
-# 需要 OpenSSL 开发库，包含真实动态 ABI、分片和非阻塞重试
-bash scripts/test/native.sh
+export CP_DETECTOR_MODEL_DIR="$PWD/models/bert4ner-base-chinese"
+export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
+./cpctl doctor
 ```
 
-可选的 TLS direct 模式需要 Linux、C11 编译器、make、OpenSSL 开发头文件及 libcrypto、pthread、libdl；pkg-config 可辅助查找编译参数。在目标架构上构建：
+**Cargo 编译不下载或生成模型、ONNX Runtime。** 从原始权重导出 ONNX 才需要 Python；运行 Rust 服务只需导出的模型包与原生库。资源路径需在每个启动终端配置，也可采用 [默认安装布局](docs/rust-detector.md#2-配置路径)。
+
+**3. 开始使用**
+
+先运行下节的检测台，无需云账号；需要模型交互时再启动网关。可选安装到当前用户目录：
 
 ```bash
-make -C native
+./cpctl install
 ```
 
-生成的库为 `native/libcp_tls_guard.so`。安装 native 库时使用 `bash scripts/install.sh --with-native --prefix /usr/local`；直接运行时通过 `--native-library` 指定。
+安装后可在任意目录运行 `~/.local/bin/cpctl`。安装脚本复制命令、插件和文档，模型与 ONNX Runtime 单独准备。系统服务、公共安装和完整依赖见 [构建与部署](docs/build-and-deploy.md)。
 
-## 启动网关
+### 使用完整包
 
-先设置 `CONTROL_DIR` 为管理员管理的私有目录，在其中准备 `gateway.token` 和 `upstream.key`。token 使用 24–512 个可见 ASCII 字符；凭据文件权限为 `0600`，放在 agent workspace 和可见依赖树之外。两个文件分别用于本机认证和上游认证。
-
-将上游 origin 和模型 ID 换成实际配置：
+从发布方取得匹配版本的归档与 `.sha256` 文件，在两者所在目录执行：
 
 ```bash
-censorprivacy serve \
-  --policy examples/policy.yaml \
-  --upstream https://model.example \
-  --model MODEL_ID \
-  --token-file "$CONTROL_DIR/gateway.token" \
-  --upstream-key-file "$CONTROL_DIR/upstream.key" \
-  --run-state-file "$CONTROL_DIR/run.json" \
-  --host 127.0.0.1 --port 8765
+sha256sum -c censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz.sha256
+tar -xzf censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz
+cd censorprivacy-0.3.0-linux-x86_64-standalone
+./cpctl self-test
 ```
 
-客户端使用网关 token，provider key 由服务持有。Chat Completions 和 Responses 客户端通常将 base URL 配置为 `http://127.0.0.1:8765/v1`；Messages 客户端应按其路径拼接方式配置服务 origin。
+完整包已验收平台为 **openEuler 24.03 LTS / x86_64 / glibc 2.38+**。自检使用真实本地检测器和模拟上游，无云调用；结束后自动停止临时进程。`self-test` 仅完整包提供，下载、版本与重新打包见 [二进制包说明](docs/binary-distribution.md)。
 
-支持的模型入口为 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 和 `/v1/messages/count_tokens`。请求中的 system、历史、工具描述、JSON 参数、工具结果和 metadata 都经过检查。完整网关支持已实现的 JSON 与文本 SSE 响应格式。
+## 隐私检测台
 
-本机 HTTPS 入口可增加 `--tls-cert` 和 `--tls-key`；自定义上游 CA 使用 `--upstream-ca-file`。上游保持证书和主机名校验。`privacy-run` 与 `tls-run` 的控制面探测目前使用本机 HTTP。
-
-## 策略
-
-[examples/policy.yaml](examples/policy.yaml) 是可复制的配置起点。支持 `epoch`、`dictionaries`、`patterns`、`mask_money`、`mask_dates`、`mask_all_numbers`、`default_labels` 和 `ttl_seconds`。填写业务词典与正则规则，或使用 `--sensitive-path` 指定整体保护的 JSON 字段路径；未知配置字段拒绝加载。
-
-Rust 库通过 `Detector` / `LocalAnalyzer` 接入由调用方预先加载的本机检测器，`AnalyzerDetector` 映射标准实体类型并校验 Unicode 字符索引；网关通过 `PrivacyGate::with_detectors` 注册，重载时保留必需检测器。产品不自动下载模型。
-
-规则未覆盖的名称、业务秘密和编码变形不会自动获得完整识别保证。业务数值需要计算时，应使用私密计算引用；不能通过把 JSON 数字改成字符串来保持协议兼容。
-
-在支持 SIGHUP 的系统上，策略重载要求增加 `epoch`。旧引用随策略版本失效；服务重启会创建新 run 并丢失内存映射，客户端应重新初始化。
-
-## Linux 受管启动
-
-`privacy-run` 为启动的进程及后代创建受限运行域，出口只允许连接指定网关。需要 root 控制面、iproute2、nftables、unshare、libseccomp，以及支持 `mount_setattr`、`close_range`、pidfd 和密封 memfd 的内核。默认只读挂载公共 bin/lib/share 运行库目录，额外依赖通过 `--read-only-path` 明确添加。
+资源就绪后启动：
 
 ```bash
-sudo privacy-run \
-  --run-state-file "$CONTROL_DIR/run.json" \
-  --token-file "$CONTROL_DIR/gateway.token" \
-  --workspace "$AGENT_WORKSPACE" \
-  --uid "$AGENT_UID" --gid "$AGENT_GID" \
-  --gateway-port 8765 \
-  --read-only-path "$AGENT_RUNTIME" \
-  --timeout 300 \
-  -- "$AGENT_EXECUTABLE" AGENT_ARGS
+# 源码构建产物
+./target/release/censorprivacy web
 ```
 
-这些变量应指向专属 workspace、非 root UID/GID、可信只读依赖和实际可执行文件。launcher 控制文件必须为私有普通文件，由 root 或目标 UID 持有。服务账户不同的部署应由管理员提供符合所有权要求的本次 token 和 run 状态文件。
+完整包使用 `./bin/censorprivacy web`；源码安装后使用 `~/.local/bin/censorprivacy web`。
 
-网关需要同时可供本机 readiness 探测和运行域内的 veth 访问；仅监听宿主 `127.0.0.1` 不满足后者。按部署边界调整监听地址和访问规则。现有未受管进程不属于该运行域。
+打开 **http://127.0.0.1:8766/**，粘贴文本并检测，即可查看：
 
-## TLS direct
+- **原文高亮**：定位命中的隐私范围。
+- **检测依据**：展示 REGEX / RULES / NER 来源、分数与校验状态。
+- **遮蔽预览**：切换随机引用、类别占位符或等字符数星号，调整遮蔽阈值。
 
-`tls-run` 为协作的动态 OpenSSL 客户端加载 native 库，保持客户端原 TLS 连接，在加密前与交付响应前调用本机 broker。
+检测台不需要上游或 API Key，预览引用不能用于网关恢复。Ctrl+C 停止；内存较小时，先停止检测台再启动网关。服务器访问使用 [SSH 端口转发](docs/usage.md#1-打开隐私检测台)，详细交互见 [检测台说明](plugins/detector-web/README.md)。
 
-服务增加 `--tls-direct`，上游配置为实际 HTTPS IPv4 字面量 origin。客户端示例：
+## 模型网关
+
+准备好本地检测资源后，按 **初始化 → 配置策略 → 启动 → 检查** 操作。以下以 DeepSeek 为例，其他服务替换为实际 origin 与模型 ID：
 
 ```bash
-tls-run \
-  --broker http://127.0.0.1:8765 \
-  --token-file "$CONTROL_DIR/gateway.token" \
-  --run-state-file "$CONTROL_DIR/run.json" \
-  --upstream-key-file "$CONTROL_DIR/upstream.key" \
-  --native-library "$PWD/native/libcp_tls_guard.so" \
-  --workspace "$AGENT_WORKSPACE" \
-  --timeout 120 \
-  -- "$CLIENT_EXECUTABLE" CLIENT_ARGS
+./cpctl init --upstream https://api.deepseek.com --model-id deepseek-flash
 ```
 
-此模式需要匹配目标证书的客户端配置，仅支持固定 IPv4 peer、HTTP/1.1、Content-Length 和非流式未压缩 JSON。SSE、HTTP/2、chunked、静态 TLS 和其他 TLS 后端不在支持范围内。`tls-run` 本身不创建强制网络隔离域。构建、接入与长度限制见 [native/README.md](native/README.md)。
+按提示输入 provider API Key，输入不回显。上游地址不加 `/v1`；`--model-id` 指上游聊天模型，本地隐私检测模型固定为 `bert4ner-base-chinese`。
 
-## 私密计算
-
-`privcalc` 和 `censorprivacy-mcp` 调用本机 `/v1/private_compute`。工具输入是已签发引用，服务内部解引用并执行受限 Decimal/日期运算；返回派生引用，保留敏感标签，不向模型返回原始操作数或结果。
+初始化后编辑 `~/.config/censorprivacy/managed/policy.yaml`，补充需要保护的业务词典、正则和秘密，再执行：
 
 ```bash
-privcalc aggregate "$REF_A" "$REF_B"
+./cpctl start
+./cpctl check --model
 ```
 
-工具环境需要 `CENSORPRIVACY_URL`、`CENSORPRIVACY_TOKEN` 和 `CENSORPRIVACY_RUN_ID`，由 launcher 或可信控制面提供。CLI 支持 `sum`、`mean`、`min`、`max`、`aggregate`、`date_diff`；stdio MCP 入口为 `censorprivacy-mcp`。在客户端已有 MCP 配置中注册该命令，实际可用操作由 `tools/list` 返回。TLS direct 工具环境还需 `CENSORPRIVACY_MODE=tls-direct`。
+网关默认地址为 `http://127.0.0.1:8775`。`check --model` 会调用实际上游，可能计费。私有凭据、策略示例、多实例与 systemd 使用见 [使用手册](docs/usage.md)。
 
-普通 shell 或 Python 工具不会自动获得引用的解密权限。URL、代码、工具参数等主动使用位置不进行普通显示还原。
+## Agent 接入
 
-## 服务部署与范围
+保持网关运行，选择已有客户端或项目适配入口。
 
-systemd 模板和配置步骤见 [deploy/README.md](deploy/README.md)。
+### 通用客户端
 
-完整网关保护配置到该入口的模型请求；独立出口限制需要 `privacy-run`。当前不支持任意媒体、opaque reasoning、远程状态、任意 TLS ABI 或通用私密代码执行。占位符会改变模型输入与 token 用量，使用场景应按实际策略评估。
+| 配置项 | 填写内容 |
+| --- | --- |
+| Chat Completions Base URL | `http://127.0.0.1:8775/v1` |
+| API Key | `~/.config/censorprivacy/managed/gateway.token` 的内容 |
+| 模型 ID | 与 `init --model-id` 一致 |
+
+Agent 使用本机 gateway token，provider Key 由网关持有。Responses/Messages 等接口的路径配置见 [使用手册](docs/usage.md#31-通用客户端)。
+
+### DeepSeek Harness 与 openEuler xiaoO
+
+先按各自官方说明安装或构建客户端，再执行对应入口：
+
+```bash
+# DeepSeek Harness：浏览器聊天
+./cpctl dsh web --dsh-root /path/to/deepseek-harness
+```
+
+```bash
+# openEuler xiaoO：终端交互
+./cpctl xiaoo tui --xiaoo-root /path/to/xiaoO
+```
+
+两者自动复用当前网关的模型与凭据，使用独立配置，不覆盖原客户端配置。PATH 已有可用命令时可省略源码目录。完整准备、聊天示例和工具调用验收见 [Agent 接入指南](docs/usage.md#3-接入-agent)。
+
+## 日常管理与本机演示
+
+| 命令 | 用途 |
+| --- | --- |
+| `./cpctl check` | 检查当前网关认证、权限与 run 状态，无上游调用 |
+| `./cpctl stop` | 停止当前用户实例 |
+| `./cpctl start` | 启动新 run；Agent 需新建会话 |
+| `./cpctl demo gateway` | 真实检测器 + 模拟上游，演示遮蔽、恢复与引用计算，无需云 Key |
+| `./cpctl help` | 查看命令与选项 |
+
+演示另需 Node 22.19+（22.x）或 ≥24。映射只保存在服务内存中，重启后旧引用失效；默认 run 有效期为一小时，调整与排查见 [日常管理](docs/usage.md#4-日常管理)。
+
+## 工作方式与可选能力
+
+**Agent 请求 → 本机检测 → 隐私替换 → 模型服务 → 回复检查 → 授权显示恢复。**
+
+正则、规则、验证与 NER 在同一 Rust 进程中完成，原值保留在本机 vault。普通网关支持已实现的 Chat Completions、Responses、Messages 及文本 SSE；代码、链接目标与普通工具参数不恢复原值。未知格式或检测失败时拒绝处理。检测范围、阈值和协议边界见 [检测器说明](docs/rust-detector.md) 与 [架构说明](docs/architecture.md)。
+
+按场景启用额外能力：
+
+- [私密计算与 MCP](docs/usage.md#私密计算与-mcp)：用授权引用完成本地数值/日期运算，返回派生引用。
+- [Linux 受管运行域](docs/usage.md#linux-受管运行域)：通过 `privacy-run` 约束受管进程及后代的网络出口，需要 root 与相应内核能力。
+- [TLS direct](docs/usage.md#tls-direct)：通过 `tls-run` 与可选 native hook 保留受支持客户端的原 TLS 连接。普通网关和检测台无需构建 native。
+
+## 开发与交付
+
+```bash
+# 默认回归，无需模型或 Python
+CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 bash scripts/test/run-all.sh
+```
+
+修改检测器时，另行配置 ONNX/ORT 后执行 `bash scripts/test/detector.sh --integration`。安装、打包、浏览器及环境相关测试的条件与参数见 [脚本速查](docs/scripts.md)；已执行的测试范围见 [验收记录](docs/validation.md)。
+
+## 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [文档首页](docs/README.md) | 阅读路线与统一约定 |
+| [构建与部署](docs/build-and-deploy.md) | 源码下载、依赖、模型导出、安装与 systemd |
+| [使用手册](docs/usage.md) | 检测台、网关、Agent 接入及可选模式 |
+| [二进制包](docs/binary-distribution.md) | 获取、校验、解压、自检与打包 |
+| [脚本速查](docs/scripts.md) | 运维、模型工具及测试参数 |
+| [故障排查](docs/troubleshooting.md) | 资源、内存、认证、上游与客户端问题 |
 
 ## 许可证
 
-沿用 AgentCensor 的 [木兰宽松许可证，第 2 版](LICENSE)。
+沿用 AgentCensor 的 [木兰宽松许可证，第 2 版](../LICENSE)。第三方代码与模型来源见 [许可说明](licenses/README.md)。
