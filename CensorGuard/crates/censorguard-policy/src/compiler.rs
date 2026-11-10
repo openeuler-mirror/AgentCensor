@@ -265,7 +265,7 @@ impl CompiledPolicy {
         }
         if name == BASE_GROUP {
             return Err(PolicyError::InvalidGroupName(format!(
-                "{BASE_GROUP} is immutable until daemon restart"
+                "{BASE_GROUP} cannot be published as a group; use censorguardctl rule apply for global rules"
             )));
         }
         let group: GroupPolicy = serde_yaml::from_slice(bytes)?;

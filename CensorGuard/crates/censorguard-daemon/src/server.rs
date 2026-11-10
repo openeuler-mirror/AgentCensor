@@ -805,6 +805,7 @@ fn legacy_request(op: Operation) -> Request {
         policy_yaml: None,
         policy_source: None,
         group: None,
+        rule: None,
         dry_run: false,
         enable_file: None,
         enable_exec: None,
@@ -1003,6 +1004,36 @@ fn dispatch_inner(
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
                 failure(error.to_string())
             }
+        },
+        Operation::RuleAppend | Operation::RuleRemove => {
+            let Some(rule) = request.rule.as_deref() else {
+                return failure("rule append/remove requires rule");
+            };
+            match runtime.edit_rule(rule, request.op == Operation::RuleAppend) {
+                Ok(()) => Response {
+                    config_path: Some(runtime.config_path().display().to_string()),
+                    ..success()
+                },
+                Err(error) => failure(error.to_string()),
+            }
+        }
+        Operation::RuleApply => match runtime.apply_rules() {
+            Ok(result) => Response {
+                ok: true,
+                reload_gen: result.generation,
+                version: result.version,
+                active_bank: result.active_bank,
+                changed: result.changed,
+                config_path: Some(runtime.config_path().display().to_string()),
+                enable_file: result.enables[0],
+                enable_exec: result.enables[1],
+                enable_net: result.enables[2],
+                audit_file: result.audits[0],
+                audit_exec: result.audits[1],
+                audit_net: result.audits[2],
+                ..Response::default()
+            },
+            Err(error) => failure(error.to_string()),
         },
         Operation::Reload => match runtime.reload(
             request.policy_file.as_deref(),
