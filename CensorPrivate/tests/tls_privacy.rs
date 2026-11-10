@@ -125,7 +125,7 @@ fn restore_only_passive_display_and_never_credentials_or_tool_arguments() {
 fn nested_tool_json_projection_and_long_compute_result_padding() {
     let mut gate = gate();
     let mut transformer = LengthPreservingTransformer::new(&gate).unwrap();
-    let raw=br#"{"model":"configured-model","messages":[{"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"private_compute","arguments":"{\"value\":\"\u5f20\u4e09\"}"}}]}]}"#;
+    let raw=br#"{"model":"configured-model","messages":[{"role":"assistant","tool_calls":[{"id":"call","type":"function","function":{"name":"lookup","arguments":"{\"value\":\"\u5f20\u4e09\"}"}}]}]}"#;
     let protected = transformer.protect_json(&gate, Api::Chat, raw).unwrap();
     assert_eq!(protected.len(), raw.len());
     assert!(!String::from_utf8_lossy(&protected).contains("5f20"));

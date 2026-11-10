@@ -29,7 +29,10 @@
 #define MAX_STATES 256u
 #define READ_STAGE 16384u
 #define MAX_HEADER 8192u
-#define RPC_TIMEOUT_MS 2000
+/* Local BERT inference shares the broker's bounded 60-second transaction
+ * budget. The former 2-second transport deadline could reject a valid reply
+ * before the required detector finished; timeouts still fail closed. */
+#define RPC_TIMEOUT_MS 60000
 #define REQ_HEADER 20u
 #define RESP_HEADER 12u
 

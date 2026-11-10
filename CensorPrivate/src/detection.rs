@@ -1,6 +1,7 @@
 use crate::{
     error::{Error, Result},
     policy::{validate_entity_type, PrivacyPolicy},
+    professional::ProfessionalDetector,
     references::TOKEN_RE,
 };
 use fancy_regex::Regex;
@@ -201,6 +202,13 @@ pub struct RuleDetector {
 
 impl RuleDetector {
     pub fn new(policy: PrivacyPolicy) -> Result<Self> {
+        Self::build(policy, true)
+    }
+    /// Only policy/numeric overlays run beside the professional detector.
+    fn policy_overlays(policy: PrivacyPolicy) -> Result<Self> {
+        Self::build(policy, false)
+    }
+    fn build(policy: PrivacyPolicy, legacy: bool) -> Result<Self> {
         let mut detector = Self {
             policy,
             rules: Vec::new(),
@@ -239,8 +247,10 @@ impl RuleDetector {
                 1,
             ),
         ];
-        for (kind, expression, group) in builtins {
-            detector.add(kind, expression, group, None)?;
+        if legacy {
+            for (kind, expression, group) in builtins {
+                detector.add(kind, expression, group, None)?;
+            }
         }
         let number = r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?";
         if detector.policy.mask_money() {
@@ -354,8 +364,17 @@ impl Detector for RuleDetector {
         }
         for (kind, literals) in self.policy.dictionaries() {
             for literal in literals {
-                for (start, _) in text.match_indices(literal) {
+                let mut offset = 0;
+                while let Some(relative) = text[offset..].find(literal) {
+                    let start = offset + relative;
                     add(kind, start, start + literal.len(), &BTreeMap::new())?;
+                    // Advance by one Unicode scalar to include overlapping literals.
+                    offset = start
+                        + text[start..]
+                            .chars()
+                            .next()
+                            .ok_or(Error::DetectionFailed)?
+                            .len_utf8();
                 }
             }
         }
@@ -367,6 +386,7 @@ pub struct DetectionEngine {
     policy: PrivacyPolicy,
     rules: RuleDetector,
     specs: Vec<DetectorSpec>,
+    professional: Option<Arc<ProfessionalDetector>>,
 }
 
 impl DetectionEngine {
@@ -375,20 +395,43 @@ impl DetectionEngine {
             rules: RuleDetector::new(policy.clone())?,
             policy,
             specs: Vec::new(),
+            professional: None,
         })
     }
     pub fn with_detectors(mut self, specs: Vec<DetectorSpec>) -> Self {
         self.specs = specs;
         self
     }
+    pub fn with_professional(mut self, detector: Arc<ProfessionalDetector>) -> Result<Self> {
+        self.rules = RuleDetector::policy_overlays(self.policy.clone())?;
+        self.professional = Some(detector);
+        Ok(self)
+    }
     pub(crate) fn with_policy(&self, policy: PrivacyPolicy) -> Result<Self> {
-        Ok(Self::new(policy)?.with_detectors(self.specs.clone()))
+        let engine = Self::new(policy)?.with_detectors(self.specs.clone());
+        match &self.professional {
+            Some(detector) => engine.with_professional(detector.clone()),
+            None => Ok(engine),
+        }
     }
     pub fn detect(&self, text: &str, source_sensitive: bool) -> Result<Vec<Span>> {
+        self.detect_context(text, source_sensitive, "", false)
+    }
+    pub(crate) fn detect_context(
+        &self,
+        text: &str,
+        source_sensitive: bool,
+        field: &str,
+        structural: bool,
+    ) -> Result<Vec<Span>> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
-        let mut spans = self.rules.detect(text)?;
+        let mut spans = match &self.professional {
+            Some(detector) => detector.detect(text, field, structural, &self.policy)?,
+            None => Vec::new(),
+        };
+        spans.extend(self.rules.detect(text)?);
         for spec in &self.specs {
             let detected = (|| {
                 let detected = spec.detector.detect(text)?;

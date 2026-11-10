@@ -377,6 +377,42 @@ fn visit(
             let mut output = serde_json::Map::new();
             for (field, item) in object {
                 structural(context, field, &pointer(path, "<key>")?)?;
+                if !in_arguments
+                    && field == "arguments"
+                    && matches!(
+                        value.get("name").and_then(Value::as_str),
+                        Some("private_compute" | "privcalc")
+                    )
+                {
+                    // Private-compute operation names are protocol enums. Running
+                    // NER on isolated "sum" can register it as a person and then
+                    // reject the unchanged tool schema on the next model turn.
+                    let argument_path = pointer(path, field)?;
+                    let mut arguments =
+                        json::from_slice(item.as_str().ok_or(Error::ProtocolBlocked)?.as_bytes())?;
+                    let fields = arguments.as_object_mut().ok_or(Error::ProtocolBlocked)?;
+                    let operation = fields.remove("operation").ok_or(Error::ProtocolBlocked)?;
+                    let name = operation
+                        .as_str()
+                        .filter(|name| {
+                            ["sum", "mean", "min", "max", "aggregate", "date_diff"].contains(name)
+                        })
+                        .ok_or(Error::ProtocolBlocked)?;
+                    structural(context, "operation", &pointer(&argument_path, "<key>")?)?;
+                    structural(context, name, &pointer(&argument_path, "operation")?)?;
+                    let mut protected = visit(context, &arguments, &argument_path, "", true)?;
+                    protected
+                        .as_object_mut()
+                        .ok_or(Error::ProtocolBlocked)?
+                        .insert("operation".into(), operation);
+                    output.insert(
+                        field.clone(),
+                        serde_json::to_string(&protected)
+                            .map_err(|_| Error::ProtocolBlocked)?
+                            .into(),
+                    );
+                    continue;
+                }
                 let business = field == "input"
                     && matches!(
                         value.get("type").and_then(Value::as_str),

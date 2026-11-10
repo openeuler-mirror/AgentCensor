@@ -470,7 +470,7 @@ impl LengthPreservingTransformer {
         let mut ranges = Vec::new();
         for node in nodes.iter().chain(&secret_nodes) {
             for span in gate
-                .spans(&node.value, "", false)?
+                .credential_spans(&node.value)?
                 .iter()
                 .filter(|span| span.entity_type == "SECRET" || span.labels.contains("secret"))
             {

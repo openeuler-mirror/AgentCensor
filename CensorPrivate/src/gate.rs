@@ -5,6 +5,7 @@ use crate::{
     error::{Error, Result},
     json,
     policy::PrivacyPolicy,
+    professional::{ProfessionalConfig, ProfessionalDetector},
     protocols::{self, Api, RequestProtector},
     references::{random_hex, Reference, TOKEN_PATTERN, TOKEN_RE},
     vault::{Clock, MonotonicClock, Registration, RunCapability, RunVault},
@@ -93,6 +94,26 @@ impl PrivacyGate {
     pub fn new(policy: PrivacyPolicy, options: GateOptions) -> Result<Self> {
         Self::with_clock(policy, options, Arc::new(MonotonicClock(Instant::now())))
     }
+    /// Production constructor shared by HTTP gateway and TLS broker. Startup
+    /// verifies all three local engines before any request can be released.
+    pub fn with_professional_detector(
+        policy: PrivacyPolicy,
+        options: GateOptions,
+        config: ProfessionalConfig,
+    ) -> Result<Self> {
+        let detector = Arc::new(ProfessionalDetector::start(config)?);
+        Self::with_loaded_professional_detector(policy, options, detector)
+    }
+    /// Reuse one verified native model across transport adapters or local tests.
+    pub fn with_loaded_professional_detector(
+        policy: PrivacyPolicy,
+        options: GateOptions,
+        detector: Arc<ProfessionalDetector>,
+    ) -> Result<Self> {
+        let mut gate = Self::new(policy, options)?;
+        gate.detector = gate.detector.with_professional(detector)?;
+        Ok(gate)
+    }
     pub fn with_detectors(
         policy: PrivacyPolicy,
         options: GateOptions,
@@ -149,7 +170,30 @@ impl PrivacyGate {
         })
     }
     pub(crate) fn spans(&self, text: &str, path: &str, source_check: bool) -> Result<Vec<Span>> {
-        let mut spans = self.detector.detect(text, false)?;
+        self.spans_context(text, path, source_check, false)
+    }
+    /// Fixed BERT predicts names/organizations/locations/time, never secrets.
+    /// Credential-only response checks use validated formats/rules plus all
+    /// caller-supplied detectors and known vault literals.
+    pub(crate) fn credential_spans(&self, text: &str) -> Result<Vec<Span>> {
+        self.spans_context(text, "", false, true)
+    }
+    fn spans_context(
+        &self,
+        text: &str,
+        path: &str,
+        source_check: bool,
+        structural: bool,
+    ) -> Result<Vec<Span>> {
+        let field = path
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .replace("~1", "/")
+            .replace("~0", "~");
+        let mut spans = self
+            .detector
+            .detect_context(text, false, &field, structural)?;
         if source_check && self.source_sensitive(path) && !text.is_empty() {
             // Whole-field protection must not downgrade a detected credential
             // to an ordinary display-restorable CONFIDENTIAL value. Retain the
@@ -545,7 +589,7 @@ impl RequestProtector for PrivacyGate {
         self.protect_text(text, path)
     }
     fn structural(&self, text: &str, path: &str) -> Result<()> {
-        let mut spans = self.spans(text, path, true)?;
+        let mut spans = self.spans_context(text, path, true, true)?;
         let leaf = path.rsplit('/').next().unwrap_or("");
         let schema = path.split('/').any(|part| {
             matches!(
