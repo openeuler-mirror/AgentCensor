@@ -139,6 +139,45 @@ async fn decode(response: Response) -> Value {
 }
 
 #[tokio::test]
+async fn deepseek_gateway_defaults_to_visible_output_without_overriding_explicit_thinking() {
+    let (service, mock, handle) = setup(1_048_576).await;
+    for model in ["deepseek-flash", "configured-model"] {
+        let response = service
+            .router()
+            .oneshot(request(
+                "/v1/chat/completions",
+                json!({"model":model,"messages":[{"role":"user","content":"姓名：张三"}],"stream":false}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            decode(response).await["choices"][0]["message"]["content"],
+            "姓名：张三"
+        );
+    }
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls[0].2["thinking"], json!({"type":"disabled"}));
+        assert!(calls[1].2.get("thinking").is_none());
+        assert!(!calls[0].2.to_string().contains("张三"));
+    }
+    for thinking in [json!({"type":"enabled"}), json!(null), json!({})] {
+        let response = service
+            .router()
+            .oneshot(request(
+                "/v1/chat/completions",
+                json!({"model":"deepseek-flash","messages":[],"thinking":thinking}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
+    handle.abort();
+}
+
+#[tokio::test]
 async fn real_upstream_only_sees_protected_context_and_service_credentials() {
     let (service, mock, handle) = setup(1_048_576).await;
     for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
