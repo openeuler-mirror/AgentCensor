@@ -16,6 +16,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[path = "../plugins/detector-web/server.rs"]
+mod detector_web;
+
 #[derive(Parser)]
 #[command(
     name = "censorprivacy",
@@ -29,6 +32,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve(Box<Serve>),
+    /// Open the local privacy detection workspace (no upstream required).
+    Web(detector_web::WebArgs),
 }
 #[derive(clap::Args)]
 struct Serve {
@@ -249,6 +254,7 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Serve(args) => serve(*args).await,
+        Command::Web(args) => detector_web::serve(args).await,
     };
     if let Err(error) = result {
         eprintln!("{{\"error\":{{\"code\":\"{}\"}}}}", error.code());
