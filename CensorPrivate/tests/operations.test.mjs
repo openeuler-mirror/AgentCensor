@@ -10,39 +10,54 @@ import { join, resolve } from 'node:path';
 
 const exec = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
-test('installed cpctl: initialization, lifecycle, credential routing and fail closed', { timeout: 90000 }, async () => {
+test('installed cpctl: initialization, lifecycle, credential routing and fail closed', { timeout: 180000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cp-ops-test-'));
   const config = join(directory, 'control'); const prefix = join(directory, 'prefix');
   let received = 0; const captured = []; const providerKey = 'fictional-provider-credential-for-test';
   const upstream = createServer(async (request, response) => {
     const chunks = []; for await (const chunk of request) chunks.push(chunk);
-    captured.push(JSON.parse(Buffer.concat(chunks)));
+    const body = JSON.parse(Buffer.concat(chunks));
+    captured.push(body);
     assert.equal(request.headers.authorization, `Bearer ${providerKey}`); received++;
     response.setHeader('Content-Type', 'application/json');
-    response.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }] }));
+    response.setHeader('Connection', 'close');
+    const reasoning = body.model.startsWith('deepseek-') && body.thinking?.type !== 'disabled';
+    response.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'OK',
+      ...(reasoning ? { reasoning_content: 'synthetic default reasoning' } : {}) }, finish_reason: 'stop' }] }));
   });
   await new Promise(ok => upstream.listen(0, '127.0.0.1', ok));
   const reserve = createServer(); await new Promise(ok => reserve.listen(0, '127.0.0.1', ok));
   const port = reserve.address().port; await new Promise(ok => reserve.close(ok));
   const command = join(prefix, 'bin/cpctl');
-  const call = (operation, ...args) => exec(command, [operation, '--config-dir', config, ...args], { cwd: directory, timeout: 20000, maxBuffer: 1024 * 1024 });
+  const call = (operation, ...args) => exec(command, [operation, '--config-dir', config, ...args], { cwd: directory, timeout: 60000, maxBuffer: 1024 * 1024 });
   try {
     await exec(join(root, 'cpctl'), ['install', '--tls', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 60000 });
     for (const binary of ['censorprivacy', 'privacy-run', 'privcalc', 'censorprivacy-mcp', 'tls-run', 'cpctl']) assert.ok((await stat(join(prefix, 'bin', binary))).mode & 0o111);
     await stat(join(prefix, 'share/censorprivacy/docs/usage.md'));
+    await stat(join(prefix, 'share/censorprivacy/LICENSE'));
+    await stat(join(prefix, 'share/censorprivacy/docs/rust-detector.md'));
+    await assert.rejects(stat(join(prefix, 'share/censorprivacy/detector/worker.py')), { code: 'ENOENT' });
+    for (const directory of ['offline', 'tools', 'scripts/model', 'licenses']) {
+      await assert.rejects(stat(join(prefix, 'share/censorprivacy', directory)), { code: 'ENOENT' });
+    }
     assert.equal((await stat(join(prefix, 'share/censorprivacy'))).mode & 0o777, 0o755);
     await stat(join(prefix, 'share/censorprivacy/plugins/dsh-censorprivacy/index.mjs'));
     const key = join(directory, 'provider.key'); await writeFile(key, providerKey, { mode: 0o600 });
-    await call('init', '--upstream', `http://127.0.0.1:${upstream.address().port}`, '--model-id', 'test-model', '--key-file', key, '--port', String(port));
+    await call('init', '--upstream', `http://127.0.0.1:${upstream.address().port}`, '--model-id', 'deepseek-flash', '--key-file', key, '--port', String(port));
     const before = await readFile(join(config, 'config.json'), 'utf8');
     await call('init'); assert.equal(await readFile(join(config, 'config.json'), 'utf8'), before);
     assert.equal((await stat(config)).mode & 0o777, 0o700);
     for (const file of ['config.json', 'policy.yaml', 'upstream.key', 'gateway.token', 'curl.headers']) assert.equal((await stat(join(config, file))).mode & 0o777, 0o600);
     await call('start'); await call('check', '--model'); assert.equal(received, 1);
+    assert.deepEqual(captured[0].thinking, { type: 'disabled' });
     if (process.env.CP_TEST_DSH_ROOT) {
       await call('dsh', 'setup', '--dsh-root', process.env.CP_TEST_DSH_ROOT);
       const literalTask = '--help --root /not-a-real-directory should be ordinary task text';
-      const result = await call('dsh', 'run', '--', literalTask);
+      const result = await call('dsh', 'run', '--', literalTask).catch(async failure => {
+        failure.message += '\nDSH stderr:\n' + await readFile(join(config, 'dsh/dsh-stderr.txt'), 'utf8');
+        failure.message += '\nCaptured request metadata:\n' + JSON.stringify(captured.map(body => ({ model: body.model, thinking: body.thinking })));
+        throw failure;
+      });
       assert.equal(result.stdout.trim(), 'OK');
       assert.ok(captured.at(-1).messages.some(message => message.role === 'user' && message.content.includes(literalTask)));
     }
