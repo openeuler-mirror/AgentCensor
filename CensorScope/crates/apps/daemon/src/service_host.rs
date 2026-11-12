@@ -1945,6 +1945,13 @@ impl DaemonServiceHost {
             return Ok(());
         }
         let host_pid = raw.envelope.process.host.as_ref().map(|host| host.pid);
+        if matches!(&raw.payload, collector_event::RawObservationPayload::Process { operation, .. } if operation == "exec")
+        {
+            if let Some(pid) = host_pid {
+                self.session_lookups
+                    .retain(|(cached_pid, _), _| *cached_pid != pid);
+            }
+        }
         let session_resolution = self.resolve_item_session(trace_id, host_pid, &mut raw.envelope);
         let operation = match &raw.payload {
             collector_event::RawObservationPayload::Process { operation, .. } => {
