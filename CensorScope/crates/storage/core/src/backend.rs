@@ -144,7 +144,7 @@ pub trait StorageBackend {
     /// `call_id`.  Ingestion can attribute an event before a queued control
     /// call-start reaches the daemon (single-threaded stalls); this lets the
     /// daemon re-evaluate those rows once the span is known.  Returns
-    /// `(event_id, host_pid, observed_at_ns)` — host_pid is `None` when no
+    /// `(event_id, host_pid, observed_at_ns, session_id)` — host_pid is `None` when no
     /// process record resolved.  Events with a NULL session match any window
     /// (mirror of the ingest-time matcher).
     fn unassigned_events_in_window(
@@ -154,7 +154,7 @@ pub trait StorageBackend {
         started_at_ns: i64,
         ended_at_ns: i64,
         limit: u64,
-    ) -> Result<Vec<(i64, Option<u32>, i64)>, StorageError>;
+    ) -> Result<Vec<(i64, Option<u32>, i64, Option<String>)>, StorageError>;
     /// Backfills `call_id` onto previously stored events, skipping rows that
     /// were attributed in the meantime (UPDATE ... WHERE call_id IS NULL).
     fn assign_event_call_ids(&mut self, assignments: &[(i64, String)]) -> Result<(), StorageError>;

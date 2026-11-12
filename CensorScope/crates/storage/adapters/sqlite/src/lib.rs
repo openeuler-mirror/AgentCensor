@@ -89,10 +89,10 @@ impl SqliteStorage {
         started_at_ns: i64,
         ended_at_ns: i64,
         limit: u64,
-    ) -> Result<Vec<(i64, Option<u32>, i64)>, rusqlite::Error> {
+    ) -> Result<Vec<(i64, Option<u32>, i64, Option<String>)>, rusqlite::Error> {
         let connection = self.connection.borrow();
         let mut statement = connection.prepare(
-            "SELECT e.event_id, p.host_pid, e.observed_at
+            "SELECT e.event_id, p.host_pid, e.observed_at, e.session_id
                FROM events e
                LEFT JOIN processes p ON p.process_id = e.process_id
               WHERE e.trace_id = ?1
@@ -110,7 +110,7 @@ impl SqliteStorage {
                 session_id,
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         rows.collect()
     }
@@ -2463,6 +2463,8 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].0, 1);
         assert_eq!(candidates[1].0, 2);
+        assert_eq!(candidates[0].3.as_deref(), Some("sess-1"));
+        assert_eq!(candidates[1].3, None);
         storage
             .assign_event_call_ids(&[(1, "call-new".to_string()), (2, "call-new".to_string())])
             .unwrap();
