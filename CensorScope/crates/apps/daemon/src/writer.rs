@@ -405,7 +405,6 @@ impl WriterHandle {
         self.counters.backfill_gave_up.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn call_start(&self, write: CallStartWrite) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control
@@ -414,27 +413,12 @@ impl WriterHandle {
         wait_reply(reply_rx).map(|_| ())
     }
 
-    pub fn call_start_async(&self, write: CallStartWrite) -> Result<(), String> {
-        let (reply_tx, _reply_rx) = mpsc::channel();
-        self.control
-            .try_send(ControlItem::CallStart(write, reply_tx))
-            .map_err(|error| control_queue_error(error.to_string()))
-    }
-
-    #[allow(dead_code)]
     pub fn call_close(&self, write: CallCloseWrite) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control
             .send(ControlItem::CallClose(write, reply_tx))
             .map_err(|_| "writer channel closed".to_string())?;
         wait_reply(reply_rx).map(|_| ())
-    }
-
-    pub fn call_close_async(&self, write: CallCloseWrite) -> Result<(), String> {
-        let (reply_tx, _reply_rx) = mpsc::channel();
-        self.control
-            .try_send(ControlItem::CallClose(write, reply_tx))
-            .map_err(|error| control_queue_error(error.to_string()))
     }
 
     pub fn persist(&self, writes: Vec<PersistWrite>) -> Result<(), String> {

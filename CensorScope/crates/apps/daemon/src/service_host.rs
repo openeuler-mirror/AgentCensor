@@ -2748,19 +2748,30 @@ impl DaemonServiceHost {
             ControlCommand::CallStart(command) => {
                 let started_at =
                     std::time::UNIX_EPOCH + std::time::Duration::from_nanos(command.started_at);
-                // SQLite keys spans by (trace_id, call_id): dedupe the
-                // in-memory matcher on the same identity so a retried
-                // call-start cannot create ambiguous duplicate time-window
-                // candidates. Only span metadata is deduped; every eBPF
-                // observation remains independently stored.
-                if let Some(span) = self.call_spans.iter_mut().find(|span| {
+                let existing = self.call_spans.iter().find(|span| {
                     span.trace_id == command.trace_id && span.call_id == command.call_id
-                }) {
-                    span.session_id = command.session_id.clone();
-                    span.host_pid = command.host_pid;
-                    span.started_at = started_at;
-                    span.ended_at = None;
-                } else {
+                });
+                if let Some(span) = existing {
+                    if span.session_id != command.session_id
+                        || span.host_pid != command.host_pid
+                        || span.started_at != started_at
+                    {
+                        return Err(ControlError::new(
+                            "call_conflict",
+                            "call identity or start does not match",
+                        ));
+                    }
+                }
+                self.writer
+                    .call_start(CallStartWrite {
+                        trace_id: command.trace_id,
+                        session_id: command.session_id.clone(),
+                        call_id: command.call_id.clone(),
+                        host_pid: command.host_pid,
+                        started_at,
+                    })
+                    .map_err(|error| control_error("call_start_persist", error))?;
+                if existing.is_none() {
                     self.call_spans.push(CallSpanRecord {
                         trace_id: command.trace_id,
                         session_id: command.session_id.clone(),
@@ -2771,15 +2782,6 @@ impl DaemonServiceHost {
                         status: None,
                     });
                 }
-                self.writer
-                    .call_start_async(CallStartWrite {
-                        trace_id: command.trace_id,
-                        session_id: command.session_id.clone(),
-                        call_id: command.call_id.clone(),
-                        host_pid: command.host_pid,
-                        started_at,
-                    })
-                    .map_err(|error| control_error("call_start_queue", error))?;
                 Ok(ControlReply::CallStarted)
             }
             ControlCommand::CallEnd(command) => {
@@ -2794,18 +2796,41 @@ impl DaemonServiceHost {
                 }
                 let ended_at =
                     std::time::UNIX_EPOCH + std::time::Duration::from_nanos(command.ended_at);
-                // Close the in-memory span first so ingest attribution is
-                // settled for events drained after this point; jobs scope by
-                // the registered span session, not this command's value.
-                let (span_started, span_session) = match self.call_spans.iter_mut().find(|span| {
-                    span.trace_id == command.trace_id && span.call_id == command.call_id
-                }) {
-                    Some(span) => {
-                        span.ended_at = Some(ended_at);
-                        (Some(span.started_at), span.session_id.clone())
-                    }
-                    None => (None, None),
-                };
+                let span = self
+                    .call_spans
+                    .iter()
+                    .find(|span| {
+                        span.trace_id == command.trace_id && span.call_id == command.call_id
+                    })
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "call_missing",
+                            "call-start must be acknowledged before call-end",
+                        )
+                    })?;
+                if span.session_id != command.session_id
+                    || span.host_pid != command.host_pid
+                    || ended_at < span.started_at
+                {
+                    return Err(ControlError::new(
+                        "call_conflict",
+                        "call-end does not match the registered call",
+                    ));
+                }
+                if let Some(previous) = span.ended_at {
+                    return if previous == ended_at
+                        && span.status.as_deref() == Some(command.status.as_str())
+                    {
+                        Ok(ControlReply::CallEnded)
+                    } else {
+                        Err(ControlError::new(
+                            "call_conflict",
+                            "terminal call cannot be changed",
+                        ))
+                    };
+                }
+                let span_started = Some(span.started_at);
+                let span_session = span.session_id.clone();
                 let job_session = span_session.or_else(|| command.session_id.clone());
                 let gate = self.writer.bulk_pushed_count();
                 let now = SystemTime::now();
@@ -2852,10 +2877,8 @@ impl DaemonServiceHost {
                         }
                     }
                 }
-                // Close the stored span and enqueue its backfill jobs together;
-                // the writer commits the transaction asynchronously.
                 self.writer
-                    .call_close_async(CallCloseWrite {
+                    .call_close(CallCloseWrite {
                         trace_id: command.trace_id,
                         session_id: command.session_id.clone(),
                         call_id: command.call_id.clone(),
@@ -2864,7 +2887,13 @@ impl DaemonServiceHost {
                         status: command.status.clone(),
                         jobs,
                     })
-                    .map_err(|error| control_error("call_end_queue", error))?;
+                    .map_err(|error| control_error("call_end_persist", error))?;
+                if let Some(span) = self.call_spans.iter_mut().find(|span| {
+                    span.trace_id == command.trace_id && span.call_id == command.call_id
+                }) {
+                    span.ended_at = Some(ended_at);
+                    span.status = Some(command.status.clone());
+                }
                 Ok(ControlReply::CallEnded)
             }
         }
@@ -3241,7 +3270,29 @@ mod writer_pipeline_tests {
             )
             .expect("call end");
         assert!(matches!(reply, ControlReply::CallEnded));
-        // Give the writer an idle tick to commit the close and execute its job.
+        host.handle_command(
+            None,
+            ControlCommand::CallStart(CallStartCommand {
+                request_id: RequestId::new(3),
+                trace_id: trace,
+                session_id: Some("s1".to_string()),
+                call_id: "c1".to_string(),
+                host_pid: 9,
+                started_at: 5_000_000_000,
+            }),
+        )
+        .expect("duplicate start");
+        assert_eq!(
+            host.call_spans[0].ended_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20))
+        );
+        let storage = open_storage_backend(&StorageConfig::sqlite(&db, 5_000)).unwrap();
+        assert_eq!(
+            storage.list_call_spans(trace).unwrap()[0].ended_at,
+            host.call_spans[0].ended_at
+        );
+        drop(storage);
+        // Give the writer an idle tick to execute the queued backfill job.
         std::thread::sleep(std::time::Duration::from_millis(60));
         host.shutdown().expect("host shutdown");
         drop(host);
