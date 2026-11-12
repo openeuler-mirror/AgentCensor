@@ -46,6 +46,7 @@ pub fn normalize_payload(raw: RawPayloadSegment, matched: IngestMatch) -> Payloa
         trace_id: matched.trace_id,
         process: matched.process,
         session_id: matched.session,
+        attribution: Default::default(),
         call_id: raw.envelope.call_id.clone(),
         observed_at: raw.envelope.observed_at,
         source: raw.source,

@@ -17,6 +17,12 @@ use storage_core::CallSpanRecord;
 /// A child shell differs in pid from the span host that spawned it, so the pid
 /// is only a disambiguator, never a hard requirement. Events without a session
 /// id match any span of the trace (mirroring ingest behaviour).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowDecision {
+    pub call_id: Option<String>,
+    pub candidates: Vec<String>,
+}
+
 pub fn unique_call_window_match(
     spans: &[CallSpanRecord],
     trace_id: TraceId,
@@ -24,6 +30,16 @@ pub fn unique_call_window_match(
     session_id: &Option<SessionIdentity>,
     observed_at: SystemTime,
 ) -> Option<String> {
+    call_window_decision(spans, trace_id, host_pid, session_id, observed_at).call_id
+}
+
+pub fn call_window_decision(
+    spans: &[CallSpanRecord],
+    trace_id: TraceId,
+    host_pid: Option<u32>,
+    session_id: &Option<SessionIdentity>,
+    observed_at: SystemTime,
+) -> WindowDecision {
     let session_matches = |span: &CallSpanRecord| {
         session_id
             .as_ref()
@@ -63,7 +79,18 @@ pub fn unique_call_window_match(
             candidate_count = pid_count;
         }
     }
-    (candidate_count == 1).then(|| candidate.expect("candidate count is one").to_string())
+    let mut candidates: Vec<String> = spans
+        .iter()
+        .filter(|span| span.trace_id == trace_id && session_matches(span) && in_window(span))
+        .map(|span| span.call_id.clone())
+        .collect();
+    candidates.sort();
+    candidates.dedup();
+    WindowDecision {
+        call_id: (candidate_count == 1)
+            .then(|| candidate.expect("candidate count is one").to_string()),
+        candidates,
+    }
 }
 
 #[cfg(test)]

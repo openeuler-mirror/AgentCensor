@@ -20,11 +20,11 @@ pub struct EventEnvelope {
     pub collector: CollectorName,
     pub kind: EventKind,
     pub flags: EventFlags,
-    /// Session identified from the process environment. `None` marks a
-    /// non-session operation.
+    /// Resolved session; absence means that attribution is unknown.
     pub session_id: Option<SessionIdentity>,
     /// Harness tool call identifier used to correlate low-level observations.
     pub call_id: Option<String>,
+    pub attribution: crate::attribution::AttributionEvidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

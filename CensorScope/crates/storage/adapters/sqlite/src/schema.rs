@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-const SQLITE_SCHEMA_VERSION_CURRENT: i32 = 4;
+const SQLITE_SCHEMA_VERSION_CURRENT: i32 = 5;
 const CREATE_TABLES_SQL: &str = r#"
 CREATE TABLE process_id_sequence (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -107,7 +107,8 @@ CREATE TABLE events (
     dropped_bytes INTEGER,
     session_id TEXT,
     call_id TEXT,
-    metadata TEXT NOT NULL
+    metadata TEXT NOT NULL,
+    attribution TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX idx_processes_host_pid ON processes (host_pid);
@@ -194,7 +195,8 @@ CREATE TABLE payload_segments (
     protocol_hint TEXT,
     loss_reason TEXT,
     bytes BLOB,
-    call_id TEXT
+    call_id TEXT,
+    attribution TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX idx_payload_segments_trace_sequence
@@ -360,6 +362,14 @@ fn initialize_inner(connection: &Connection) -> Result<(), rusqlite::Error> {
     if version == SQLITE_SCHEMA_VERSION_CURRENT {
         return validate_current_schema(connection);
     }
+    if version == 4 {
+        connection.execute_batch(
+            "ALTER TABLE events ADD COLUMN attribution TEXT NOT NULL DEFAULT '{}';
+            ALTER TABLE payload_segments ADD COLUMN attribution TEXT NOT NULL DEFAULT '{}';
+            PRAGMA user_version = 5;",
+        )?;
+        return validate_current_schema(connection);
+    }
     if version == 3 {
         connection.execute_batch(
             "ALTER TABLE payload_segments ADD COLUMN operation_completion_state INTEGER NOT NULL DEFAULT 0;
@@ -395,7 +405,7 @@ fn initialize_inner(connection: &Connection) -> Result<(), rusqlite::Error> {
              FROM semantic_action_links;
              PRAGMA user_version = 4;",
         )?;
-        return validate_current_schema(connection);
+        return initialize_inner(connection);
     }
     if version == 2 {
         connection.execute_batch(
@@ -442,6 +452,8 @@ fn validate_current_schema(connection: &Connection) -> Result<(), rusqlite::Erro
         ("events", "path"),
         ("events", "session_id"),
         ("events", "call_id"),
+        ("events", "attribution"),
+        ("payload_segments", "attribution"),
         ("external_event_receipts", "source_instance_id"),
         ("external_event_receipts", "source_sequence"),
         ("payload_segments", "content_state"),
@@ -501,6 +513,7 @@ mod tests {
 
     fn old_schema(version: i32) -> String {
         let mut sql = CREATE_TABLES_SQL
+            .replace(",\n    attribution TEXT NOT NULL DEFAULT '{}'", "")
             .replace(
                 "    operation_completion_state INTEGER NOT NULL DEFAULT 0,\n",
                 "",
@@ -592,13 +605,37 @@ mod tests {
     }
 
     #[test]
+    fn v4_migration_keeps_legacy_attribution_unknown() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                &CREATE_TABLES_SQL.replace(",\n    attribution TEXT NOT NULL DEFAULT '{}'", ""),
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        connection.execute("INSERT INTO events(event_id,trace_id,observed_at,process_id,collector,kind,flags,operation,session_id,call_id,metadata) VALUES (1,1,0,1,'old',1,0,'exec','s','c','{}')", []).unwrap();
+        initialize(&connection).unwrap();
+        let row: (String, String, String) = connection
+            .query_row(
+                "SELECT session_id,call_id,attribution FROM events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("s".into(), "c".into(), "{}".into()));
+    }
+
+    #[test]
     fn supported_old_schemas_migrate_to_current_without_losing_rows() {
         for version in [1, 2, 3] {
             let connection = old_database(version);
             initialize(&connection).unwrap();
             initialize(&connection).unwrap();
 
-            assert_eq!(user_version(&connection).unwrap(), 4);
+            assert_eq!(
+                user_version(&connection).unwrap(),
+                SQLITE_SCHEMA_VERSION_CURRENT
+            );
             let payload_states: (i64, i64, i64) = connection
                 .query_row(
                     "SELECT operation_completion_state, truncation_state, redaction_state
@@ -653,7 +690,10 @@ mod tests {
             .unwrap();
         initialize(&connection).unwrap();
         initialize(&connection).unwrap();
-        assert_eq!(user_version(&connection).unwrap(), 4);
+        assert_eq!(
+            user_version(&connection).unwrap(),
+            SQLITE_SCHEMA_VERSION_CURRENT
+        );
         let event: (i64, String) = connection
             .query_row(
                 "SELECT kind, metadata FROM events WHERE event_id = 10",
