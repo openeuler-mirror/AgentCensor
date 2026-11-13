@@ -752,7 +752,7 @@ static __noinline void find_call_id(struct censorscope_event *event,
                     break;
             }
             event->call_id[CALL_ID_LEN - 1] = '\0';
-            if (value_offset == 19)
+            if (value_offset == 20)
                 break;
         }
         cursor += n;
