@@ -613,150 +613,154 @@ static __noinline void copy_cached_call_id(struct censorscope_event *event,
                          sizeof(event->call_id));
 }
 
-/* Read the agent-provided SessionId from the current task's env at
- * observation time (no later /proc read).  Kept a separate BPF subprogram:
- * inlining this scan into TLS payload probes would multiply verifier state
- * with the payload chunk loop. */
-static __noinline void find_session(struct censorscope_event *event,
-                                    struct task_struct *task) {
-    struct mm_struct *mm = 0;
-    struct censorscope_env_scratch *scratch;
+/* Keep the environment iteration inside the kernel so label matching and
+ * canonical/legacy precedence do not multiply verifier states per variable. */
+struct censorscope_env_scan {
+    struct censorscope_event *event;
     unsigned long cursor;
     unsigned long end;
+};
+
+static __noinline long scan_session_env(__u32 index, void *context) {
+    struct censorscope_env_scan *scan = context;
+    struct censorscope_event *event = scan->event;
+    struct censorscope_env_scratch *scratch;
     __u32 zero = 0;
-    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
-        return;
-    if (CORE_READ(&cursor, mm, env_start) != 0 ||
-        CORE_READ(&end, mm, env_end) != 0 || !cursor || cursor >= end)
-        return;
+    long n;
+
+    if (index >= MAX_ENV_VARS || scan->cursor >= scan->end)
+        return 1;
     scratch = bpf_map_lookup_elem(&env_scratch, &zero);
     if (!scratch)
-        return;
-#pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_ENV_VARS; i++) {
-        long n;
-        if (cursor >= end)
-            break;
-        n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
-                                    (const void *)cursor);
-        if (n <= 1)
-            break;
-        __u32 value_offset = 0;
-        if (scratch->value[0] == 'C' && scratch->value[1] == 'E' &&
-            scratch->value[2] == 'N' && scratch->value[3] == 'S' &&
-            scratch->value[4] == 'O' && scratch->value[5] == 'R' &&
-            scratch->value[6] == 'S' && scratch->value[7] == 'C' &&
-            scratch->value[8] == 'O' && scratch->value[9] == 'P' &&
-            scratch->value[10] == 'E' && scratch->value[11] == '_' &&
-            scratch->value[12] == 'S' && scratch->value[13] == 'E' &&
-            scratch->value[14] == 'S' && scratch->value[15] == 'S' &&
-            scratch->value[16] == 'I' && scratch->value[17] == 'O' &&
-            scratch->value[18] == 'N' && scratch->value[19] == '_' &&
-            scratch->value[20] == 'I' && scratch->value[21] == 'D' &&
-            scratch->value[22] == '=' && scratch->value[23] != '\0') {
-            value_offset = 23;
-        } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
-                   scratch->value[2] == 'H' && scratch->value[3] == '_' &&
-                   scratch->value[4] == 'S' && scratch->value[5] == 'E' &&
-                   scratch->value[6] == 'S' && scratch->value[7] == 'S' &&
-                   scratch->value[8] == 'I' && scratch->value[9] == 'O' &&
-                   scratch->value[10] == 'N' && scratch->value[11] == '_' &&
-                   scratch->value[12] == 'I' && scratch->value[13] == 'D' &&
-                   scratch->value[14] == '=' && scratch->value[15] != '\0') {
-            value_offset = 15;
-        }
-        if (value_offset != 0) {
-#pragma clang loop unroll(full)
-            for (int j = 0; j < SESSION_LEN - 1; j++) {
-                char c = scratch->value[j + value_offset];
-                event->session[j] = c;
-                if (!c)
-                    break;
-            }
-            event->session[SESSION_LEN - 1] = '\0';
-            if (value_offset == 23)
-                break;
-        }
-        cursor += n;
+        return 1;
+    n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
+                                (const void *)scan->cursor);
+    /* A truncated entry has no reliable next-variable boundary. */
+    if (n <= 1 || n == sizeof(scratch->value))
+        return 1;
+    __u32 value_offset = 0;
+    if (scratch->value[0] == 'C' && scratch->value[1] == 'E' &&
+        scratch->value[2] == 'N' && scratch->value[3] == 'S' &&
+        scratch->value[4] == 'O' && scratch->value[5] == 'R' &&
+        scratch->value[6] == 'S' && scratch->value[7] == 'C' &&
+        scratch->value[8] == 'O' && scratch->value[9] == 'P' &&
+        scratch->value[10] == 'E' && scratch->value[11] == '_' &&
+        scratch->value[12] == 'S' && scratch->value[13] == 'E' &&
+        scratch->value[14] == 'S' && scratch->value[15] == 'S' &&
+        scratch->value[16] == 'I' && scratch->value[17] == 'O' &&
+        scratch->value[18] == 'N' && scratch->value[19] == '_' &&
+        scratch->value[20] == 'I' && scratch->value[21] == 'D' &&
+        scratch->value[22] == '=' && scratch->value[23] != '\0') {
+        value_offset = 23;
+    } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
+               scratch->value[2] == 'H' && scratch->value[3] == '_' &&
+               scratch->value[4] == 'S' && scratch->value[5] == 'E' &&
+               scratch->value[6] == 'S' && scratch->value[7] == 'S' &&
+               scratch->value[8] == 'I' && scratch->value[9] == 'O' &&
+               scratch->value[10] == 'N' && scratch->value[11] == '_' &&
+               scratch->value[12] == 'I' && scratch->value[13] == 'D' &&
+               scratch->value[14] == '=' && scratch->value[15] != '\0') {
+        value_offset = 15;
     }
+    if (value_offset != 0) {
+        bpf_probe_read_kernel_str(event->session, SESSION_LEN,
+                                  scratch->value + value_offset);
+        if (value_offset == 23)
+            return 1;
+    }
+    scan->cursor += n;
+    return 0;
 }
 
-/* Per-tool Harness CallId, read while current (mirrors find_session) and
- * cached per process for later events, including TLS uprobes. */
-static __noinline void find_call_id(struct censorscope_event *event,
-                                    struct task_struct *task) {
-    struct mm_struct *mm = 0;
+static __noinline long scan_call_id_env(__u32 index, void *context) {
+    struct censorscope_env_scan *scan = context;
+    struct censorscope_event *event = scan->event;
     struct censorscope_env_scratch *scratch;
-    unsigned long cursor;
-    unsigned long end;
     __u32 zero = 0;
-    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
-        return;
-    if (CORE_READ(&cursor, mm, env_start) != 0 ||
-        CORE_READ(&end, mm, env_end) != 0 || !cursor || cursor >= end)
-        return;
+    long n;
+
+    if (index >= MAX_ENV_VARS || scan->cursor >= scan->end)
+        return 1;
     scratch = bpf_map_lookup_elem(&env_scratch, &zero);
     if (!scratch)
-        return;
-#pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_ENV_VARS; i++) {
-        long n;
-        if (cursor >= end)
-            break;
-        n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
-                                    (const void *)cursor);
-        if (n <= 1)
-            break;
-        int value_offset = 0;
-        if (scratch->value[0] == 'C' &&
-            scratch->value[1] == 'E' &&
-            scratch->value[2] == 'N' &&
-            scratch->value[3] == 'S' &&
-            scratch->value[4] == 'O' &&
-            scratch->value[5] == 'R' &&
-            scratch->value[6] == 'S' &&
-            scratch->value[7] == 'C' &&
-            scratch->value[8] == 'O' &&
-            scratch->value[9] == 'P' &&
-            scratch->value[10] == 'E' &&
-            scratch->value[11] == '_' &&
-            scratch->value[12] == 'C' &&
-            scratch->value[13] == 'A' &&
-            scratch->value[14] == 'L' &&
-            scratch->value[15] == 'L' &&
-            scratch->value[16] == '_' &&
-            scratch->value[17] == 'I' &&
-            scratch->value[18] == 'D' &&
-            scratch->value[19] == '=') {
-            value_offset = 20;
-        } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
-            scratch->value[2] == 'H' && scratch->value[3] == '_' &&
-            scratch->value[4] == 'C' && scratch->value[5] == 'E' &&
-            scratch->value[6] == 'N' && scratch->value[7] == 'S' &&
-            scratch->value[8] == 'O' && scratch->value[9] == 'R' &&
-            scratch->value[10] == 'S' && scratch->value[11] == 'C' &&
-            scratch->value[12] == 'O' && scratch->value[13] == 'P' &&
-            scratch->value[14] == 'E' && scratch->value[15] == '_' &&
-            scratch->value[16] == 'C' && scratch->value[17] == 'A' &&
-            scratch->value[18] == 'L' && scratch->value[19] == 'L' &&
-            scratch->value[20] == '_' && scratch->value[21] == 'I' &&
-            scratch->value[22] == 'D' && scratch->value[23] == '=') {
-            value_offset = 24;
-        }
-        if (value_offset != 0) {
-#pragma clang loop unroll(full)
-            for (int j = 0; j < CALL_ID_LEN - 1; j++) {
-                char c = scratch->value[j + value_offset];
-                event->call_id[j] = c;
-                if (!c)
-                    break;
-            }
-            event->call_id[CALL_ID_LEN - 1] = '\0';
-            if (value_offset == 20)
-                break;
-        }
-        cursor += n;
+        return 1;
+    n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
+                                (const void *)scan->cursor);
+    /* A truncated entry has no reliable next-variable boundary. */
+    if (n <= 1 || n == sizeof(scratch->value))
+        return 1;
+    int value_offset = 0;
+    if (scratch->value[0] == 'C' &&
+        scratch->value[1] == 'E' &&
+        scratch->value[2] == 'N' &&
+        scratch->value[3] == 'S' &&
+        scratch->value[4] == 'O' &&
+        scratch->value[5] == 'R' &&
+        scratch->value[6] == 'S' &&
+        scratch->value[7] == 'C' &&
+        scratch->value[8] == 'O' &&
+        scratch->value[9] == 'P' &&
+        scratch->value[10] == 'E' &&
+        scratch->value[11] == '_' &&
+        scratch->value[12] == 'C' &&
+        scratch->value[13] == 'A' &&
+        scratch->value[14] == 'L' &&
+        scratch->value[15] == 'L' &&
+        scratch->value[16] == '_' &&
+        scratch->value[17] == 'I' &&
+        scratch->value[18] == 'D' &&
+        scratch->value[19] == '=') {
+        value_offset = 20;
+    } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
+        scratch->value[2] == 'H' && scratch->value[3] == '_' &&
+        scratch->value[4] == 'C' && scratch->value[5] == 'E' &&
+        scratch->value[6] == 'N' && scratch->value[7] == 'S' &&
+        scratch->value[8] == 'O' && scratch->value[9] == 'R' &&
+        scratch->value[10] == 'S' && scratch->value[11] == 'C' &&
+        scratch->value[12] == 'O' && scratch->value[13] == 'P' &&
+        scratch->value[14] == 'E' && scratch->value[15] == '_' &&
+        scratch->value[16] == 'C' && scratch->value[17] == 'A' &&
+        scratch->value[18] == 'L' && scratch->value[19] == 'L' &&
+        scratch->value[20] == '_' && scratch->value[21] == 'I' &&
+        scratch->value[22] == 'D' && scratch->value[23] == '=') {
+        value_offset = 24;
     }
+    if (value_offset != 0) {
+        bpf_probe_read_kernel_str(event->call_id, CALL_ID_LEN,
+                                  scratch->value + value_offset);
+        if (value_offset == 20)
+            return 1;
+    }
+    scan->cursor += n;
+    return 0;
+}
+
+static __noinline void find_session(struct censorscope_event *event,
+                                    struct task_struct *task) {
+    struct censorscope_env_scan scan = { .event = event };
+    struct mm_struct *mm = 0;
+
+    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
+        return;
+    if (CORE_READ(&scan.cursor, mm, env_start) != 0 ||
+        CORE_READ(&scan.end, mm, env_end) != 0 || !scan.cursor ||
+        scan.cursor >= scan.end)
+        return;
+    bpf_loop(MAX_ENV_VARS, scan_session_env, &scan, 0);
+}
+
+static __noinline void find_call_id(struct censorscope_event *event,
+                                    struct task_struct *task) {
+    struct censorscope_env_scan scan = { .event = event };
+    struct mm_struct *mm = 0;
+
+    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
+        return;
+    if (CORE_READ(&scan.cursor, mm, env_start) != 0 ||
+        CORE_READ(&scan.end, mm, env_end) != 0 || !scan.cursor ||
+        scan.cursor >= scan.end)
+        return;
+    bpf_loop(MAX_ENV_VARS, scan_call_id_env, &scan, 0);
 }
 
 static __always_inline void init_event_from_cache(struct censorscope_event *event,

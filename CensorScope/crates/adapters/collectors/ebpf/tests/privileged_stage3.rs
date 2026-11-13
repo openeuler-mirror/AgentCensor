@@ -229,11 +229,19 @@ if sys.argv[1] == 'context-a':
     env['DSH_CENSORSCOPE_CALL_ID'] = 'legacy-call'
     env['CENSORSCOPE_SESSION_ID'] = 'session-b'
     env['CENSORSCOPE_CALL_ID'] = 'call-b'
-    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-b'], env)
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-b', sys.argv[2]], env)
 "#;
     let next = r#"
-import os
+import os, sys
 env = dict(os.environ)
+if sys.argv[1] == 'context-b':
+    env['CENSORSCOPE_CALL_ID'] = ''
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-empty', sys.argv[2]], env)
+if sys.argv[1] == 'context-empty':
+    env.pop('CENSORSCOPE_SESSION_ID', None)
+    env.pop('CENSORSCOPE_CALL_ID', None)
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-legacy', sys.argv[2]], env)
+env['CENSORSCOPE_SESSION_ID'] = 'session-b'
 env.pop('CENSORSCOPE_CALL_ID', None)
 env.pop('DSH_CENSORSCOPE_CALL_ID', None)
 os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
@@ -254,6 +262,8 @@ os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
     }
     for (marker, session, call) in [
         ("context-b", "session-b", Some("call-b")),
+        ("context-empty", "session-b", None),
+        ("context-legacy", "legacy-session", Some("legacy-call")),
         ("context-cleared", "session-b", None),
     ] {
         let event = observations.iter().find(|event| matches!(
