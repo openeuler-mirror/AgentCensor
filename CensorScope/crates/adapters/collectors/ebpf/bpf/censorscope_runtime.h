@@ -706,8 +706,11 @@ static __noinline long scan_context_env(__u32 index, void *context) {
                 event->session[0] = '\0';
             }
             if (rule->priority == scan->session_priority &&
-                scan->session_profile != rule->profile_id)
+                scan->session_profile != rule->profile_id) {
+                event->session[0] = '\0';
+                scan->session_profile = 0;
                 continue;
+            }
             bpf_probe_read_kernel_str(event->session, SESSION_LEN,
                                       scratch->value + value_offset);
         } else {
@@ -719,8 +722,11 @@ static __noinline long scan_context_env(__u32 index, void *context) {
                 event->call_id[0] = '\0';
             }
             if (rule->priority == scan->call_priority &&
-                scan->call_profile != rule->profile_id)
+                scan->call_profile != rule->profile_id) {
+                event->call_id[0] = '\0';
+                scan->call_profile = 0;
                 continue;
+            }
             bpf_probe_read_kernel_str(event->call_id, CALL_ID_LEN,
                                       scratch->value + value_offset);
         }

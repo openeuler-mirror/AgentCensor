@@ -112,6 +112,7 @@ fn stage3_real_file_tcp_ipc_stdio_signal_workload() {
 
     run_file_workload();
     run_tcp_workload();
+    run_raw_socket_io_workload();
     run_pipe_workload();
     run_socketpair_workload();
     run_sendmsg_workload();
@@ -244,21 +245,32 @@ if sys.argv[1] == 'context-empty':
     env.pop('CENSORSCOPE_SESSION_ID', None)
     env.pop('CENSORSCOPE_CALL_ID', None)
     os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-legacy', sys.argv[2]], env)
+if sys.argv[1] == 'context-legacy':
+    env.pop('DSH_SESSION_ID', None)
+    env.pop('DSH_CENSORSCOPE_CALL_ID', None)
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-inherited', sys.argv[2]], env)
 env['CENSORSCOPE_SESSION_ID'] = 'session-b'
 env.pop('CENSORSCOPE_CALL_ID', None)
 env.pop('DSH_CENSORSCOPE_CALL_ID', None)
 os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
 "#;
-    assert!(
-        std::process::Command::new("python3")
-            .args(["-c", script, "context-a", next])
-            .env("CENSORSCOPE_SESSION_ID", "session-a")
-            .env("CENSORSCOPE_CALL_ID", "call-a")
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script, "context-a", next])
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CENSORSCOPE_SESSION_ID", "session-a")
+        .env("CENSORSCOPE_CALL_ID", "call-a")
+        .spawn()
+        .expect("spawn exec context workload");
     let mut observations = Vec::new();
+    loop {
+        observations.extend(collector.poll_batch().unwrap().observations);
+        if let Some(status) = child.try_wait().expect("wait for exec context workload") {
+            assert!(status.success(), "exec context workload: {status}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     for _ in 0..20 {
         observations.extend(collector.poll_batch().unwrap().observations);
         std::thread::sleep(Duration::from_millis(10));
@@ -267,18 +279,20 @@ os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
         ("context-b", "session-b", Some("call-b")),
         ("context-empty", "session-b", None),
         ("context-legacy", "legacy-session", Some("legacy-call")),
+        ("context-inherited", "legacy-session", None),
         ("context-cleared", "session-b", None),
     ] {
         let event = observations.iter().find(|event| matches!(
             &event.payload,
             RawObservationPayload::Process { operation, argv: Some(argv), .. }
                 if operation == "exec" && argv.args.iter().any(|arg| arg == marker.as_bytes())
-        )).unwrap_or_else(|| panic!("missing exec {marker}"));
+        )).unwrap_or_else(|| panic!("missing exec {marker}; collector stats: {:?}", collector.stats()));
         assert_eq!(
             event.envelope.session_id.as_ref().map(|s| s.as_str()),
-            Some(session)
+            Some(session),
+            "session for {marker}"
         );
-        assert_eq!(event.envelope.call_id.as_deref(), call);
+        assert_eq!(event.envelope.call_id.as_deref(), call, "call for {marker}");
     }
     collector.unbind_trace(TraceId::new(1)).unwrap();
 }
@@ -437,6 +451,31 @@ fn run_tcp_workload() {
     let mut bytes = [0_u8; 4];
     server.read_exact(&mut bytes).expect("receive TCP");
     assert_eq!(&bytes, b"ping");
+}
+
+fn run_raw_socket_io_workload() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind raw TCP listener");
+    let client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect raw TCP");
+    let (server, _) = listener.accept().expect("accept raw TCP");
+    let outbound = b"raw-write";
+    let mut inbound = [0_u8; 9];
+
+    // SAFETY: both sockets remain open, and the buffers cover the requested lengths.
+    unsafe {
+        assert_eq!(
+            libc::write(client.as_raw_fd(), outbound.as_ptr().cast(), outbound.len()),
+            outbound.len() as isize
+        );
+        assert_eq!(
+            libc::read(
+                server.as_raw_fd(),
+                inbound.as_mut_ptr().cast(),
+                inbound.len()
+            ),
+            inbound.len() as isize
+        );
+    }
+    assert_eq!(&inbound, outbound);
 }
 
 fn run_pipe_workload() {
