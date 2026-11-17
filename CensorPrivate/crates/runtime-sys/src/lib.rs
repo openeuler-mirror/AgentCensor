@@ -30,6 +30,18 @@ pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no pointers and has no preconditions.
     unsafe { libc::geteuid() }
 }
+/// Lock this open file description until its owning File is closed. Callers
+/// should open a separate description for each independently acquired lock.
+pub fn lock_file_exclusive(file: &File) -> io::Result<()> {
+    loop {
+        // SAFETY: file owns a live descriptor; flock takes scalar arguments.
+        let result = checked(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) });
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
 fn duplicate(fd: libc::c_int) -> io::Result<File> {
     // SAFETY: fcntl validates fd; a successful F_DUPFD_CLOEXEC returns a new,
     // uniquely owned descriptor. No ownership is taken from the source.

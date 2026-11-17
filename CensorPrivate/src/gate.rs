@@ -1,6 +1,7 @@
 //! Complete-message privacy gate. This module performs no network operations.
 use crate::{
     compute::{self, ComputeResult, Operation},
+    conversations::TextSnapshot,
     detection::{DetectionEngine, DetectorSpec, Span},
     error::{Error, Result},
     json,
@@ -14,6 +15,7 @@ use regex::Regex;
 use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -271,7 +273,32 @@ impl PrivacyGate {
     }
     pub fn protect(&mut self, api: Api, body: &Value, target: &str) -> Result<ReleasePermit> {
         self.validate()?;
+        // Later messages can identify values as sensitive that also occur in
+        // earlier history. Discover the complete request before emitting any
+        // replacements; final validation must see one consistent vault state.
+        protocols::protect_request(api, body, self)?;
         let transformed = protocols::protect_request(api, body, self)?;
+        self.permit(api, transformed, target)
+    }
+    /// Observe the release's spans and replacements, without independent
+    /// preview inference or generating preview-only references.
+    pub fn protect_recorded(
+        &mut self,
+        api: Api,
+        body: &Value,
+        target: &str,
+    ) -> Result<(ReleasePermit, Vec<TextSnapshot>)> {
+        self.validate()?;
+        protocols::protect_request(api, body, self)?;
+        let observer = RecordingProtector {
+            gate: self,
+            snapshots: RefCell::new(Vec::new()),
+        };
+        let transformed = protocols::protect_request(api, body, &observer)?;
+        let snapshots = observer.snapshots.into_inner();
+        Ok((self.permit(api, transformed, target)?, snapshots))
+    }
+    fn permit(&mut self, api: Api, transformed: Value, target: &str) -> Result<ReleasePermit> {
         let body = serde_json::to_vec(&transformed).map_err(|_| Error::InvalidJson)?;
         if body.len() > self.options.max_body_bytes {
             return Err(Error::ResourceLimit);
@@ -642,6 +669,32 @@ impl RequestProtector for PrivacyGate {
     }
 }
 struct FinalCheck<'a>(&'a PrivacyGate);
+struct RecordingProtector<'a> {
+    gate: &'a PrivacyGate,
+    snapshots: RefCell<Vec<TextSnapshot>>,
+}
+impl RequestProtector for RecordingProtector<'_> {
+    fn text(&self, text: &str, path: &str) -> Result<String> {
+        let spans = self.gate.spans(text, path, true)?;
+        let masked =
+            self.gate
+                .vault
+                .protect_text(&self.gate.cap, self.gate.epoch(), text, spans.clone())?;
+        if path.starts_with("/messages/") {
+            let merged = crate::detection::merge_spans(text, spans)?;
+            self.snapshots
+                .borrow_mut()
+                .push(TextSnapshot::new(path, text, &masked, &merged));
+        }
+        Ok(masked)
+    }
+    fn structural(&self, text: &str, path: &str) -> Result<()> {
+        self.gate.structural(text, path)
+    }
+    fn number(&self, value: &Number, path: &str) -> Result<()> {
+        self.gate.number(value, path)
+    }
+}
 impl RequestProtector for FinalCheck<'_> {
     fn text(&self, text: &str, path: &str) -> Result<String> {
         if !self.0.spans(text, path, false)?.is_empty() {

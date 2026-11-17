@@ -7,6 +7,7 @@
 pub mod compute;
 #[cfg(target_os = "linux")]
 pub mod control;
+pub mod conversations;
 pub mod detection;
 pub mod display;
 pub mod error;
