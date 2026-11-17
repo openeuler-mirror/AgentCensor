@@ -5,6 +5,8 @@ use std::fmt;
 pub enum Error {
     PolicyInvalid,
     DetectionFailed,
+    NerConfigInvalid,
+    NerDeviceUnavailable,
     VaultDenied,
     ComputeInvalid,
     InvalidReference,
@@ -27,6 +29,8 @@ impl Error {
         match self {
             Self::PolicyInvalid => "policy_invalid",
             Self::DetectionFailed => "detection_failed",
+            Self::NerConfigInvalid => "ner_config_invalid",
+            Self::NerDeviceUnavailable => "ner_device_unavailable",
             Self::VaultDenied => "vault_denied",
             Self::ComputeInvalid => "compute_invalid",
             Self::InvalidReference => "invalid_reference",

@@ -1,6 +1,9 @@
 //! Native privacy detection using local ONNX resources.
+mod batch;
+mod config;
 mod model;
 mod rules;
+pub use config::{configured_ner_batch_size, configured_ner_device, NerDevice};
 
 use crate::{
     detection::{validate_spans, Span},
@@ -19,6 +22,11 @@ pub const MODEL_ID: &str = "shibing624/bert4ner-base-chinese";
 pub struct ProfessionalConfig {
     pub model_directory: Option<PathBuf>,
     pub runtime_library: Option<PathBuf>,
+    /// ONNX intra-op threads; inter-op remains one to avoid oversubscription.
+    pub ner_threads: usize,
+    pub ner_device: NerDevice,
+    /// Maximum windows per inference, per device; incomplete batches run immediately.
+    pub ner_batch_size: usize,
 }
 impl Default for ProfessionalConfig {
     fn default() -> Self {
@@ -26,6 +34,9 @@ impl Default for ProfessionalConfig {
             .ok()
             .and_then(|p| p.parent()?.parent().map(PathBuf::from));
         Self {
+            ner_threads: 1,
+            ner_device: NerDevice::Cpu,
+            ner_batch_size: 1,
             model_directory: std::env::var_os("CP_DETECTOR_MODEL_DIR")
                 .map(PathBuf::from)
                 .or_else(|| {
@@ -45,6 +56,36 @@ impl Default for ProfessionalConfig {
                 .map(PathBuf::from)
                 .or_else(|| prefix.map(|p| p.join("lib/censorprivacy/libonnxruntime.so"))),
         }
+    }
+}
+
+/// CLI overrides the environment. Invalid configuration must never silently
+/// select a different inference setup.
+pub fn configured_ner_threads(explicit: Option<u16>) -> Result<usize> {
+    let threads = match explicit {
+        Some(value) => usize::from(value),
+        None => match std::env::var("CP_NER_THREADS") {
+            Ok(value) => value.parse().map_err(|_| Error::DetectionFailed)?,
+            Err(std::env::VarError::NotPresent) => 1,
+            Err(_) => return Err(Error::DetectionFailed),
+        },
+    };
+    if !(1..=256).contains(&threads) {
+        return Err(Error::DetectionFailed);
+    }
+    Ok(threads)
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    #[test]
+    fn explicit_thread_configuration_is_bounded_and_overrides_environment() {
+        assert_eq!(configured_ner_threads(Some(4)).unwrap(), 4);
+        assert_eq!(configured_ner_threads(Some(1)).unwrap(), 1);
+        assert_eq!(configured_ner_threads(Some(256)).unwrap(), 256);
+        assert!(configured_ner_threads(Some(0)).is_err());
+        assert!(configured_ner_threads(Some(257)).is_err());
     }
 }
 
@@ -104,7 +145,7 @@ impl ProfessionalDetector {
     pub fn start(config: ProfessionalConfig) -> Result<Self> {
         let rules = rules::Rules::new()?;
         let mut ner = model::NerModel::load(&config)?;
-        ner.predict("张三在北京工作。")?;
+        ner.warmup()?;
         Ok(Self {
             native: Mutex::new(Native {
                 rules,

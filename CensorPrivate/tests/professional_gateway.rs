@@ -15,6 +15,102 @@ const TOKEN: &str = "professional-local-test-token-01234567890123456789";
 
 #[test]
 #[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
+fn cpu_batches_preserve_entities_offsets_and_tail_windows() {
+    let documents = [
+        "😀张三在清华大学工作。".to_owned(),
+        format!("{}张三在清华大学工作。", "普通测试文本。".repeat(72)),
+        format!(
+            "{}张三在清华大学工作。{}李四在北京大学工作。",
+            "普通测试文本。".repeat(136),
+            "普通测试文本。".repeat(100)
+        ),
+    ];
+    let mut tokenizer = tokenizers::Tokenizer::from_file(
+        ProfessionalConfig::default()
+            .model_directory
+            .unwrap()
+            .join("tokenizer.json"),
+    )
+    .unwrap();
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 512,
+            stride: 64,
+            ..Default::default()
+        }))
+        .unwrap();
+    // Ensure these are real tokenizer boundaries: the organization crosses
+    // the end of the first window, then the end of the second window.
+    for (doc, edge) in [(1, 0), (2, 1)] {
+        let encoded = tokenizer.encode(documents[doc].as_str(), true).unwrap();
+        let window = if edge == 0 {
+            &encoded
+        } else {
+            &encoded.get_overflowing()[0]
+        };
+        let boundary = window.get_offsets()[window.len() - 2].1;
+        let start = documents[doc].find("清华大学").unwrap();
+        assert!(start < boundary && start + "清华大学".len() > boundary);
+    }
+    let mut baseline = None;
+    // Serialize model instances on the small acceptance host.
+    for size in [1, 2, 4] {
+        let detector = ProfessionalDetector::start(ProfessionalConfig {
+            ner_threads: 4,
+            ner_batch_size: size,
+            ..Default::default()
+        })
+        .unwrap();
+        let actual: Vec<_> = documents
+            .iter()
+            .map(|text| detector.ner_entities(text).unwrap())
+            .collect();
+        if let Some(expected) = &baseline {
+            let expected: &Vec<Vec<censorprivacy::professional::NerEntity>> = expected;
+            for (doc, (left, right)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(left.len(), right.len(), "batch={size}, document={doc}");
+                for (a, b) in left.iter().zip(right) {
+                    assert_eq!((&a.label, a.start, a.end), (&b.label, b.start, b.end));
+                    assert!(
+                        (a.score - b.score).abs() <= 2e-5,
+                        "batch={size}, document={doc}"
+                    );
+                }
+            }
+        } else {
+            for (text, entities) in documents.iter().zip(&actual) {
+                for (label, value) in [("PER", "张三"), ("ORG", "清华大学")] {
+                    let start = text.find(value).unwrap();
+                    // The existing BIO merger can include a neighboring word
+                    // (e.g. 张三在) at an edge. Require complete protection here;
+                    // batch-to-batch comparisons above still require exact spans.
+                    assert!(
+                        entities.iter().any(|e| e.label == label
+                            && e.start <= start
+                            && e.end >= start + value.len()),
+                        "expected {label} {value} at {start}; entities={}",
+                        serde_json::to_string(entities).unwrap()
+                    );
+                }
+            }
+            let text = &documents[2];
+            let entities = &actual[2];
+            for (label, value) in [("PER", "李四"), ("ORG", "北京大学")] {
+                let start = text.find(value).unwrap();
+                assert!(entities
+                    .iter()
+                    .any(|e| e.label == label && e.start == start && e.end == start + value.len()));
+            }
+            baseline = Some(actual);
+        }
+        drop(detector);
+    }
+    println!("CPU batch 1/2/4 agree: Unicode, 512/64 boundary, padding, incomplete batch and final-window entities");
+}
+
+#[test]
+#[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
 fn committed_reference_matches_real_onnx_detector() {
     let detector = ProfessionalDetector::start(ProfessionalConfig::default()).unwrap();
     for (index, line) in include_str!("fixtures/native-detector-reference.jsonl")
