@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use censorprivacy::{
+    conversations::{agent_session_id, ConversationStore},
     gate::{GateOptions, PrivacyGate},
     json,
     policy::PrivacyPolicy,
@@ -86,6 +87,7 @@ async fn provider(State(state): State<Mock>, request: Request) -> Response {
             return Json(json!({"choices":[{"message":{"content":"x".repeat(8192)}}]}))
                 .into_response()
         }
+        6 => return Json(json!({"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"read","type":"function","function":{"name":"file_read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})).into_response(),
         _ => (),
     }
     if path == "/v1/messages/count_tokens" {
@@ -106,6 +108,120 @@ async fn provider(State(state): State<Mock>, request: Request) -> Response {
     ([("x-provider-secret", KEY)], Json(response)).into_response()
 }
 async fn setup(limit: usize) -> (GatewayService, Mock, tokio::task::JoinHandle<()>) {
+    setup_with_store(limit, None).await
+}
+
+#[tokio::test]
+async fn xiaoo_preparation_stays_local_and_disabled_tools_are_enforced() {
+    let directory = std::env::temp_dir().join(format!(
+        "cp-tool-switch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = Arc::new(ConversationStore::open(directory.clone()).unwrap());
+    let (service, mock, handle) = setup_with_store(1_048_576, Some(store.clone())).await;
+    let session = "0123456789abcdef0123456789abcdef";
+    let body = json!({"model":"configured-model","messages":[{"role":"user","content":"hello"}],
+        "tools":[{"type":"function","function":{"name":"file_read","description":"Read a local file","parameters":{"type":"object","properties":{}}}}],"tool_choice":"auto"});
+    for missing in [Value::Null, json!([])] {
+        let mut warm = body.clone();
+        warm["tools"] = missing;
+        let response = service
+            .router()
+            .oneshot(request(
+                &format!("/xiaoo/{session}/prepare/v1/chat/completions"),
+                warm,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            decode(response).await["error"]["code"],
+            "tool_preparation_requires_tools"
+        );
+    }
+    for streaming in [false, true] {
+        let mut warm = body.clone();
+        warm["stream"] = json!(streaming);
+        let response = service
+            .router()
+            .oneshot(request(
+                &format!("/xiaoo/{session}/prepare/v1/chat/completions"),
+                warm,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("READY"));
+        assert!(mock.calls.lock().unwrap().is_empty());
+        assert!(store.sessions().unwrap().is_empty());
+    }
+    let disabled = format!("/xiaoo/{session}/no-tools/v1/chat/completions");
+    // A tool description which would be rejected if inspected as structural
+    // data must never leave the disabled-mode TUI request.
+    let mut hidden = body.clone();
+    hidden["tools"][0]["function"]["name"] = json!("secret=NeverSendThisToolSecret");
+    let response = service
+        .router()
+        .oneshot(request(&disabled, hidden))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = decode(response).await;
+    let wire = mock.calls.lock().unwrap().last().unwrap().2.clone();
+    assert!(wire.get("tools").is_none());
+    assert!(wire.get("tool_choice").is_none());
+    assert!(!wire.to_string().contains("NeverSendThisToolSecret"));
+    assert_eq!(store.exchanges(session).unwrap().len(), 1);
+    mock.mode.store(6, Ordering::SeqCst);
+    let response = service
+        .router()
+        .oneshot(request(&disabled, body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(decode(response).await["error"]["code"], "tools_disabled");
+    let before = mock.calls.lock().unwrap().len();
+    let mut history = body.clone();
+    history["messages"][0] =
+        json!({"role":"tool","tool_call_id":"read","content":"should stay local"});
+    let response = service
+        .router()
+        .oneshot(request(&disabled, history))
+        .await
+        .unwrap();
+    assert_eq!(decode(response).await["error"]["code"], "tools_disabled");
+    assert_eq!(mock.calls.lock().unwrap().len(), before);
+    // Legacy/enabled routes retain the catalog and existing tool behavior.
+    mock.mode.store(0, Ordering::SeqCst);
+    let response = service
+        .router()
+        .oneshot(request(
+            &format!("/xiaoo/{session}/v1/chat/completions"),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = decode(response).await;
+    assert!(mock
+        .calls
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .2
+        .get("tools")
+        .is_some());
+    handle.abort();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+async fn setup_with_store(
+    limit: usize,
+    store: Option<Arc<ConversationStore>>,
+) -> (GatewayService, Mock, tokio::task::JoinHandle<()>) {
     let state = Mock::default();
     let app = Router::new().fallback(provider).with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -122,8 +238,137 @@ async fn setup(limit: usize) -> (GatewayService, Mock, tokio::task::JoinHandle<(
     )
     .unwrap();
     config.max_decoded_bytes = limit;
+    config.conversations = store;
     let service = GatewayService::new(gate, config).unwrap();
     (service, state, handle)
+}
+
+#[tokio::test]
+async fn xiaoo_records_exact_release_restored_streams_and_isolated_persistent_sessions() {
+    use std::os::unix::fs::MetadataExt;
+    let directory = std::env::temp_dir().join(format!(
+        "cp-conversations-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = Arc::new(ConversationStore::open(directory.clone()).unwrap());
+    let (service, mock, handle) = setup_with_store(1_048_576, Some(store.clone())).await;
+    let first = "0123456789abcdef0123456789abcdef";
+    let second = "fedcba9876543210fedcba9876543210";
+    let text = "😀姓名：张三；邮箱：alice@example.com；密码：Demo!2026";
+    let body = json!({"model":"configured-model","messages":[{"role":"user","content":text}]});
+    let response = service
+        .router()
+        .oneshot(request(
+            &format!("/xiaoo/{first}/v1/chat/completions"),
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = decode(response).await;
+    let records = store.exchanges(first).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, "completed");
+    assert_eq!(records[0].messages[0]["content"], text);
+    assert_eq!(records[0].response, restored["choices"][0]["message"]);
+    let snapshot = &records[0].snapshots[0];
+    assert_eq!(snapshot.text, text);
+    assert_eq!(snapshot.path, "/messages/0/content");
+    assert_eq!(
+        snapshot.analysis["masked_text"],
+        mock.calls.lock().unwrap()[0].2["messages"][0]["content"]
+    );
+    assert!(!snapshot.analysis["masked_text"]
+        .as_str()
+        .unwrap()
+        .contains("Demo!2026"));
+    assert!(!records[0].response.to_string().contains("Demo!2026"));
+    let characters: Vec<_> = text.chars().collect();
+    assert!(snapshot.analysis["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| {
+            characters[s["start"].as_u64().unwrap() as usize..s["end"].as_u64().unwrap() as usize]
+                .iter()
+                .collect::<String>()
+                == "alice@example.com"
+        }));
+    mock.mode.store(4, Ordering::SeqCst);
+    let response = service
+        .router()
+        .oneshot(request(
+            &format!("/xiaoo/{second}/v1/chat/completions"),
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    let streamed = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+    assert!(String::from_utf8_lossy(&streamed).contains("[DONE]"));
+    let records = store.exchanges(second).unwrap();
+    assert_eq!(records[0].status, "completed");
+    assert_eq!(
+        records[0].response["content"],
+        restored["choices"][0]["message"]["content"]
+    );
+    assert_eq!(store.sessions().unwrap().len(), 2);
+    // Dropping an unconsumed streaming response must not leave a running badge.
+    let response = service
+        .router()
+        .oneshot(request(
+            &format!("/xiaoo/{second}/v1/chat/completions"),
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    drop(response);
+    let records = store.exchanges(second).unwrap();
+    assert_eq!(records.last().unwrap().status, "error");
+    assert_eq!(
+        records.last().unwrap().error.as_deref(),
+        Some("interrupted")
+    );
+    let before = store.exchanges(first).unwrap().len();
+    let response = service
+        .router()
+        .oneshot(request("/v1/chat/completions", body))
+        .await
+        .unwrap();
+    let _ = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+    assert_eq!(
+        store.exchanges(first).unwrap().len(),
+        before,
+        "untagged clients must not be recorded"
+    );
+    assert!(store.exchanges("../").is_err());
+    let reopened = ConversationStore::open(directory.clone()).unwrap();
+    assert_eq!(reopened.sessions().unwrap().len(), 2);
+    assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    let record_file = directory
+        .join(first)
+        .join(format!("{}.json", store.exchanges(first).unwrap()[0].id));
+    assert_eq!(
+        std::fs::metadata(record_file).unwrap().mode() & 0o777,
+        0o600
+    );
+    // A process crash cannot run Drop. Startup recovery marks that exchange as
+    // interrupted without changing completed history or any masking snapshot.
+    let abandoned = store.begin(first, &json!({"model":"configured-model","messages":[{"role":"user","content":"unfinished"}]})).unwrap();
+    std::mem::forget(abandoned);
+    reopened.recover_interrupted().unwrap();
+    let recovered = reopened.exchanges(first).unwrap();
+    assert_eq!(recovered.last().unwrap().status, "error");
+    assert_eq!(
+        recovered.last().unwrap().error.as_deref(),
+        Some("gateway_restarted")
+    );
+    assert_eq!(recovered[0].status, "completed");
+    handle.abort();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 fn request(path: &str, body: Value) -> Request {
     Request::builder()
@@ -136,6 +381,121 @@ fn request(path: &str, body: Value) -> Request {
 }
 async fn decode(response: Response) -> Value {
     json::from_slice(&to_bytes(response.into_body(), 1_048_576).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn agent_conversations_group_headers_and_base_urls_without_leaking_metadata() {
+    let directory = std::env::temp_dir().join(format!(
+        "cp-agent-conversations-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = Arc::new(ConversationStore::open(directory.clone()).unwrap());
+    let (service, mock, handle) = setup_with_store(1_048_576, Some(store.clone())).await;
+    let body = json!({"model":"configured-model","messages":[{"role":"user","content":"邮箱：alice@example.com"}]});
+    let tagged = |agent: &str, session: &str| {
+        let mut req = request("/v1/chat/completions", body.clone());
+        req.headers_mut()
+            .insert("x-censorprivacy-agent", agent.parse().unwrap());
+        req.headers_mut()
+            .insert("x-censorprivacy-session", session.parse().unwrap());
+        req
+    };
+    let response = service
+        .router()
+        .oneshot(tagged("deepseek-harness", "session-one"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = decode(response).await;
+    let id = agent_session_id("deepseek-harness", "session-one").unwrap();
+    let records = store.exchanges(&id).unwrap();
+    assert_eq!(records[0].agent, "deepseek-harness");
+    assert_eq!(records[0].response, restored["choices"][0]["message"]);
+    assert_eq!(
+        records[0].snapshots[0].analysis["masked_text"],
+        mock.calls.lock().unwrap()[0].2["messages"][0]["content"]
+    );
+    mock.mode.store(4, Ordering::SeqCst);
+    let response = service
+        .router()
+        .oneshot(request(
+            "/agents/deepseek-harness/session-one/v1/chat/completions",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+    assert_eq!(
+        store.exchanges(&id).unwrap().len(),
+        2,
+        "header and Base URL must identify the same session"
+    );
+    assert_eq!(store.exchanges(&id).unwrap()[1].status, "completed");
+    for (agent, session) in [
+        ("other-agent", "session-one"),
+        ("deepseek-harness", "session-two"),
+    ] {
+        let response = service
+            .router()
+            .oneshot(tagged(agent, session))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 1_048_576).await.unwrap();
+    }
+    let sessions = store.sessions().unwrap();
+    assert_eq!(
+        sessions.len(),
+        3,
+        "different agents and sessions must remain isolated"
+    );
+    assert_eq!(
+        sessions.iter().find(|s| s["id"] == id).unwrap()["agent"],
+        "deepseek-harness"
+    );
+    for (path, headers, payload) in mock.calls.lock().unwrap().iter() {
+        assert_eq!(path, "/v1/chat/completions");
+        assert!(!headers.contains_key("x-censorprivacy-agent"));
+        assert!(!headers.contains_key("x-censorprivacy-session"));
+        assert!(!payload.to_string().contains("session-one"));
+        assert!(!payload.to_string().contains("alice@example.com"));
+    }
+    let before = mock.calls.lock().unwrap().len();
+    let mut duplicate = tagged("other-agent", "session-one");
+    duplicate
+        .headers_mut()
+        .append("x-censorprivacy-session", "session-two".parse().unwrap());
+    let mut missing = tagged("other-agent", "session-one");
+    missing.headers_mut().remove("x-censorprivacy-agent");
+    let mut ambiguous = tagged("other-agent", "session-one");
+    *ambiguous.uri_mut() = "/agents/other-agent/session-one/v1/chat/completions"
+        .parse()
+        .unwrap();
+    for req in [
+        duplicate,
+        missing,
+        ambiguous,
+        tagged("../escape", "session-one"),
+        tagged("other-agent", &"a".repeat(129)),
+        request("/agents/other-agent/%2e%2e/v1/chat/completions", body),
+    ] {
+        let response = service.router().oneshot(req).await.unwrap();
+        assert_ne!(response.status(), StatusCode::OK);
+        assert_eq!(decode(response).await["error"]["code"], "invalid_session");
+    }
+    assert_eq!(mock.calls.lock().unwrap().len(), before);
+    let reopened = ConversationStore::open(directory.clone()).unwrap();
+    assert_eq!(
+        reopened.exchanges(&id).unwrap()[0].agent,
+        "deepseek-harness"
+    );
+    handle.abort();
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[tokio::test]

@@ -1,8 +1,13 @@
 use censorprivacy::{
+    conversations::ConversationStore,
+    detector_web,
     error::{Error, Result},
     gate::{GateOptions, PrivacyGate},
     policy::PrivacyPolicy,
-    professional::ProfessionalConfig,
+    professional::{
+        configured_ner_batch_size, configured_ner_device, configured_ner_threads, NerDevice,
+        ProfessionalConfig, ProfessionalDetector,
+    },
     server::{GatewayConfig, GatewayService},
 };
 use clap::{Parser, Subcommand};
@@ -15,9 +20,6 @@ use std::{
     sync::Arc,
 };
 use zeroize::Zeroizing;
-
-#[path = "../plugins/detector-web/server.rs"]
-mod detector_web;
 
 #[derive(Parser)]
 #[command(
@@ -65,6 +67,18 @@ struct Serve {
     /// Local ONNX Runtime shared library, never downloaded at runtime.
     #[arg(long)]
     detector_ort_library: Option<PathBuf>,
+    /// ONNX intra-op threads (1–256); defaults to CP_NER_THREADS, then 1.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    ner_threads: Option<u16>,
+    /// cpu (default), cuda[:ids], or cann[:ids]; unnumbered accelerators use device 0; CP_NER_DEVICE overrides the default.
+    #[arg(long)]
+    ner_device: Option<NerDevice>,
+    /// Maximum windows per device inference (1–256); CP_NER_BATCH_SIZE, then 1.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    ner_batch_size: Option<u16>,
+    /// Record tagged Agent sessions and serve the local privacy workspace.
+    #[arg(long, visible_alias = "xiaoo-records-dir")]
+    conversation_records_dir: Option<PathBuf>,
     #[arg(long)]
     sensitive_path: Vec<String>,
     #[arg(long)]
@@ -144,14 +158,29 @@ async fn serve(args: Serve) -> Result<()> {
         public_identifiers: args.model,
         ..Default::default()
     };
-    let mut detector = ProfessionalConfig::default();
+    let mut detector = ProfessionalConfig {
+        ner_threads: configured_ner_threads(args.ner_threads)?,
+        ner_device: configured_ner_device(args.ner_device)?,
+        ner_batch_size: configured_ner_batch_size(args.ner_batch_size)?,
+        ..Default::default()
+    };
+    let ner_threads = detector.ner_threads;
+    let ner_device = detector.ner_device.to_string();
+    let ner_batch_size = detector.ner_batch_size;
     if let Some(path) = args.detector_ort_library {
         detector.runtime_library = Some(path);
     }
     if let Some(path) = args.detector_model_dir {
         detector.model_directory = Some(path);
     }
-    let gate = PrivacyGate::with_professional_detector(policy, options, detector)?;
+    if args.conversation_records_dir.is_some()
+        && (args.host != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || args.tls_cert.is_some())
+    {
+        return Err(Error::ProtocolBlocked);
+    }
+    let detector = Arc::new(ProfessionalDetector::start(detector)?);
+    let mut gate =
+        PrivacyGate::with_loaded_professional_detector(policy, options, detector.clone())?;
     let run_id = gate.run_id().to_owned();
     let token = read_file(&args.token_file, true, 8192)?;
     let upstream_key = args
@@ -166,6 +195,15 @@ async fn serve(args: Serve) -> Result<()> {
         args.allow_http_test_upstream,
     )?;
     config.enable_tls_direct = args.tls_direct;
+    config.ner_threads = Some(ner_threads);
+    config.ner_device = Some(ner_device);
+    config.ner_batch_size = Some(ner_batch_size);
+    let conversations = args
+        .conversation_records_dir
+        .map(ConversationStore::open)
+        .transpose()?
+        .map(Arc::new);
+    config.conversations = conversations.clone();
     if let Some(path) = args.upstream_ca_file {
         config.upstream_ca_pem = Some(read_file(&path, false, 1_048_576)?.as_bytes().to_vec());
     }
@@ -175,6 +213,9 @@ async fn serve(args: Serve) -> Result<()> {
     listener
         .set_nonblocking(true)
         .map_err(|_| Error::ServiceUnavailable)?;
+    if let Some(store) = &conversations {
+        store.recover_interrupted()?;
+    }
     let tls = match (&args.tls_cert, &args.tls_key) {
         (Some(cert), Some(key)) => {
             let certificate = read_file(cert, false, 1_048_576)?;
@@ -222,7 +263,15 @@ async fn serve(args: Serve) -> Result<()> {
         }
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     });
-    let router = service.router();
+    let mut router = service.router();
+    if conversations.is_some() {
+        let port = listener
+            .local_addr()
+            .map_err(|_| Error::ServiceUnavailable)?
+            .port();
+        router = router.merge(detector_web::workspace(detector, conversations, port));
+        println!("隐私检测台：http://127.0.0.1:{port}/");
+    }
     let result = match tls {
         Some(tls) => {
             axum_server::from_tcp_rustls(listener, tls)

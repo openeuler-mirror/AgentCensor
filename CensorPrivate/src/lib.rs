@@ -9,6 +9,8 @@ pub mod compute;
 pub mod control;
 pub mod conversations;
 pub mod detection;
+#[path = "../plugins/detector-web/server.rs"]
+pub mod detector_web;
 pub mod display;
 pub mod error;
 pub mod gate;

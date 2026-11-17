@@ -126,6 +126,7 @@ pub struct SseTransformer {
     tool_bytes: usize,
     sequence: u64,
     closed: bool,
+    tools_enabled: bool,
 }
 impl SseTransformer {
     pub fn new(api: Api, gate: &PrivacyGate) -> Result<Self> {
@@ -141,7 +142,12 @@ impl SseTransformer {
             tool_bytes: 0,
             sequence: 0,
             closed: false,
+            tools_enabled: true,
         })
+    }
+    pub fn with_tools_enabled(mut self, enabled: bool) -> Self {
+        self.tools_enabled = enabled;
+        self
     }
     fn validate(&self, gate: &PrivacyGate) -> Result<()> {
         gate.validate()?;
@@ -182,6 +188,9 @@ impl SseTransformer {
         })? + &text.display.finish()?)
     }
     fn new_tool(&mut self, channel: Channel, name: &str) -> Result<()> {
+        if !self.tools_enabled {
+            return Err(Error::ProtocolBlocked);
+        }
         if name.len() > 128 {
             return Err(Error::ResourceLimit);
         }
@@ -280,6 +289,13 @@ impl SseTransformer {
                     !["role", "content", "refusal", "tool_calls", "function_call"]
                         .contains(&key.as_str())
                 })
+            {
+                return Err(Error::ProtocolBlocked);
+            }
+            if !self.tools_enabled
+                && ["tool_calls", "function_call"]
+                    .iter()
+                    .any(|field| delta.get(field).is_some_and(|value| !value.is_null()))
             {
                 return Err(Error::ProtocolBlocked);
             }
