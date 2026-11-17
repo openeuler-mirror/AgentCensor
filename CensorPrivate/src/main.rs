@@ -36,9 +36,17 @@ enum Command {
     Serve(Box<Serve>),
     /// Open the local privacy detection workspace (no upstream required).
     Web(detector_web::WebArgs),
+    #[command(hide = true)]
+    PrivateProgramWorker {
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 #[derive(clap::Args)]
 struct Serve {
+    /// Private JSON manifest of operator-registered local programs.
+    #[arg(long)]
+    private_tools_file: Option<PathBuf>,
     #[arg(long)]
     policy: Option<PathBuf>,
     #[arg(long)]
@@ -173,6 +181,9 @@ async fn serve(args: Serve) -> Result<()> {
     if let Some(path) = args.detector_model_dir {
         detector.model_directory = Some(path);
     }
+    if args.private_tools_file.is_some() && !args.host.is_loopback() {
+        return Err(Error::ProtocolBlocked);
+    }
     if args.conversation_records_dir.is_some()
         && (args.host != IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || args.tls_cert.is_some())
     {
@@ -181,6 +192,9 @@ async fn serve(args: Serve) -> Result<()> {
     let detector = Arc::new(ProfessionalDetector::start(detector)?);
     let mut gate =
         PrivacyGate::with_loaded_professional_detector(policy, options, detector.clone())?;
+    if let Some(path) = args.private_tools_file {
+        gate.configure_private_tools(&read_file(&path, true, 256 * 1024)?)?;
+    }
     let run_id = gate.run_id().to_owned();
     let token = read_file(&args.token_file, true, 8192)?;
     let upstream_key = args
@@ -294,19 +308,44 @@ async fn serve(args: Serve) -> Result<()> {
     result.map_err(|_| Error::ServiceUnavailable)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Third-party panic text may contain input. Do not print payloads/backtraces.
     std::panic::set_hook(Box::new(|_| {
         eprintln!("{{\"error\":{{\"code\":\"processing_failed\"}}}}")
     }));
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Serve(args) => serve(*args).await,
-        Command::Web(args) => detector_web::serve(args).await,
+        Command::PrivateProgramWorker { command } => private_program_worker(command),
+        command => run_service(command),
     };
     if let Err(error) = result {
         eprintln!("{{\"error\":{{\"code\":\"{}\"}}}}", error.code());
         std::process::exit(2);
     }
+}
+
+#[tokio::main]
+async fn run_service(command: Command) -> Result<()> {
+    match command {
+        Command::Serve(args) => serve(*args).await,
+        Command::Web(args) => detector_web::serve(args).await,
+        Command::PrivateProgramWorker { .. } => Err(Error::PrivateToolFailed),
+    }
+}
+
+fn private_program_worker(command: Vec<String>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let executable = command.first().ok_or(Error::PrivateToolFailed)?;
+        if !Path::new(executable).is_absolute() {
+            return Err(Error::PrivateToolFailed);
+        }
+        let mut program = std::process::Command::new(executable);
+        program.args(&command[1..]);
+        censorprivacy_runtime_sys::restrict_private_program()
+            .map_err(|_| Error::PrivateToolFailed)?;
+        let _ = program.exec();
+    }
+    Err(Error::PrivateToolFailed)
 }

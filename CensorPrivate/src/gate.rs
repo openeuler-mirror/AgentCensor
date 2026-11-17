@@ -6,6 +6,7 @@ use crate::{
     error::{Error, Result},
     json,
     policy::PrivacyPolicy,
+    private_tools::{self, Invocation, Output, Registry},
     professional::{ProfessionalConfig, ProfessionalDetector},
     protocols::{self, Api, RequestProtector},
     references::{random_hex, Reference, TOKEN_PATTERN, TOKEN_RE},
@@ -91,6 +92,7 @@ pub struct PrivacyGate {
     observed_ids: BTreeSet<String>,
     disabled: bool,
     clock: Arc<dyn Clock>,
+    private_tools: Registry,
 }
 impl PrivacyGate {
     pub fn new(policy: PrivacyPolicy, options: GateOptions) -> Result<Self> {
@@ -146,6 +148,7 @@ impl PrivacyGate {
             observed_ids: BTreeSet::new(),
             disabled: false,
             clock,
+            private_tools: Registry::default(),
         })
     }
     pub fn run_id(&self) -> &str {
@@ -153,6 +156,89 @@ impl PrivacyGate {
     }
     pub fn epoch(&self) -> u64 {
         self.policy.epoch()
+    }
+    /// Definitions are local administrator configuration, never model input.
+    pub fn configure_private_tools(&mut self, raw: &str) -> Result<()> {
+        self.private_tools = Registry::from_json(raw)?;
+        Ok(())
+    }
+    pub fn private_tools_catalog(&self) -> Result<Value> {
+        self.validate()?;
+        Ok(self.private_tools.catalog())
+    }
+    pub(crate) fn prepare_private_tool(&self, name: &str, payload: &Value) -> Result<Invocation> {
+        self.validate()?;
+        let program = self
+            .private_tools
+            .program(name)
+            .ok_or(Error::ComputeInvalid)?;
+        let refs = private_tools::references(payload)?;
+        let entries = self.vault.resolve_compute_bounded(
+            &self.cap,
+            self.epoch(),
+            &refs,
+            private_tools::MAX_IO,
+        )?;
+        Ok(Invocation {
+            program,
+            epoch: self.epoch(),
+            refs,
+            entries,
+        })
+    }
+    pub(crate) fn publish_private_tool(
+        &self,
+        invocation: &Invocation,
+        output: Output,
+    ) -> Result<Value> {
+        self.validate()?;
+        // Revalidate under the original epoch and re-resolve every dependency:
+        // reload, run expiry and revocation while the program ran reject output.
+        let entries = self.vault.resolve_compute_bounded(
+            &self.cap,
+            invocation.epoch,
+            &invocation.refs,
+            private_tools::MAX_IO,
+        )?;
+        let values = match output {
+            Output::Order(order) => {
+                return Ok(
+                    serde_json::json!({"refs": order.into_iter().map(|i| &invocation.refs[i]).collect::<Vec<_>>()}),
+                );
+            }
+            Output::Values(values) => values,
+        };
+        let mut labels = self.policy.labels().clone();
+        labels.extend(
+            entries
+                .iter()
+                .flat_map(|entry| entry.labels.iter().cloned()),
+        );
+        for value in &values {
+            if self
+                .credential_spans(value)?
+                .iter()
+                .any(|span| span.entity_type == "SECRET" || span.labels.contains("secret"))
+            {
+                return Err(Error::VaultDenied);
+            }
+        }
+        let expression =
+            serde_json::to_vec(&invocation.refs).map_err(|_| Error::PrivateToolFailed)?;
+        let digest = Sha256::digest(expression);
+        let mut refs = Vec::new();
+        for value in values {
+            let mut registration = Registration::new("PRIVATE_RESULT", labels.clone());
+            registration.metadata.entity_id = Some(format!("private_tools:{digest:x}"));
+            registration.depends_on = invocation.refs.clone();
+            refs.push(self.vault.register_value(
+                &self.cap,
+                invocation.epoch,
+                &value,
+                registration,
+            )?);
+        }
+        Ok(serde_json::json!({"refs": refs}))
     }
     pub fn model_ids(&self) -> &[String] {
         &self.options.public_identifiers
@@ -524,6 +610,16 @@ impl crate::response::ResponseRestorer for PrivacyGate {
     }
     fn tool_arguments(&self, name: &str, arguments: &Value) -> Result<Value> {
         self.validate()?;
+        if self.private_tools.program(name).is_some() {
+            let refs = private_tools::references(arguments)?;
+            self.vault.resolve_compute_bounded(
+                &self.cap,
+                self.epoch(),
+                &refs,
+                private_tools::MAX_IO,
+            )?;
+            return Ok(arguments.clone());
+        }
         let encoded = serde_json::to_string(arguments).map_err(|_| Error::ProtocolBlocked)?;
         if !TOKEN_RE.is_match(&encoded) {
             return Ok(arguments.clone());

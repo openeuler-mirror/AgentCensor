@@ -17,6 +17,7 @@ pub mod gate;
 pub mod json;
 pub mod mcp;
 pub mod policy;
+mod private_tools;
 pub mod professional;
 pub mod protocols;
 pub mod references;

@@ -40,6 +40,9 @@ pub struct GatewayConfig {
     pub ner_threads: Option<usize>,
     pub ner_device: Option<String>,
     pub ner_batch_size: Option<usize>,
+    /// Executable implementing the local private program worker. The stock
+    /// gateway uses its own executable if this is unset.
+    pub private_tool_worker: Option<std::path::PathBuf>,
 }
 impl GatewayConfig {
     pub fn new(
@@ -85,6 +88,7 @@ impl GatewayConfig {
             ner_threads: None,
             ner_device: None,
             ner_batch_size: None,
+            private_tool_worker: None,
         })
     }
 }
@@ -95,6 +99,7 @@ struct ServiceState {
     config: Arc<GatewayConfig>,
     client: reqwest::Client,
     tls: Arc<Mutex<Option<TlsBroker>>>,
+    private_tool_slot: Arc<tokio::sync::Semaphore>,
 }
 pub struct GatewayService {
     state: ServiceState,
@@ -136,6 +141,7 @@ impl GatewayService {
                 config: Arc::new(config),
                 client: client.build().map_err(|_| Error::ServiceUnavailable)?,
                 tls: Arc::new(Mutex::new(tls)),
+                private_tool_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         })
     }
@@ -389,34 +395,75 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
         ("GET", "/ready") => {
             let gate = lock(&state)?;
             gate.validate()?;
-            return Ok(Json(json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"run_id":gate.run_id(),"conversation_web":state.config.conversations.is_some(),"xiaoo_web":state.config.conversations.is_some(),"xiaoo_startup_prepare":state.config.conversations.is_some(),"ner_threads":state.config.ner_threads,"ner_device":state.config.ner_device,"ner_batch_size":state.config.ner_batch_size})).into_response());
+            return Ok(Json(json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"run_id":gate.run_id(),"private_tools":true,"conversation_web":state.config.conversations.is_some(),"xiaoo_web":state.config.conversations.is_some(),"xiaoo_startup_prepare":state.config.conversations.is_some(),"ner_threads":state.config.ner_threads,"ner_device":state.config.ner_device,"ner_batch_size":state.config.ner_batch_size})).into_response());
         }
         ("GET", "/v1/models") => {
             let gate = lock(&state)?;
             gate.validate()?;
             return Ok(Json(json!({"object":"list","data":gate.model_ids().iter().map(|id| json!({"id":id,"object":"model"})).collect::<Vec<_>>()})).into_response());
         }
-        ("POST", "/v1/private_compute") => {
+        ("GET", "/v1/private_tools") => {
+            return Ok(Json(lock(&state)?.private_tools_catalog()?).into_response());
+        }
+        ("POST", tool_path)
+            if tool_path == "/v1/private_compute"
+                || tool_path.starts_with("/v1/private_tools/") =>
+        {
+            let name = tool_path
+                .strip_prefix("/v1/private_tools/")
+                .unwrap_or("private_compute");
             let mut payload = body(request, &state).await?;
-            let gate = lock(&state)?;
-            if let Some(refs) = payload.get_mut("refs").and_then(Value::as_array_mut) {
-                let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
-                if let Some(tls) = tls.as_mut() {
-                    // status revalidates epoch before resolving any alias.
-                    tls.status(&gate)?;
-                    for reference in refs {
-                        if let Some(alias) = reference
-                            .as_str()
-                            .filter(|value| !value.starts_with("<CP_"))
-                        {
-                            *reference = Value::String(
-                                tls.transformer.resolve_alias(&gate, alias)?.to_string(),
-                            );
+            // Keep this permit inside spawn_blocking so a cancelled HTTP
+            // request cannot allow another script to start before cleanup.
+            let slot = if name == "private_compute" {
+                None
+            } else {
+                Some(
+                    state
+                        .private_tool_slot
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| Error::PrivateToolBusy)?,
+                )
+            };
+            let invocation = {
+                let gate = lock(&state)?;
+                if let Some(refs) = payload.get_mut("refs").and_then(Value::as_array_mut) {
+                    let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
+                    if let Some(tls) = tls.as_mut() {
+                        // status revalidates epoch before resolving any alias.
+                        tls.status(&gate)?;
+                        for reference in refs {
+                            if let Some(alias) = reference
+                                .as_str()
+                                .filter(|value| !value.starts_with("<CP_"))
+                            {
+                                *reference = Value::String(
+                                    tls.transformer.resolve_alias(&gate, alias)?.to_string(),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            return Ok(Json(gate.compute(&payload)?).into_response());
+                if name == "private_compute" {
+                    return Ok(Json(gate.compute(&payload)?).into_response());
+                }
+                gate.prepare_private_tool(name, &payload)?
+            };
+            let helper = match &state.config.private_tool_worker {
+                Some(path) => path.clone(),
+                None => std::env::current_exe().map_err(|_| Error::PrivateToolFailed)?,
+            };
+            let (invocation, output) = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                let output = invocation.execute(helper)?;
+                Ok::<_, Error>((invocation, output))
+            })
+            .await
+            .map_err(|_| Error::PrivateToolFailed)??;
+            return Ok(
+                Json(lock(&state)?.publish_private_tool(&invocation, output)?).into_response(),
+            );
         }
         ("GET", "/v1/tls/status") => {
             let gate = lock(&state)?;

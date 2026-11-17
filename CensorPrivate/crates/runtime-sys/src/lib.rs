@@ -485,6 +485,21 @@ struct ArgCmp {
     datum_b: u64,
 }
 pub fn install_seccomp() -> io::Result<()> {
+    install_seccomp_profile(false)
+}
+
+/// Apply the offline program restrictions before exec, with no raw error text.
+pub fn restrict_private_program() -> io::Result<()> {
+    let zero = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: rlimit points to a valid read-only limit value.
+    checked(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &zero) })?;
+    install_seccomp_profile(true)
+}
+
+fn install_seccomp_profile(offline: bool) -> io::Result<()> {
     type Init = unsafe extern "C" fn(u32) -> *mut libc::c_void;
     type Resolve = unsafe extern "C" fn(*const libc::c_char) -> i32;
     type Rule = unsafe extern "C" fn(*mut libc::c_void, u32, i32, u32, *const ArgCmp) -> i32;
@@ -563,6 +578,19 @@ pub fn install_seccomp() -> io::Result<()> {
         for name in ["setns", "unshare", "ptrace"] {
             deny(name, &[], libc::EPERM, true)?;
         }
+        if offline {
+            for name in ["socket", "setsid", "setpgid"] {
+                deny(name, &[], libc::EPERM, true)?;
+            }
+            for name in [
+                "socketcall",
+                "io_uring_setup",
+                "io_uring_enter",
+                "io_uring_register",
+            ] {
+                deny(name, &[], libc::EPERM, false)?;
+            }
+        }
         for name in [
             "mount",
             "mount_setattr",
@@ -623,10 +651,26 @@ pub fn install_seccomp() -> io::Result<()> {
 
 /// Start a child in a new session with only standard descriptors inherited.
 pub fn spawn_session(command: &mut Command) -> io::Result<Child> {
+    spawn_session_impl(command, false)
+}
+
+pub fn spawn_private_program(command: &mut Command) -> io::Result<Child> {
+    spawn_session_impl(command, true)
+}
+
+fn spawn_session_impl(command: &mut Command, die_with_parent: bool) -> io::Result<Child> {
+    // SAFETY: getpid has no parameters and can always be called.
+    let parent = unsafe { libc::getpid() };
     // SAFETY: this closure uses only async-signal-safe syscalls after fork.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             checked(libc::setsid())?;
+            if die_with_parent {
+                checked(libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0))?;
+                if libc::getppid() != parent {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+            }
             if libc::syscall(
                 libc::SYS_close_range,
                 3u32,
@@ -640,6 +684,13 @@ pub fn spawn_session(command: &mut Command) -> io::Result<Child> {
         });
     }
     command.spawn()
+}
+pub fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
+    let fd = fd.as_fd().as_raw_fd();
+    // SAFETY: fd remains borrowed for both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    checked(flags)?;
+    checked(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) })
 }
 /// Observe exit without reaping; its PID/session cannot be reused before wait.
 pub fn exited_unreaped(pidfd: &OwnedFd) -> io::Result<bool> {
