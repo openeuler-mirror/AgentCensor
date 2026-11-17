@@ -168,7 +168,11 @@ async function nativeLibrary() {
   if (!await exists(library)) throw new Error('native_library_missing_run_cpctl_install_--tls');
   return resolve(library);
 }
-async function fixture(mode, agent, actual) {
+const nerKeys = ['ner_threads', 'ner_device', 'ner_batch_size'];
+const nerSettings = value => Object.fromEntries(nerKeys.map(key => [key, value[key] ?? null]));
+const validNer = n => [n.ner_threads, n.ner_batch_size].every(v => Number.isInteger(v) && v >= 1 && v <= 256) &&
+  typeof n.ner_device === 'string' && /^(?:cpu|(?:cuda|cann):[0-9]+(?:,[0-9]+)*)$/.test(n.ner_device);
+async function fixture(mode, agent, actual, report) {
   const directory = await temporary(); const workspace = join(directory, 'workspace'); await mkdir(workspace, { mode: 0o700 });
   const provider = actual ? { origin: actual.upstream } : await mock(directory, mode === 'tls', agent);
   const token = randomBytes(32).toString('hex'); const tokenFile = join(directory, 'gateway.token');
@@ -183,9 +187,19 @@ async function fixture(mode, agent, actual) {
   if (provider.origin.startsWith('http:')) args.push('--allow-http-test-upstream');
   if (actual?.has_key) args.push('--upstream-key-file', join(configDir, 'upstream.key'));
   if (actual?.ca_file) args.push('--upstream-ca-file', actual.ca_file);
+  if (report) {
+    assertion(validNer(report.ner_requested), 'managed_gateway_ner_settings_missing');
+    for (const key of nerKeys) args.push('--' + key.replaceAll('_', '-'), String(report.ner_requested[key]));
+  }
   const child = start(join(bin, 'censorprivacy'), args);
   let stderr = ''; child.stderr.on('data', chunk => { if (stderr.length < 8192) stderr += chunk; }); child.stdout.resume();
-  try { await ready(base, token, child, runFile); } catch (failure) { await writeFile(join(directory, 'gateway.log'), stderr); throw failure; }
+  try {
+    const observed = await ready(base, token, child, runFile);
+    if (report) {
+      report.ner_effective = nerSettings(observed);
+      assertion(nerKeys.every(key => report.ner_effective[key] === report.ner_requested[key]), 'cloud_gateway_ner_settings_mismatch');
+    }
+  } catch (failure) { await writeFile(join(directory, 'gateway.log'), stderr); throw failure; }
   const config = { mode, baseURL: mode === 'tls' ? provider.origin : base, broker: base, model,
     tlsRun: join(bin, 'tls-run'), nativeLibrary: mode === 'tls' ? (actual?.native_library || await nativeLibrary()) : '', tokenFile,
     runStateFile: runFile, workspace, caFile: mode === 'tls' ? (actual?.ca_file ?? (actual ? '' : join(directory, 'server.crt'))) : '',
@@ -325,11 +339,12 @@ async function managedDsh() {
     assertion(target.protocol === 'https:' && !target.hostname.endsWith('.example') && !/^(?:127\.|0\.)/.test(target.hostname) && !['localhost', '::1', '[::1]'].includes(target.hostname), 'actual_remote_https_upstream_required');
     const reportPath = join(directory, 'cloud-report.json');
     const report = { status: 'running', mode: config.mode, model: config.model, upstream: config.upstream, timestamp: new Date().toISOString(),
+      ner_requested: nerSettings(readyValue), ner_effective: null,
       scope: 'Actual DSH agent and remote HTTPS model, isolated synthetic policy and run. Cloud internal storage is not observable.' };
     await writeFile(reportPath, JSON.stringify(report, null, 2));
     try {
       // A separate run with fictional rules avoids editing the live business policy.
-      const f = await fixture(config.mode, true, config);
+      const f = await fixture(config.mode, true, config, report);
       report.run_id = JSON.parse(await privateText(f.config.runStateFile)).run_id;
       await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
       const invoke = await dshProfile(f.directory, f.config, f.token, flags['dsh-root'] ||
@@ -345,7 +360,8 @@ async function managedDsh() {
       log('通过：真实模型工具调用、引用计算及授权显示；请求出口保护的逐字节证据见本机模拟验收。');
     } catch (failure) {
       report.status = 'failed';
-      report.reason = 'cloud_acceptance_failed';
+      report.reason = ['managed_gateway_ner_settings_missing', 'cloud_gateway_ner_settings_mismatch'].includes(failure.message)
+        ? failure.message : 'cloud_acceptance_failed';
       throw failure;
     } finally { await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 }); log(`云端验收记录：${reportPath}`); }
     return;
