@@ -16,24 +16,30 @@ use std::{
 };
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
+fn inference_budget(window_count: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(16 * window_count as u64)
+}
+
 // ONNX Runtime termination is cooperative. A timed-out inference is rejected;
 // the required detector is then latched failed by ProfessionalDetector.
 struct Deadline {
     options: std::sync::Arc<RunOptions>,
+    until: std::time::Instant,
     stop: Option<std::sync::mpsc::Sender<()>>,
     timer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Deadline {
-    fn new() -> Result<Self> {
+    fn new(budget: std::time::Duration) -> Result<Self> {
         let options = std::sync::Arc::new(RunOptions::new().map_err(|_| Error::DetectionFailed)?);
         let (stop, received) = std::sync::mpsc::channel();
         let shared = options.clone();
+        let until = std::time::Instant::now() + budget;
         let timer = std::thread::Builder::new()
             .name("ner-deadline".into())
             .spawn(move || {
                 if received
-                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .recv_timeout(until.saturating_duration_since(std::time::Instant::now()))
                     .is_err()
                 {
                     let _ = shared.terminate();
@@ -42,11 +48,17 @@ impl Deadline {
             .map_err(|_| Error::DetectionFailed)?;
         Ok(Self {
             options,
+            until,
             stop: Some(stop),
             timer: Some(timer),
         })
     }
-
+    fn finish(self) -> Result<()> {
+        if std::time::Instant::now() >= self.until {
+            return Err(Error::DetectionFailed);
+        }
+        Ok(())
+    }
 }
 impl Drop for Deadline {
     fn drop(&mut self) {
@@ -337,11 +349,14 @@ fn infer_batch(
             .map_err(|_| Error::DetectionFailed)
     };
     let inputs = ort::inputs!["input_ids"=>tensor(ids)?, "attention_mask"=>tensor(mask)?, "token_type_ids"=>tensor(types)?];
-    let deadline = Deadline::new()?;
+    // ORT runs a tensor batch as one unit. Grant 16 s per window in
+    // this run, including a short final batch; queued windows wait separately.
+    let deadline = Deadline::new(inference_budget(count))?;
     let options = deadline.options.clone();
     let output = session
         .run_with_options(inputs, &*options)
         .map_err(|_| Error::DetectionFailed)?;
+    deadline.finish()?;
     let (shape, logits) = output["logits"]
         .try_extract_tensor::<f32>()
         .map_err(|_| Error::DetectionFailed)?;
