@@ -350,8 +350,12 @@ async function managedDsh() {
     } finally { await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 }); log(`云端验收记录：${reportPath}`); }
     return;
   }
+  const privateTools = readyValue.private_tools === true
+    ? (await requestJSON(`${base}/v1/private_tools`, undefined, { method: 'GET', token, timeoutMs: 3000 })).tools
+    : [];
+  assertion(Array.isArray(privateTools), 'private_tools_catalog_invalid');
   const transport = { mode: config.mode, baseURL: config.mode === 'tls' ? config.upstream : base, model: config.model,
-    privateToolsOnly: flags.tools !== '--enable-tools',
+    privateToolsOnly: flags.tools !== '--enable-tools', privateTools,
     broker: base, tlsRun: join(bin, 'tls-run'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
     runStateFile, upstreamKeyFile: config.has_key ? join(configDir, 'upstream.key') : '', caFile: config.ca_file ?? '', workspace,
     timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512, cliStream: action === 'run' };

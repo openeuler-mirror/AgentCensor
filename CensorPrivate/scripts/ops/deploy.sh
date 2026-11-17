@@ -89,6 +89,10 @@ op_start() {
     --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port"
     --ner-threads "$ner_threads" --ner-device "$ner_device" --ner-batch-size "$ner_batch_size"
     --conversation-records-dir "$config_dir/xiaoo/records")
+  if [[ -e $config_dir/private-tools.json || -L $config_dir/private-tools.json ]]; then
+    private_file "$config_dir/private-tools.json"
+    args+=(--private-tools-file "$config_dir/private-tools.json")
+  fi
   [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || args+=(--upstream-key-file "$config_dir/upstream.key")
   [[ $upstream != http://* ]] || args+=(--allow-http-test-upstream)
   [[ $mode != tls ]] || args+=(--tls-direct)
@@ -193,6 +197,10 @@ op_systemd() (
   if [[ $mode == tls ]]; then sed -i '/^ExecStart=/ s|$| --tls-direct|' "$unit"; fi
   if [[ $upstream == http://* ]]; then sed -i '/^ExecStart=/ s|$| --allow-http-test-upstream|' "$unit"; fi
   if [[ -n $ca_file ]]; then sed -i "/^ExecStart=/ s|$| --upstream-ca-file /etc/censorprivacy/$instance.ca.crt|" "$unit"; fi
+  if [[ -e $config_dir/private-tools.json || -L $config_dir/private-tools.json ]]; then
+    private_file "$config_dir/private-tools.json"
+    sed -i "/^ExecStart=/ s|$| --private-tools-file /etc/censorprivacy/$instance.private-tools.json|" "$unit"
+  fi
   printf 'CP_UPSTREAM=%s\nCP_BIND=127.0.0.1\nCP_PORT=%s\nCP_MODEL=%s\n' "$upstream" "$port" "$model" > "$stage/config.env"
   if $dry_run; then cat "$unit"; note '仅预览，未安装或启动服务。' >&2; return; fi
   if admin systemctl is-active --quiet "$service"; then fail '先 ./cpctl systemd stop，再重新安装配置'; fi
@@ -209,6 +217,9 @@ op_systemd() (
   admin install -o root -g censorprivacy -m 0640 "$stage/config.env" "/etc/censorprivacy/$instance.env"
   admin install -o root -g censorprivacy -m 0640 "$config_dir/policy.yaml" "/etc/censorprivacy/$instance.policy.yaml"
   admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/gateway.token" "/etc/censorprivacy/$instance.token"
+  if [[ -f $config_dir/private-tools.json ]]; then
+    admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/private-tools.json" "/etc/censorprivacy/$instance.private-tools.json"
+  fi
   if [[ $(jq -r .has_key "$config_dir/config.json") == true ]]; then admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/upstream.key" "/etc/censorprivacy/$instance.upstream-key"; fi
   if [[ -n $ca_file ]]; then admin install -o censorprivacy -g censorprivacy -m 0600 "$ca_file" "/etc/censorprivacy/$instance.ca.crt"; fi
   admin install -m 0644 "$unit" /etc/systemd/system/

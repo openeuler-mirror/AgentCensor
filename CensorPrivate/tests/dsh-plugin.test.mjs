@@ -46,7 +46,8 @@ test('private-only requests hide agent-scoped tools and preserve supported compu
     { name: 'bash', parameters: { type: 'object' } },
   ] };
   assert.deepEqual(serialize(options, { privateToolsOnly: true }).tools.map(tool => tool.function.name), ['private_compute']);
-  assert.equal(serialize(options, {}).tools.length, 3);
+  assert.deepEqual(serialize(options, {}).tools.map(tool => tool.function.name), ['private_compute']);
+  assert.equal(serialize(options, { privateToolsOnly: false }).tools.length, 3);
   assert.equal(serialize({ ...options, tools: [options.tools[1]] }, { privateToolsOnly: true }).tools, undefined);
 });
 test('invalid date arithmetic is a recoverable local tool error; valid arithmetic still calls the broker', async () => {
@@ -62,7 +63,7 @@ test('invalid date arithmetic is a recoverable local tool error; valid arithmeti
   const original = process.env.CENSORPRIVACY_TOKEN; process.env.CENSORPRIVACY_TOKEN = 'synthetic-test-token';
   try {
     const baseURL = `http://127.0.0.1:${server.address().port}`;
-    apply({ llm: { registerAdapter() {} }, tools: { register(value) { tool = value; } } }, { mode: 'gateway', baseURL, broker: baseURL, model: 'model' });
+    apply({ llm: { registerAdapter() {} }, tools: { register(value) { tool = value; }, guard() {} }, on() {} }, { mode: 'gateway', baseURL, broker: baseURL, model: 'model' });
     await assert.rejects(tool.execute({ operation: 'date_diff', refs: [date], options: { reference: 'today' } }, {}), /DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES/);
     for (const options of [{ reference: 'today' }, { unit: 'weeks' }, null]) {
       await assert.rejects(tool.execute({ operation: 'date_diff', refs: [date, date], options }, {}), /COMPUTE_OPTIONS_INVALID/);
@@ -72,6 +73,47 @@ test('invalid date arithmetic is a recoverable local tool error; valid arithmeti
     assert.equal(requests, 0, 'invalid arguments must not reach the broker');
     assert.equal((await tool.execute({ operation: 'sum', refs: [reference] }, {})).result, reference);
     assert.equal(requests, 1, 'a tool error must not prevent the next valid call');
+  } finally {
+    if (original === undefined) delete process.env.CENSORPRIVACY_TOKEN; else process.env.CENSORPRIVACY_TOKEN = original;
+    server.closeAllConnections(); await new Promise(ok => server.close(ok));
+  }
+});
+test('private tool catalog drives advertisement and execution independently of the native tools toggle', async () => {
+  const catalog = [{ name: 'private_compute', kind: 'builtin' },
+    { name: 'private_sort', kind: 'program', description: 'Sort the private values.', output: 'order' }];
+  const other = reference.replace('0123', 'abcd');
+  let raw = false; const calls = [];
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    calls.push({ path: request.url, args: JSON.parse(Buffer.concat(chunks)) });
+    response.end(JSON.stringify({ refs: raw ? ['raw value', reference] : [other, reference] }));
+  });
+  await new Promise(ok => server.listen(0, '127.0.0.1', ok));
+  const original = process.env.CENSORPRIVACY_TOKEN; process.env.CENSORPRIVACY_TOKEN = 'synthetic-token';
+  try {
+    const baseURL = `http://127.0.0.1:${server.address().port}`;
+    for (const enabled of [false, true]) {
+      let guard, allowed, adapter; const registered = new Map();
+      apply({
+        llm: { registerAdapter(_ids, value) { adapter = value; } },
+        tools: { register(tool) { registered.set(tool.name, tool); }, guard(fn) { guard = fn; } },
+        on(_event, fn) { fn({ agent: { ctx: { tools: { restrict(spec) { allowed = spec.allow; } } } } }); },
+      }, { mode: 'gateway', baseURL, broker: baseURL, model: 'test', privateToolsOnly: !enabled, privateTools: catalog });
+      const options = { model: 'test', messages: [], tools: [...registered.values(), { name: 'bash' }] };
+      assert.deepEqual(serialize(options, adapter.config).tools.map(tool => tool.function.name),
+        enabled ? ['private_compute', 'private_sort', 'bash'] : ['private_compute', 'private_sort']);
+      const sort = registered.get('private_sort');
+      if (enabled) { assert.equal(guard, undefined); continue; }
+      assert.deepEqual(allowed, ['private_compute', 'private_sort']);
+      assert.equal(guard({ name: 'private_sort' }), undefined);
+      assert.match(guard({ name: 'bash' }), /PRIVATE_TOOLS_ONLY/);
+      await assert.rejects(sort.execute({ refs: [reference], command: 'never' }, {}), /REFERENCES_REQUIRED/);
+      const refs = [reference, other];
+      assert.deepEqual((await sort.execute({ refs }, {})).refs, [other, reference]);
+      assert.deepEqual(calls, [{ path: '/v1/private_tools/private_sort', args: { refs } }]);
+      raw = true;
+      await assert.rejects(sort.execute({ refs }, {}), /PRIVATE_RESULT_REQUIRED/);
+    }
   } finally {
     if (original === undefined) delete process.env.CENSORPRIVACY_TOKEN; else process.env.CENSORPRIVACY_TOKEN = original;
     server.closeAllConnections(); await new Promise(ok => server.close(ok));

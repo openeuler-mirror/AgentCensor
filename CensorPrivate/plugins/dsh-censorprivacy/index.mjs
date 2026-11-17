@@ -11,6 +11,25 @@ const error = code => Object.assign(new Error(`CensorPrivacy: ${code}`), { code 
 const operations = ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const keys = (value, allowed) => object(value) && Object.keys(value).every(key => allowed.includes(key));
+const programName = /^private_[a-z][a-z0-9_]{0,55}$/;
+const canonicalRef = /^<CP_[A-Z][A-Z0-9_]*_[0-9a-f]{32}>$/;
+const refsValid = (refs, pattern) => Array.isArray(refs) && refs.length >= 1 && refs.length <= 256 &&
+  refs.every(value => typeof value === 'string' && pattern.test(value));
+
+function programs(catalog = []) {
+  if (!Array.isArray(catalog) || catalog.length > 33) throw error('PRIVATE_TOOLS_CATALOG_INVALID');
+  const found = new Map();
+  for (const item of catalog) {
+    if (keys(item, ['name', 'kind']) && item.kind === 'builtin' && item.name === 'private_compute') continue;
+    if (!keys(item, ['name', 'kind', 'description', 'output']) || item.kind !== 'program' ||
+        typeof item.name !== 'string' || !programName.test(item.name) || item.name === 'private_compute' ||
+        typeof item.description !== 'string' || !item.description.trim() || item.description.trim().length > 512 ||
+        !['order', 'values'].includes(item.output) || found.has(item.name)) throw error('PRIVATE_TOOLS_CATALOG_INVALID');
+    found.set(item.name, item);
+  }
+  return found;
+}
+
 function validateComputeArguments(args) {
   if (!keys(args, ['operation', 'refs', 'options']) || !operations.includes(args.operation) ||
       !Array.isArray(args.refs) || !args.refs.length || args.refs.length > 256 ||
@@ -81,7 +100,8 @@ export function serialize(options, config) {
   }
   // DSH may add agent-scoped tools after the global restriction was applied.
   // Keep the actual model-facing catalog consistent with the execution guard.
-  const tools = config.privateToolsOnly ? options.tools?.filter(tool => tool.name === 'private_compute') : options.tools;
+  const allowed = config.privateToolNames ?? new Set(['private_compute', ...programs(config.privateTools).keys()]);
+  const tools = config.privateToolsOnly !== false ? options.tools?.filter(tool => allowed.has(tool.name)) : options.tools;
   return { model: options.model, messages, stream: config.mode !== 'tls',
     ...(typeof options.model === 'string' && options.model.startsWith('deepseek-') ? { thinking: { type: 'disabled' } } : {}),
     ...(tools?.length ? { tools: tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) } : {}),
@@ -147,13 +167,16 @@ export class PrivacyAdapter {
 }
 
 export function apply(ctx, supplied) {
-  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, ...supplied };
+  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, privateToolsOnly: true, ...supplied };
   if (!['gateway', 'tls'].includes(config.mode) || !config.baseURL || !config.model || !config.broker || !process.env.CENSORPRIVACY_TOKEN) throw error('CONFIGURATION_REQUIRED');
   if (config.mode === 'gateway' && !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.baseURL)) throw error('LOCAL_GATEWAY_REQUIRED');
   if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(config.broker)) throw error('LOCAL_BROKER_REQUIRED');
   if (![config.timeoutMs, config.maxTokens, config.contextWindow].every(value => Number.isSafeInteger(value) && value > 0) || config.timeoutMs > 180000 || config.maxTokens > 8192) throw error('CONFIGURATION_INVALID');
   if (config.mode === 'tls' && ['tlsRun', 'nativeLibrary', 'tokenFile', 'runStateFile', 'workspace'].some(key => !config[key])) throw error('TLS_CONFIGURATION_REQUIRED');
   if (config.conversationSession !== undefined && (typeof config.conversationSession !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(config.conversationSession))) throw error('CONFIGURATION_INVALID');
+  if (typeof config.privateToolsOnly !== 'boolean') throw error('CONFIGURATION_INVALID');
+  const localPrograms = programs(config.privateTools);
+  config.privateToolNames = new Set(['private_compute', ...localPrograms.keys()]);
   ctx.llm.registerAdapter(['censorprivacy'], new PrivacyAdapter(config));
   ctx.tools.register({
     name: 'private_compute',
@@ -175,8 +198,28 @@ export function apply(ctx, supplied) {
       return result;
     },
   });
+  for (const tool of localPrograms.values()) {
+    const inputPattern = config.mode === 'tls' ? ref : canonicalRef;
+    ctx.tools.register({
+      name: tool.name,
+      description: tool.description.trim() + ' Use current private references only. Copy complete references; never pass raw values. Results are private references.',
+      parameters: { type: 'object', properties: {
+        refs: { type: 'array', items: { type: 'string', pattern: inputPattern.source }, minItems: 1, maxItems: 256 },
+      }, required: ['refs'], additionalProperties: false },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+      async execute(args, exec) {
+        if (!keys(args, ['refs']) || !refsValid(args.refs, inputPattern)) throw error('REFERENCES_REQUIRED');
+        const result = await requestJSON(`${config.broker}/v1/private_tools/${tool.name}`, args,
+          { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: exec.signal });
+        if (!keys(result, ['refs']) || !refsValid(result.refs, canonicalRef) ||
+            (tool.output === 'order' && result.refs.length !== args.refs.length)) throw error('PRIVATE_RESULT_REQUIRED');
+        await receipt(config, { event: 'private_tool', tool: tool.name, ref_count: args.refs.length, result_count: result.refs.length, arguments_are_references: true, results_are_references: true });
+        return result;
+      },
+    });
+  }
   if (config.privateToolsOnly) {
-    ctx.on('agent/created', ({ agent }) => agent.ctx.tools.restrict({ allow: ['private_compute'] }));
-    ctx.tools.guard(exec => exec.name === 'private_compute' ? undefined : 'CensorPrivacy: PRIVATE_TOOLS_ONLY');
+    ctx.on('agent/created', ({ agent }) => agent.ctx.tools.restrict({ allow: [...config.privateToolNames] }));
+    ctx.tools.guard(exec => config.privateToolNames.has(exec.name) ? undefined : 'CensorPrivacy: PRIVATE_TOOLS_ONLY');
   }
 }
