@@ -35,7 +35,7 @@ doctor() {
   fi
   if $dsh; then
     if [[ -n $dsh_root && -f $dsh_root/apps/cli/lib/bin.js ]]; then note 'OK DSH 已构建源码';
-    elif command -v dsh >/dev/null; then note 'OK DSH CLI'; else note '缺失：DSH CLI 或 --dsh-root 已构建目录'; missing=1; fi
+    elif command -v dsh >/dev/null; then note 'OK DSH CLI'; else note '缺失：DSH CLI 或 --dsh-path 已构建目录'; missing=1; fi
   fi
   note "磁盘剩余：$(df -h "$CP_REPO_ROOT" | awk 'NR==2 {print $4}')"
   (( missing == 0 )) || fail '检查未通过；./cpctl deps 可安装系统包，Rust/DSH 按手册准备'

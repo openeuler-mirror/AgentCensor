@@ -43,6 +43,7 @@ op_init() {
   fi
   [[ -n $model ]] || read -r -p '实际模型 ID: ' model
   validate_connection
+  ner_threads=${ner_threads:-1}; ner_device=${ner_device:-cpu}; ner_batch_size=${ner_batch_size:-1}; validate_ner_options
   find_bins
   local native=${native_library:-${bin_dir%/bin}/lib/censorprivacy/libcp_tls_guard.so}
   if [[ -z $native_library && ! -f $native ]]; then native=$CP_REPO_ROOT/native/libcp_tls_guard.so; fi
@@ -68,8 +69,9 @@ op_init() {
   private_file "$config_dir/gateway.token"
   printf 'Authorization: Bearer %s\n' "$(cat "$config_dir/gateway.token")" > "$config_dir/curl.headers"
   jq -n --arg mode "$mode" --arg upstream "$upstream" --arg model "$model" --argjson port "$port" \
-    --argjson has_key "$has_key" --arg native "$native" --arg ca "$ca_file" \
-    '{mode:$mode,upstream:$upstream,model:$model,port:$port,has_key:$has_key,native_library:$native,ca_file:$ca}' > "$config_dir/config.json"
+    --argjson has_key "$has_key" --arg native "$native" --arg ca "$ca_file" --argjson threads "$ner_threads" \
+    --arg device "$ner_device" --argjson batch "$ner_batch_size" \
+    '{mode:$mode,upstream:$upstream,model:$model,port:$port,has_key:$has_key,native_library:$native,ca_file:$ca,ner_threads:$threads,ner_device:$device,ner_batch_size:$batch}' > "$config_dir/config.json"
   note "已准备：$config_dir（policy.yaml / 私有凭据 / config.json）；下一步 ./cpctl start"
 }
 op_start() {
@@ -78,20 +80,36 @@ op_start() {
     if service_ready; then fail '本实例已经运行且就绪；可执行 ./cpctl check'; fi
     fail "本实例进程仍在运行；$readiness_error"
   fi
+  # Do not replace an existing instance's ownership record or load a second
+  # detector when a stale installation selected a different executable.
+  if curl --noproxy '*' --silent --connect-timeout 1 --max-time 2 --output /dev/null "http://127.0.0.1:$port/ready"; then
+    fail "端口 $port 已有 HTTP 服务，但进程记录不匹配；请先用原启动目录的 cpctl stop 停止，未覆盖进程记录"
+  fi
   local args=(serve --policy "$config_dir/policy.yaml" --upstream "$upstream" --model "$model"
-    --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port")
+    --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port"
+    --ner-threads "$ner_threads" --ner-device "$ner_device" --ner-batch-size "$ner_batch_size"
+    --conversation-records-dir "$config_dir/xiaoo/records")
   [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || args+=(--upstream-key-file "$config_dir/upstream.key")
   [[ $upstream != http://* ]] || args+=(--allow-http-test-upstream)
   [[ $mode != tls ]] || args+=(--tls-direct)
   [[ -z $ca_file ]] || args+=(--upstream-ca-file "$ca_file")
-  local pid ticks code previous_run=
+  local pid ticks code exit_code executable previous_run=
   if [[ -f $config_dir/run.json ]]; then previous_run=$(jq -r .run_id "$config_dir/run.json"); fi
+  executable=$(readlink -f "$bin_dir/censorprivacy")
+  note "启动程序：$executable（NER 设备：$ner_device，CPU 线程：$ner_threads，每卡 batch：$ner_batch_size）"
   nohup "$bin_dir/censorprivacy" "${args[@]}" 9>&- </dev/null > "$config_dir/service.log" 2>&1 &
   pid=$!
-  ticks=$(awk '{print $22}' "/proc/$pid/stat")
-  jq -n --argjson pid "$pid" --arg ticks "$ticks" '{pid:$pid,start_ticks:$ticks}' > "$config_dir/process.json"
+  if ! ticks=$(process_start_ticks "$pid"); then
+    exit_code=0; wait "$pid" || exit_code=$?
+    fail "服务启动失败（程序：$executable，退出码：$exit_code）；查看 $config_dir/service.log"
+  fi
+  jq -n --argjson pid "$pid" --arg ticks "$ticks" --arg executable "$executable" \
+    '{pid:$pid,start_ticks:$ticks,executable:$executable}' > "$config_dir/process.json"
   for _ in {1..1200}; do
-    if ! kill -0 "$pid" 2>/dev/null; then fail "服务启动失败，查看 $config_dir/service.log 中固定错误码"; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      exit_code=0; wait "$pid" || exit_code=$?
+      fail "服务启动失败（程序：$executable，退出码：$exit_code）；查看 $config_dir/service.log"
+    fi
     code=$(auth_curl --max-time 1 --output "$config_dir/ready.json" --write-out '%{http_code}' "http://127.0.0.1:$port/ready" 2>/dev/null) || code=000
     if [[ $code == 200 ]] && process_matches && jq -e --arg previous "$previous_run" --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id and .run_id != $previous' "$config_dir/ready.json" >/dev/null; then note "已启动：http://127.0.0.1:$port（$mode）；./cpctl check"; return; fi
     sleep 0.1
@@ -170,6 +188,7 @@ op_systemd() (
   [[ $bin_dir =~ ^/[a-zA-Z0-9_./-]+$ ]] || fail 'systemd 可执行文件路径含不支持的字符'
   unit=$stage/$service
   sed -e "s|%i|$instance|g" -e "s|/usr/local/bin/censorprivacy|$bin_dir/censorprivacy|g" "$CP_REPO_ROOT/deploy/censorprivacy@.service" > "$unit"
+  sed -i "/^ExecStart=/ s|$| --ner-threads $ner_threads --ner-device $ner_device --ner-batch-size $ner_batch_size|" "$unit"
   if [[ $(jq -r .has_key "$config_dir/config.json") == false ]]; then sed -i "s| --upstream-key-file /etc/censorprivacy/$instance.upstream-key||" "$unit"; fi
   if [[ $mode == tls ]]; then sed -i '/^ExecStart=/ s|$| --tls-direct|' "$unit"; fi
   if [[ $upstream == http://* ]]; then sed -i '/^ExecStart=/ s|$| --allow-http-test-upstream|' "$unit"; fi

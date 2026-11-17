@@ -34,25 +34,57 @@ validate_connection() {
 load_config() {
   need jq
   private_file "$config_dir/config.json"
-  jq -e 'type == "object" and (.mode|type == "string") and (.port|type == "number" and . == floor) and (.upstream|type == "string") and (.model|type == "string") and (.has_key|type == "boolean") and (.native_library|type == "string") and ((.ca_file // "")|type == "string")' "$config_dir/config.json" >/dev/null || fail '配置格式错误'
+  jq -e 'type == "object" and (.mode|type == "string") and (.port|type == "number" and . == floor) and (.upstream|type == "string") and (.model|type == "string") and (.has_key|type == "boolean") and (.native_library|type == "string") and ((.ca_file // "")|type == "string") and ((has("ner_device")|not) or (.ner_device|type == "string")) and ((has("ner_batch_size")|not) or (.ner_batch_size|type == "number" and . == floor and . >= 1 and . <= 256)) and ((has("ner_threads")|not) or (.ner_threads|type == "number" and . == floor and . >= 1 and . <= 256))' "$config_dir/config.json" >/dev/null || fail '配置格式错误'
   mode=$(jq -r .mode "$config_dir/config.json")
   port=$(jq -r .port "$config_dir/config.json")
   upstream=$(jq -r .upstream "$config_dir/config.json")
   model=$(jq -r .model "$config_dir/config.json")
+  if [[ -z $ner_threads ]]; then ner_threads=$(jq -r '.ner_threads // 1' "$config_dir/config.json"); fi
+  if [[ -z $ner_device ]]; then ner_device=$(jq -r '.ner_device // "cpu"' "$config_dir/config.json"); fi
+  if [[ -z $ner_batch_size ]]; then ner_batch_size=$(jq -r '.ner_batch_size // 1' "$config_dir/config.json"); fi
+  validate_ner_options
   validate_connection
   private_file "$config_dir/gateway.token"; private_file "$config_dir/curl.headers"; private_file "$config_dir/policy.yaml"
   [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || private_file "$config_dir/upstream.key"
   ca_file=$(jq -r '.ca_file // ""' "$config_dir/config.json")
   if [[ -n $ca_file ]]; then [[ $ca_file == /* ]] || fail 'CA 文件需要绝对路径'; private_file "$ca_file"; fi
 }
+validate_ner_threads() {
+  [[ $ner_threads =~ ^[1-9][0-9]{0,2}$ && $ner_threads -le 256 ]] || fail 'NER 线程数应为 1–256 的整数'
+}
+validate_ner_options() {
+  validate_ner_threads
+  [[ $ner_batch_size =~ ^[1-9][0-9]{0,2}$ && $ner_batch_size -le 256 ]] || fail 'NER batch 大小应为 1–256 的整数'
+  case "$ner_device" in cuda|cann) ner_device=$ner_device:0 ;; esac
+  [[ $ner_device != cpu ]] || return 0
+  [[ $ner_device =~ ^(cuda|cann):[0-9]+(,[0-9]+)*$ ]] || fail 'NER 设备应为 cpu、cuda[:ids] 或 cann[:ids]'
+  local ids=() id normalized= seen=, number backend=${ner_device%%:*}
+  IFS=, read -r -a ids <<< "${ner_device#*:}"
+  [[ ${#ids[@]} -le 64 ]] || fail 'NER 设备列表最多 64 项'
+  for id in "${ids[@]}"; do
+    [[ ${#id} -le 10 ]] || fail 'NER 设备编号超出范围'
+    number=$((10#$id))
+    [[ $number -le 2147483647 ]] || fail 'NER 设备编号超出范围'
+    [[ $seen != *",$number,"* ]] || fail 'NER 设备编号不能重复'
+    seen+="$number,"
+    normalized+="${normalized:+,}$number"
+  done
+  ner_device=$backend:$normalized
+}
+
 find_bins() {
   if [[ -f $CP_REPO_ROOT/BUNDLE.json && -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then
+    bin_dir=$CP_DEFAULT_BIN_DIR
+  elif ${prefix_explicit:-false} && [[ -x $prefix/bin/censorprivacy ]]; then
+    bin_dir=$prefix/bin
+  elif [[ -f $CP_REPO_ROOT/Cargo.toml && -x $CP_REPO_ROOT/target/release/censorprivacy ]]; then
+    bin_dir=$CP_REPO_ROOT/target/release
+  elif [[ -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then
     bin_dir=$CP_DEFAULT_BIN_DIR
   elif [[ -f $config_dir/install.json ]]; then
     private_file "$config_dir/install.json"
     bin_dir=$(jq -er .bin_dir "$config_dir/install.json")
   elif [[ -x $prefix/bin/censorprivacy ]]; then bin_dir=$prefix/bin
-  elif [[ -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then bin_dir=$CP_DEFAULT_BIN_DIR
   else bin_dir=$CP_REPO_ROOT/target/release; fi
   [[ $bin_dir == /* && $bin_dir != *$'\n'* ]] || fail '无效安装路径'
   [[ -x $bin_dir/censorprivacy ]] || fail '找不到 Rust 可执行文件；先运行 ./cpctl install'
@@ -93,15 +125,26 @@ service_ready() {
     return 1
   fi
 }
+process_start_ticks() {
+  local line fields
+  [[ $1 =~ ^[0-9]+$ ]] || return 1
+  IFS= read -r line 2>/dev/null < "/proc/$1/stat" || return 1
+  # comm can contain spaces and parentheses; field 22 follows the final ') '.
+  line=${line##*) }
+  read -r -a fields <<< "$line"
+  [[ ${fields[19]:-} =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${fields[19]}"
+}
 process_matches() {
   [[ -f $config_dir/process.json ]] || return 1
   private_file "$config_dir/process.json"
-  local pid tick current executable
+  local pid tick current executable expected
   pid=$(jq -er .pid "$config_dir/process.json") || return 1
   tick=$(jq -er .start_ticks "$config_dir/process.json") || return 1
-  [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/stat ]] || return 1
-  current=$(awk '{print $22}' "/proc/$pid/stat") || return 1
-  executable=$(readlink "/proc/$pid/exe") || return 1
+  [[ $pid =~ ^[0-9]+$ && $tick =~ ^[0-9]+$ ]] || return 1
+  current=$(process_start_ticks "$pid") || return 1
+  executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || return 1
   executable=${executable%" (deleted)"}
-  [[ $tick == "$current" && $executable == "$(readlink -f "$bin_dir/censorprivacy")" ]]
+  expected=$(jq -er '.executable // empty' "$config_dir/process.json") || expected=$(readlink -f "$bin_dir/censorprivacy")
+  [[ $expected == /* && $tick == "$current" && $executable == "$expected" ]]
 }
