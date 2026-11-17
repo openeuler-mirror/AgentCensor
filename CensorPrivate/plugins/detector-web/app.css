@@ -1267,3 +1267,35 @@ textarea::placeholder {
     scroll-behavior: auto !important;
   }
 }
+.conversations-card { margin-bottom: 24px; }
+.conversations-card .card-header { flex-wrap: wrap; gap: 12px; }
+.conversation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+#clear-conversations { color: #a33a32; }
+#clear-conversations:disabled { opacity: .45; cursor: default; }
+.record-detail .workspace { grid-template-columns: minmax(0, 1fr); }
+.conversation-workspace { display: grid; grid-template-columns: minmax(220px, 28%) minmax(0, 1fr); }
+.session-list { border-right: 1px solid #e5e8e2; padding: 12px; max-height: 580px; overflow-y: auto; }
+.session-button { display: block; width: 100%; border: 1px solid transparent; border-radius: 10px; background: transparent; padding: 12px; text-align: left; cursor: pointer; color: inherit; margin-bottom: 8px; }
+.session-button strong, .session-button small { display: block; overflow-wrap: anywhere; }
+.session-button strong { font-size: 13px; line-height: 1.6; }
+.session-button small { font-size: 11px; color: #64756b; margin-top: 6px; }
+.session-button.selected, .record-button.selected { background: #edf4e7; border-color: #73976a; }
+.conversation-timeline { padding: 20px; min-height: 180px; max-height: 580px; overflow-y: auto; overflow-wrap: anywhere; }
+.conversation-hint { color: #64756b; font-size: 13px; line-height: 1.8; padding: 12px; }
+.exchange + .exchange { margin-top: 24px; border-top: 1px solid #e5e8e2; padding-top: 16px; }
+.exchange-meta { color: #64756b; font-size: 12px; margin-bottom: 12px; }
+.chat-message { background: #f5f7f3; border-radius: 10px; padding: 14px; margin: 10px 0; }
+.chat-message.role-user { background: #edf4e7; }
+.chat-message.role-tool { border-left: 3px solid #b3c5a8; }
+.message-role { font-size: 12px; }
+.message-content { font: inherit; font-size: 13px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 280px; overflow-y: auto; margin: 8px 0; }
+.record-button { border: 1px solid #c8d4c1; border-radius: 7px; padding: 6px 10px; background: #fff; color: #27483e; cursor: pointer; margin: 8px 8px 0 0; font-size: 12px; }
+.system-message summary { cursor: pointer; color: #64756b; font-size: 12px; }
+.conversation-error { color: #a33a32; font-size: 12px; }
+.detail-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 12px; }
+#detail-context { font-size: 13px; color: #536858; overflow-wrap: anywhere; }
+@media (max-width: 680px) {
+  .conversation-workspace { grid-template-columns: minmax(0, 1fr); }
+  .session-list { max-height: 180px; border-right: 0; border-bottom: 1px solid #e5e8e2; }
+  .conversation-timeline { padding: 12px; max-height: 480px; }
+}

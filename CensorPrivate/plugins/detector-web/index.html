@@ -59,7 +59,7 @@
           <span>隐私检测台<small>PRIVACY DETECTOR</small></span>
         </a>
         <span class="local-badge"
-          ><span class="status-dot"></span> 本地检测 · 文本不保存</span
+          ><span class="status-dot"></span> 本地隐私工作台</span
         >
       </header>
 
@@ -70,7 +70,7 @@
             <h1 id="page-title">
               让敏感信息，<br class="mobile-break" />止于发送之前<span>。</span>
             </h1>
-            <p>粘贴文本，使用本地模型检测。从隐私识别到内容遮蔽，在一个工作台完成。</p>
+            <p>同步 Agent 对话，查看每次发送前的检测与遮蔽结果，也可粘贴文本独立检测。</p>
           </div>
           <div class="hero-note">
             <svg class="icon"><use href="#shield" /></svg
@@ -78,6 +78,26 @@
           </div>
         </section>
 
+        <section class="card conversations-card" aria-labelledby="conversations-title">
+          <div class="card-header">
+            <h2 id="conversations-title">Agent 对话记录</h2>
+            <div class="conversation-actions">
+              <span id="conversation-status" class="subtle" role="status">正在连接…</span>
+              <button id="clear-conversations" type="button" class="text-button" disabled>清空记录</button>
+            </div>
+          </div>
+          <p id="conversation-notice" class="conversation-hint" role="status" hidden></p>
+          <div class="conversation-workspace">
+            <nav id="session-list" class="session-list" aria-label="Agent 会话"></nav>
+            <div id="conversation-timeline" class="conversation-timeline" aria-label="对话过程" aria-live="polite">
+              <p class="conversation-hint">通过 CensorPrivacy 网关启动 DeepSeek Harness、xiaoO 或其他 Agent，对话记录会自动出现在这里。</p>
+            </div>
+          </div>
+        </section>
+        <div class="detail-heading">
+          <p id="detail-context">独立文本检测</p>
+          <button id="manual-mode" type="button" class="text-button" hidden>返回独立检测</button>
+        </div>
         <form id="detector-form" novalidate>
           <div class="workspace">
             <section class="card editor-card" aria-labelledby="input-title">
@@ -95,13 +115,9 @@
                 spellcheck="false"
                 placeholder="在这里粘贴邮件、消息或任何准备发送的内容…"
                 data-max-length="5000"
-              >
-你好，这是我的联系方式：
-邮箱 lin@example.com，手机号 13800138000。
-登录密码：Cloud!2026
-我的身份证号是 11010519491231002X。</textarea>
+              ></textarea>
               <div class="editor-meta">
-                <span><span class="tiny-dot"></span> 仅在点击检测后分析</span>
+                <span><span class="tiny-dot"></span> <span id="editor-hint">仅在点击检测后分析</span></span>
                 <span id="char-count">0 / 5000</span>
               </div>
               <div class="example-row">
@@ -327,7 +343,7 @@
         <div class="page-footnote">
           <svg class="icon"><use href="#shield" /></svg>
           <p>
-            文本仅发送至本机检测服务，不记录、不保存。遮蔽为独立预览，引用不可用于网关恢复；结果供人工复核。
+            独立检测文本不保存，遮蔽为预览。Agent 会话及原文保存在本机私有目录；对话详情展示当次网关实际结果。结果供人工复核。
           </p>
         </div>
       </main>

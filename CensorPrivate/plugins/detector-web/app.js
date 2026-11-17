@@ -103,6 +103,7 @@ let revision = 0;
 let activeController = null;
 let loading = false;
 let lastResults = null;
+let historyMode = false;
 function announce(text) {
   $("#live-message").textContent = text;
 }
@@ -116,10 +117,10 @@ function updateControls() {
   $("#char-count").textContent = `${length} / ${maxLength}`;
   $("#char-count").classList.toggle("over-limit", length > maxLength);
   const threshold = $("#mask-threshold").valueAsNumber;
-  analyzeButton.disabled = loading || !input.value.trim() || length > maxLength ||
+  analyzeButton.disabled = historyMode || loading || !input.value.trim() || length > maxLength ||
     !Number.isFinite(threshold) || threshold < 0 || threshold > 1;
   $("#analyze-label").textContent = loading ? "检测中…" : "开始检测";
-  $("#active-pipeline").textContent = selectedEngines().includes("ner")
+  $("#active-pipeline").textContent = historyMode ? "当次网关策略 · 记录只读" : selectedEngines().includes("ner")
     ? "正则 + 精确规则 + NER" : "正则 + 精确规则";
 }
 function resetResults() {
@@ -203,14 +204,15 @@ function renderResults(data, text) {
   $("#result-count").hidden = false;
   $("#result-count").textContent = String(data.count);
   $("#result-summary").textContent =
-    `${data.category_count} 类线索 · ${data.elapsed_ms} ms`;
+    data.recorded ? `${data.category_count} 类线索 · 当次网关记录` : `${data.category_count} 类线索 · ${data.elapsed_ms} ms`;
   $("#loading-state").hidden = true;
   $("#empty-state").hidden = data.count > 0;
   $("#result-content").hidden = data.count === 0;
   $("#masked-text").value = data.masked_text;
   $("#masked-panel").hidden = false;
   $("#masked-summary").textContent =
-    `已遮蔽 ${data.masked_count} 个范围 · 分数阈值 ≥ ${data.mask_threshold.toFixed(2)}。低分候选保留供复核。`;
+    data.recorded ? `当次网关实际发送的文本 · 已遮蔽 ${data.masked_count} 个范围。`
+      : `已遮蔽 ${data.masked_count} 个范围 · 分数阈值 ≥ ${data.mask_threshold.toFixed(2)}。低分候选保留供复核。`;
   if (!data.count) {
     $("#empty-title").textContent = "暂未发现敏感信息";
     $("#empty-description").textContent =
@@ -229,7 +231,7 @@ function renderResults(data, text) {
           "entity-label",
           labels[result.entity_type] || result.entity_type,
         ),
-        node("span", "score", `分数 ${result.score.toFixed(2)}`),
+        node("span", "score", Number.isFinite(result.score) ? `分数 ${result.score.toFixed(2)}` : "策略命中"),
       );
       const snippet = node(
         "span",
@@ -249,7 +251,7 @@ function renderResults(data, text) {
         node(
           "span",
           "",
-          result.mask_eligible ? "已达遮蔽阈值" : "低于阈值 · 未遮蔽",
+          data.recorded ? "已由网关遮蔽" : result.mask_eligible ? "已达遮蔽阈值" : "低于阈值 · 未遮蔽",
         ),
         ...(result.validation === "failed"
           ? [node("span", "", "校验未通过")]
@@ -360,3 +362,227 @@ $("#copy-masked").addEventListener("click", async () => {
   }
 });
 updateControls();
+
+const statusLabels = {pending:"检测中",streaming:"回复中",completed:"已完成",error:"未完成"};
+const roleLabels = {system:"系统",developer:"系统",user:"用户",assistant:"助手",tool:"工具结果"};
+let selectedSession = null;
+let selectedRecord = null;
+let sessionVersion = "";
+let timelineVersion = "";
+let polling = false;
+let clearingConversations = false;
+let conversationRevision = 0;
+
+function resetConversationDetails() {
+  selectedRecord = null;
+  setHistoryMode(false);
+  input.value = "";
+  invalidate();
+  $("#detail-context").textContent = "选择消息查看检测与遮蔽详情";
+}
+
+$("#clear-conversations").addEventListener("click", async () => {
+  if (clearingConversations || !window.confirm(
+    "清空所有已保存的 Agent 对话和检测详情？此操作无法撤销。\n\n清空后请新开 Agent 会话开始测试；正在使用的客户端仍保留原来的对话上下文。",
+  )) return;
+  clearingConversations = true;
+  conversationRevision += 1;
+  const button = $("#clear-conversations");
+  button.disabled = true;
+  button.textContent = "正在清空…";
+  try {
+    const response = await fetch("/api/conversations", {
+      method: "DELETE",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({confirm:true}),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "清空未完成，请重试。");
+    selectedSession = null;
+    sessionVersion = "";
+    timelineVersion = "";
+    resetConversationDetails();
+    $("#session-list").replaceChildren(node("p", "conversation-hint", "尚无会话"));
+    renderTimeline([]);
+    const message = `已清空 ${data.cleared_sessions} 个会话。请新开 Agent 会话开始测试。`;
+    $("#conversation-notice").textContent = message;
+    $("#conversation-notice").hidden = false;
+    announce(message);
+  } catch (error) {
+    const message = error instanceof TypeError ? "无法连接会话服务，清空未完成。" : error.message;
+    $("#conversation-notice").textContent = message;
+    $("#conversation-notice").hidden = false;
+    announce(message);
+  } finally {
+    clearingConversations = false;
+    button.textContent = "清空记录";
+    button.disabled = false;
+  }
+  syncConversations();
+});
+
+function setHistoryMode(enabled) {
+  historyMode = enabled;
+  input.readOnly = enabled;
+  for (const element of document.querySelectorAll('#clear, [data-sample], #mask-style, #mask-threshold, input[value="ner"]')) {
+    element.disabled = enabled;
+  }
+  $("#manual-mode").hidden = !enabled;
+  $("#editor-hint").textContent = enabled ? "当次发送前的原始文本 · 只读" : "仅在点击检测后分析";
+  $(".settings-sidebar").hidden = enabled;
+  form.classList.toggle("record-detail", enabled);
+  $("#input-title").lastChild.textContent = enabled ? " 发送前的原文" : " 待检测文本";
+  updateControls();
+}
+
+function showSnapshot(snapshot, context, key) {
+  invalidate();
+  setHistoryMode(true);
+  selectedRecord = key;
+  input.value = snapshot.text;
+  updateControls();
+  renderResults(snapshot.analysis, snapshot.text);
+  $("#detail-context").textContent = context;
+  document.querySelectorAll('[data-record-key]').forEach(button => {
+    button.classList.toggle("selected", button.dataset.recordKey === key);
+    button.setAttribute("aria-pressed", String(button.dataset.recordKey === key));
+  });
+}
+
+$("#manual-mode").addEventListener("click", () => {
+  selectedRecord = null;
+  setHistoryMode(false);
+  invalidate();
+  $("#detail-context").textContent = "独立文本检测";
+  document.querySelectorAll('[data-record-key]').forEach(button => {
+    button.classList.remove("selected"); button.setAttribute("aria-pressed", "false");
+  });
+});
+
+function messageText(message) {
+  const content = typeof message.content === "string" ? message.content
+    : Array.isArray(message.content) ? message.content.map(part => part.text || "").join("\n") : "";
+  const tools = message.tool_calls?.length ? "\n" + message.tool_calls.map(call =>
+    `${call.function?.name || "工具调用"}(${call.function?.arguments || ""})`).join("\n") : "";
+  return content + tools || "（空消息）";
+}
+
+function agentLabel(agent) {
+  if (!agent || agent === "xiaoo") return "xiaoO";
+  if (agent === "deepseek-harness") return "DeepSeek Harness";
+  return agent;
+}
+
+function renderTimeline(exchanges) {
+  const fragment = document.createDocumentFragment();
+  let previousMessages = [];
+  let previousResponse = null;
+  exchanges.forEach((exchange, turn) => {
+    const label = agentLabel(exchange.agent);
+    const roleLabel = role => role === "assistant" ? label : roleLabels[role] || role;
+    const group = node("section", "exchange");
+    group.append(node("p", "exchange-meta", `第 ${turn + 1} 次模型调用 · ${new Date(exchange.created_at).toLocaleTimeString()} · ${statusLabels[exchange.status] || exchange.status}`));
+    const messages = exchange.messages || [];
+    let shared = 0;
+    while (shared < previousMessages.length && shared < messages.length &&
+      JSON.stringify(previousMessages[shared]) === JSON.stringify(messages[shared])) shared += 1;
+    // The prior response is already visible below its request. Keep its exact
+    // outbound version inspectable when the Agent sends it back in the next round.
+    messages.forEach((message, index) => {
+      if (index < shared) return;
+      const holder = node("div", `chat-message role-${message.role || "unknown"}`);
+      holder.append(node("strong", "message-role", roleLabel(message.role)));
+      if (message.name || message.tool_call_id) holder.append(node("span", "subtle", ` ${message.name || message.tool_call_id}`));
+      const snapshots = exchange.snapshots.filter(snapshot => snapshot.path.startsWith(`/messages/${index}/`));
+      holder.append(node("pre", "message-content", messageText(message)));
+      if (previousResponse && index === shared && message.role === "assistant") {
+        holder.append(node("small", "subtle", "上一轮回复再次发送给模型"));
+      }
+      if (snapshots.length) {
+        snapshots.forEach((snapshot, part) => {
+          const key = `${exchange.id}:${snapshot.path}`;
+          const button = node("button", "record-button", snapshots.length > 1 ? `查看片段 ${part + 1} 的检测与遮蔽` : "查看检测与遮蔽");
+          button.type = "button";
+          button.dataset.recordKey = key;
+          button.classList.toggle("selected", selectedRecord === key);
+          button.setAttribute("aria-pressed", String(selectedRecord === key));
+          button.addEventListener("click", () => {
+            showSnapshot(snapshot, `第 ${turn + 1} 次调用 · ${roleLabel(message.role)} · ${snapshot.path} · 实际发送记录`, key);
+            $("#detail-context").scrollIntoView({block:"start",behavior:"smooth"});
+          });
+          holder.append(button);
+        });
+      } else holder.append(node("small", "subtle", exchange.status === "error" ? "请求未通过网关，无已发送的遮蔽结果。" : "等待网关检测记录…"));
+      if (["system","developer"].includes(message.role)) {
+        const details = node("details", "system-message");
+        details.append(node("summary", "", "系统提示词"), holder); group.append(details);
+      } else group.append(holder);
+    });
+    if (exchange.response && (exchange.response.content || exchange.response.tool_calls?.length)) {
+      const reply = node("div", "chat-message role-assistant");
+      reply.append(node("strong", "message-role", `${label} 回复`), node("pre", "message-content", messageText(exchange.response)),
+        node("small", "subtle", "本地恢复后的回复；工具调用与工具结果按执行顺序记录。"));
+      group.append(reply);
+    }
+    if (exchange.error) group.append(node("p", "conversation-error", `本次调用未完成：${exchange.error}`));
+    fragment.append(group);
+    previousMessages = messages;
+    previousResponse = exchange.response;
+  });
+  if (!exchanges.length) fragment.append(node("p", "conversation-hint", "等待第一条对话记录…"));
+  $("#conversation-timeline").replaceChildren(fragment);
+}
+
+async function syncConversations() {
+  if (polling || clearingConversations || document.hidden) return;
+  polling = true;
+  const currentRevision = conversationRevision;
+  try {
+    const response = await fetch("/api/conversations", {cache:"no-store"});
+    if (!response.ok) throw new Error("会话服务暂时不可用，正在重连…");
+    const data = await response.json();
+    if (currentRevision !== conversationRevision) return;
+    $("#conversation-status").textContent = data.enabled ? "自动同步 · 本机保存" : "尚未连接 · 使用 cpctl start 启用";
+    $("#clear-conversations").disabled = !data.enabled || !data.sessions.length;
+    if (!data.enabled) return;
+    if (!selectedSession && data.sessions.length) selectedSession = data.sessions[0].id;
+    if (selectedSession && !data.sessions.some(session => session.id === selectedSession)) {
+      selectedSession = data.sessions[0]?.id || null; timelineVersion = "";
+      if (historyMode) resetConversationDetails();
+    }
+    const version = JSON.stringify([selectedSession, data.sessions]);
+    if (version !== sessionVersion) {
+      const fragment = document.createDocumentFragment();
+      for (const session of data.sessions) {
+        const button = node("button", "session-button"); button.type = "button";
+        button.classList.toggle("selected", session.id === selectedSession);
+        button.setAttribute("aria-pressed", String(session.id === selectedSession));
+        button.append(node("strong", "", session.title), node("small", "", `${agentLabel(session.agent)} · ${new Date(session.created_at).toLocaleString()} · ${session.exchange_count} 次调用 · ${statusLabels[session.status] || session.status}`));
+        button.addEventListener("click", () => {
+          selectedSession = session.id; timelineVersion = ""; sessionVersion = "";
+          selectedRecord = null;
+          if (historyMode) {setHistoryMode(false);input.value="";invalidate();$("#detail-context").textContent = "选择消息查看检测与遮蔽详情";}
+          syncConversations();
+        });
+        fragment.append(button);
+      }
+      if (!data.sessions.length) fragment.append(node("p", "conversation-hint", "尚无会话"));
+      $("#session-list").replaceChildren(fragment); sessionVersion = version;
+    }
+    if (selectedSession) {
+      const currentSession = selectedSession;
+      const detail = await fetch(`/api/conversations/${currentSession}`, {cache:"no-store"});
+      if (!detail.ok) throw new Error("会话读取失败，正在重试…");
+      const records = await detail.json();
+      if (currentRevision !== conversationRevision || currentSession !== selectedSession) return;
+      const nextVersion = JSON.stringify(records);
+      if (nextVersion !== timelineVersion) {renderTimeline(records.exchanges);timelineVersion = nextVersion;}
+    } else {renderTimeline([]);timelineVersion = "";}
+  } catch (error) {
+    if (currentRevision !== conversationRevision) return;
+    $("#conversation-status").textContent = error.message || "连接中断，正在重连…";
+  } finally {polling = false;}
+}
+syncConversations();
+setInterval(syncConversations, 1500);
+document.addEventListener("visibilitychange", syncConversations);
