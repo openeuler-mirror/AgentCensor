@@ -9,6 +9,36 @@ import { serialize, privateResult, PrivacyAdapter, apply } from '../plugins/dsh-
 import { requestJSON, tlsJSON } from '../plugins/dsh-censorprivacy/transport.mjs';
 
 const reference = '<CP_MONEY_0123456789abcdef0123456789abcdef>';
+test('Harness automatically attaches real session metadata locally, with an explicit fallback for older versions', async () => {
+  const calls = [];
+  const server = createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    calls.push({ headers: request.headers, body: JSON.parse(Buffer.concat(chunks)) });
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'OK' }, finish_reason: 'stop' }] }));
+  });
+  await new Promise(ok => server.listen(0, '127.0.0.1', ok));
+  try {
+    const config = { mode: 'gateway', baseURL: `http://127.0.0.1:${server.address().port}` };
+    const adapter = new PrivacyAdapter(config);
+    const options = { model: 'model', messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }] };
+    for (const sessionId of ['session-one', 'session-one', 'session-two']) {
+      for await (const _ of adapter.stream({ ...options, sessionId })) { /* consume */ }
+    }
+    for await (const _ of adapter.stream({ ...options, sessionId: 'session-one', purpose: 'session-title' })) { /* consume */ }
+    for await (const _ of adapter.stream(options)) { /* consume */ }
+    const fallback = new PrivacyAdapter({ ...config, conversationSession: 'configured-session' });
+    for await (const _ of fallback.stream(options)) { /* consume */ }
+    for await (const _ of fallback.stream({ ...options, sessionId: 'real-session' })) { /* consume */ }
+    assert.deepEqual(calls.map(call => call.headers['x-censorprivacy-session']),
+      ['session-one', 'session-one', 'session-two', undefined, undefined, 'configured-session', 'real-session']);
+    for (const call of calls) {
+      assert.equal(call.headers['x-censorprivacy-agent'], call.headers['x-censorprivacy-session'] ? 'deepseek-harness' : undefined);
+      assert.equal(call.body.sessionId, undefined);
+      assert.equal(call.body.agent, undefined);
+    }
+  } finally { server.closeAllConnections(); await new Promise(ok => server.close(ok)); }
+});
 test('private-only requests hide agent-scoped tools and preserve supported compute schemas', () => {
   const options = { model: 'model', messages: [], tools: [
     { name: 'private_compute', parameters: { type: 'object' } },
@@ -49,7 +79,8 @@ test('invalid date arithmetic is a recoverable local tool error; valid arithmeti
 });
 test('DSH rejects unsupported content and never returns raw compute results or extra fields', () => {
   const options = { model: 'model', messages: [{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }] };
-  assert.equal(serialize(options, { maxTokens: 512 }).stream, false);
+  assert.equal(serialize(options, { maxTokens: 512 }).stream, true);
+  assert.equal(serialize(options, { mode: 'tls', maxTokens: 512 }).stream, false);
   assert.equal(serialize(options, { maxTokens: 512 }).thinking, undefined);
   for (const block of [{ type: 'image' }, { type: 'reasoning', text: 'private' }, { type: 'text', text: 'Hello', secret: 'hidden' }]) {
     assert.throws(() => serialize({ ...options, messages: [{ role: 'user', content: [block] }] }, {}), /UNSUPPORTED_CONTENT/);

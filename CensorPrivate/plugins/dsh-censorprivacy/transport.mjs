@@ -5,6 +5,62 @@ import { spawn } from 'node:child_process';
 import { constants, existsSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
+import { chatJSON, chatSSE } from './openai-chat.mjs';
+
+const diagnostic = (target, status, raw) => {
+  let code;
+  try { code = JSON.parse(raw).error?.code; } catch { /* Keep only fixed status/code diagnostics. */ }
+  const local = target.hostname === '127.0.0.1' && ['protocol_blocked', 'sensitive_structure', 'invalid_reference',
+    'private_number_requires_compute', 'compute_invalid', 'private_tool_failed', 'private_tool_busy',
+    'runtime_timeout', 'detection_failed', 'vault_denied', 'release_denied',
+    'upstream_status', 'upstream_unavailable', 'upstream_timeout'].includes(code);
+  return new Error(`upstream_http_${status}${local ? '_' + code : ''}`);
+};
+
+export async function* requestChat(url, body, { token, timeoutMs = 90000, signal, conversation } = {}) {
+  const target = new URL(url), data = Buffer.from(JSON.stringify(body));
+  if (target.username || target.password || !['http:', 'https:'].includes(target.protocol)) throw new Error('endpoint_invalid');
+  if (data.length > 1024 * 1024 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 180000) throw new Error('request_limit');
+  let request, response;
+  const timer = setTimeout(() => request?.destroy(new Error('timeout')), timeoutMs);
+  try {
+    response = await new Promise((ok, no) => {
+      request = (target.protocol === 'http:' ? http : https).request(target, {
+        method: 'POST', signal, agent: false,
+        headers: { 'content-type': 'application/json', 'content-length': data.length,
+          accept: 'text/event-stream, application/json', 'accept-encoding': 'identity',
+          ...(conversation ? { 'x-censorprivacy-agent': conversation.agent, 'x-censorprivacy-session': conversation.session } : {}),
+          ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      }, ok);
+      // Keep the listener for errors occurring after response headers as well.
+      request.on('error', no);
+      request.end(data);
+    });
+    let size = 0;
+    async function* bounded() {
+      for await (const chunk of response) {
+        size += chunk.length;
+        if (size > 1024 * 1024) throw new Error('response_limit');
+        yield chunk;
+      }
+    }
+    if (response.statusCode !== 200) {
+      const chunks = []; for await (const chunk of bounded()) chunks.push(chunk);
+      throw diagnostic(target, response.statusCode, Buffer.concat(chunks));
+    }
+    if (response.headers['content-encoding'] && response.headers['content-encoding'] !== 'identity') throw new Error('response_encoding_invalid');
+    const type = response.headers['content-type']?.split(';')[0].trim().toLowerCase();
+    if (type === 'text/event-stream') yield* chatSSE(bounded());
+    else if (type === 'application/json') {
+      const chunks = []; for await (const chunk of bounded()) chunks.push(chunk);
+      yield* chatJSON(JSON.parse(Buffer.concat(chunks)));
+    } else throw new Error('response_invalid');
+  } finally {
+    clearTimeout(timer);
+    response?.destroy();
+    request?.destroy();
+  }
+}
 
 async function privateKey(path) {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -17,17 +73,18 @@ async function privateKey(path) {
   } finally { await file.close(); }
 }
 
-export function requestJSON(url, body, { token, timeoutMs = 90000, signal } = {}) {
+export function requestJSON(url, body, { token, timeoutMs = 90000, signal, method = 'POST' } = {}) {
   const target = new URL(url);
   if (target.username || target.password || !['http:', 'https:'].includes(target.protocol)) throw new Error('endpoint_invalid');
-  const data = Buffer.from(JSON.stringify(body));
+  if (!['GET', 'POST'].includes(method) || (method === 'GET' && body !== undefined)) throw new Error('request_invalid');
+  const data = method === 'GET' ? Buffer.alloc(0) : Buffer.from(JSON.stringify(body));
   if (data.length > 1024 * 1024 || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 180000) throw new Error('request_limit');
   return new Promise((resolve, reject) => {
     let timer;
     const succeed = value => { clearTimeout(timer); resolve(value); };
     const fail = failure => { clearTimeout(timer); reject(failure); };
     const request = (target.protocol === 'http:' ? http : https).request(target, {
-      method: 'POST', signal, agent: false,
+      method, signal, agent: false,
       headers: {
         'content-type': 'application/json', 'content-length': data.length,
         'accept-encoding': 'identity', 'user-agent': 'deepseek-harness (CensorPrivacy/0.3.0)',
@@ -43,11 +100,7 @@ export function requestJSON(url, body, { token, timeoutMs = 90000, signal } = {}
       response.on('error', () => fail(new Error('transport_failed')));
       response.on('end', () => {
         if (response.statusCode !== 200) {
-          let code;
-          try { code = JSON.parse(Buffer.concat(chunks)).error?.code; } catch { /* Non-JSON errors retain only the HTTP status. */ }
-          const localCode = target.hostname === '127.0.0.1' && ['protocol_blocked', 'sensitive_structure', 'invalid_reference',
-            'private_number_requires_compute', 'compute_invalid', 'detection_failed', 'vault_denied', 'release_denied', 'upstream_status', 'upstream_unavailable'].includes(code);
-          return fail(new Error(`upstream_http_${response.statusCode}${localCode ? '_' + code : ''}`));
+          return fail(diagnostic(target, response.statusCode, Buffer.concat(chunks)));
         }
         if (response.headers['content-encoding'] && response.headers['content-encoding'] !== 'identity') return fail(new Error('response_encoding_invalid'));
         try { succeed(JSON.parse(Buffer.concat(chunks))); } catch { fail(new Error('response_invalid')); }
