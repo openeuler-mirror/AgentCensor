@@ -1,4 +1,5 @@
-// Build-time assembly only. The delivered service never invokes Cargo or Python.
+// Build-time assembly only. Core inference needs no Cargo or Python;
+// operator-registered private tools may use a separately installed interpreter.
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, chmodSync } from 'node:fs';
@@ -129,9 +130,11 @@ for (const source of [...dependencies.values(), ...['jq', 'curl', 'openssl', 'aw
     // Some openEuler RPMs omit the upstream notice. Retrieve only the
     // pinned build-time supplement; no license download runs in production.
     if (!noticeCount && name === 'krb5-libs') {
-      const notice = execFileSync('curl', ['--fail', '--silent', '--show-error',
-        '--location', '--proto', '=https', '--max-time', '60',
-        'https://raw.githubusercontent.com/krb5/krb5/krb5-1.21.2-final/NOTICE']);
+      const notice = process.env.CP_KRB5_NOTICE_FILE
+        ? readFileSync(process.env.CP_KRB5_NOTICE_FILE)
+        : execFileSync('curl', ['--fail', '--silent', '--show-error',
+          '--location', '--proto', '=https', '--max-time', '60',
+          'https://raw.githubusercontent.com/krb5/krb5/krb5-1.21.2-final/NOTICE']);
       if (createHash('sha256').update(notice).digest('hex') !==
           '0d5373486138cb176c063db98274b4c4ab6ef3518c4191360736384b780306c2') {
         throw new Error('Kerberos license notice checksum mismatch');
@@ -191,12 +194,19 @@ const metadata = {
   format: 1, version: cargo.packages.find(pkg => pkg.name === 'censorprivacy').version,
   platform: { os: 'linux', distribution: readFileSync('/etc/os-release', 'utf8'), arch: 'x86_64', minimum_glibc: minimumGlibc, cpu: 'x86_64; ONNX Runtime CPU execution provider' },
   source: { base_commit: run('git', ['rev-parse', 'HEAD']), working_tree_dirty: Boolean(run('git', ['status', '--porcelain'])), snapshot_sha256: snapshot.digest('hex') },
+  ner_inference: { code_backends: ['cpu', 'cuda', 'cann'], default_device: 'cpu', default_batch_size: 1, max_length: 512, overlap: 64,
+    window_timeout_seconds: 16, batch_timeout: 'actual_window_count * window_timeout_seconds',
+    cuda_hardware_qualified: false, cann_hardware_qualified: false },
+  private_tools: { builtin: ['private_compute'], manifest: 'private-tools.json', dsh_native_tools_default: false,
+    input: 'current run refs only', outputs: ['order', 'values'], program_network: 'socket syscalls denied',
+    max_concurrent_programs: 1 },
   model: { id: manifest.model_id, manifest_sha256: hash(join(sourceModel, 'manifest.json')) },
   onnx_runtime: { input_sha256: hash(ort), delivered_sha256: hash(ortDestination), library: 'lib/censorprivacy/libonnxruntime.so' },
   tools, system_packages: [...systemPackages.keys()].sort(), rustc: run('rustc', ['--version']),
   patchelf: run(flags.patchelf, ['--version']),
   runtime_dependencies: ['Linux x86_64 kernel with /proc', 'glibc >= ' + minimumGlibc, 'Bash and GNU coreutils, grep, sed'],
-  optional: { isolated_agent_runtime: 'privacy-run additionally requires root, iproute2, nftables, libseccomp and namespace support; not part of the gateway/TLS self-test' },
+  optional: { isolated_agent_runtime: 'privacy-run additionally requires root, iproute2, nftables, libseccomp and namespace support; not part of the gateway/TLS self-test',
+    custom_private_tools: 'Operator-registered scripts require Linux libseccomp and their own interpreter/dependencies; not required for private_compute' },
 };
 json(join(share, 'BUNDLE.json'), metadata);
 const quickstart = readFileSync(join(root, 'scripts/release/README.md'), 'utf8')

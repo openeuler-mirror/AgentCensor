@@ -87,7 +87,7 @@ export function requestJSON(url, body, { token, timeoutMs = 90000, signal, metho
       method, signal, agent: false,
       headers: {
         'content-type': 'application/json', 'content-length': data.length,
-        'accept-encoding': 'identity', 'user-agent': 'deepseek-harness (CensorPrivacy/0.3.0)',
+        'accept-encoding': 'identity', 'user-agent': 'deepseek-harness (CensorPrivacy/0.3.2)',
         ...(token ? { authorization: `Bearer ${token}` } : {}),
       },
     }, response => {
@@ -127,7 +127,7 @@ export async function tlsJSON(config, body, signal) {
   const lines = ['silent', 'show-error', 'fail', 'http1.1', 'noproxy = "*"',
     `max-time = ${Math.ceil(timeoutMs / 1000)}`, `url = ${JSON.stringify(`${target.origin}/v1/chat/completions`)}`,
     'header = "Content-Type: application/json"', 'header = "Accept-Encoding: identity"',
-    'header = "Connection: close"', 'user-agent = "deepseek-harness (CensorPrivacy/0.3.0)"',
+    'header = "Connection: close"', 'user-agent = "deepseek-harness (CensorPrivacy/0.3.2)"',
     `data = ${JSON.stringify(JSON.stringify(body))}`];
   if (config.caFile) lines.push(`cacert = ${JSON.stringify(config.caFile)}`);
   if (config.upstreamKeyFile) lines.push(`header = ${JSON.stringify(`Authorization: Bearer ${await privateKey(config.upstreamKeyFile)}`)}`);

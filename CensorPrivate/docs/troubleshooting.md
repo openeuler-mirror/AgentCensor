@@ -35,6 +35,8 @@ export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
 | 修改后再次 `init` 没有效果 | `init` 保留已有配置。编辑私有目录中的配置和策略，停止后重启；系统服务重新 `systemd install` |
 | 提示权限错误 | 私有目录为当前用户所有且 0700，配置/凭据为 0600 普通文件，不使用叶子符号链接。配置目录置于 Agent 工作区之外 |
 | 网关端口被占用 | 确认是否已有用户或系统实例。独立实例在 `init` 选不同 `--port`，后续各命令保持同一 `--config-dir` |
+| 新参数被报 `unexpected argument` | 核对 `start` 打印的程序路径及 `service.log`。旧安装记录可能指向旧二进制；源码入口优先本仓库 `target/release/`，先串行执行 `CARGO_BUILD_JOBS=1 cargo build --locked --release --bins`，或使用更新后的完整包 |
+| `stop` 报无匹配进程，但端口仍在监听 | 核对原启动目录与进程记录，勿按端口直接杀进程。新记录保存 PID、启动时刻和程序路径，支持跨入口停止同一实例；旧记录仍按原程序路径核验 |
 | 重启后旧引用不能恢复 | 映射只在原进程内存中；新 run、策略 epoch 或 TTL 均会影响授权。新建 Agent 会话，不能只复制 `run.json` |
 
 用户实例日志位于私有目录的 `service.log`，模型探测结果位于 `probe-response.json`。查看时保留其私有权限。
@@ -46,6 +48,8 @@ export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
 | `check` 通过但模型请求失败 | 本机就绪不代表上游可用。运行 `check --model`，核对 origin、实际模型 ID、Key、CA 和网络 |
 | URL 变成重复 `/v1` 或路径被拒绝 | `init --upstream` 只填 origin，例如 `https://api.deepseek.com`；客户端 Base URL 通常使用本机 `/v1` |
 | 模型返回 502 或 `protocol_blocked` | 检查受支持的请求/响应格式；未知内容、opaque reasoning、图片等不受支持格式会拒绝。原始上游错误正文不应成为公共日志 |
+| 启动返回 `ner_device_unavailable` | 选择了 CUDA/CANN，但加载的 ORT 不支持对应 provider、provider 依赖缺失、设备编号不可见或设备初始化失败。完整包默认附带 CPU 库；设置对应 provider 的 `CP_DETECTOR_ORT_LIBRARY` 及匹配的驱动/工具包，检查设备可见性；CUDA 需要 CUDA/cuDNN，昇腾需要 CANN。选择 `--ner-device cpu` 可显式使用 CPU |
+| 启动返回 `ner_config_invalid` | 检查 `CP_NER_DEVICE`、`CP_NER_BATCH_SIZE` 或嵌入配置；设备列表禁止重复，batch 为 1–256，默认 CPU/batch 1 |
 | DeepSeek 思考回复被拒绝 | 使用关闭思考的 Chat Completions。网关仅对未指定 `thinking` 的 `deepseek-*` 请求自动补关闭值；显式开启仍拒绝，TLS direct 不自动改此字段 |
 | SECRET 没有恢复 | 预期行为。SECRET 原值不恢复，显示为遮盖文本 |
 | 普通隐私也没有恢复 | 模型需完整保留占位符，包括尖括号；只在授权的被动显示位置恢复。代码、URL 目标和普通工具参数不恢复 |
@@ -57,9 +61,9 @@ export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
 | 服务器页面无法从电脑浏览器打开 | 检测台仅监听 loopback；使用 `ssh -N -L 8766:127.0.0.1:8766 用户@服务器IP`。DSH Web 转发 3080，并打开含 token 的完整网址 |
 | 检测台提示忙 | 服务一次处理一个分析请求，等待当前请求结束再试；不要为重试同时启动多个模型进程 |
 | 页面修改后没有变化 | 静态文件内嵌 Rust 二进制，重新编译或安装后重启服务，再刷新页面 |
-| `dsh` 找不到或未构建 | 按官方文档完成构建，再传 `--dsh-root /绝对路径`；项目不会自动构建 Harness |
+| `dsh` 找不到或未构建 | 按官方文档完成构建，再传 `--dsh-path /绝对路径`；项目不会自动构建 Harness |
 | DSH Web 模型或会话失效 | 核对当前网关并重启 Web，新建会话；命令行 profile 重新执行 `dsh setup` |
-| xiaoO 启动不了 | 其源码构建需 Rust ≥1.88；使用 `--xiaoo-root` 或 `--xiaoo-bin` 指定已构建程序，且当前配置须为 gateway 模式 |
+| xiaoO 启动不了 | 其源码构建需 Rust ≥1.88；使用 `--xiaoO-path` 指定包含已构建程序的源码目录，且当前配置须为 gateway 模式 |
 | xiaoO 首次请求较慢 | 系统提示与完整工具目录需检测；等待当前请求，不要并发重启。工具和系统提示的重复分析会使用有界缓存 |
 | 私密计算失败 | 输入必须为当前实例有效引用，检查 URL、token、run/epoch/TTL。xiaoO 当前尚未注册 DSH 的 `private_compute` |
 

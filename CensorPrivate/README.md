@@ -20,7 +20,6 @@ CensorPrivate 是 AgentCensor 的模型数据隐私组件。它在本地检测�
 ```bash
 git clone https://gitcode.com/coco12373/AgentCensor.git
 cd AgentCensor/CensorPrivate
-export CARGO_BUILD_JOBS=1
 ./cpctl deps --dry-run
 ./cpctl deps
 cargo build --locked --release --bins
@@ -55,9 +54,9 @@ export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
 从发布方取得匹配版本的归档与 `.sha256` 文件，在两者所在目录执行：
 
 ```bash
-sha256sum -c censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz.sha256
-tar -xzf censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz
-cd censorprivacy-0.3.0-linux-x86_64-standalone
+sha256sum -c censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256
+tar -xzf censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz
+cd censorprivacy-0.3.2-linux-x86_64-standalone
 ./cpctl self-test
 ```
 
@@ -121,15 +120,21 @@ Agent 使用本机 gateway token，provider Key 由网关持有。Responses/Mess
 
 ```bash
 # DeepSeek Harness：浏览器聊天
-./cpctl dsh web --dsh-root /path/to/deepseek-harness
+./cpctl dsh web --dsh-path /path/to/deepseek-harness
 ```
 
 ```bash
 # openEuler xiaoO：终端交互
-./cpctl xiaoo tui --xiaoo-root /path/to/xiaoO
+./cpctl xiaoo tui --xiaoO-path /path/to/xiaoO
+# 查看会话检测台地址（默认 http://127.0.0.1:8775/）
+./cpctl xiaoo web
 ```
 
 两者自动复用当前网关的模型与凭据，使用独立配置，不覆盖原客户端配置。PATH 已有可用命令时可省略源码目录。完整准备、聊天示例和工具调用验收见 [Agent 接入指南](docs/usage.md#3-接入-agent)。
+
+xiaoO 默认关闭自身工具。需要文件、Shell 等工具时加 `--enable-tools`，启动器会在进入对话前加载真实工具目录并预热本地隐私检测，显示准备状态；准备请求不调用云模型，也不保存为会话。NER 线程数可通过 `init --ner-threads N` 持久保存，或 `start --ner-threads N` 临时覆盖，默认 1。 NER 支持 `start --ner-device cpu --ner-threads 4` 和 `start --ner-device cuda --ner-batch-size 4`，多卡使用 `--ner-device cuda:0,1,2,3`；昇腾使用 `--ner-device cann` 或 `cann:0,1`。CUDA/CANN 须另配对应原生运行库及设备依赖，配置见 [检测器说明](docs/rust-detector.md#2-配置路径)。
+
+DeepSeek Harness CLI/Web 和 xiaoO 会话自动同步到隐私检测台，运行 `./cpctl web` 查看地址；页面标明 Agent 来源，点击消息可查看原文、检测结果和实际遮蔽文本。对话与工具结果保存在本机私有目录 `xiaoo/records/`，刷新和重启后可回看；网页与网关共用模型。更新后重启网关与 Agent 客户端。其他 OpenAI Chat Completions Agent 可通过 Base URL 或请求头指定来源与会话，见 [通用接入说明](plugins/detector-web/README.md)。
 
 ## 日常管理与本机演示
 
@@ -159,7 +164,7 @@ Agent 使用本机 gateway token，provider Key 由网关持有。Responses/Mess
 
 ```bash
 # 默认回归，无需模型或 Python
-CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 bash scripts/test/run-all.sh
+bash scripts/test/run-all.sh
 ```
 
 修改检测器时，另行配置 ONNX/ORT 后执行 `bash scripts/test/detector.sh --integration`。安装、打包、浏览器及环境相关测试的条件与参数见 [脚本速查](docs/scripts.md)；已执行的测试范围见 [验收记录](docs/validation.md)。

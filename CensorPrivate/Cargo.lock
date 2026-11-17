@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "censorprivacy"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -294,7 +294,7 @@ dependencies = [
 
 [[package]]
 name = "censorprivacy-runtime-sys"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "libc",
  "libloading",

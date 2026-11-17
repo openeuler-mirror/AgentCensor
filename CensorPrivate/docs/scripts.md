@@ -30,7 +30,7 @@
 
 | 命令 | 常用选项 | 行为 |
 | --- | --- | --- |
-| `doctor` | `--tls --demo --dsh --runtime`、`--dsh-root DIR` | 只读检查；检测资源未准备时会失败 |
+| `doctor` | `--tls --demo --dsh --runtime`、`--dsh-path DIR` | 只读检查；检测资源未准备时会失败 |
 | `deps` | `--tls --demo --dsh --runtime --dry-run` | 选择 apt/dnf；需要时 sudo；不安装 Rust、模型或 DSH |
 | `install` | `--prefix DIR --tls --dry-run` | 从源码构建安装；默认 `~/.local`；`--tls` 加入 native |
 
@@ -38,25 +38,31 @@
 
 | 命令 | 常用选项 | 行为 |
 | --- | --- | --- |
-| `init` | `--mode gateway\|tls --upstream ORIGIN --model-id ID --port PORT` | 首次准备配置；已有配置保留；默认 gateway/8775 |
+| `init` | `--mode gateway\|tls --upstream ORIGIN --model-id ID --port PORT --ner-threads N --ner-device DEVICE --ner-batch-size N` | 首次准备配置；已有配置保留；默认 gateway/8775 |
 | `init` 凭据参数 | `--key-file FILE` 或 `--no-key`；`--ca-file FILE` | 读取私有 Key 或指定无认证上游；可复制私有 CA |
 | `init` TLS 参数 | `--native-library FILE` | 保存 TLS direct 使用的 hook 路径 |
-| `start` / `stop` | 通用实例选项 | 启停当前用户实例，停止时核对进程身份 |
+| `start` / `stop` | `start --ner-device DEVICE --ner-threads N --ner-batch-size N` 可临时覆盖 | 启停当前用户实例，停止时核对进程身份 |
 | `check` | `--model` | 默认只检查本机；`--model` 实际调用上游，可能计费 |
 | `systemd install` | `--dry-run` | 生成实例 unit，复制当前配置；需要公共安装 |
 | `systemd start` / `check` / `stop` | 通用实例选项 | 管理对应系统实例；具体服务名由脚本生成 |
 
 通用选项 `--config-dir /绝对路径` 选择实例，默认 `~/.config/censorprivacy/managed/`。`--prefix /绝对路径` 设置安装前缀；它不改变配置目录。`init` 不保存检测模型与运行库的环境变量，见 [路径说明](rust-detector.md#2-配置路径)。
 
+源码 checkout 的 `cpctl` 优先使用本仓库 `target/release/` 中已构建的程序；显式 `--prefix`（或 `CP_INSTALL_PREFIX`）下已有 `bin/censorprivacy` 时使用该安装。已安装的 `cpctl` 优先使用同目录的程序，standalone 始终使用包内程序，旧 `install.json` 仅作为后备。`start` 会打印实际启动程序路径；更新源码后需重新构建本地二进制。
+
 ### 演示与 Agent
 
 | 命令 | 参数 | 上游 |
 | --- | --- | --- |
 | `demo gateway` / `demo tls` | TLS 可用 `--native-library FILE` | 自动启动本机模拟上游，无需云 Key |
-| `demo dsh-gateway` / `demo dsh-tls` | `--dsh-root DIR` | 真实 Agent + 本机模拟上游 |
-| `dsh web` | `--dsh-root DIR --port 3080` | 当前配置的实际上游 |
-| `dsh setup` / `run` / `cloud` | `--dsh-root DIR`；`run` 接任务文本 | `run/cloud` 使用实际上游，可能计费 |
-| `xiaoo setup` / `tui` / `run` / `demo` | `--xiaoo-root DIR` 或 `--xiaoo-bin FILE` | `tui/run/demo` 使用实际上游，可能计费 |
+| `demo dsh-gateway` / `demo dsh-tls` | `--dsh-path DIR` | 真实 Agent + 本机模拟上游 |
+| `dsh web` | `--dsh-path DIR --port 3080 --enable-tools` | 默认仅私密工具；`--enable-tools` 同时开放 DSH 原生工具 |
+| `dsh run` | `--dsh-path DIR --enable-tools`，接任务文本 | 同 Web 的工具策略；使用实际上游，可能计费 |
+| `dsh setup` / `cloud` | `--dsh-path DIR` | `cloud` 继承当前网关实际 NER 设置；使用实际上游，可能计费 |
+| `web` | `--config-dir DIR` | 显示通用隐私检测台地址；自动同步 Harness/xiaoO 会话 |
+| `xiaoo setup` / `tui` / `run` / `demo` / `web` | `--xiaoO-path DIR`，`--enable-tools` | `tui/run/demo` 使用实际上游，可能计费；`web` 显示会话检测台地址 |
+
+NER 线程数范围 1–256，默认 1；`init` 将其保存为配置的 `ner_threads`，`start` 参数仅影响本次进程。xiaoO 每次启动默认关闭工具，显式 `--enable-tools` 时先完成本地工具目录检测与缓存准备，再进入对话；准备不调用上游、不保存 Web 记录。`demo` 必须加 `--enable-tools`。
 
 任务含以 `-` 开头的内容时，用 `--` 分隔；配置选项放在分隔符之前：
 
@@ -144,9 +150,9 @@ node scripts/test/dsh-web.mjs /path/to/extracted /path/to/deepseek-harness
 
 # 完整包 + 实际 xiaoO 二进制，本机模拟上游
 node scripts/test/xiaoo-gateway.mjs /path/to/extracted /path/to/xiaoo
+node scripts/test/xiaoo-web.mjs target/debug/censorprivacy /path/to/xiaoO/target/debug/xiaoo
 ```
 
 检测台脚本可用 `CP_PLAYWRIGHT_MODULE` 指定本地 Playwright 模块目录，`CHROMIUM_EXECUTABLE` 指定浏览器，`CP_WEB_SCREENSHOT_DIR` 指定截图目录（默认 `.artifacts/detector-web/`）。DSH 浏览器脚本从 Harness 依赖加载 Playwright，可用 `CP_BROWSER_EXECUTABLE` 指定浏览器。浏览器与系统依赖须自行准备。
 
 `xiaoo-gateway.mjs` 追加第 3 个参数 `/绝对路径/managed` 时复用该目录的云连接与凭据，另建独立网关，会实际调用模型。其余上述浏览器/包验收默认使用本机模拟上游。实际执行范围与历史结果见 [验收记录](validation.md)。
-
