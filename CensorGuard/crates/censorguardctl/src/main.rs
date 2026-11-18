@@ -67,7 +67,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if matches!(env::args().nth(1).as_deref(), Some("-h" | "--help")) {
         println!(
-            "CensorGuard control\n\n  status           Show protection, domains, policies and source paths\n  doctor           Check installation and runtime health\n  policy apply     Publish a group: --policy NAME --file PATH (or --stdin)\n                   Add --dry-run to validate without applying\n  policy remove    Delete an unbound group: --policy NAME\n  bind / remove    Add/remove a domain policy: --domain NAME --policy NAME\n  attach           Manage a process tree: --pid PID [--domain NAME]\n  unattach         Release a registered process tree: --pid PID\n  spawn            Run a managed command: [--domain NAME] -- COMMAND [ARGS...]\n  audit            Follow hook decisions: [--kind file|exec|net|guard]\n                   [--domain NAME] [--result allow|deny] [--pid PID]\n                   Numeric kinds 1|2|3|4 are also accepted\n\nUse --json with status, doctor, policy, bind, remove, attach or unattach for scripts.\nUse doctor --verbose for individual checks.\nCustom configuration: --config PATH before the command."
+            "CensorGuard control\n\n  status           Show protection, domains, policies and source paths\n  doctor           Check installation and runtime health\n  rule append      Save a global rule: 'TYPE ACTION TARGET'\n  rule remove      Delete a saved global rule: 'TYPE ACTION TARGET'\n  rule apply       Hot-apply saved global rules without restarting\n  policy apply     Publish a group: --policy NAME --file PATH (or --stdin)\n                   Add --dry-run to validate without applying\n  policy remove    Delete an unbound group: --policy NAME\n  bind / remove    Add/remove a domain policy: --domain NAME --policy NAME\n  attach           Manage a process tree: --pid PID [--domain NAME]\n  unattach         Release a registered process tree: --pid PID\n  spawn            Run a managed command: [--domain NAME] -- COMMAND [ARGS...]\n  audit            Follow hook decisions: [--kind file|exec|net|guard]\n                   [--domain NAME] [--result allow|deny] [--pid PID]\n                   Numeric kinds 1|2|3|4 are also accepted\n\nUse --json with status, doctor, rule, policy, bind, remove, attach or unattach for scripts.\nUse doctor --verbose for individual checks.\nCustom configuration: --config PATH before the command."
         );
         return Ok(());
     }
@@ -247,7 +247,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
     let socket = daemon.control_socket.clone();
     let Some(command) = values.first().map(String::as_str) else {
         return Err(invalid_input(
-            "usage: censorguardctl [--config PATH] <status|doctor|policy|attach|unattach|bind|remove|spawn|audit> ...\n\
+            "usage: censorguardctl [--config PATH] <status|doctor|rule|policy|attach|unattach|bind|remove|spawn|audit> ...\n\
              bind --domain NAME --policy GROUP; remove --domain NAME --policy GROUP",
         ));
     };
@@ -297,6 +297,7 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
             }
         }
         "policy" => parse_policy(&values[1..])?,
+        "rule" => parse_rule(&values[1..])?,
         "attach" => {
             let options = &values[1..];
             validate_options(options, &["--pid", "--domain"], &["--json"])?;
@@ -349,6 +350,47 @@ fn parse_args(arguments: impl Iterator<Item = String>) -> Result<(PathBuf, Actio
         }
     };
     Ok((socket, action))
+}
+
+fn parse_rule(values: &[String]) -> Result<Action, io::Error> {
+    let Some(subcommand) = values.first().map(String::as_str) else {
+        return Err(invalid_input(
+            "usage: censorguardctl rule append|remove 'RULE' | apply",
+        ));
+    };
+    let op = match subcommand {
+        "append" => Operation::RuleAppend,
+        "remove" => Operation::RuleRemove,
+        "apply" => Operation::RuleApply,
+        _ => {
+            return Err(invalid_input(format!(
+                "unknown rule command {subcommand:?}"
+            )));
+        }
+    };
+    let needs_rule = op != Operation::RuleApply;
+    let rule = if needs_rule {
+        Some(
+            values
+                .get(1)
+                .filter(|rule| !rule.trim().is_empty() && !rule.starts_with("--"))
+                .ok_or_else(|| {
+                    invalid_input(format!("rule {subcommand} requires one quoted rule"))
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let options = &values[if needs_rule { 2 } else { 1 }..];
+    validate_options(options, &[], &["--json"])?;
+    Ok(request_action(
+        Request {
+            rule,
+            ..request(op)
+        },
+        options,
+    ))
 }
 
 fn parse_policy(values: &[String]) -> Result<Action, io::Error> {
@@ -581,6 +623,7 @@ fn request(op: Operation) -> Request {
         policy_yaml: None,
         policy_source: None,
         group: None,
+        rule: None,
         dry_run: false,
         enable_file: None,
         enable_exec: None,
@@ -752,6 +795,45 @@ mod tests {
                 .map(str::to_owned),
         );
         assert!(matches!(parsed, Err(error) if error.to_string().contains("invalid config")));
+    }
+
+    #[test]
+    fn rule_commands_keep_quoted_rules_and_reject_extra_arguments() -> Result<(), io::Error> {
+        for (command, op) in [
+            ("append", Operation::RuleAppend),
+            ("remove", Operation::RuleRemove),
+        ] {
+            let action = parse_rule(&[
+                command.into(),
+                "exec deny /usr/bin/git push".into(),
+                "--json".into(),
+            ])?;
+            assert_eq!(
+                action,
+                Action::Request {
+                    request: Request {
+                        rule: Some("exec deny /usr/bin/git push".into()),
+                        ..request(op)
+                    },
+                    json: true,
+                }
+            );
+        }
+        assert_eq!(
+            parse_rule(&["apply".into()])?,
+            request_action(request(Operation::RuleApply), &[])
+        );
+        for args in [
+            vec!["append"],
+            vec!["remove", ""],
+            vec!["append", "exec", "deny", "/bin/true"],
+            vec!["apply", "extra"],
+            vec!["apply", "--dry-run"],
+            vec!["delete", "exec deny /bin/true"],
+        ] {
+            assert!(parse_rule(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err());
+        }
+        Ok(())
     }
 
     #[test]

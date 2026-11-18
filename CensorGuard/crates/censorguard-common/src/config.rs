@@ -98,7 +98,7 @@ impl Default for DaemonConfig {
     }
 }
 
-/// Public startup input contains only daemon settings and immutable base rules.
+/// Public startup input contains only daemon settings and global base rules.
 /// Dynamic group definitions and domain bindings are managed through the control API.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]

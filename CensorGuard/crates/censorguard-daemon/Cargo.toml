@@ -19,8 +19,6 @@ nix = { version = "0.30.1", features = ["fs", "process", "signal", "socket", "ti
 serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tempfile = "3.24.0"
 
 [lints]

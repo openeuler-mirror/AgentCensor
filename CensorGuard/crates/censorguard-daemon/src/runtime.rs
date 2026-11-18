@@ -62,6 +62,8 @@ pub enum RuntimeError {
     UnknownRevision(u64),
     #[error("policy revision store failed: {0}")]
     RevisionStore(String),
+    #[error("global rule configuration failed: {0}")]
+    RuleConfig(io::Error),
     #[error("policy group {0:?} is not in the DSH self-serve whitelist")]
     GroupNotAllowed(String),
     #[error("instance hint {0:?} is invalid")]
@@ -1197,6 +1199,45 @@ impl Runtime {
         result
     }
 
+    pub fn edit_rule(&self, rule: &str, append: bool) -> Result<(), RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        self.ensure_running()?;
+        crate::rules::edit(&self.config_path, rule, append).map_err(RuntimeError::RuleConfig)
+    }
+
+    pub fn apply_rules(&self) -> Result<ReloadResult, RuntimeError> {
+        let result = self.apply_rules_inner();
+        self.observe_reload(&result);
+        result
+    }
+
+    fn apply_rules_inner(&self) -> Result<ReloadResult, RuntimeError> {
+        let _reload = self
+            .reload_lock
+            .lock()
+            .map_err(|_| RuntimeError::Poisoned)?;
+        self.ensure_running()?;
+        let canonical = policy_with_saved_rules(&self.read_policy()?.policy, &self.config_path)?;
+        let (next_policy, cache, status) = self.resolve_dns(canonical)?;
+        let result = self.publish_policy_locked(next_policy, false, true)?;
+        let mut dns = self.dns_state.lock().map_err(|_| RuntimeError::Poisoned)?;
+        dns.cache = cache;
+        dns.status = status;
+        Ok(result)
+    }
+
+    fn ensure_running(&self) -> Result<(), RuntimeError> {
+        if self.restart_requested() || self.stop_requested() {
+            return Err(RuntimeError::RevisionStore(
+                "daemon shutdown is pending".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn reload_inner(
         &self,
         policy_file: Option<&str>,
@@ -1215,7 +1256,7 @@ impl Runtime {
         }
         let group = group.filter(|name| !name.is_empty()).ok_or_else(|| {
             RuntimeError::RevisionStore(
-                "baseline is immutable; use censorguardd reload to restart".into(),
+                "group reload requires a named policy; use censorguardctl rule apply for global rules".into(),
             )
         })?;
         if policy_file.is_some() {
@@ -1320,11 +1361,16 @@ impl Runtime {
         next_policy: CompiledPolicy,
         dry_run: bool,
     ) -> Result<ReloadResult, RuntimeError> {
-        if self.restart_requested() || self.stop_requested() {
-            return Err(RuntimeError::RevisionStore(
-                "daemon shutdown is pending".into(),
-            ));
-        }
+        self.publish_policy_locked(next_policy, dry_run, false)
+    }
+
+    fn publish_policy_locked(
+        &self,
+        next_policy: CompiledPolicy,
+        dry_run: bool,
+        allow_baseline_change: bool,
+    ) -> Result<ReloadResult, RuntimeError> {
+        self.ensure_running()?;
         let (
             next_layout,
             next_bank,
@@ -1335,11 +1381,12 @@ impl Runtime {
             previous_version,
         ) = {
             let current = self.read_policy()?;
-            if current.policy.baseline_definition != next_policy.baseline_definition
+            if (!allow_baseline_change
+                && current.policy.baseline_definition != next_policy.baseline_definition)
                 || current.policy.daemon != next_policy.daemon
             {
                 return Err(RuntimeError::RevisionStore(
-                    "base and daemon settings are immutable until restart".into(),
+                    "this policy operation cannot change global rules or daemon settings; use rule apply for global rules and restart for daemon settings".into(),
                 ));
             }
             self.validate_reload(&current.policy, &next_policy)?;
@@ -1800,6 +1847,15 @@ fn dsh_domain_name(
     Ok(name)
 }
 
+fn policy_with_saved_rules(
+    current: &CompiledPolicy,
+    path: &Path,
+) -> Result<CompiledPolicy, RuntimeError> {
+    let mut root = current.to_root();
+    root.rules = crate::rules::load(path).map_err(RuntimeError::RuleConfig)?;
+    Ok(compile(root)?)
+}
+
 fn changed_groups(current: &CompiledPolicy, next: &CompiledPolicy) -> Vec<String> {
     let mut names: BTreeSet<_> = current
         .groups
@@ -1829,6 +1885,32 @@ fn policy_definition(group: &GroupPolicy) -> PolicyDefinition {
 #[cfg(test)]
 mod tests {
     use super::dsh_domain_name;
+
+    #[test]
+    fn saved_rules_preserve_live_settings_groups_sources_and_bindings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("base.yaml");
+        std::fs::write(
+            &config,
+            "daemon:\n  enable_exec: false\n  audit_exec: true\nrules:\n  - exec deny /bin/false\n",
+        )?;
+        let current = censorguard_policy::compile_yaml(b"rules:\n  - exec deny /bin/true\n")?
+            .replace_group_yaml_from(
+                "worker",
+                b"rules:\n  - file deny /tmp/secret\n",
+                censorguard_common::protocol::PolicySource::Stdin,
+            )?
+            .bind_domain("agent", "worker", &[])?;
+        let next = super::policy_with_saved_rules(&current, &config)?;
+        assert_eq!(next.to_root().rules, vec!["exec deny /bin/false"]);
+        assert_eq!(next.daemon, current.daemon);
+        assert_eq!(next.group_definitions, current.group_definitions);
+        assert_eq!(next.group_sources, current.group_sources);
+        assert_eq!(next.domains, current.domains);
+        assert_eq!(super::changed_groups(&current, &next), vec!["__base__"]);
+        Ok(())
+    }
 
     #[test]
     fn registration_respects_published_domain_binding() -> Result<(), super::RuntimeError> {

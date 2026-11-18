@@ -23,6 +23,9 @@ pub enum Operation {
     Remove,
     DaemonReload,
     DaemonStop,
+    RuleAppend,
+    RuleRemove,
+    RuleApply,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -204,6 +207,9 @@ impl Operation {
                 | Self::Remove
                 | Self::DaemonReload
                 | Self::DaemonStop
+                | Self::RuleAppend
+                | Self::RuleRemove
+                | Self::RuleApply
         )
     }
 }
@@ -228,6 +234,8 @@ pub struct Request {
     pub policy_source: Option<PolicySource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -532,6 +540,7 @@ mod tests {
             policy_yaml: None,
             policy_source: None,
             group: None,
+            rule: None,
             dry_run: false,
             enable_file: None,
             enable_exec: None,
@@ -553,6 +562,9 @@ mod tests {
         assert!(Operation::Bind.requires_root());
         assert!(Operation::DaemonStop.requires_root());
         assert!(Operation::DaemonReload.requires_root());
+        assert!(Operation::RuleAppend.requires_root());
+        assert!(Operation::RuleRemove.requires_root());
+        assert!(Operation::RuleApply.requires_root());
         assert!(!Operation::Track.requires_root());
     }
 
