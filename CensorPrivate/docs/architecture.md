@@ -1,11 +1,39 @@
 # CensorPrivate 架构
 
+[文档首页](README.md) · [构建与部署](build-and-deploy.md) · [使用手册](usage.md) · [检测器说明](rust-detector.md)
+
 CensorPrivate 是 AgentCensor 的模型数据隐私子项目。CensorFS 管理文件工作区，CensorGuard 管理内核执行与访问边界，CensorScope 管理运行观测，CensorPivot 编排批次；CensorPrivate 负责模型请求保护、授权显示及引用计算。当前项目可独立运行，没有将自身隐式注册为其他组件的服务，也不要求修改 DSH 源码。
+
+## 网关链路
+
+```mermaid
+flowchart LR
+    Client[完整模型上下文] --> Auth[认证与严格解析]
+    Auth --> Gate[协议分类与策略检测]
+    Gate --> Vault[本机 vault 与随机引用]
+    Vault --> Permit[序列化复查与一次性放行]
+    Permit --> Provider[固定上游]
+    Provider --> Restore[JSON/SSE 回复检查]
+    Restore --> Display[被动显示恢复与秘密遮盖]
+    Vault --> Compute[本机引用计算]
+    Compute --> Derived[派生引用]
+    Derived --> Restore
+```
+
+生产入口在服务启动时验证三类本地检测器，HTTP 网关和 TLS broker 共用相同实例与策略。候选、验证、边界处理和 NER 聚合均在 Rust 中，NER 通过本地 ONNX Runtime 推理；无生产 Python worker。UTF-8 校验、重叠合并、映射表、占位符和恢复接口保留。资源校验或检测失败拒绝放行，单次推理采用 cooperative timeout，具体边界与兼容构造接口见 [检测器说明](rust-detector.md)。
+
+模型、角色、URL、工具名等结构字段不得任意改写。业务数字和协议控制数字按位置分类。放行凭据绑定目标、方法、请求字节、run 和 epoch，不能重复消费。异常只返回稳定错误码，不输出输入或上游错误正文。
+
+只有被动显示位置可以恢复。代码、URL、Markdown 活动目标、普通工具参数与未知通道不获得显示授权。SSE 任意分片不能改变规则；未知格式与失败均拒绝，无原文回退。
 
 ## 目录与职责
 
 | 位置 | 职责 |
 | --- | --- |
+| `src/professional.rs`、`src/professional/` | Rust regex/rule/验证、tokenizers、固定 BERT4NER ONNX 推理 |
+| `scripts/model/` | 独立的生产模型导出、数值检查、依赖版本和产物来源 |
+| `tests/fixtures/native-detector-reference.jsonl` | 共享模型导出检查输入与 Rust 固定参考结果 |
+| `licenses/` | 第三方必要许可和简要来源说明；项目许可引用仓库根目录 |
 | `src/policy.rs`、`detection.rs` | 不可变策略、规则与本机检测器、UTF-8 范围检查、重叠合并 |
 | `src/references.rs`、`vault.rs`、`compute.rs` | 随机引用、run 授权、内存原值、期限/标签继承、精确计算 |
 | `src/json.rs`、`protocols.rs`、`gate.rs` | 有界严格解析、协议字段分类、完整请求保护、一次性放行 |
@@ -24,27 +52,7 @@ CP 引用是随机对象标识，不是密文或授权凭据。原值只保存�
 
 SECRET 不能恢复或计算。私密计算只接受授权引用，内部采用有界精确十进制与日期运算，结果仍是继承标签、期限和依赖的引用。表达式身份使 min/max 结果不能通过引用相等暴露获胜输入。非终止除法、混合单位、过大数值和未知操作拒绝处理。
 
-核心 crate 使用 `#![forbid(unsafe_code)]`，FFI 集中在最小系统边界。vault 敏感字符串和运行配置释放时清零；此措施不保证所有 JSON 临时副本、第三方大整数 limb、分配器或操作系统内存均被清除。
-
-## 网关链路
-
-```mermaid
-flowchart LR
-    Client[完整模型上下文] --> Auth[认证与严格解析]
-    Auth --> Gate[协议分类与策略检测]
-    Gate --> Vault[本机 vault 与随机引用]
-    Vault --> Permit[序列化复查与一次性放行]
-    Permit --> Provider[固定上游]
-    Provider --> Restore[JSON/SSE 回复检查]
-    Restore --> Display[被动显示恢复与秘密遮盖]
-    Vault --> Compute[本机引用计算]
-    Compute --> Derived[派生引用]
-    Derived --> Restore
-```
-
-模型、角色、URL、工具名等结构字段不得任意改写。业务数字和协议控制数字按位置分类。放行凭据绑定目标、方法、请求字节、run 和 epoch，不能重复消费。异常只返回稳定错误码，不输出输入或上游错误正文。
-
-只有被动显示位置可以恢复。代码、URL、Markdown 活动目标、普通工具参数与未知通道不获得显示授权。SSE 任意分片不能改变规则；未知格式与失败均拒绝，无原文回退。
+核心 crate 使用 `#![forbid(unsafe_code)]`，自有 Linux FFI 集中在 runtime-sys；ONNX Runtime 的原生调用由第三方 ort 封装。vault 敏感字符串和运行配置释放时清零；此措施不保证所有 JSON 临时副本、第三方推理内存、大整数 limb、分配器或操作系统内存均被清除。
 
 ## TLS 与运行域
 
