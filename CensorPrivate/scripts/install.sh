@@ -25,10 +25,15 @@ if $with_native; then
 fi
 install -d -m 0755 "$destdir$prefix/share/censorprivacy"
 install -m 0644 examples/policy.yaml "$destdir$prefix/share/censorprivacy/policy.example.yaml"
-for directory in scripts/ops plugins/dsh-censorprivacy docs deploy examples native; do
+for directory in scripts/ops plugins/dsh-censorprivacy plugins/detector-web docs deploy examples native; do
   install -d -m 0755 "$destdir$prefix/share/censorprivacy/$directory"
 done
-for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md docs/*.md deploy/censorprivacy@.service examples/policy.yaml native/README.md README.md CONTRIBUTING.md LICENSE; do
+for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md plugins/detector-web/README.md docs/*.md deploy/censorprivacy@.service examples/policy.yaml examples/*.txt native/README.md README.md; do
   install -m 0644 "$file" "$destdir$prefix/share/censorprivacy/$file"
 done
+# Production installs contain no Python detector or worker. Assets are provisioned separately.
+# Source documentation links to the repository license; installed docs use the copy.
+sed -i 's|](../LICENSE)|](LICENSE)|g' "$destdir$prefix/share/censorprivacy/README.md"
+install -m 0644 ../LICENSE "$destdir$prefix/share/censorprivacy/LICENSE"
 printf 'Installed Rust commands to %s\n' "$destdir$prefix/bin"
+printf 'Provision the local ONNX bundle and ONNX Runtime: see docs/rust-detector.md\n'
