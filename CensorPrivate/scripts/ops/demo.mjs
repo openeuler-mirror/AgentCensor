@@ -15,7 +15,7 @@ process.umask(0o077);
 const positionals = []; const flags = {};
 for (let i = 2; i < process.argv.length; i++) {
   if (process.argv[i] === '--') { positionals.push(...process.argv.slice(i + 1)); break; }
-  if (['--root', '--bin-dir', '--config-dir', '--dsh-root', '--native-library', '--web-port'].includes(process.argv[i])) flags[process.argv[i].slice(2)] = process.argv[++i];
+  if (['--root', '--bin-dir', '--config-dir', '--dsh-root', '--native-library', '--web-port', '--tools'].includes(process.argv[i])) flags[process.argv[i].slice(2)] = process.argv[++i];
   else positionals.push(process.argv[i]);
 }
 const [operation, action, ...taskParts] = positionals;
@@ -58,8 +58,17 @@ function start(command, args, options = {}) {
   return child;
 }
 async function run(command, args, options = {}) {
-  const child = start(command, args, options);
+  const child = start(command, args, { ...options, ...(options.liveOutput ? { stdio: ['ignore', 'pipe', 'pipe', 'pipe'] } : {}) });
   const stdout = []; const stderr = []; let bytes = 0;
+  let liveBytes = 0;
+  if (options.liveOutput) {
+    const live = child.stdio[3];
+    live.on('data', chunk => {
+      liveBytes += chunk.length; bytes += chunk.length;
+      if (bytes > 4 * 1024 * 1024) child.kill('SIGTERM');
+    });
+    live.pipe(process.stdout, { end: false });
+  }
   for (const [stream, chunks] of [[child.stdout, stdout], [child.stderr, stderr]]) {
     stream?.on('data', chunk => { bytes += chunk.length; if (bytes > 4 * 1024 * 1024) child.kill('SIGTERM'); else chunks.push(chunk); });
   }
@@ -68,7 +77,7 @@ async function run(command, args, options = {}) {
     child.once('error', () => { clearTimeout(timeout); reject(new Error('command_unavailable')); });
     child.once('close', (code, signal) => {
       clearTimeout(timeout);
-      const result = { code, signal, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+      const result = { code, signal, stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString(), liveBytes };
       if (code !== 0 && !options.allowFailure) {
         // DSH may include request text in its errors; retain only in the private workspace.
         reject(Object.assign(new Error('command_failed'), { diagnostic: result }));
@@ -159,7 +168,11 @@ async function nativeLibrary() {
   if (!await exists(library)) throw new Error('native_library_missing_run_cpctl_install_--tls');
   return resolve(library);
 }
-async function fixture(mode, agent, actual) {
+const nerKeys = ['ner_threads', 'ner_device', 'ner_batch_size'];
+const nerSettings = value => Object.fromEntries(nerKeys.map(key => [key, value[key] ?? null]));
+const validNer = n => [n.ner_threads, n.ner_batch_size].every(v => Number.isInteger(v) && v >= 1 && v <= 256) &&
+  typeof n.ner_device === 'string' && /^(?:cpu|(?:cuda|cann):[0-9]+(?:,[0-9]+)*)$/.test(n.ner_device);
+async function fixture(mode, agent, actual, report) {
   const directory = await temporary(); const workspace = join(directory, 'workspace'); await mkdir(workspace, { mode: 0o700 });
   const provider = actual ? { origin: actual.upstream } : await mock(directory, mode === 'tls', agent);
   const token = randomBytes(32).toString('hex'); const tokenFile = join(directory, 'gateway.token');
@@ -174,9 +187,19 @@ async function fixture(mode, agent, actual) {
   if (provider.origin.startsWith('http:')) args.push('--allow-http-test-upstream');
   if (actual?.has_key) args.push('--upstream-key-file', join(configDir, 'upstream.key'));
   if (actual?.ca_file) args.push('--upstream-ca-file', actual.ca_file);
+  if (report) {
+    assertion(validNer(report.ner_requested), 'managed_gateway_ner_settings_missing');
+    for (const key of nerKeys) args.push('--' + key.replaceAll('_', '-'), String(report.ner_requested[key]));
+  }
   const child = start(join(bin, 'censorprivacy'), args);
   let stderr = ''; child.stderr.on('data', chunk => { if (stderr.length < 8192) stderr += chunk; }); child.stdout.resume();
-  try { await ready(base, token, child, runFile); } catch (failure) { await writeFile(join(directory, 'gateway.log'), stderr); throw failure; }
+  try {
+    const observed = await ready(base, token, child, runFile);
+    if (report) {
+      report.ner_effective = nerSettings(observed);
+      assertion(nerKeys.every(key => report.ner_effective[key] === report.ner_requested[key]), 'cloud_gateway_ner_settings_mismatch');
+    }
+  } catch (failure) { await writeFile(join(directory, 'gateway.log'), stderr); throw failure; }
   const config = { mode, baseURL: mode === 'tls' ? provider.origin : base, broker: base, model,
     tlsRun: join(bin, 'tls-run'), nativeLibrary: mode === 'tls' ? (actual?.native_library || await nativeLibrary()) : '', tokenFile,
     runStateFile: runFile, workspace, caFile: mode === 'tls' ? (actual?.ca_file ?? (actual ? '' : join(directory, 'server.crt'))) : '',
@@ -239,11 +262,12 @@ async function dshCommand(givenRoot) {
 async function overlay(directory, config) {
   const content = [
     '- insert:', '    - id: censorprivacy', `      name: ${JSON.stringify(join(root, 'plugins/dsh-censorprivacy/index.mjs'))}`, '      config:',
-    ...Object.entries({ ...config, privateToolsOnly: true }).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`),
+    ...Object.entries({ privateToolsOnly: true, ...config }).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`),
     '- id: agent-default-model', '  config:', '    provider: censorprivacy', `    model: ${JSON.stringify(config.model)}`,
     ...['llm-deepseek', 'llm-pi-ai', 'session-title-llm', 'session-log-deepseek', 'session-telemetry-otel'].flatMap(id => [`- id: ${id}`, '  disabled: true']),
   ].join('\n') + '\n';
-  const path = join(directory, 'censorprivacy.patch.yml'); await writeFile(path, content, { mode: 0o600 }); return path;
+  const path = join(directory, config.privateToolsOnly === false ? 'censorprivacy-tools-enabled.patch.yml' : 'censorprivacy.patch.yml');
+  await writeFile(path, content, { mode: 0o600 }); return path;
 }
 function dshEnvironment(home, token, runID) {
   // Never inherit real provider credentials, telemetry settings or preload into DSH.
@@ -265,13 +289,14 @@ async function prepareDsh(directory, config, token, dshRoot, surface = 'headless
 }
 async function dshProfile(directory, config, token, dshRoot, persistent = false) {
   const { command, args, env } = await prepareDsh(directory, config, token, dshRoot);
-  const invoke = async prompt => {
+  const invoke = async (prompt, liveOutput = false) => {
     // Both the DSH launcher and the headless app parse argv. End each one's
     // options so arbitrary task text cannot select a profile or print help.
-    const result = await run(command[0], [...args, '--', '--', prompt], { env, cwd: config.workspace, allowFailure: true, timeout: 180000 });
+    const result = await run(command[0], [...args, '--', '--', prompt], { env, cwd: config.workspace, allowFailure: true, timeout: 180000, liveOutput });
     await writeFile(join(directory, 'dsh-stdout.txt'), result.stdout, { mode: 0o600 });
     await writeFile(join(directory, 'dsh-stderr.txt'), result.stderr, { mode: 0o600 });
     assertion(result.code === 0, `dsh_agent_failed_see_${join(directory, 'dsh-stderr.txt')}`);
+    if (liveOutput && !result.liveBytes) process.stdout.write(result.stdout);
     return result.stdout.trim();
   };
   if (persistent) await writeFile(join(directory, 'setup.json'), JSON.stringify({ dshRoot, workspace: config.workspace }), { mode: 0o600 });
@@ -308,37 +333,48 @@ async function managedDsh() {
   const runStateFile = join(configDir, 'run.json');
   const readyResponse = await fetch(`${base}/ready`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(3000) });
   const readyValue = await readyResponse.json();
-  assertion(readyResponse.ok && readyValue.run_id === JSON.parse(await privateText(runStateFile)).run_id, 'start_current_gateway_first');
+  assertion(readyResponse.ok && readyValue.status === 'ready' && readyValue.run_id === JSON.parse(await privateText(runStateFile)).run_id, 'start_current_gateway_first');
   if (action === 'cloud') {
     const target = new URL(config.upstream);
     assertion(target.protocol === 'https:' && !target.hostname.endsWith('.example') && !/^(?:127\.|0\.)/.test(target.hostname) && !['localhost', '::1', '[::1]'].includes(target.hostname), 'actual_remote_https_upstream_required');
     const reportPath = join(directory, 'cloud-report.json');
     const report = { status: 'running', mode: config.mode, model: config.model, upstream: config.upstream, timestamp: new Date().toISOString(),
+      ner_requested: nerSettings(readyValue), ner_effective: null,
       scope: 'Actual DSH agent and remote HTTPS model, isolated synthetic policy and run. Cloud internal storage is not observable.' };
     await writeFile(reportPath, JSON.stringify(report, null, 2));
     try {
       // A separate run with fictional rules avoids editing the live business policy.
-      const f = await fixture(config.mode, true, config);
+      const f = await fixture(config.mode, true, config, report);
+      report.run_id = JSON.parse(await privateText(f.config.runStateFile)).run_id;
+      await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 });
       const invoke = await dshProfile(f.directory, f.config, f.token, flags['dsh-root'] ||
         (await exists(join(directory, 'setup.json')) ? JSON.parse(await privateText(join(directory, 'setup.json'))).dshRoot : ''));
       const reply = await invoke(task + ' You must call private_compute with operation sum and only the two provided amount references. Copy each complete reference exactly, including its leading < and trailing > delimiters. Echo the protected customer reference exactly and the derived sum reference exactly in your final plain text. Do not guess values.');
       const receipts = (await privateText(f.config.receiptFile)).trim().split('\n').map(line => JSON.parse(line));
       assertion(receipts.filter(event => event.event === 'model_response').length >= 2 && receipts.some(event => event.event === 'private_compute' && event.operation === 'sum' && event.ref_count === 2), 'cloud_private_compute_not_confirmed');
       assertion(reply.includes(customer) && /\b300(?:\.00)?\b/.test(reply) && !reply.includes(secret), 'cloud_authorized_display_not_confirmed');
-      report.status = 'passed'; report.run_id = JSON.parse(await privateText(f.config.runStateFile)).run_id;
+      report.status = 'passed';
       report.checks = ['remote_model_response', 'DSH_private_compute_with_references', 'derived_results_are_references', 'authorized_customer_and_sum_display', 'secret_not_displayed'];
       report.receipts = receipts; report.reply_sha256 = createHash('sha256').update(reply).digest('hex');
       log(`DSH 真实上游最终显示（虚构数据）：${reply}`);
       log('通过：真实模型工具调用、引用计算及授权显示；请求出口保护的逐字节证据见本机模拟验收。');
     } catch (failure) {
-      report.status = 'failed'; report.reason = 'cloud_acceptance_failed'; throw failure;
+      report.status = 'failed';
+      report.reason = ['managed_gateway_ner_settings_missing', 'cloud_gateway_ner_settings_mismatch'].includes(failure.message)
+        ? failure.message : 'cloud_acceptance_failed';
+      throw failure;
     } finally { await writeFile(reportPath, JSON.stringify(report, null, 2), { mode: 0o600 }); log(`云端验收记录：${reportPath}`); }
     return;
   }
+  const privateTools = readyValue.private_tools === true
+    ? (await requestJSON(`${base}/v1/private_tools`, undefined, { method: 'GET', token, timeoutMs: 3000 })).tools
+    : [];
+  assertion(Array.isArray(privateTools), 'private_tools_catalog_invalid');
   const transport = { mode: config.mode, baseURL: config.mode === 'tls' ? config.upstream : base, model: config.model,
+    privateToolsOnly: flags.tools !== '--enable-tools', privateTools,
     broker: base, tlsRun: join(bin, 'tls-run'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
     runStateFile, upstreamKeyFile: config.has_key ? join(configDir, 'upstream.key') : '', caFile: config.ca_file ?? '', workspace,
-    timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512 };
+    timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512, cliStream: action === 'run' };
   let dshRoot = flags['dsh-root'];
   if (!dshRoot && await exists(join(directory, 'setup.json'))) dshRoot = JSON.parse(await privateText(join(directory, 'setup.json'))).dshRoot;
   if (!dshRoot && await exists(join(configDir, 'dsh/setup.json'))) dshRoot = JSON.parse(await privateText(join(configDir, 'dsh/setup.json'))).dshRoot;
@@ -356,7 +392,7 @@ async function managedDsh() {
   }
   const invoke = await dshProfile(directory, transport, token, dshRoot, true);
   if (action === 'setup') { log(`DSH 独立 profile 就绪：${directory}；./cpctl dsh run '任务'`); return; }
-  if (action === 'run') { assertion(taskParts.length > 0, 'task_required'); log(await invoke(taskParts.join(' '))); return; }
+  if (action === 'run') { assertion(taskParts.length > 0, 'task_required'); await invoke(taskParts.join(' '), true); return; }
   throw new Error('use_dsh_web_setup_run_or_cloud');
 }
 let cleanupPromise;

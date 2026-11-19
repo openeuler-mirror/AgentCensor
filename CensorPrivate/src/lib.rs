@@ -7,13 +7,17 @@
 pub mod compute;
 #[cfg(target_os = "linux")]
 pub mod control;
+pub mod conversations;
 pub mod detection;
+#[path = "../plugins/detector-web/server.rs"]
+pub mod detector_web;
 pub mod display;
 pub mod error;
 pub mod gate;
 pub mod json;
 pub mod mcp;
 pub mod policy;
+mod private_tools;
 pub mod professional;
 pub mod protocols;
 pub mod references;

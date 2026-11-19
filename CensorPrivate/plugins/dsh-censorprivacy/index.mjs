@@ -1,4 +1,6 @@
-import { requestJSON, tlsJSON } from './transport.mjs';
+import { requestJSON, requestChat, tlsJSON } from './transport.mjs';
+import { chatJSON } from './openai-chat.mjs';
+import { cliOutput } from './cli-output.mjs';
 import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 
@@ -9,6 +11,24 @@ const error = code => Object.assign(new Error(`CensorPrivacy: ${code}`), { code 
 const operations = ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const keys = (value, allowed) => object(value) && Object.keys(value).every(key => allowed.includes(key));
+const programName = /^private_[a-z][a-z0-9_]{0,55}$/;
+const canonicalRef = /^<CP_[A-Z][A-Z0-9_]*_[0-9a-f]{32}>$/;
+const refsValid = (refs, pattern) => Array.isArray(refs) && refs.length >= 1 && refs.length <= 256 &&
+  refs.every(value => typeof value === 'string' && pattern.test(value));
+
+function programs(catalog = []) {
+  if (!Array.isArray(catalog) || catalog.length > 33) throw error('PRIVATE_TOOLS_CATALOG_INVALID');
+  const found = new Map();
+  for (const item of catalog) {
+    if (keys(item, ['name', 'kind']) && item.kind === 'builtin' && item.name === 'private_compute') continue;
+    if (!keys(item, ['name', 'kind', 'description', 'output']) || item.kind !== 'program' ||
+        typeof item.name !== 'string' || !programName.test(item.name) || item.name === 'private_compute' ||
+        typeof item.description !== 'string' || !item.description.trim() || item.description.trim().length > 512 ||
+        !['order', 'values'].includes(item.output) || found.has(item.name)) throw error('PRIVATE_TOOLS_CATALOG_INVALID');
+    found.set(item.name, item);
+  }
+  return found;
+}
 
 function validateComputeArguments(args) {
   if (!keys(args, ['operation', 'refs', 'options']) || !operations.includes(args.operation) ||
@@ -80,8 +100,9 @@ export function serialize(options, config) {
   }
   // DSH may add agent-scoped tools after the global restriction was applied.
   // Keep the actual model-facing catalog consistent with the execution guard.
-  const tools = config.privateToolsOnly ? options.tools?.filter(tool => tool.name === 'private_compute') : options.tools;
-  return { model: options.model, messages, stream: false,
+  const allowed = config.privateToolNames ?? new Set(['private_compute', ...programs(config.privateTools).keys()]);
+  const tools = config.privateToolsOnly !== false ? options.tools?.filter(tool => allowed.has(tool.name)) : options.tools;
+  return { model: options.model, messages, stream: config.mode !== 'tls',
     ...(typeof options.model === 'string' && options.model.startsWith('deepseek-') ? { thinking: { type: 'disabled' } } : {}),
     ...(tools?.length ? { tools: tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) } : {}),
     max_tokens: options.maxTokens ?? config.maxTokens,
@@ -90,7 +111,7 @@ export function serialize(options, config) {
 }
 
 export class PrivacyAdapter {
-  constructor(config) { this.config = config; }
+  constructor(config) { this.config = config; this.display = cliOutput(config.cliStream); }
   providerInfo(provider) { return { id: provider, name: 'CensorPrivacy' }; }
   providerRetryPolicy() { return undefined; }
   imageRequestPricing() { return undefined; }
@@ -102,55 +123,60 @@ export class PrivacyAdapter {
   async prepareCall(provider, model) { return { model: await this.resolveModel(provider, model), stream: options => this.stream(options) }; }
   async *stream(options) {
     const config = this.config;
-    let result;
+    let index = 0, content = '', textOpen = false, toolCalls = 0;
     try {
       const body = serialize(options, config);
-      result = config.mode === 'tls' ? await tlsJSON(config, body, options.signal)
-        : await requestJSON(`${config.baseURL.replace(/\/$/, '')}/v1/chat/completions`, body,
-          { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: options.signal });
+      // The Harness loop stamps the real session on each call. Keep it out of
+      // the model payload; title/compaction calls are auxiliary, not chat turns.
+      const session = options.sessionId ?? config.conversationSession;
+      const conversation = session && !options.purpose
+        ? { agent: 'deepseek-harness', session: String(session) } : undefined;
+      const events = config.mode === 'tls' ? chatJSON(await tlsJSON(config, body, options.signal))
+        : requestChat(`${config.baseURL.replace(/\/$/, '')}/v1/chat/completions`, body,
+          { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: options.signal, conversation });
+      for await (const event of events) {
+        await this.display(event);
+        if (event.type === 'text') {
+          if (!textOpen) { yield { type: 'block-start', index, blockType: 'text' }; textOpen = true; }
+          content += event.text;
+          yield { type: 'text-delta', index, text: event.text };
+        } else if (event.type === 'tool-call') {
+          if (textOpen) {
+            yield { type: 'block-end', index: index++, block: { type: 'text', text: content } };
+            textOpen = false;
+          }
+          const block = { type: 'tool-call', id: event.id, name: event.name, arguments: event.arguments };
+          yield { type: 'block-start', index, blockType: 'tool-call' };
+          yield { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments };
+          yield { type: 'block-end', index: index++, block };
+          toolCalls++;
+        } else if (event.type === 'usage') {
+          yield { type: 'usage', usage: { inputTokens: event.inputTokens, outputTokens: event.outputTokens } };
+        } else if (event.type === 'finish') {
+          if (textOpen) yield { type: 'block-end', index, block: { type: 'text', text: content } };
+          await receipt(config, { event: 'model_response', mode: config.mode, tool_calls: toolCalls });
+          yield { type: 'finish', reason: { kind: event.reason === 'tool_calls' ? 'tool-calls' : event.reason === 'length' ? 'max-tokens' : 'stop' } };
+        }
+      }
     } catch (failure) {
       if (['UNSUPPORTED_CONTENT', 'UNSUPPORTED_OPTION'].includes(failure?.code)) throw failure;
+      if (failure?.message === 'response_invalid') throw error('UNSUPPORTED_RESPONSE');
       throw error(/^upstream_http_[0-9]{3}(?:_[a-z_]+)?$/.test(failure?.message) ? failure.message.toUpperCase() : 'PRIVACY_TRANSPORT_FAILED');
     }
-    const choice = result?.choices?.[0]; const message = choice?.message;
-    if (!Array.isArray(result?.choices) || result.choices.length !== 1 ||
-        !keys(message, ['role', 'content', 'tool_calls', 'refusal', 'reasoning_content']) || message.role !== 'assistant' ||
-        (message.reasoning_content != null && message.reasoning_content !== '') ||
-        (message.refusal != null && message.refusal !== '') ||
-        (message.content != null && typeof message.content !== 'string') ||
-        (message.tool_calls !== undefined && !Array.isArray(message.tool_calls)) ||
-        !['stop', 'tool_calls', 'length'].includes(choice.finish_reason)) throw error('UNSUPPORTED_RESPONSE');
-    if (result.usage !== undefined && (!object(result.usage) || ['prompt_tokens', 'completion_tokens'].some(key => result.usage[key] !== undefined && (!Number.isSafeInteger(result.usage[key]) || result.usage[key] < 0)))) throw error('UNSUPPORTED_RESPONSE');
-    for (const call of message.tool_calls ?? []) {
-      if (!keys(call, ['id', 'type', 'function', 'index']) || call.type !== 'function' || typeof call.id !== 'string' ||
-          (call.index !== undefined && (!Number.isSafeInteger(call.index) || call.index < 0)) ||
-          !keys(call.function, ['name', 'arguments']) || typeof call.function.name !== 'string' || typeof call.function.arguments !== 'string') throw error('UNSUPPORTED_RESPONSE');
-    }
-    await receipt(config, { event: 'model_response', mode: config.mode, tool_calls: message.tool_calls?.length ?? 0 });
-    let index = 0;
-    if (typeof message.content === 'string' && message.content.length) {
-      yield { type: 'block-start', index, blockType: 'text' };
-      yield { type: 'text-delta', index, text: message.content };
-      yield { type: 'block-end', index: index++, block: { type: 'text', text: message.content } };
-    }
-    for (const call of message.tool_calls ?? []) {
-      const block = { type: 'tool-call', id: call.id, name: call.function.name, arguments: call.function.arguments };
-      yield { type: 'block-start', index, blockType: 'tool-call' };
-      yield { type: 'tool-call-delta', index, id: block.id, name: block.name, argumentsDelta: block.arguments };
-      yield { type: 'block-end', index: index++, block };
-    }
-    if (result.usage) yield { type: 'usage', usage: { inputTokens: result.usage.prompt_tokens ?? 0, outputTokens: result.usage.completion_tokens ?? 0 } };
-    yield { type: 'finish', reason: { kind: choice.finish_reason === 'tool_calls' ? 'tool-calls' : choice.finish_reason === 'length' ? 'max-tokens' : 'stop' } };
   }
 }
 
 export function apply(ctx, supplied) {
-  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, ...supplied };
+  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, privateToolsOnly: true, ...supplied };
   if (!['gateway', 'tls'].includes(config.mode) || !config.baseURL || !config.model || !config.broker || !process.env.CENSORPRIVACY_TOKEN) throw error('CONFIGURATION_REQUIRED');
   if (config.mode === 'gateway' && !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.baseURL)) throw error('LOCAL_GATEWAY_REQUIRED');
   if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(config.broker)) throw error('LOCAL_BROKER_REQUIRED');
   if (![config.timeoutMs, config.maxTokens, config.contextWindow].every(value => Number.isSafeInteger(value) && value > 0) || config.timeoutMs > 180000 || config.maxTokens > 8192) throw error('CONFIGURATION_INVALID');
   if (config.mode === 'tls' && ['tlsRun', 'nativeLibrary', 'tokenFile', 'runStateFile', 'workspace'].some(key => !config[key])) throw error('TLS_CONFIGURATION_REQUIRED');
+  if (config.conversationSession !== undefined && (typeof config.conversationSession !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(config.conversationSession))) throw error('CONFIGURATION_INVALID');
+  if (typeof config.privateToolsOnly !== 'boolean') throw error('CONFIGURATION_INVALID');
+  const localPrograms = programs(config.privateTools);
+  config.privateToolNames = new Set(['private_compute', ...localPrograms.keys()]);
   ctx.llm.registerAdapter(['censorprivacy'], new PrivacyAdapter(config));
   ctx.tools.register({
     name: 'private_compute',
@@ -172,8 +198,28 @@ export function apply(ctx, supplied) {
       return result;
     },
   });
+  for (const tool of localPrograms.values()) {
+    const inputPattern = config.mode === 'tls' ? ref : canonicalRef;
+    ctx.tools.register({
+      name: tool.name,
+      description: tool.description.trim() + ' Use current private references only. Copy complete references; never pass raw values. Results are private references.',
+      parameters: { type: 'object', properties: {
+        refs: { type: 'array', items: { type: 'string', pattern: inputPattern.source }, minItems: 1, maxItems: 256 },
+      }, required: ['refs'], additionalProperties: false },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+      async execute(args, exec) {
+        if (!keys(args, ['refs']) || !refsValid(args.refs, inputPattern)) throw error('REFERENCES_REQUIRED');
+        const result = await requestJSON(`${config.broker}/v1/private_tools/${tool.name}`, args,
+          { token: process.env.CENSORPRIVACY_TOKEN, timeoutMs: config.timeoutMs, signal: exec.signal });
+        if (!keys(result, ['refs']) || !refsValid(result.refs, canonicalRef) ||
+            (tool.output === 'order' && result.refs.length !== args.refs.length)) throw error('PRIVATE_RESULT_REQUIRED');
+        await receipt(config, { event: 'private_tool', tool: tool.name, ref_count: args.refs.length, result_count: result.refs.length, arguments_are_references: true, results_are_references: true });
+        return result;
+      },
+    });
+  }
   if (config.privateToolsOnly) {
-    ctx.on('agent/created', ({ agent }) => agent.ctx.tools.restrict({ allow: ['private_compute'] }));
-    ctx.tools.guard(exec => exec.name === 'private_compute' ? undefined : 'CensorPrivacy: PRIVATE_TOOLS_ONLY');
+    ctx.on('agent/created', ({ agent }) => agent.ctx.tools.restrict({ allow: [...config.privateToolNames] }));
+    ctx.tools.guard(exec => config.privateToolNames.has(exec.name) ? undefined : 'CensorPrivacy: PRIVATE_TOOLS_ONLY');
   }
 }

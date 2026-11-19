@@ -69,6 +69,11 @@ try {
   await call('check', '--model');
   assert.equal(requests.at(-1).thinking, undefined);
   const token = (await readFile(join(config, 'gateway.token'), 'utf8')).trim();
+  const nerReady = await (await fetch('http://127.0.0.1:' + port + '/ready', {
+    headers: { authorization: 'Bearer ' + token },
+  })).json();
+  assert.equal(nerReady.ner_device, 'cpu');
+  assert.equal(nerReady.ner_batch_size, 1);
   const firstRun = JSON.parse(await readFile(join(config, 'run.json'))).run_id;
   const runPath = join(config, 'run.json');
   const runState = await readFile(runPath);
@@ -103,11 +108,49 @@ try {
   assert.ok(!displayed.includes(secret));
   assert.match(displayed, /REDACTED_SECRET/);
   checks.push({ check: 'configured_gateway_business_text_ner_phone_email_address_date_money_secret_and_restoration', passed: true });
+  // A later assistant message can reveal the sensitivity of a value already
+  // present in earlier history. Both the release and recorded detail must use
+  // the complete request's sensitive values, while retaining final validation.
+  const session = '0123456789abcdef'.repeat(2);
+  const history = [{ role: 'user', content: 'Please retain the phrase hiddencredential for this conversation.' }];
+  const chat = async messages => {
+    const response = await fetch('http://127.0.0.1:' + port + '/xiaoo/' + session + '/v1/chat/completions', {
+      method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'standalone-model', messages, stream: false }),
+      signal: AbortSignal.timeout(90000),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(body.error));
+    return body;
+  };
+  await chat(history);
+  history.push({role:'assistant',content:'password=hiddencredential'},
+    {role:'user',content:'Summarize the preceding conversation.'});
+  await chat(history);
+  const historyWire = requests.at(-1);
+  assert.ok(!JSON.stringify(historyWire).includes('hiddencredential'));
+  assert.match(historyWire.messages[0].content, /<CP_SECRET_/);
+  const recorded = await (await fetch('http://127.0.0.1:' + port + '/api/conversations/' + session)).json();
+  assert.equal(recorded.exchanges.length, 2);
+  assert.ok(recorded.exchanges.every(exchange => exchange.status === 'completed'));
+  for (const snapshot of recorded.exchanges.at(-1).snapshots) {
+    const index = Number(snapshot.path.split('/')[2]);
+    assert.equal(snapshot.analysis.masked_text, historyWire.messages[index].content);
+  }
+  checks.push({check:'multi_turn_later_credentials_protect_earlier_history_and_exact_web_snapshots',passed:true});
   await call('stop');
   await call('start');
   assert.notEqual(JSON.parse(await readFile(join(config, 'run.json'))).run_id, firstRun);
   await call('check');
   await call('stop');
+  // This standalone ships the CPU runtime. An explicit CUDA request must fail
+  // before opening the listener, even on a host with NVIDIA hardware installed.
+  for (const device of ['cuda', 'cann']) {
+    await assert.rejects(call('start', '--ner-device', device, '--ner-batch-size', '4'));
+    assert.match(await readFile(join(config, 'service.log'), 'utf8'), /ner_device_unavailable/);
+  }
+  await assert.rejects(fetch('http://127.0.0.1:' + port + '/ready', { signal: AbortSignal.timeout(1000) }));
+  checks.push({ check: 'cpu_runtime_rejects_explicit_cuda_and_cann_without_silent_backend_fallback', passed: true });
   const policyPath = join(config, 'policy.yaml');
   const policy = await readFile(policyPath, 'utf8');
   assert.match(policy, /^ttl_seconds: \d+$/m);

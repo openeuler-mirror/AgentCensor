@@ -9,16 +9,16 @@ elif [[ $# != 0 ]]; then
   printf 'Usage: bash scripts/test/operations.sh [--static|--dsh-root /path/to/deepseek-harness]\n' >&2; exit 2
 fi
 for file in cpctl scripts/ops/*.sh scripts/release/*.sh scripts/install.sh scripts/package.sh; do bash -n "$file"; done
-for file in scripts/ops/*.mjs scripts/release/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/detector-web/app.js scripts/test/detector-web.mjs scripts/test/standalone.mjs scripts/test/dsh-web.mjs scripts/test/xiaoo-gateway.mjs; do node --check "$file"; done
+for file in scripts/ops/*.mjs scripts/release/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/detector-web/app.js scripts/test/detector-web.mjs scripts/test/standalone.mjs scripts/test/relocation.mjs scripts/test/dsh-web.mjs scripts/test/dsh-streaming.mjs scripts/test/xiaoo-gateway.mjs scripts/test/xiaoo-web.mjs; do node --check "$file"; done
 if $static_only; then
   # Fresh-clone CI can validate adapters without provisioning 400 MB weights.
-  node --test tests/dsh-plugin.test.mjs
+  node --test tests/dsh-plugin.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs
   exit 0
 fi
 # Build before timed lifecycle assertions; a cold LTO link can exceed their
 # timeout while installation and daemon startup themselves remain responsive.
 cargo build --locked --release --bins
-CP_TEST_DSH_ROOT="$dsh_test_root" node --test tests/dsh-plugin.test.mjs tests/operations.test.mjs
+CP_TEST_DSH_ROOT="$dsh_test_root" node --test tests/dsh-plugin.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs tests/operations.test.mjs
 if [[ -n $dsh_test_root ]]; then
   dsh_demo_config=$(mktemp -d)
   trap 'rm -rf -- "$dsh_demo_config"' EXIT

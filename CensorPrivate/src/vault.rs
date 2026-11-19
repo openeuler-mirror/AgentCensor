@@ -376,13 +376,30 @@ impl RunVault {
         epoch: u64,
         refs: &[Reference],
     ) -> Result<Vec<VaultEntry>> {
+        self.resolve_compute_bounded(cap, epoch, refs, usize::MAX)
+    }
+
+    pub(crate) fn resolve_compute_bounded(
+        &self,
+        cap: &RunCapability,
+        epoch: u64,
+        refs: &[Reference],
+        max_bytes: usize,
+    ) -> Result<Vec<VaultEntry>> {
         let runs = self.lock()?;
         let run = self.run(&runs, cap, epoch)?;
+        let mut bytes = 0usize;
         refs.iter()
             .map(|reference| {
                 let entry = self.entry(run, reference)?;
                 if entry.is_secret() {
                     return Err(Error::VaultDenied);
+                }
+                bytes = bytes
+                    .checked_add(entry.value.len())
+                    .ok_or(Error::ResourceLimit)?;
+                if bytes > max_bytes {
+                    return Err(Error::ResourceLimit);
                 }
                 Ok(entry.clone())
             })

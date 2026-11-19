@@ -15,31 +15,31 @@
 向发布方取得这两个匹配版本的文件：
 
 ```text
-censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz
-censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz.sha256
+censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz
+censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256
 ```
 
 仓库没有内置固定二进制下载地址或自动下载脚本。若发布方提供 HTTPS 目录地址，可以在空目录中执行以下下载命令；直接收到文件则跳过下载：
 
 ```bash
 read -r -p '发布方提供的 HTTPS 目录地址: ' CP_RELEASE_URL
-curl -fLO "${CP_RELEASE_URL%/}/censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz"
-curl -fLO "${CP_RELEASE_URL%/}/censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz.sha256"
+curl -fLO "${CP_RELEASE_URL%/}/censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz"
+curl -fLO "${CP_RELEASE_URL%/}/censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256"
 ```
 
 在这两个文件所在目录校验，预期输出 `OK`：
 
 ```bash
-sha256sum -c censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz.sha256
+sha256sum -c censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256
 ```
 
-示例为 0.3.0，其他版本同时替换归档名与校验文件名。已验收目标为 **openEuler 24.03 LTS、x86_64、glibc 2.38+**；其他系统先核对包内 `BUNDLE.json` 的实际 ABI 要求。
+示例为 0.3.2，其他版本同时替换归档名与校验文件名。已验收目标为 **openEuler 24.03 LTS、x86_64、glibc 2.38+**；其他系统先核对包内 `BUNDLE.json` 的实际 ABI 要求。
 
 ## 2. 解压与自检
 
 ```bash
-tar -xzf censorprivacy-0.3.0-linux-x86_64-standalone.tar.gz
-cd censorprivacy-0.3.0-linux-x86_64-standalone
+tar -xzf censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz
+cd censorprivacy-0.3.2-linux-x86_64-standalone
 ./cpctl self-test
 ```
 
@@ -48,6 +48,8 @@ cd censorprivacy-0.3.0-linux-x86_64-standalone
 只检查包内完整性可运行 `./cpctl verify`。这两个命令由**完整包根目录**的 `cpctl` 提供，源码入口和基础安装归档不提供。自检不会启动日常网关，也不会续期已有 run。
 
 包内资源按相对位置定位。初始化前可以整体移动包目录，移动后保留 `bin/`、`lib/`、`runtime/`、`share/` 的布局；不要继承指向其他环境的检测资源变量。
+
+升级或移动已使用的网关前，在旧目录执行 `./cpctl stop`；随后在新目录执行 `./cpctl start`、`./cpctl check`，再重新打开 xiaoO 并新建会话。配置、策略、凭据和已有 Web 记录会保留。0.3.1 修复后续历史消息新增敏感值时第二轮返回 `detection_failed` 的问题，整条请求会统一遮蔽后再接受最终复核。
 
 ## 3. 开始使用
 
@@ -66,6 +68,8 @@ cd censorprivacy-0.3.0-linux-x86_64-standalone
 ```
 
 按提示输入自己的 API Key；模型请求可能计费。客户端 Base URL 为 `http://127.0.0.1:8775/v1`，认证使用私有配置目录中的 `gateway.token`。
+
+网关同时在 `http://127.0.0.1:8775/` 提供检测台，共用已加载模型。通过 `./cpctl xiaoo tui` 或 `./cpctl xiaoo run` 启动的会话会自动显示原文、实际遮蔽文本、回复和工具交互。测试前可点击“清空记录”并确认；新包默认没有会话或预填文本，用户记录不会被打入交付包。清空 Web 记录后，需要全新上下文时请重新启动 xiaoO。
 
 接入与日常操作见 [使用手册](usage.md)：
 
@@ -106,6 +110,8 @@ cd censorprivacy-0.3.0-linux-x86_64-standalone
 
 当前组装器按 wheel 的 ORT 许可布局查找文件。使用官方 ORT tar 包时，先按上述布局暂存库和原有许可，或使用准备环境 wheel 的原目录。
 
+若系统 RPM 缺少 Kerberos 许可，打包器会获取固定版本的 NOTICE。离线构建可用 `CP_KRB5_NOTICE_FILE=/绝对路径/NOTICE` 提供缓存副本，仍须通过内置 SHA-256 校验；也可复用已验证完整包中 `share/censorprivacy/licenses/system/krb5-libs/NOTICE`。
+
 ### 4.3 执行与验收
 
 ```bash
@@ -126,7 +132,17 @@ bash scripts/package.sh --standalone \
 /path/to/extracted/runtime/bin/node scripts/test/standalone.mjs /path/to/extracted
 ```
 
-验收覆盖包自检、命令入口、配置凭据、网关保护/恢复、重启与停止。保存归档、外部 SHA-256 和对应验收结果；历史交付的结果不代表刚生成的新包已通过验收。
+验收覆盖包自检、命令入口、配置凭据、网关保护/恢复、重启与停止。需要验证实际 xiaoO 和 Web 时，可在准备好 Playwright/Chromium 的构建机执行：
+
+```bash
+CP_TEST_BUNDLE=/path/to/extracted \
+  /path/to/extracted/runtime/bin/node scripts/test/xiaoo-web.mjs \
+  /path/to/extracted/bin/censorprivacy /path/to/xiaoo
+```
+
+此模式使用包内运维入口和模型，测试配置及记录保存在独立临时目录，上游为本机模拟服务。浏览器和 Python PTY 驱动仅为验收工具，不是交付包运行依赖。保存归档、外部 SHA-256 和对应验收结果；历史交付的结果不代表刚生成的新包已通过验收。
+
+目录迁移验收使用 `scripts/test/relocation.mjs /path/to/extracted /path/to/report.json`，用包内 Node 和普通用户运行；解压目录的父目录需要允许该用户重命名。它先初始化并停止网关，再将整个包移入含空格和中文的新路径，检查既有配置、真实检测、恢复和完整网关/TLS 自检，完成后恢复原目录名。
 
 ## 5. 交付参考
 

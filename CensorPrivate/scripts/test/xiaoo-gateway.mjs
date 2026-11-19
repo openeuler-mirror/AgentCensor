@@ -91,15 +91,18 @@ try {
   }
   const reserve = createServer(); await new Promise(ok => reserve.listen(0, '127.0.0.1', ok));
   const port = reserve.address().port; await new Promise(ok => reserve.close(ok));
-  await call('init', '--upstream', origin, '--model-id', model, ...credentialArgs, '--port', String(port));
+  await call('init', '--upstream', origin, '--model-id', model, ...credentialArgs, '--port', String(port), '--ner-threads', '4');
   await call('start');
   await call('xiaoo', 'setup', '--xiaoo-bin', binary);
   const token = (await readFile(join(config, 'gateway.token'), 'utf8')).trim();
   const generated = await readFile(join(config, 'xiaoo/config.toml'), 'utf8');
-  assert.ok(generated.includes(`api_base = "http://127.0.0.1:${port}/v1/chat/completions"`));
+  assert.match(generated, new RegExp(`api_base = "http://127\\.0\\.0\\.1:${port}/xiaoo/[0-9a-f]{32}/no-tools/v1/chat/completions"`));
   assert.ok(!generated.includes(token));
   assert.equal((await stat(join(config, 'xiaoo/config.toml'))).mode & 0o777, 0o600);
-  const result = await call('xiaoo', 'demo'); // Reuses the saved executable path.
+  assert.equal((await (await fetch(`http://127.0.0.1:${port}/ready`, {headers:{authorization:'Bearer '+token}})).json()).ner_threads,4);
+  await assert.rejects(call('xiaoo','demo'),error=>/--enable-tools/.test(error.stderr));
+  const result = await call('xiaoo', 'demo', '--enable-tools'); // Reuses the saved executable path.
+  assert.ok(result.stdout.includes('工具准备完成'));
   await writeFile(join(directory, 'demo-stdout.txt'), result.stdout);
   await writeFile(join(directory, 'demo-stderr.txt'), result.stderr);
   for (const value of values) assert.ok(result.stdout.includes(value), 'restoration missing: ' + value);
@@ -117,12 +120,26 @@ try {
     const task = '请复述：联系人张三，电话13800138000。';
     const ordinary = await call('xiaoo', 'run', task);
     assert.ok(ordinary.stdout.includes('13800138000'));
+    assert.equal(requests.at(-1).tools,undefined,'default CLI must not advertise tools');
     const piped = new Promise((ok, no) => {
       const child = execFile(ctl, ['xiaoo', 'run', '--config-dir', config], { env, timeout: 120000 },
         (error, stdout) => error ? no(error) : ok(stdout));
       child.stdin.end(task);
     });
     assert.ok((await piped).includes('13800138000'));
+    assert.equal(requests.at(-1).tools,undefined);
+    const beforeEnabled=requests.length;
+    const enabled=await call('xiaoo','run',task,'--enable-tools');
+    assert.ok(enabled.stdout.includes('工具准备完成'));
+    assert.equal(requests.length,beforeEnabled+1,'preparation must not reach the upstream');
+    assert.ok(requests.at(-1).tools.length>1,'enabled mode must prepare the actual default catalog');
+    assert.ok(!JSON.stringify(requests).includes('Prepare the available tool definitions.'));
+    const sessions=await (await fetch(`http://127.0.0.1:${port}/api/conversations`)).json();
+    for(const session of sessions.sessions){
+      const records=await (await fetch(`http://127.0.0.1:${port}/api/conversations/${session.id}`)).json();
+      assert.ok(!JSON.stringify(records).includes('Prepare the available tool definitions.'),'preparation must not become a conversation');
+    }
+    await assert.rejects(call('xiaoo','run',task,'--enable-tools','--no-tools'));
     await assert.rejects(call('xiaoo', 'run', '--api-base', 'http://127.0.0.1:1'));
     await assert.rejects(call('xiaoo', 'tui'), 'TUI must require an interactive terminal');
   }
@@ -131,7 +148,8 @@ try {
     mode: liveConfig ? 'actual_remote_https_model' : 'local_fixture_with_actual_rust_onnx_and_xiaoo', model,
     checks: ['native_xiaoo_file_read_tool', 'long_mail_restoration', 'secret_stays_redacted', 'gateway_keeps_running'],
     ...(liveConfig ? {} : { upstream_requests: requests.length, extra_checks: ['native_sse', 'outbound_contains_no_raw_values',
-      'deepseek_thinking_disabled', 'private_config_without_key', 'ordinary_task', 'stdin_task', 'reject_endpoint_override'] }),
+      'deepseek_thinking_disabled', 'private_config_without_key', 'ordinary_task', 'stdin_task', 'reject_endpoint_override',
+      'ner_four_threads','default_tools_disabled','explicit_tools_enabled','startup_preparation_local_without_records'] }),
   };
   if (process.env.CP_XIAOO_TEST_REPORT) await writeFile(process.env.CP_XIAOO_TEST_REPORT, JSON.stringify(report, null, 2) + '\n');
   console.log('PASS xiaoO: ' + JSON.stringify(report));

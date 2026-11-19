@@ -11,10 +11,13 @@ mod linux {
     use serde_json::{json, Value};
     use std::{
         collections::BTreeMap,
-        fs::OpenOptions,
+        fs::{File, OpenOptions},
         io::Read,
         net::{Ipv4Addr, SocketAddrV4},
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
+        os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        },
         path::{Path, PathBuf},
         process::{Child, Command},
         time::{Duration, Instant},
@@ -61,7 +64,24 @@ mod linux {
             }
         }
     }
-    fn library(path: &Path) -> Result<PathBuf> {
+    struct Library {
+        path: PathBuf,
+        file: File,
+        directory: File,
+    }
+    impl Library {
+        fn preload(&self) -> String {
+            format!("/proc/{}/fd/{}", std::process::id(), self.file.as_raw_fd())
+        }
+        fn search_path(&self) -> String {
+            format!(
+                "/proc/{}/fd/{}",
+                std::process::id(),
+                self.directory.as_raw_fd()
+            )
+        }
+    }
+    fn library(path: &Path) -> Result<Library> {
         let path = path.canonicalize().map_err(|_| Error::TlsBlocked)?;
         let mut file = OpenOptions::new()
             .read(true)
@@ -89,7 +109,16 @@ mod linux {
         {
             return Err(Error::TlsBlocked);
         }
-        Ok(path)
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path.parent().ok_or(Error::TlsBlocked)?)
+            .map_err(|_| Error::TlsBlocked)?;
+        Ok(Library {
+            path,
+            file,
+            directory,
+        })
     }
     fn executable(name: &str) -> Result<PathBuf> {
         let path = Path::new(name);
@@ -236,7 +265,13 @@ mod linux {
             environment.insert("ANTHROPIC_API_KEY".into(), key.into());
         }
         for (key, value) in [
-            ("LD_PRELOAD", library.to_string_lossy().into_owned()),
+            // The loader splits LD_PRELOAD on spaces/colons and cannot quote
+            // filenames. Keep the verified file and its dependency directory
+            // open in this supervising process until the child exits. Procfs
+            // aliases contain no separators, survive directory renames, and
+            // require no inherited child descriptors or temporary copies.
+            ("LD_PRELOAD", library.preload()),
+            ("LD_LIBRARY_PATH", library.search_path()),
             ("CENSORPRIVACY_URL", cli.broker.trim_end_matches('/').into()),
             ("CENSORPRIVACY_TOKEN", token.to_string()),
             (
@@ -254,7 +289,7 @@ mod linux {
         if cli.dry_run {
             println!(
                 "{}",
-                json!({"mode":"tls-direct","run_id":status["run_id"],"peer":status["peer"],"command":{"executable":cli.command[0],"argument_count":cli.command.len()-1},"library":library,"workspace":workspace,"environment_keys":environment.keys().collect::<Vec<_>>(),"supported":"cooperating dynamic OpenSSL, HTTP/1.1 JSON"})
+                json!({"mode":"tls-direct","run_id":status["run_id"],"peer":status["peer"],"command":{"executable":cli.command[0],"argument_count":cli.command.len()-1},"library":library.path,"workspace":workspace,"environment_keys":environment.keys().collect::<Vec<_>>(),"supported":"cooperating dynamic OpenSSL, HTTP/1.1 JSON"})
             );
             return Ok(0);
         }
@@ -319,6 +354,48 @@ mod linux {
                     125
                 }
             }
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn preload_pins_verified_file_and_dependencies_under_delimited_paths() {
+            let directory = std::env::temp_dir().join(format!(
+                "cp-preload-{}-{} 中文 :;",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("guard : spaced.so");
+            std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+            let handle = library(&path).unwrap();
+            for alias in [handle.preload(), handle.search_path()] {
+                assert!(!alias
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b":;".contains(&b)));
+            }
+            assert_eq!(
+                std::fs::metadata(handle.preload()).unwrap().ino(),
+                std::fs::metadata(&path).unwrap().ino()
+            );
+            let moved = directory.with_extension("moved");
+            std::fs::rename(&directory, &moved).unwrap();
+            assert_eq!(
+                std::fs::metadata(handle.search_path()).unwrap().ino(),
+                std::fs::metadata(&moved).unwrap().ino()
+            );
+            assert_eq!(
+                std::fs::metadata(handle.preload()).unwrap().ino(),
+                std::fs::metadata(moved.join(path.file_name().unwrap()))
+                    .unwrap()
+                    .ino()
+            );
+            drop(handle);
+            std::fs::remove_dir_all(moved).unwrap();
         }
     }
 }

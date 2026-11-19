@@ -2,7 +2,7 @@
 
 [文档首页](README.md) · [构建与部署](build-and-deploy.md) · [使用手册](usage.md) · [脚本速查](scripts.md)
 
-网关、TLS broker 和检测页面共用 Rust 正则、规则与 NER。固定本地模型为 `shibing624/bert4ner-base-chinese`，使用 FP32 ONNX、Rust tokenizers 与 ONNX Runtime CPU；生产不启动 Python，不在线下载模型。
+网关、TLS broker 和检测页面共用 Rust 正则、规则与 NER。固定本地模型为 `shibing624/bert4ner-base-chinese`，使用 FP32 ONNX、Rust tokenizers 与 ONNX Runtime，支持 CPU、NVIDIA CUDA 或华为昇腾 CANN；生产不启动 Python，不在线下载模型。
 
 首次使用先按 [构建步骤](build-and-deploy.md#4-准备检测资源) 下载/导出资源，再按本页配置路径。模型导出细节见 [模型工具](../scripts/model/README.md)。
 
@@ -45,7 +45,41 @@ export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
 
 源码二进制位于 `target/debug/` 或 `target/release/` 时，默认 ORT 位置相应为 `target/lib/censorprivacy/libonnxruntime.so`。该目录被 Git 忽略，`cargo clean` 后需重新准备；服务不会自动搜索 Python 环境。
 
-CLI 与环境变量只定位固定模型，不提供模型选择。`--model` / `init --model-id` 指上游聊天模型，与本地 NER 资源无关。变量不由 `init` 持久保存；systemd 安装会把当前变量写入实例环境文件，部署步骤见 [系统服务](build-and-deploy.md#6-部署为系统服务)。
+NER 并行度可用 `censorprivacy serve/web --ner-threads N` 或环境变量 `CP_NER_THREADS=N` 配置，优先级为命令行 → 环境变量 → 默认 1，范围 1–256；inter-op 固定为 1。`cpctl init --ner-threads N` 持久保存到 `config.json`，`cpctl start --ner-threads N` 临时覆盖，未指定时使用配置值或 1。`cpctl` 显式传递该值，因此不继承 `CP_NER_THREADS`；4 核 CPU 可选择 4，需按实际负载验证。认证 `/ready` 会返回生效的 `ner_threads`。
+
+设备和 batch 由检测核心统一处理，适用于所有 Harness/协议：
+
+```bash
+# CPU：保留 ONNX CPU 算子线程配置
+./cpctl start --ner-device cpu --ner-threads 4
+# CUDA：默认第 0 张可见卡，每卡每次最多 4 个窗口
+./cpctl start --ner-device cuda --ner-batch-size 4
+# 多卡：每卡一个会话，空闲卡继续领取下一批，结果按文档顺序合并
+./cpctl start --ner-device cuda:0,1,2,3 --ner-batch-size 4
+# 华为昇腾：默认第 0 张卡，也支持 cann:0,1 多卡列表
+./cpctl start --ner-device cann --ner-batch-size 4
+```
+
+`--ner-device` 默认 `cpu`，`cuda` 等同于 `cuda:0`，`cann` 等同于 `cann:0`；两种后端均支持多卡列表且禁止重复，编号对应进程可见设备（CUDA 受 `CUDA_VISIBLE_DEVICES` 影响，CANN 按其运行环境的可见设备设置）。`--ner-batch-size` 范围 1–256，默认 1，按每卡计算。`init` 可保存这两个参数，`start` 临时覆盖且不改写配置；旧配置仍使用 CPU/batch 1。直接运行 `censorprivacy serve/web` 时可通过 `CP_NER_DEVICE`、`CP_NER_BATCH_SIZE` 设置默认值，CLI 优先；`cpctl` 显式传递配置，不继承这两个环境变量。认证 `/ready` 返回规范化的 `ner_device`、`ner_batch_size` 和原有 `ner_threads`。
+
+batch 只组合当前文本的窗口，不等待其他请求；最后不足一批立即推理，按每批最长窗口右侧补齐并使用 attention mask，补齐部分不参与实体聚合。多卡每卡至多一个在途 batch，所有卡均在启动时加载模型并验证推理；任何一批失败拒绝整次结果。`--ner-threads` 仍控制各会话的 CPU 算子线程，不代表 GPU 分发线程数。多卡会增加模型副本和主机内存占用；短文本窗口不足时不会用满所有卡。
+
+当前 standalone 包附带 **CPU** 运行库。CUDA 使用同一个 Rust 二进制，但需要另外准备与 ort API、驱动及 CUDA/cuDNN 匹配的 ONNX Runtime GPU 原生库，并通过 `CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so` 指定；同目录的 CUDA provider 库及其依赖必须能被动态加载器找到。Rust 服务不需要安装 Python 的 `onnxruntime-gpu` 包。CUDA 显式关闭 TF32，保持现有 FP32 推理精度策略。显式选择加速设备后，provider 注册或会话创建失败返回 `ner_device_unavailable`，不会静默改用整个 CPU 后端；部分不受选定 provider 支持的算子仍可由 ORT 分配给 CPU。
+
+昇腾使用同一二进制接口和 batch/多卡调度层，但需要 **含 CANNExecutionProvider 的 ONNX Runtime**、匹配的 Ascend 驱动/固件及 CANN Toolkit。普通 CPU/CUDA ORT 库不自动支持 CANN。通过 `CP_DETECTOR_ORT_LIBRARY` 指定库，并按 CANN 安装说明配置动态库搜索路径。CANN 保留模型原始精度（`must_keep_origin_dtype`），优先高精度实现；不自动转换为 FP16。现有交付包为 x86_64，ARM 昇腾主机需要另行构建对应架构的二进制和运行库。
+
+加速卡主机可运行独立验收（同一加速运行库先跑 CPU 参考、释放模型后再跑指定设备，比较 batch 1/4 的实体、偏移和分数；昇腾将设备改为 `cann` 或 `cann:0,1`）：
+
+```bash
+CP_TEST_NER_DEVICE=cuda:0,1 \
+CP_DETECTOR_ORT_LIBRARY=/path/to/gpu/libonnxruntime.so \
+CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 \
+cargo test --locked --test ner_accelerator -- --ignored --nocapture --test-threads=1
+```
+
+CUDA/CANN 的真实设备执行、算子覆盖、数值差异和性能须在对应硬件主机验收。本机 CPU 回归和后端不可用检查不代表真实加速硬件已通过验收。
+
+模型路径的 CLI 与环境变量只定位固定模型，不提供模型选择。`--model` / `init --model-id` 指上游聊天模型，与本地 NER 资源无关。变量不由 `init` 持久保存；systemd 安装会把当前变量写入实例环境文件，部署步骤见 [系统服务](build-and-deploy.md#6-部署为系统服务)。
 
 ## 3. 验证资源与运行
 
@@ -76,7 +110,7 @@ Rust 依赖锁定 ort `2.0.0-rc.10`、tokenizers `0.21.4`；本机验收使用 O
 - Rust policy 的 dictionaries、patterns、标签、金额/日期/全数字开关及 epoch reload 继续生效；额外检测器可通过原 Detector trait 注入。内置专业规则当前编译进 catalog，修改后需重建；模型固定。
 - CLI 默认加载专业检测器。Rust 嵌入方使用 `PrivacyGate::with_professional_detector`，或共享 Arc 的 `with_loaded_professional_detector`。`PrivacyGate::new`、`with_detectors`、Detector/LocalAnalyzer 保留原轻量接口，不隐式加载 BERT。
 
-单次文本上限 1 MiB、字段名上限 8192 bytes，正则有回溯预算，候选上限 65536。推理串行运行；每次 predict 设置 60 秒计时并请求 ONNX Runtime cooperative termination，超时结果拒绝，检测错误锁存为失败。它不是进程级强制中断，也不是多字段请求的统一 60 秒截止时间。TLS hook 本机 RPC 保留 60 秒有限等待。长文和多字段生产容量需单独评测。
+单次文本上限 1 MiB、字段名上限 8192 bytes，正则有回溯预算，候选上限 65536。请求按检测器互斥访问，单卡逐批运行、多卡可并行运行同一文本的不同批次。每个 512 token 窗口的 ONNX 执行预算为 16 秒：默认单窗执行时逐窗计时；一批包含多个窗口时，ONNX 将该批作为一次执行，预算为实际窗口数乘以 16 秒，尾批也按实际数量计时。排队不消耗后续批次的预算。超时请求 ONNX Runtime 协作中止，整次检测拒绝返回部分结果并锁存失败。TLS hook 本机 RPC、DSH 客户端和上游 HTTP 仍有各自的传输超时；长文吞吐要按实际硬件评估。
 
 检测器不建立第二份原值映射表，不记录输入原文；原值/引用仍由 vault 持有。重复分析使用最多 512 项、合计 4096 个候选的内存缓存，只存请求 SHA-256 和位置/元数据，键包含字段、structural 和三个策略开关；健康状态先于缓存检查，错误后清空并拒绝继续。扫描副本使用 Zeroizing，第三方 tokenizer、ONNX Runtime、分配器和其他临时副本不保证安全清零。
 

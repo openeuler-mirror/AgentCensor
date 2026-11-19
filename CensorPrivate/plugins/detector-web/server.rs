@@ -1,18 +1,20 @@
 //! Local visualization of the production detector; assets originate at detector 007c7ea.
+use crate::{
+    conversations::ConversationStore,
+    detection::{merge_spans, Span},
+    error::{Error, Result},
+    professional::{
+        configured_ner_batch_size, configured_ner_device, configured_ner_threads, AnalyzeOptions,
+        NerDevice, Prediction, ProfessionalConfig, ProfessionalDetector, MODEL_ID,
+    },
+};
 use axum::{
-    extract::{rejection::JsonRejection, DefaultBodyLimit, Request, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
-};
-use censorprivacy::{
-    detection::{merge_spans, Span},
-    error::{Error, Result},
-    professional::{
-        AnalyzeOptions, Prediction, ProfessionalConfig, ProfessionalDetector, MODEL_ID,
-    },
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,11 +34,24 @@ pub struct WebArgs {
     detector_model_dir: Option<PathBuf>,
     #[arg(long)]
     detector_ort_library: Option<PathBuf>,
+    /// ONNX intra-op threads (1–256); defaults to CP_NER_THREADS, then 1.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    ner_threads: Option<u16>,
+    /// cpu (default), cuda[:ids], or cann[:ids]; unnumbered accelerators use device 0; CP_NER_DEVICE overrides the default.
+    #[arg(long)]
+    ner_device: Option<NerDevice>,
+    /// Maximum windows per device inference (1–256); CP_NER_BATCH_SIZE, then 1.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
+    ner_batch_size: Option<u16>,
+    /// Read Agent conversations recorded by the gateway.
+    #[arg(long, visible_alias = "xiaoo-records-dir")]
+    conversation_records_dir: Option<PathBuf>,
 }
 
 struct WebState {
-    detector: ProfessionalDetector,
+    detector: Arc<ProfessionalDetector>,
     capacity: Arc<Semaphore>,
+    conversations: Option<Arc<ConversationStore>>,
 }
 
 #[derive(Deserialize)]
@@ -103,6 +118,7 @@ async fn local_only(State(port): State<u16>, request: Request, next: Next) -> Re
 }
 
 fn router(state: Arc<WebState>, port: u16) -> Router {
+    let conversations = conversation_routes(state.conversations.clone());
     Router::new()
         .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route(
@@ -124,9 +140,81 @@ fn router(state: Arc<WebState>, port: u16) -> Router {
             }),
         )
         .route("/api/analyze", post(analyze))
+        .with_state(state)
+        .merge(conversations)
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(port, local_only))
-        .with_state(state)
+}
+
+fn conversation_routes(store: Option<Arc<ConversationStore>>) -> Router {
+    Router::new()
+        .route(
+            "/api/conversations",
+            get(conversations).delete(clear_conversations),
+        )
+        .route("/api/conversations/:session", get(conversation))
+        .with_state(store)
+}
+
+/// Share the gateway's verified model and recordings with the local workspace.
+pub fn workspace(
+    detector: Arc<ProfessionalDetector>,
+    conversations: Option<Arc<ConversationStore>>,
+    port: u16,
+) -> Router {
+    router(
+        Arc::new(WebState {
+            detector,
+            capacity: Arc::new(Semaphore::new(1)),
+            conversations,
+        }),
+        port,
+    )
+}
+
+async fn conversations(State(store): State<Option<Arc<ConversationStore>>>) -> Response {
+    match &store {
+        None => Json(json!({"enabled":false,"sessions":[]})).into_response(),
+        Some(store) => match store.sessions() {
+            Ok(sessions) => Json(json!({"enabled":true,"sessions":sessions})).into_response(),
+            Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "暂时无法读取会话记录。"),
+        },
+    }
+}
+
+async fn conversation(
+    State(store): State<Option<Arc<ConversationStore>>>,
+    Path(session): Path<String>,
+) -> Response {
+    match &store {
+        Some(store) => match store.exchanges(&session) {
+            Ok(records) => Json(json!({"session_id":session,"exchanges":records})).into_response(),
+            Err(_) => failure(StatusCode::NOT_FOUND, "未找到会话记录。"),
+        },
+        None => failure(StatusCode::NOT_FOUND, "尚未连接 Agent 会话记录。"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClearConversations {
+    confirm: bool,
+}
+
+async fn clear_conversations(
+    State(store): State<Option<Arc<ConversationStore>>>,
+    payload: std::result::Result<Json<ClearConversations>, JsonRejection>,
+) -> Response {
+    if !matches!(payload, Ok(Json(ClearConversations { confirm: true }))) {
+        return failure(StatusCode::BAD_REQUEST, "清空记录需要明确确认。");
+    }
+    match store {
+        Some(store) => match store.clear() {
+            Ok(count) => Json(json!({"cleared_sessions":count})).into_response(),
+            Err(_) => failure(StatusCode::SERVICE_UNAVAILABLE, "清空未完成，请重试。"),
+        },
+        None => failure(StatusCode::NOT_FOUND, "尚未连接 Agent 会话记录。"),
+    }
 }
 
 async fn analyze(
@@ -262,7 +350,12 @@ fn preview(text: &str, predictions: Vec<Prediction>, style: &str, threshold: f64
 }
 
 pub async fn serve(args: WebArgs) -> Result<()> {
-    let mut config = ProfessionalConfig::default();
+    let mut config = ProfessionalConfig {
+        ner_threads: configured_ner_threads(args.ner_threads)?,
+        ner_device: configured_ner_device(args.ner_device)?,
+        ner_batch_size: configured_ner_batch_size(args.ner_batch_size)?,
+        ..Default::default()
+    };
     if let Some(path) = args.detector_model_dir {
         config.model_directory = Some(path);
     }
@@ -290,10 +383,12 @@ pub async fn serve(args: WebArgs) -> Result<()> {
         eprintln!("未找到 ONNX Runtime 原生运行库；请设置 CP_DETECTOR_ORT_LIBRARY 或 --detector-ort-library，指向 libonnxruntime.so（也支持版本文件名）。Cargo 构建不会下载此运行库。");
         return Err(Error::DetectionFailed);
     }
-    let state = Arc::new(WebState {
-        detector: ProfessionalDetector::start(config)?,
-        capacity: Arc::new(Semaphore::new(1)),
-    });
+    let detector = Arc::new(ProfessionalDetector::start(config)?);
+    let conversations = args
+        .conversation_records_dir
+        .map(ConversationStore::open)
+        .transpose()?
+        .map(Arc::new);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port))
         .await
         .map_err(|_| Error::ServiceUnavailable)?;
@@ -302,7 +397,7 @@ pub async fn serve(args: WebArgs) -> Result<()> {
         .map_err(|_| Error::ServiceUnavailable)?
         .port();
     println!("Privacy Detector: http://127.0.0.1:{port}/");
-    axum::serve(listener, router(state, port)).with_graceful_shutdown(async {
+    axum::serve(listener, workspace(detector, conversations, port)).with_graceful_shutdown(async {
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => (),
@@ -315,6 +410,92 @@ pub async fn serve(args: WebArgs) -> Result<()> {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn clearing_recordings_requires_confirmed_same_origin_json_and_survives_reopen() {
+        let directory = std::env::temp_dir().join(format!(
+            "cp-web-clear-{}",
+            crate::references::random_hex::<16>().unwrap()
+        ));
+        let store = Arc::new(ConversationStore::open(directory.clone()).unwrap());
+        let session = "0123456789abcdef0123456789abcdef";
+        let mut pending = store.begin(session, &json!({"messages":[]})).unwrap();
+        let app = conversation_routes(Some(store.clone()))
+            .layer(DefaultBodyLimit::max(64 * 1024))
+            .layer(middleware::from_fn_with_state(8766u16, local_only));
+        for (body, origin, content_type, expected) in [
+            (
+                r#"{"confirm":false}"#,
+                "http://127.0.0.1:8766",
+                "application/json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{}"#,
+                "http://127.0.0.1:8766",
+                "application/json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"confirm":true}"#,
+                "https://foreign.example",
+                "application/json",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                r#"{"confirm":true}"#,
+                "http://127.0.0.1:8766",
+                "text/plain",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("DELETE")
+                .uri("/api/conversations")
+                .header("host", "127.0.0.1:8766")
+                .header("origin", origin)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+            assert_eq!(store.sessions().unwrap().len(), 1);
+        }
+        let request = Request::builder()
+            .method("DELETE")
+            .uri("/api/conversations")
+            .header("host", "127.0.0.1:8766")
+            .header("origin", "http://127.0.0.1:8766")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"confirm":true}"#))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["cleared_sessions"],
+            1
+        );
+        pending.protected(vec![]).unwrap();
+        pending.complete(None).unwrap();
+        let reopened = ConversationStore::open(directory.clone()).unwrap();
+        assert!(reopened.sessions().unwrap().is_empty());
+        let request = Request::builder()
+            .uri(format!("/api/conversations/{session}"))
+            .header("host", "127.0.0.1:8766")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn preview_handles_unicode_overlaps_repeats_and_thresholds() {
