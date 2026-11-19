@@ -74,6 +74,7 @@ mod tests {
             tls_dynamic_loading: false,
             tls_scan_debounce: TlsScanDebounce::Image,
             tls_scan_interval_ms: 250,
+            context_env_rules: Vec::new(),
         }
     }
 

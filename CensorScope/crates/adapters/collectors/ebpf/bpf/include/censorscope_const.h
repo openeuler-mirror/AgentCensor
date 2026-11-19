@@ -18,6 +18,13 @@
 #define CALL_ID_LEN 128
 #define ENV_BUF_LEN 512
 #define MAX_ENV_VARS 96
+#define MAX_CONTEXT_ENV_RULES 5
+#define CONTEXT_ENV_NAME_LEN 64
+
+enum censorscope_context_env_kind {
+    CONTEXT_ENV_SESSION = 1,
+    CONTEXT_ENV_CALL = 2,
+};
 
 
 enum censorscope_exec_flag {

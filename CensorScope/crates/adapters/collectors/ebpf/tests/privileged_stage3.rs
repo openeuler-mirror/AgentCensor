@@ -51,6 +51,7 @@ fn every_compiled_program_passes_the_kernel_verifier() {
         tls_dynamic_loading: false,
         tls_scan_debounce: config_core::daemon::TlsScanDebounce::Image,
         tls_scan_interval_ms: 250,
+        context_env_rules: config_core::daemon::default_context_env_rules("DSH_SESSION_ID"),
     });
 
     collector
@@ -96,6 +97,7 @@ fn stage3_real_file_tcp_ipc_stdio_signal_workload() {
         tls_dynamic_loading: false,
         tls_scan_debounce: config_core::daemon::TlsScanDebounce::Image,
         tls_scan_interval_ms: 250,
+        context_env_rules: config_core::daemon::default_context_env_rules("DSH_SESSION_ID"),
     });
     collector
         .bind_trace(&TraceBindingRequest {
@@ -208,6 +210,7 @@ fn exec_replaces_inherited_call_and_prefers_canonical_context() {
         tls_dynamic_loading: false,
         tls_scan_debounce: config_core::daemon::TlsScanDebounce::Image,
         tls_scan_interval_ms: 250,
+        context_env_rules: config_core::daemon::default_context_env_rules("DSH_SESSION_ID"),
     });
 
     collector
@@ -276,6 +279,137 @@ os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
             Some(session)
         );
         assert_eq!(event.envelope.call_id.as_deref(), call);
+    }
+    collector.unbind_trace(TraceId::new(1)).unwrap();
+}
+
+#[test]
+#[ignore = "requires root/CAP_BPF, writable tracefs, kernel BTF, and eBPF attach support"]
+fn configured_context_environment_rules_select_one_harness_profile() {
+    use config_core::daemon::{ContextEnvKind, ContextEnvRule};
+
+    let capabilities = vec![CapabilityRequest::required(Capability::ProcLifecycle)];
+    let profile = CaptureProfile::new(ProfileName::new("context-env-config"), capabilities.clone());
+    let pid = std::process::id();
+    let observation = ProcfsIdentityReader
+        .read_identity(pid)
+        .expect("read current process identity");
+    let mut collector = EbpfCollector::new(EbpfCollectorConfig {
+        enabled_mode: EbpfEnabledMode::True,
+        enabled: true,
+        memlock_rlimit: MemlockRlimit::Unlimited,
+        tracked_process_max_entries: 4096,
+        pending_operation_max_entries: 4096,
+        event_ring_buffer_max_bytes: 1024 * 1024,
+        tls_dynamic_loading: false,
+        tls_scan_debounce: config_core::daemon::TlsScanDebounce::Image,
+        tls_scan_interval_ms: 250,
+        context_env_rules: vec![
+            ContextEnvRule {
+                name: "CODEX_SESSION_ID".into(),
+                kind: ContextEnvKind::Session,
+                profile: "codex".into(),
+                priority: 100,
+            },
+            ContextEnvRule {
+                name: "CODEX_TOOL_CALL_ID".into(),
+                kind: ContextEnvKind::Call,
+                profile: "codex".into(),
+                priority: 100,
+            },
+            ContextEnvRule {
+                name: "CENSORSCOPE_SESSION_ID".into(),
+                kind: ContextEnvKind::Session,
+                profile: "censorscope".into(),
+                priority: 80,
+            },
+            ContextEnvRule {
+                name: "CENSORSCOPE_CALL_ID".into(),
+                kind: ContextEnvKind::Call,
+                profile: "censorscope".into(),
+                priority: 80,
+            },
+            ContextEnvRule {
+                name: "DSH_SESSION_ID".into(),
+                kind: ContextEnvKind::Session,
+                profile: "dsh".into(),
+                priority: 50,
+            },
+        ],
+    });
+    collector
+        .bind_trace(&TraceBindingRequest {
+            trace_id: TraceId::new(1),
+            root_identity: ProcessIdentity::new(1),
+            root_observation: observation,
+            root_namespace_pid: pid,
+            profile_snapshot: CaptureProfileSnapshot::from_profile(&profile, SystemTime::now()),
+            requested_capabilities: capabilities,
+        })
+        .unwrap_or_else(|error| panic!("bind configured context collector: {error:?}"));
+
+    let script = r#"
+import os, sys
+env = dict(os.environ)
+if sys.argv[1] == 'codex':
+    env.pop('CODEX_SESSION_ID', None)
+    env.pop('CODEX_TOOL_CALL_ID', None)
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'canonical', sys.argv[2]], env)
+if sys.argv[1] == 'canonical':
+    env.pop('CENSORSCOPE_SESSION_ID', None)
+    env.pop('CENSORSCOPE_CALL_ID', None)
+    os.execve('/bin/true', ['/bin/true', 'dsh'], env)
+"#;
+    let mut child = std::process::Command::new("python3")
+        .args(["-c", script, "codex", script])
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("CODEX_SESSION_ID", "codex-session")
+        .env("CODEX_TOOL_CALL_ID", "codex-call")
+        .env("CENSORSCOPE_SESSION_ID", "canonical-session")
+        .env("CENSORSCOPE_CALL_ID", "canonical-call")
+        .env("DSH_SESSION_ID", "dsh-session")
+        .spawn()
+        .expect("spawn configured context workload");
+    let mut observations = Vec::new();
+    loop {
+        observations.extend(collector.poll_batch().unwrap().observations);
+        if let Some(status) = child
+            .try_wait()
+            .expect("wait for configured context workload")
+        {
+            assert!(status.success(), "configured context workload: {status}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for _ in 0..20 {
+        observations.extend(collector.poll_batch().unwrap().observations);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (marker, session, call) in [
+        ("codex", "codex-session", Some("codex-call")),
+        ("canonical", "canonical-session", Some("canonical-call")),
+        ("dsh", "dsh-session", None),
+    ] {
+        let event = observations
+            .iter()
+            .find(|event| matches!(
+                &event.payload,
+                RawObservationPayload::Process { operation, argv: Some(argv), .. }
+                    if operation == "exec" && argv.args.iter().any(|arg| arg == marker.as_bytes())
+            ))
+            .unwrap_or_else(|| panic!("missing configured context exec {marker}"));
+        assert_eq!(
+            event
+                .envelope
+                .session_id
+                .as_ref()
+                .map(|value| value.as_str()),
+            Some(session),
+            "session for {marker}"
+        );
+        assert_eq!(event.envelope.call_id.as_deref(), call, "call for {marker}");
     }
     collector.unbind_trace(TraceId::new(1)).unwrap();
 }
