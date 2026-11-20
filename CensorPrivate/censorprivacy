@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Source entry point; installed deployments use the Rust binary directly.
+set -euo pipefail
+CP_REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+CP_DEFAULT_BIN_DIR=$CP_REPO_ROOT
+export CP_REPO_ROOT CP_DEFAULT_BIN_DIR
+case "${1:-}" in
+  serve|web|config-check|compute|mcp|run|tls-run|--help|-h|--version|-V|help)
+    source "$CP_REPO_ROOT/scripts/ops/common.sh"
+    config_dir=${CP_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/censorprivacy/managed}
+    prefix=${CP_INSTALL_PREFIX:-$HOME/.local}
+    find_bins
+    exec "$bin_dir/censorprivacy" "$@"
+    ;;
+  *) exec bash "$CP_REPO_ROOT/scripts/ops/entry.sh" "$@" ;;
+esac
