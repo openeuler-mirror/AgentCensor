@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use fancy_regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
@@ -17,6 +17,26 @@ fn default_ttl() -> f64 {
 }
 fn default_labels() -> BTreeSet<String> {
     BTreeSet::from(["confidential".into()])
+}
+
+/// User-defined rules; category selection and run lifetime belong to deployment.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CustomSettings {
+    pub epoch: u64,
+    pub dictionaries: BTreeMap<String, Vec<String>>,
+    pub patterns: BTreeMap<String, Vec<String>>,
+    pub default_labels: BTreeSet<String>,
+}
+impl Default for CustomSettings {
+    fn default() -> Self {
+        Self {
+            epoch: default_epoch(),
+            dictionaries: BTreeMap::new(),
+            patterns: BTreeMap::new(),
+            default_labels: default_labels(),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -40,11 +60,18 @@ struct PolicyConfig {
     ttl_seconds: f64,
 }
 
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("constant policy configuration")
+    }
+}
+
 /// Validated immutable snapshot. No public field permits mutation after validation.
 #[derive(Clone)]
 pub struct PrivacyPolicy {
     config: PolicyConfig,
     ttl: Duration,
+    categories: crate::categories::Categories,
 }
 
 impl Default for PrivacyPolicy {
@@ -60,6 +87,23 @@ impl PrivacyPolicy {
     }
     pub fn from_yaml(raw: &str) -> Result<Self> {
         Self::validate(serde_yaml::from_str(raw).map_err(|_| Error::PolicyInvalid)?)
+    }
+    pub fn from_custom(custom: CustomSettings) -> Result<Self> {
+        Self::validate(PolicyConfig {
+            epoch: custom.epoch,
+            dictionaries: custom.dictionaries,
+            patterns: custom.patterns,
+            default_labels: custom.default_labels,
+            ..PolicyConfig::default()
+        })
+    }
+    pub fn custom_rules(&self) -> CustomSettings {
+        CustomSettings {
+            epoch: self.config.epoch,
+            dictionaries: self.config.dictionaries.clone(),
+            patterns: self.config.patterns.clone(),
+            default_labels: self.config.default_labels.clone(),
+        }
     }
     fn validate(mut config: PolicyConfig) -> Result<Self> {
         let ttl =
@@ -91,7 +135,50 @@ impl PrivacyPolicy {
                 }
             }
         }
-        Ok(Self { config, ttl })
+        Ok(Self {
+            config,
+            ttl,
+            categories: None,
+        })
+    }
+    pub fn categories(&self) -> &crate::categories::Categories {
+        &self.categories
+    }
+    pub fn allows_category(&self, kind: &str) -> bool {
+        crate::categories::allows(&self.categories, kind)
+    }
+    pub fn with_deployment(
+        mut self,
+        ttl: Option<f64>,
+        categories: crate::categories::Categories,
+    ) -> Result<Self> {
+        if let Some(items) = &categories {
+            for kind in items {
+                if !crate::categories::BUILTIN_CATEGORIES.contains(&kind.as_str())
+                    && !self
+                        .config
+                        .dictionaries
+                        .keys()
+                        .chain(self.config.patterns.keys())
+                        .any(|custom| crate::categories::canonical(custom) == kind)
+                {
+                    return Err(Error::ConfigInvalid);
+                }
+            }
+        }
+        if let Some(ttl) = ttl {
+            self.ttl = Duration::try_from_secs_f64(ttl).map_err(|_| Error::ConfigInvalid)?;
+            if self.ttl.is_zero() {
+                return Err(Error::ConfigInvalid);
+            }
+            self.config.ttl_seconds = ttl;
+        }
+        // A deployment category list is authoritative, including NUMBER.
+        self.config.mask_money = crate::categories::allows(&categories, "MONEY");
+        self.config.mask_dates = crate::categories::allows(&categories, "DATE");
+        self.config.mask_all_numbers = crate::categories::allows(&categories, "NUMBER");
+        self.categories = categories;
+        Ok(self)
     }
     pub fn epoch(&self) -> u64 {
         self.config.epoch

@@ -392,9 +392,18 @@ impl Rules {
         text: &str,
         structural: bool,
         ner: Option<&mut NerModel>,
+        categories: &crate::categories::Categories,
     ) -> Result<Vec<Prediction>> {
         let mut output = Vec::new();
         for rule in &self.rules {
+            if !crate::categories::allows(categories, &rule.pattern.entity_type)
+                && !rule
+                    .failure_entity_type
+                    .as_ref()
+                    .is_some_and(|kind| crate::categories::allows(categories, kind))
+            {
+                continue;
+            }
             for capture in rule.expression.captures_iter(text) {
                 let capture = capture.map_err(|_| Error::DetectionFailed)?;
                 let matched = match &rule.pattern.group {
@@ -430,15 +439,20 @@ impl Rules {
                     unit: None,
                 };
                 if let Some(p) = self.process(text, p, Some(rule))? {
-                    output.push(p);
+                    if crate::categories::allows(categories, &p.entity_type) {
+                        output.push(p);
+                    }
                 }
                 if output.len() > 65536 {
                     return Err(Error::ResourceLimit);
                 }
             }
         }
-        if !structural {
-            for e in ner.ok_or(Error::DetectionFailed)?.predict(text)? {
+        if !structural && crate::categories::uses_ner(categories) {
+            for e in ner
+                .ok_or(Error::DetectionFailed)?
+                .predict_selected(text, categories)?
+            {
                 let kind = match e.label.as_str() {
                     "PER" => "PERSON",
                     "ORG" => "ORGANIZATION",
@@ -446,6 +460,9 @@ impl Rules {
                     "TIME" => "DATE_TIME",
                     _ => return Err(Error::DetectionFailed),
                 };
+                if !crate::categories::allows(categories, kind) {
+                    continue;
+                }
                 let p = Prediction {
                     entity_type: kind.into(),
                     start: e.start,
@@ -457,7 +474,7 @@ impl Rules {
                     unit: None,
                 };
                 if let Some(p) = self.process(text, p, None)? {
-                    if p.score >= 0.5 {
+                    if p.score >= 0.5 && crate::categories::allows(categories, &p.entity_type) {
                         output.push(p);
                     }
                 }
@@ -494,11 +511,21 @@ impl Rules {
         });
         Ok(output)
     }
+    #[cfg(test)]
     pub(super) fn analyze(
         &self,
         text: &str,
         options: &AnalyzeOptions,
+        ner: Option<&mut NerModel>,
+    ) -> Result<Vec<Prediction>> {
+        self.analyze_selected(text, options, ner, &None)
+    }
+    pub(super) fn analyze_selected(
+        &self,
+        text: &str,
+        options: &AnalyzeOptions,
         mut ner: Option<&mut NerModel>,
+        categories: &crate::categories::Categories,
     ) -> Result<Vec<Prediction>> {
         let references: Vec<_> = TOKEN_RE
             .find_iter(text)
@@ -516,9 +543,12 @@ impl Rules {
             .chain(std::iter::once((text.len(), text.len())))
         {
             if !text[lower..upper].trim().is_empty() {
-                for mut p in
-                    self.fragment(&text[lower..upper], options.structural, ner.as_deref_mut())?
-                {
+                for mut p in self.fragment(
+                    &text[lower..upper],
+                    options.structural,
+                    ner.as_deref_mut(),
+                    categories,
+                )? {
                     p.start += lower;
                     p.end += lower;
                     results.push(p);
@@ -528,6 +558,9 @@ impl Rules {
         }
         if !options.field.is_empty() && !options.structural && !scan.trim().is_empty() {
             for (kind, pattern) in &self.fields {
+                if !crate::categories::allows(categories, kind) {
+                    continue;
+                }
                 if pattern
                     .find(&options.field)
                     .map_err(|_| Error::DetectionFailed)?
@@ -573,7 +606,9 @@ impl Rules {
                         unit: None,
                     };
                     if let Some(p) = self.process(&scan, p, Some(&spec))? {
-                        results.push(p);
+                        if crate::categories::allows(categories, &p.entity_type) {
+                            results.push(p);
+                        }
                     }
                 }
             }
@@ -643,17 +678,7 @@ impl Rules {
                 let mut item = p.clone();
                 item.start = start;
                 item.end = end;
-                item.entity_type = match p.entity_type.as_str() {
-                    "EMAIL_ADDRESS" => "EMAIL",
-                    "PHONE_NUMBER" => "PHONE",
-                    "CHINA_ID" | "ID_NUMBER" => "ID",
-                    "CREDIT_CARD" => "ACCOUNT",
-                    "PASSWORD" => "SECRET",
-                    "ORGANIZATION" => "ORG",
-                    "DATE_TIME" => "DATE",
-                    other => other,
-                }
-                .into();
+                item.entity_type = crate::categories::canonical(&p.entity_type).into();
                 if item.entity_type == "MONEY" {
                     let fragment = &text[start..end];
                     match self
@@ -699,6 +724,8 @@ impl Rules {
                             item.start = start + number.start();
                             item.end = start + number.end();
                         }
+                        // Unsupported money formats stay protected as opaque values;
+                        // category selection applies to the detected MONEY source.
                         _ => item.entity_type = "CONFIDENTIAL".into(),
                     }
                 }

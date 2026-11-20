@@ -1,0 +1,46 @@
+server:
+  host: 127.0.0.1
+  port: 8775
+  ttl_seconds: 86400
+  upstream: https://api.deepseek.com
+  models:
+    - deepseek-flash
+  token_file: /root/.config/censorprivacy/managed/gateway.token
+  upstream_key_file: /root/.config/censorprivacy/managed/upstream.key
+  upstream_ca_file: null
+  tls_cert: null
+  tls_key: null
+  tls_direct: false
+  allow_http_test_upstream: false
+  run_state_file: /root/.config/censorprivacy/managed/run.json
+
+detection:
+  categories: all
+  sensitive_paths: []
+
+ner:
+  threads: 4
+  device: cpu
+  batch_size: 1
+  window_timeout_seconds: 16
+  model_dir: models/bert4ner-base-chinese
+  ort_library: target/lib/censorprivacy/libonnxruntime.so
+
+custom:
+  epoch: 1
+  dictionaries:
+    PERSON:
+      - 小明
+    ORG:
+      - 示例客户甲
+  patterns: {}
+  default_labels:
+    - confidential
+
+limits:
+  max_body_bytes: 8388608
+  max_decoded_bytes: 33554432
+  upstream_timeout_seconds: 360
+
+private_tools_file: null
+conversation_records_dir: /root/.config/censorprivacy/managed/xiaoo/records

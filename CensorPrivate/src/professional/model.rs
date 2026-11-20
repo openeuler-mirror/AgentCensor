@@ -16,8 +16,8 @@ use std::{
 };
 use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
-fn inference_budget(window_count: usize) -> std::time::Duration {
-    std::time::Duration::from_secs(16 * window_count as u64)
+fn inference_budget(window_count: usize, seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(seconds * window_count as u64)
 }
 
 // ONNX Runtime termination is cooperative. A timed-out inference is rejected;
@@ -145,9 +145,13 @@ pub(super) struct NerModel {
     labels: Vec<String>,
     batch_size: usize,
     pad_id: u32,
+    window_timeout_seconds: u64,
 }
 impl NerModel {
     pub(super) fn load(config: &ProfessionalConfig) -> Result<Self> {
+        if !(1..=3600).contains(&config.window_timeout_seconds) {
+            return Err(Error::NerConfigInvalid);
+        }
         if !(1..=256).contains(&config.ner_threads) {
             return Err(Error::DetectionFailed);
         }
@@ -260,6 +264,7 @@ impl NerModel {
             labels: manifest.labels,
             batch_size: config.ner_batch_size,
             pad_id,
+            window_timeout_seconds: config.window_timeout_seconds,
         })
     }
     pub(super) fn warmup(&mut self) -> Result<()> {
@@ -274,11 +279,19 @@ impl NerModel {
                 "张三在北京工作。",
                 &self.labels,
                 self.pad_id,
+                self.window_timeout_seconds,
             )?;
         }
         Ok(())
     }
     pub(super) fn predict(&mut self, text: &str) -> Result<Vec<NerEntity>> {
+        self.predict_selected(text, &None)
+    }
+    pub(super) fn predict_selected(
+        &mut self,
+        text: &str,
+        categories: &crate::categories::Categories,
+    ) -> Result<Vec<NerEntity>> {
         if text.is_empty() {
             return Ok(Vec::new());
         }
@@ -291,13 +304,20 @@ impl NerModel {
             .collect();
         let labels = &self.labels;
         let pad_id = self.pad_id;
+        let timeout = self.window_timeout_seconds;
         let batches = batch::dispatch(
             &mut self.sessions,
             &windows,
             self.batch_size,
-            |session, windows| infer_batch(session, windows, text, labels, pad_id),
+            |session, windows| infer_batch(session, windows, text, labels, pad_id, timeout),
         )?;
-        let mut entities: Vec<_> = batches.into_iter().flatten().collect();
+        // Filter before resolving duplicate/overlapping window predictions so
+        // a disabled label cannot replace an enabled label at a window edge.
+        let mut entities: Vec<_> = batches
+            .into_iter()
+            .flatten()
+            .filter(|entity| crate::categories::allows(categories, &entity.label))
+            .collect();
         entities.sort_by_key(|e| e.start);
         let mut selected: Vec<NerEntity> = Vec::new();
         for entity in entities {
@@ -323,6 +343,7 @@ fn infer_batch(
     text: &str,
     labels: &[String],
     pad_id: u32,
+    window_timeout_seconds: u64,
 ) -> Result<Vec<NerEntity>> {
     let width = windows
         .iter()
@@ -349,9 +370,9 @@ fn infer_batch(
             .map_err(|_| Error::DetectionFailed)
     };
     let inputs = ort::inputs!["input_ids"=>tensor(ids)?, "attention_mask"=>tensor(mask)?, "token_type_ids"=>tensor(types)?];
-    // ORT runs a tensor batch as one unit. Grant 16 s per window in
+    // ORT runs a tensor batch as one unit. Grant the configured time per window in
     // this run, including a short final batch; queued windows wait separately.
-    let deadline = Deadline::new(inference_budget(count))?;
+    let deadline = Deadline::new(inference_budget(count, window_timeout_seconds))?;
     let options = deadline.options.clone();
     let output = session
         .run_with_options(inputs, &*options)

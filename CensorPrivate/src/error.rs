@@ -3,6 +3,7 @@ use std::fmt;
 /// Public failures carry fixed reason codes, never request data or library errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    ConfigInvalid,
     PolicyInvalid,
     DetectionFailed,
     NerConfigInvalid,
@@ -29,6 +30,7 @@ pub enum Error {
 impl Error {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::ConfigInvalid => "config_invalid",
             Self::PolicyInvalid => "policy_invalid",
             Self::DetectionFailed => "detection_failed",
             Self::NerConfigInvalid => "ner_config_invalid",
