@@ -25,7 +25,7 @@ fn register(vault: &RunVault, cap: &RunCapability, value: &str, kind: &str) -> R
 fn references_are_opaque_and_bound_to_run_and_vault() {
     let (vault, cap) = vault();
     let reference = register(&vault, &cap, "张三", "PERSON");
-    assert_eq!(reference.as_str().len(), "<CP_PERSON_>".len() + 32);
+    assert_eq!(reference.as_str().len(), "<CP_PERSON_>".len() + 8);
     assert_eq!(
         vault.restore_text(&cap, 1, reference.as_str()).unwrap(),
         "张三"
@@ -40,7 +40,7 @@ fn references_are_opaque_and_bound_to_run_and_vault() {
         unrelated.restore_text(&cap, 1, reference.as_str()),
         Err(Error::VaultDenied)
     ));
-    let fake = "<CP_PERSON_00000000000000000000000000000000>";
+    let fake = "<CP_PERSON_00000000>";
     let protected = vault.protect_text(&cap, 1, fake, vec![]).unwrap();
     assert_ne!(protected, fake);
     assert_eq!(vault.restore_text(&cap, 1, &protected).unwrap(), fake); // no recursive expansion
@@ -48,6 +48,33 @@ fn references_are_opaque_and_bound_to_run_and_vault() {
         vault.restore_text(&cap, 1, fake),
         Err(Error::VaultDenied)
     ));
+}
+
+#[test]
+fn short_references_round_trip_many_distinct_values() {
+    let (vault, cap) = vault();
+    let mut issued = BTreeSet::new();
+    for index in 0..256 {
+        let value = format!("客户{index}");
+        let reference = register(&vault, &cap, &value, "CUSTOMER");
+        let suffix = reference
+            .as_str()
+            .strip_prefix("<CP_CUSTOMER_")
+            .unwrap()
+            .strip_suffix('>')
+            .unwrap();
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
+        assert!(issued.insert(reference.clone()));
+        assert_eq!(Reference::parse(reference.as_str()).unwrap(), reference);
+        assert_eq!(register(&vault, &cap, &value, "CUSTOMER"), reference);
+        assert_eq!(
+            vault.restore_text(&cap, 1, reference.as_str()).unwrap(),
+            value
+        );
+    }
 }
 
 #[test]

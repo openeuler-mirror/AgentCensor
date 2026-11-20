@@ -39,12 +39,12 @@ Rust 进程动态加载 libonnxruntime.so，不启动 Python。可使用 ONNX Ru
 ```bash
 export CP_DETECTOR_MODEL_DIR=$PWD/models/bert4ner-base-chinese
 export CP_DETECTOR_ORT_LIBRARY=$(find "$PWD/.venv-model/lib" -path '*/onnxruntime/capi/libonnxruntime.so*' -type f -print -quit)
-./cpctl doctor
+./censorprivacy doctor
 cargo build --locked --release --bins
 bash scripts/test/detector.sh --integration
 CP_TEST_REAL_DETECTOR=1 bash scripts/test/native.sh
 ```
 
-上例 library 路径仅用于开发机。正式部署应将模型包和平台匹配的原生库放到服务账户可读的稳定目录，分别配置 CP_DETECTOR_MODEL_DIR 和 CP_DETECTOR_ORT_LIBRARY，不依赖准备环境的 venv 路径。运行时参数和安装布局见 [检测器部署说明](../../docs/rust-detector.md)。
+上例 library 路径仅用于开发机。正式部署应将模型包和平台匹配的原生库放到服务账户可读的稳定目录，在 `config.yaml` 的 `ner.model_dir`、`ner.ort_library` 中保存路径，不依赖准备环境的 venv。环境变量与 YAML 的优先级、安装布局见 [检测器部署说明](../../docs/rust-detector.md)。
 
 模型/运行库、源权重、虚拟环境和日志不进 Git。Git 保留导出工具、依赖版本、固定样本、产物结构/哈希和许可来源。完整 Python 迁移资料仅在本地保留；源码构建、导出和回归测试使用仓库内的文件即可完成。

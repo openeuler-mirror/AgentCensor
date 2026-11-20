@@ -9,7 +9,7 @@ import { resolve, join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 const { chromium } = createRequire(import.meta.url)(process.env.CP_PLAYWRIGHT_MODULE || 'playwright');
-const server = spawn(resolve(process.argv[2] || 'target/debug/censorprivacy'), ['web', '--port', '0'], {
+const server = spawn(resolve(process.argv[2] || 'target/debug/censorprivacy'), ['web', '--no-config', '--port', '0'], {
   env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
 });
 let diagnostics = '';
@@ -21,7 +21,7 @@ try {
     server.once('error', error => { clearTimeout(timer); fail(error); });
     server.once('exit', () => { clearTimeout(timer); fail(new Error('Web exited: ' + diagnostics)); });
     createInterface({ input: server.stdout }).on('line', line => {
-      const match = line.match(/^Privacy Detector: (http:\/\/127\.0\.0\.1:\d+)\/$/);
+      const match = line.match(/^CensorPrivacy: (http:\/\/127\.0\.0\.1:\d+)\/$/);
       if (match) { clearTimeout(timer); ok(match[1]); }
     });
   });
@@ -54,7 +54,7 @@ try {
   page.on('request', request => requests.push(request.url()));
   const response = await page.goto(origin);
   assert.equal(response.headers()['cache-control'], 'no-store');
-  assert.equal(await page.title(), '隐私检测台 · Privacy Detector');
+  assert.equal(await page.title(), '隐私检测台 · CensorPrivacy');
   const text = '😀张三在清华大学工作，邮箱alice@example.com。\n配送地址：广东省广州市荔湾区人民路68号27栋1442室，联系人张三（13800138000）。\n车牌号京AABCDE；护照E12345678；身份证号110105 19491231 002X；还款卡号4111111111111112；普通数量42\n密码："two words!"；重复密码：two words!';
   await page.locator('#text-input').fill(text);
   await page.locator('#mask-style').selectOption('label');
@@ -73,6 +73,14 @@ try {
   for (const value of ['张三','清华大学','alice@example.com','京AABCDE','E12345678','110105 19491231 002X','4111111111111112','two words!']) assert.ok(!masked.includes(value), value);
   assert.ok(masked.includes('普通数量42'));
   assert.ok(masked.includes('[REDACTED_SECRET]'));
+  await page.locator('#mask-style').selectOption('reference');
+  const referenceResponse = page.waitForResponse(response => response.url() === origin + '/api/analyze');
+  await page.locator('#analyze').click();
+  await referenceResponse;
+  await page.waitForFunction(() => document.querySelector('#masked-text').value.includes('<CP_EMAIL_'));
+  const references = [...(await page.locator('#masked-text').inputValue()).matchAll(/<CP_[A-Z][A-Z0-9_]*_([^>]+)>/g)];
+  assert.ok(references.length > 0);
+  for (const match of references) assert.match(match[1], /^[a-z0-9]{8}$/);
   const directory = resolve(process.env.CP_WEB_SCREENSHOT_DIR || '.artifacts/detector-web');
   await mkdir(directory, {recursive:true});
   await page.screenshot({path:join(directory,'desktop.png'),fullPage:true});

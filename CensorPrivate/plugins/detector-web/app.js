@@ -542,7 +542,7 @@ async function syncConversations() {
     if (!response.ok) throw new Error("会话服务暂时不可用，正在重连…");
     const data = await response.json();
     if (currentRevision !== conversationRevision) return;
-    $("#conversation-status").textContent = data.enabled ? "自动同步 · 本机保存" : "尚未连接 · 使用 cpctl start 启用";
+    $("#conversation-status").textContent = data.enabled ? "自动同步 · 本机保存" : "尚未连接 · 使用 censorprivacy start 启用";
     $("#clear-conversations").disabled = !data.enabled || !data.sessions.length;
     if (!data.enabled) return;
     if (!selectedSession && data.sessions.length) selectedSession = data.sessions[0].id;

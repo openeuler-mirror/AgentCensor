@@ -53,7 +53,7 @@ print(json.dumps({"values": [str(len(json.load(sys.stdin)["inputs"]))]}))
     let apple = gate.protect_text("Fictional Apple", "").unwrap();
     let secret = gate.protect_text("LOCAL_ONLY_SECRET", "").unwrap();
     let money = gate.protect_text("700.00元", "").unwrap();
-    let amount = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+    let amount = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
         .unwrap()
         .find(&money)
         .unwrap()
