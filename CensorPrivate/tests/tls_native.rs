@@ -139,7 +139,7 @@ async fn real_tls_fragments_retries_curl_and_local_compute_never_send_raw_data()
     fs::write(directory.join("run"), json!({"run_id":run}).to_string()).unwrap();
     fs::set_permissions(directory.join("run"), fs::Permissions::from_mode(0o600)).unwrap();
     let library = root
-        .join("native/libcp_tls_guard.so")
+        .join("native/libcensorprivacy_tls_guard.so")
         .canonicalize()
         .unwrap();
     let client = std::env::var_os("CP_NATIVE_TEST_CLIENT")
@@ -163,7 +163,8 @@ async fn real_tls_fragments_retries_curl_and_local_compute_never_send_raw_data()
         let mut request=format!("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).into_bytes();
         request.extend_from_slice(&body);
         fs::write(directory.join("request"), request).unwrap();
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_tls-run"));
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_censorprivacy"));
+        command.arg("tls-run");
         command.args([
             "--broker",
             &broker,
@@ -230,7 +231,8 @@ async fn real_tls_fragments_retries_curl_and_local_compute_never_send_raw_data()
         br#"{"model":"configured-model","messages":[{"role":"user","content":"Alice 100.00"}]}"#,
     )
     .unwrap();
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_tls-run"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_censorprivacy"))
+        .arg("tls-run")
         .args([
             "--broker",
             &broker,

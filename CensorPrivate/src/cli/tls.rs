@@ -6,7 +6,7 @@ mod linux {
         json,
     };
     use censorprivacy_runtime_sys as sys;
-    use clap::Parser;
+    use clap::Args;
     use futures_util::StreamExt;
     use serde_json::{json, Value};
     use std::{
@@ -22,12 +22,8 @@ mod linux {
         process::{Child, Command},
         time::{Duration, Instant},
     };
-    #[derive(Parser)]
-    #[command(
-        name = "tls-run",
-        about = "Launch a cooperating dynamic OpenSSL HTTP/1.1 JSON client"
-    )]
-    struct Cli {
+    #[derive(Args)]
+    pub struct Options {
         #[arg(long, default_value = "http://127.0.0.1:8765")]
         broker: String,
         #[arg(long)]
@@ -38,7 +34,7 @@ mod linux {
         upstream_key_file: Option<PathBuf>,
         #[arg(
             long,
-            default_value = "/usr/local/lib/censorprivacy/libcp_tls_guard.so"
+            default_value = "/usr/local/lib/censorprivacy/libcensorprivacy_tls_guard.so"
         )]
         native_library: PathBuf,
         #[arg(long, default_value = ".")]
@@ -200,7 +196,7 @@ mod linux {
         }
         Ok(value)
     }
-    async fn run(mut cli: Cli) -> Result<i32> {
+    async fn run(mut cli: Options) -> Result<i32> {
         let timeout = Duration::try_from_secs_f64(cli.timeout).map_err(|_| Error::TlsBlocked)?;
         if timeout.is_zero() {
             return Err(Error::TlsBlocked);
@@ -332,11 +328,10 @@ mod linux {
         use std::os::unix::process::ExitStatusExt;
         Ok(exit.code().unwrap_or(128 + exit.signal().unwrap_or(0)))
     }
-    pub fn main() -> i32 {
+    pub fn execute(cli: Options) -> i32 {
         std::panic::set_hook(Box::new(|_| {
             eprintln!("{{\"error\":{{\"code\":\"processing_failed\"}}}}")
         }));
-        let cli = Cli::parse();
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -399,12 +394,17 @@ mod linux {
         }
     }
 }
-fn main() {
-    #[cfg(target_os = "linux")]
-    std::process::exit(linux::main());
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("Linux required");
-        std::process::exit(125);
-    }
+#[cfg(target_os = "linux")]
+pub use linux::Options;
+#[cfg(target_os = "linux")]
+pub fn run(options: Options) -> i32 {
+    linux::execute(options)
+}
+#[cfg(not(target_os = "linux"))]
+#[derive(clap::Args)]
+pub struct Options {}
+#[cfg(not(target_os = "linux"))]
+pub fn run(_: Options) -> i32 {
+    eprintln!("Linux required");
+    125
 }

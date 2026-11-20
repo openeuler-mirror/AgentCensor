@@ -3,7 +3,8 @@ use censorprivacy::control;
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 #[test]
 fn dry_run_and_internal_bootstrap_never_execute_unisolated_commands() {
-    let output = Command::new(env!("CARGO_BIN_EXE_privacy-run"))
+    let output = Command::new(env!("CARGO_BIN_EXE_censorprivacy"))
+        .arg("run")
         .args([
             "--run-id",
             "dry-run",
@@ -27,7 +28,7 @@ fn dry_run_and_internal_bootstrap_never_execute_unisolated_commands() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["seccomp_required"], true);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("private-path-marker"));
-    let output = Command::new(env!("CARGO_BIN_EXE_privacy-run"))
+    let output = Command::new(env!("CARGO_BIN_EXE_censorprivacy"))
         .args(["--internal-bootstrap", "0", "1"])
         .output()
         .unwrap();

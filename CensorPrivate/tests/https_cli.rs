@@ -196,7 +196,11 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
     };
     fs::write(directory.join("token"), TOKEN).unwrap();
     fs::set_permissions(directory.join("token"), fs::Permissions::from_mode(0o600)).unwrap();
-    fs::write(directory.join("policy.yaml"), "epoch: 1\n").unwrap();
+    fs::write(
+        directory.join("config.yaml"),
+        "custom: {epoch: 1}\ndetection: {categories: all}\n",
+    )
+    .unwrap();
     let upstream = format!("https://{provider_address}");
     let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_censorprivacy"))
@@ -210,8 +214,8 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
                 &port.to_string(),
                 "--token-file",
                 directory.join("token").to_str().unwrap(),
-                "--policy",
-                directory.join("policy.yaml").to_str().unwrap(),
+                "--config",
+                directory.join("config.yaml").to_str().unwrap(),
                 "--run-state-file",
                 directory.join("run.json").to_str().unwrap(),
                 "--upstream-ca-file",
@@ -275,17 +279,17 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
         .unwrap()
         .to_owned();
     assert!(!protected.contains("张三"));
-    let reference = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+    let reference = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
         .unwrap()
         .find(&protected)
         .unwrap()
         .as_str()
         .to_owned();
     // The CLI shares the checked HTTP client; its output never includes raw results.
-    // Use a local HTTP service for the control-plane tool, as privacy-run does.
+    // Use a local HTTP service for the control-plane tool, as censorprivacy run does.
     let gate = PrivacyGate::new(PrivacyPolicy::default(), GateOptions::default()).unwrap();
     let money = gate.protect_text("奖金100元", "").unwrap();
-    let tool_ref = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+    let tool_ref = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
         .unwrap()
         .find(&money)
         .unwrap()
@@ -305,7 +309,8 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
     let tool_task = tokio::spawn(async move {
         axum::serve(tool_listener, router).await.unwrap();
     });
-    let computed = Command::new(env!("CARGO_BIN_EXE_privcalc"))
+    let computed = Command::new(env!("CARGO_BIN_EXE_censorprivacy"))
+        .arg("compute")
         .args(["sum", &tool_ref])
         .env_clear()
         .env("CENSORPRIVACY_URL", &tool_base)
@@ -336,7 +341,11 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
         .await
         .unwrap();
     assert_eq!(rejected.status(), axum::http::StatusCode::BAD_GATEWAY);
-    fs::write(directory.join("policy.yaml"), "epoch: 2\n").unwrap();
+    fs::write(
+        directory.join("config.yaml"),
+        "custom: {epoch: 2}\ndetection: {categories: all}\n",
+    )
+    .unwrap();
     let status = Command::new("kill")
         .args(["-HUP", &child.0.id().to_string()])
         .status()
@@ -351,7 +360,7 @@ async fn https_process_reloads_policy_and_runs_private_calculation() {
         .await
         .unwrap();
     assert_eq!(revoked.status(), reqwest::StatusCode::BAD_REQUEST);
-    fs::write(directory.join("policy.yaml"), "epoch: invalid\n").unwrap();
+    fs::write(directory.join("config.yaml"), "custom: {epoch: invalid}\n").unwrap();
     let status = Command::new("kill")
         .args(["-HUP", &child.0.id().to_string()])
         .status()

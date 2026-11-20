@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-const REF: &str = "<CP_NUMBER_0123456789abcdef0123456789abcdef>";
+const REF: &str = "<CP_NUMBER_01234567>";
 const TOKEN: &str = "local-test-token-01234567890123456789";
 struct Client {
     calls: Arc<AtomicUsize>,
@@ -110,7 +110,7 @@ async fn untrusted_http_or_inprocess_tool_results_never_release_plain_values() {
         json!({"results":{"mean":REF}}),
         json!({"operation":"mean","results":{"sum":REF}}),
         json!({"results":{"sum":REF},"unit":"raw-private-unit"}),
-        json!({"results":{"sum":REF},"result":"<CP_NUMBER_11111111111111111111111111111111>"}),
+        json!({"results":{"sum":REF},"result":"<CP_NUMBER_11111111>"}),
     ] {
         let (mut bridge, _) = bridge(result, false);
         initialize(&mut bridge).await;
