@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 fail() { printf '错误：%s\n' "$*" >&2; exit 1; }
 note() { printf '%s\n' "$*"; }
-need() { command -v "$1" >/dev/null || fail "缺少 $1；先运行 ./cpctl doctor 和 ./cpctl deps"; }
+need() { command -v "$1" >/dev/null || fail "缺少 $1；先运行 ./censorprivacy doctor 和 ./censorprivacy deps"; }
 admin() { if [[ $EUID == 0 ]]; then "$@"; else sudo "$@"; fi; }
 execute() {
   if $dry_run; then
@@ -44,7 +44,7 @@ load_config() {
   if [[ -z $ner_batch_size ]]; then ner_batch_size=$(jq -r '.ner_batch_size // 1' "$config_dir/config.json"); fi
   validate_ner_options
   validate_connection
-  private_file "$config_dir/gateway.token"; private_file "$config_dir/curl.headers"; private_file "$config_dir/policy.yaml"
+  private_file "$config_dir/gateway.token"; private_file "$config_dir/curl.headers"
   [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || private_file "$config_dir/upstream.key"
   ca_file=$(jq -r '.ca_file // ""' "$config_dir/config.json")
   if [[ -n $ca_file ]]; then [[ $ca_file == /* ]] || fail 'CA 文件需要绝对路径'; private_file "$ca_file"; fi
@@ -79,7 +79,7 @@ find_bins() {
     bin_dir=$prefix/bin
   elif [[ -f $CP_REPO_ROOT/Cargo.toml && -x $CP_REPO_ROOT/target/release/censorprivacy ]]; then
     bin_dir=$CP_REPO_ROOT/target/release
-  elif [[ -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then
+  elif [[ ! -f $CP_REPO_ROOT/Cargo.toml && -x $CP_DEFAULT_BIN_DIR/censorprivacy ]]; then
     bin_dir=$CP_DEFAULT_BIN_DIR
   elif [[ -f $config_dir/install.json ]]; then
     private_file "$config_dir/install.json"
@@ -87,7 +87,7 @@ find_bins() {
   elif [[ -x $prefix/bin/censorprivacy ]]; then bin_dir=$prefix/bin
   else bin_dir=$CP_REPO_ROOT/target/release; fi
   [[ $bin_dir == /* && $bin_dir != *$'\n'* ]] || fail '无效安装路径'
-  [[ -x $bin_dir/censorprivacy ]] || fail '找不到 Rust 可执行文件；先运行 ./cpctl install'
+  [[ -x $bin_dir/censorprivacy ]] || fail '找不到 Rust 可执行文件；先运行 ./censorprivacy install'
 }
 auth_curl() {
   curl --noproxy '*' --silent --show-error --connect-timeout 2 --max-time 90 --header "@$config_dir/curl.headers" "$@"
@@ -98,7 +98,7 @@ service_ready() {
   local response code
   readiness_error=; ready_response=
   if ! response=$(auth_curl --max-time 5 --write-out $'\n%{http_code}' "http://127.0.0.1:$port/ready" 2>/dev/null); then
-    readiness_error='无法连接当前服务；请执行 ./cpctl start；若进程仍在运行，先 ./cpctl stop 再启动'
+    readiness_error='无法连接当前服务；请执行 ./censorprivacy start；若进程仍在运行，先 ./censorprivacy stop 再启动'
     return 1
   fi
   code=${response##*$'\n'}
@@ -108,7 +108,7 @@ service_ready() {
     return 1
   fi
   if [[ $code == 400 ]] && jq -e '.error.code == "vault_denied"' <<< "$ready_response" >/dev/null 2>&1; then
-    readiness_error='当前 run 已失效（vault_denied；请检查 policy.yaml 的 ttl_seconds）；执行 ./cpctl stop 后 ./cpctl start，并新建 Agent 会话'
+    readiness_error='当前 run 已失效（vault_denied；请检查 config.yaml 的 server.ttl_seconds）；执行 ./censorprivacy stop 后 ./censorprivacy start，并新建 Agent 会话'
     return 1
   fi
   if [[ $code != 200 ]] || ! jq -e '.status == "ready"' <<< "$ready_response" >/dev/null 2>&1; then
@@ -116,12 +116,12 @@ service_ready() {
     return 1
   fi
   if [[ ! -f $config_dir/run.json ]]; then
-    readiness_error='缺少本实例 run.json；请核对 --config-dir；系统服务请先 ./cpctl systemd check'
+    readiness_error='缺少本实例 run.json；请核对 --config-dir；系统服务请先 ./censorprivacy systemd check'
     return 1
   fi
   private_file "$config_dir/run.json"
   if ! jq -e --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id' <<< "$ready_response" >/dev/null 2>&1; then
-    readiness_error='本地与服务的 run ID 不匹配；请核对 --config-dir；系统服务请先 ./cpctl systemd check'
+    readiness_error='本地与服务的 run ID 不匹配；请核对 --config-dir；系统服务请先 ./censorprivacy systemd check'
     return 1
   fi
 }

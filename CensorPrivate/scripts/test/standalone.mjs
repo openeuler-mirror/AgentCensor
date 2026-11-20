@@ -14,12 +14,12 @@ const home = join(directory, 'home');
 const config = join(directory, 'control');
 await mkdir(home, { mode: 0o700 });
 const env = { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: join(home, '.config'), LANG: 'C.UTF-8' };
-const ctl = join(bundle, 'cpctl');
+const ctl = join(bundle, 'censorprivacy');
 const checks = [];
 const run = async (args, options = {}) => {
   const start = Date.now();
   const result = await exec(ctl, args, { env, cwd: directory, timeout: 180000, maxBuffer: 4 * 1024 * 1024, ...options });
-  checks.push({ command: ['cpctl', ...args], passed: true, elapsed_ms: Date.now() - start });
+  checks.push({ command: ['censorprivacy', ...args], passed: true, elapsed_ms: Date.now() - start });
   return result;
 };
 const call = (operation, ...args) => run([operation, '--config-dir', config, ...args]);
@@ -53,10 +53,10 @@ try {
   for (const excluded of ['Cargo.toml', 'offline', 'tools', 'share/censorprivacy/scripts/model', '.venv', 'target']) {
     await assert.rejects(access(join(bundle, excluded)), { code: 'ENOENT' });
   }
-  for (const binary of ['censorprivacy', 'privacy-run', 'privcalc', 'censorprivacy-mcp', 'tls-run']) {
-    await exec(join(bundle, 'bin', binary), ['--help'], { env, cwd: directory, timeout: 10000 });
+  for (const subcommand of ['', 'serve', 'web', 'compute', 'mcp', 'run', 'tls-run']) {
+    await exec(join(bundle, 'bin/censorprivacy'), [...(subcommand ? [subcommand] : []), '--help'], { env, cwd: directory, timeout: 10000 });
   }
-  checks.push({ check: 'five_binaries_run_without_build_tools', passed: true });
+  checks.push({ check: 'unified_command_runs_without_build_tools', passed: true });
   const selfTest = await run(['self-test']);
   console.log(selfTest.stdout);
   assert.match(selfTest.stdout, /完整交付包自检/);
@@ -90,8 +90,8 @@ try {
   }
   await writeFile(headersPath, headers);
   checks.push({ check: 'check_start_xiaoo_distinguish_authentication_and_run_mismatch', passed: true });
-  const text = await readFile(join(bundle, 'share/censorprivacy/examples/deepseek-restore.txt'), 'utf8');
-  const protectedValues = ['张三', '李四', '清华大学', '北京大学', '13800138000', '13900139000',
+  const text = await readFile(join(bundle, 'share/censorprivacy/examples/demo.txt'), 'utf8');
+  const protectedValues = ['张三', '李四', '清华大学', '13800138000', '13900139000',
     'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '860.00', '1240.00'];
   const response = await fetch('http://127.0.0.1:' + port + '/v1/chat/completions', {
     method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
@@ -151,10 +151,12 @@ try {
   }
   await assert.rejects(fetch('http://127.0.0.1:' + port + '/ready', { signal: AbortSignal.timeout(1000) }));
   checks.push({ check: 'cpu_runtime_rejects_explicit_cuda_and_cann_without_silent_backend_fallback', passed: true });
-  const policyPath = join(config, 'policy.yaml');
-  const policy = await readFile(policyPath, 'utf8');
-  assert.match(policy, /^ttl_seconds: \d+$/m);
-  await writeFile(policyPath, policy.replace(/^ttl_seconds: \d+$/m, 'ttl_seconds: 3'));
+  const deploymentPath = join(bundle, 'share/censorprivacy/config.yaml');
+  const deployment = await readFile(deploymentPath, 'utf8');
+  const expiringConfig = JSON.parse(deployment);
+  assert.equal(typeof expiringConfig.server.ttl_seconds, 'number');
+  expiringConfig.server.ttl_seconds = 3;
+  await writeFile(deploymentPath, JSON.stringify(expiringConfig));
   await call('start');
   const expiringRun = JSON.parse(await readFile(runPath)).run_id;
   const until = Date.now() + 10000;
@@ -173,7 +175,7 @@ try {
   for (const args of [['check'], ['start'], ['xiaoo', 'setup']]) {
     await assert.rejects(call(...args), failure => {
       assert.match(failure.stderr, /run 已失效.*vault_denied/);
-      assert.match(failure.stderr, /cpctl stop.*cpctl start/);
+      assert.match(failure.stderr, /censorprivacy stop.*censorprivacy start/);
       if (args[0] === 'start') assert.match(failure.stderr, /进程仍在运行/);
       assert.ok(!failure.stderr.includes('请先启动当前网关'));
       return true;
@@ -190,7 +192,7 @@ try {
   assert.equal((await rejected.json()).error.code, 'vault_denied');
   assert.equal(requests.length, beforeExpiryRequest);
   await call('stop');
-  await writeFile(policyPath, policy);
+  await writeFile(deploymentPath, deployment);
   await call('start');
   assert.notEqual(JSON.parse(await readFile(runPath)).run_id, expiringRun);
   await call('check');

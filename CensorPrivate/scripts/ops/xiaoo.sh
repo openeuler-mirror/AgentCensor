@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # xiaoO uses its native OpenAI-compatible client, including SSE and tools.
 op_xiaoo() {
-  local action=${rest[0]:-} directory base binary= candidate token session launch_config route prepare_config prepare_log
+  local action=${rest[0]:-} directory base binary= candidate token session launch_config route prepare_config prepare_log demo_source
   local system_prompt='You are xiaoO, a helpful agent connected through a local privacy gateway. Use the available tools to complete the user task. Preserve complete privacy references including their angle brackets; never guess their original values. Answer in plain text when reproducing private material. If a file path is supplied, use it exactly. Do not calculate hidden values with ordinary tools.'
   case "$action" in
     setup|tui|demo|web) [[ ${#rest[@]} == 1 ]] || fail "$action 不接受任务参数" ;;
     run) ;; # The task can also be read from stdin by xiaoO itself.
-    *) fail '用法：./cpctl xiaoo setup|tui|run|demo|web [--xiaoO-path 源码目录]' ;;
+    *) fail '用法：./censorprivacy xiaoo setup|tui|run|demo|web [--xiaoO-path 源码目录]' ;;
   esac
-  if [[ $action == demo ]] && ! $xiaoo_tools; then
-    fail '文件读取演示需要工具；请显式添加 --enable-tools'
+  if [[ $action == demo ]]; then
+    $xiaoo_tools || fail '文件读取演示需要工具；请显式添加 --enable-tools'
+    demo_source=$CP_REPO_ROOT/examples/demo.txt
+    [[ -f $demo_source && -r $demo_source ]] || fail "缺少演示文件：$demo_source"
   fi
   load_config
   [[ $mode == gateway ]] || fail 'xiaoO 当前接入网关模式；请使用 --mode gateway 的配置'
   base="http://127.0.0.1:$port"
   service_ready || fail "$readiness_error"
-  [[ $(jq -r '.xiaoo_web // false' <<< "$ready_response") == true ]] || fail '当前网关未启用会话检测台；更新 censorprivacy 后执行 ./cpctl stop 与 ./cpctl start'
+  [[ $(jq -r '.xiaoo_web // false' <<< "$ready_response") == true ]] || fail '当前网关未启用会话检测台；更新 censorprivacy 后执行 ./censorprivacy stop 与 ./censorprivacy start'
   if [[ $action == web ]]; then
-    note "xiaoO 隐私检测台：$base/；会话自动同步，点击消息查看原文、检测与实际遮蔽结果。"
+    note "xiaoO 隐私检测台：$base/"
     return
   fi
   [[ $(jq -r '.xiaoo_startup_prepare // false' <<< "$ready_response") == true ]] || fail '当前网关不支持工具开关与启动预热；请更新并重启网关'
@@ -27,7 +29,6 @@ op_xiaoo() {
   safe_output "$directory/setup.json"
   safe_output "$directory/config.toml"
   private_dir "$directory/workspace"
-  safe_output "$directory/workspace/privacy-business.txt"
   if [[ -n $xiaoo_bin ]]; then
     [[ $xiaoo_bin == /* && -f $xiaoo_bin && -x $xiaoo_bin ]] || fail '--xiaoo-bin 需要绝对路径的可执行文件'
     binary=$xiaoo_bin
@@ -68,9 +69,12 @@ op_xiaoo() {
   install -m 600 "$launch_config" "$directory/config.toml"
   jq -n --arg binary "$binary" '{binary:$binary}' > "$directory/setup.json"
   chmod 600 "$directory/config.toml" "$directory/setup.json"
-  install -m 600 "$CP_REPO_ROOT/examples/privacy-business.txt" "$directory/workspace/privacy-business.txt"
+  if [[ $action == demo ]]; then
+    safe_output "$directory/workspace/demo.txt"
+    install -m 600 "$demo_source" "$directory/workspace/demo.txt"
+  fi
   if [[ $action == setup ]]; then
-    note "xiaoO 已就绪：$directory/config.toml；./cpctl xiaoo tui 或 ./cpctl xiaoo demo --enable-tools"
+    note "xiaoO 已就绪：$directory/config.toml"
     return
   fi
   token=$(cat "$config_dir/gateway.token")
@@ -96,11 +100,11 @@ op_xiaoo() {
     fi
     note "xiaoO 工具准备完成（用时 $((SECONDS - prepare_started)) 秒），开始对话。"
   else
-    note 'xiaoO 工具已关闭；添加 --enable-tools 可开启。' >&2
+    note 'xiaoO 工具已关闭。' >&2
   fi
   case "$action" in
     tui)
-      note "xiaoO TUI：会话检测台 $base/；点击消息查看检测与遮蔽详情。退出 xiaoO 后网关继续运行。"
+      note "会话检测台：$base/"
       exec "$binary"
       ;;
     run)
@@ -110,9 +114,9 @@ op_xiaoo() {
       exec "$binary" "${args[@]}"
       ;;
     demo)
-      note 'xiaoO：通过 file_read 读取虚构邮件，工具结果经网关脱敏，模型回复在本地恢复。'
+      note 'xiaoO：通过 file_read 读取虚构工单，工具结果经网关脱敏，模型回复在本地恢复。'
       exec "$binary" --cli run --debug --reasoning-effort off --system "$system_prompt" --tools file_read --max-turns 4 \
-        -p '请调用 file_read，参数 file_path 必须填写 privacy-business.txt，使用这个相对路径，不要拼接其他目录。然后按文件开头的要求逐字复述整封邮件。保留全部段落和完整占位符（包括尖括号），使用普通文本，不使用代码块、表格或链接，不计算金额。不要读取其他文件。' </dev/null
+        -p '请调用 file_read，参数 file_path 必须填写 demo.txt，使用这个相对路径，不要拼接其他目录。然后按文件开头的要求逐字复述整份工单。保留全部段落和完整占位符（包括尖括号），使用普通文本，不使用代码块、表格或链接，不计算金额。不要读取其他文件。' </dev/null
       ;;
   esac
 }

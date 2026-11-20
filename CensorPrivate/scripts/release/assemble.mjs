@@ -14,6 +14,11 @@ const root = resolve(import.meta.dirname, '../..');
 const bundle = resolve(flags.directory);
 const share = join(bundle, 'share/censorprivacy');
 const libraries = join(bundle, 'lib/censorprivacy');
+const deploymentPath = join(share, 'config.yaml');
+const deployment = JSON.parse(readFileSync(deploymentPath, 'utf8'));
+deployment.ner.model_dir = 'models/bert4ner-base-chinese';
+deployment.ner.ort_library = '../../lib/censorprivacy/libonnxruntime.so';
+writeFileSync(deploymentPath, JSON.stringify(deployment, null, 2) + '\n');
 const notices = join(share, 'licenses');
 const run = (command, args) => execFileSync(command, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }).trim();
 const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -52,14 +57,14 @@ const ortDestination = join(libraries, 'libonnxruntime.so');
 copy(ort, ortDestination, true);
 const provider = join(dirname(ort), 'libonnxruntime_providers_shared.so');
 if (existsSync(provider)) copy(provider, join(libraries, basename(provider)), true);
-copy(join(root, 'scripts/release/launcher.sh'), join(bundle, 'cpctl'), true);
+copy(join(root, 'scripts/release/launcher.sh'), join(bundle, 'censorprivacy'), true);
 const node = realpathSync(flags.node);
 copy(resolve(dirname(node), '../LICENSE'), join(notices, 'node/LICENSE'));
 const certFile = ['/etc/ssl/certs/ca-certificates.crt', '/etc/pki/tls/certs/ca-bundle.crt'].find(existsSync);
 if (!certFile) throw new Error('No system CA bundle available');
 copy(certFile, join(share, 'ca-bundle.crt'));
 
-const elfFiles = files(join(bundle, 'bin')).filter(path => basename(path) !== 'cpctl');
+const elfFiles = files(join(bundle, 'bin'));
 elfFiles.push(...files(libraries));
 const tools = {};
 for (const name of ['node', 'jq', 'curl', 'openssl', 'awk', 'flock']) {
@@ -71,7 +76,7 @@ for (const name of ['node', 'jq', 'curl', 'openssl', 'awk', 'flock']) {
 }
 tools.node.version = run(node, ['--version']);
 const [nodeMajor, nodeMinor] = tools.node.version.slice(1).split('.').map(Number);
-if (!(nodeMajor === 22 && nodeMinor >= 19 || nodeMajor >= 24)) throw new Error('Node 22.19+ (22.x), or 24+ required');
+if (!(nodeMajor > 24 || nodeMajor === 24 && nodeMinor >= 9)) throw new Error('Node 24.9+ required for DSH 0.2.2-rc.1');
 tools.jq.version = run(join(bundle, 'runtime/bin/jq'), ['--version']);
 tools.curl.version = run(join(bundle, 'runtime/bin/curl'), ['--version']).split('\n')[0];
 tools.openssl.version = run(join(bundle, 'runtime/bin/openssl'), ['version']);
@@ -200,12 +205,13 @@ const metadata = {
   private_tools: { builtin: ['private_compute'], manifest: 'private-tools.json', dsh_native_tools_default: false,
     input: 'current run refs only', outputs: ['order', 'values'], program_network: 'socket syscalls denied',
     max_concurrent_programs: 1 },
+  dsh: { compatibility_target: '0.2.2-rc.1', source_tag: 'dsh-v0.2.2-rc.1', minimum_node: '24.9.0', bundled: false },
   model: { id: manifest.model_id, manifest_sha256: hash(join(sourceModel, 'manifest.json')) },
   onnx_runtime: { input_sha256: hash(ort), delivered_sha256: hash(ortDestination), library: 'lib/censorprivacy/libonnxruntime.so' },
   tools, system_packages: [...systemPackages.keys()].sort(), rustc: run('rustc', ['--version']),
   patchelf: run(flags.patchelf, ['--version']),
   runtime_dependencies: ['Linux x86_64 kernel with /proc', 'glibc >= ' + minimumGlibc, 'Bash and GNU coreutils, grep, sed'],
-  optional: { isolated_agent_runtime: 'privacy-run additionally requires root, iproute2, nftables, libseccomp and namespace support; not part of the gateway/TLS self-test',
+  optional: { isolated_agent_runtime: 'censorprivacy run additionally requires root, iproute2, nftables, libseccomp and namespace support; not part of the gateway/TLS self-test',
     custom_private_tools: 'Operator-registered scripts require Linux libseccomp and their own interpreter/dependencies; not required for private_compute' },
 };
 json(join(share, 'BUNDLE.json'), metadata);

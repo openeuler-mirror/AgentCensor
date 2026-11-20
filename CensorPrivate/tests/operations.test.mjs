@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path';
 
 const exec = promisify(execFile);
 const root = resolve(import.meta.dirname, '..');
-test('installed cpctl: initialization, lifecycle, credential routing and fail closed', { timeout: 180000 }, async () => {
+test('installed censorprivacy: initialization, lifecycle, credential routing and fail closed', { timeout: 180000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cp-ops-test-'));
   const config = join(directory, 'control'); const prefix = join(directory, 'prefix');
   let received = 0; const captured = []; const providerKey = 'fictional-provider-credential-for-test';
@@ -22,7 +22,7 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
     response.setHeader('Content-Type', 'application/json');
     response.setHeader('Connection', 'close');
     if (body.messages.some(message => message.role === 'user' && message.content.includes('cp_custom_sort_probe'))) {
-      const operands = body.messages.flatMap(message => message.role === 'user' ? message.content.match(/<CP_CUSTOMER_[0-9a-f]{32}>/g) || [] : []);
+      const operands = body.messages.flatMap(message => message.role === 'user' ? message.content.match(/<CP_CUSTOMER_[a-z0-9]{8}>/g) || [] : []);
       if (operands.length !== 2) { response.writeHead(400); response.end('{}'); return; }
       const tool = body.messages.find(message => message.role === 'tool');
       if (tool) {
@@ -41,12 +41,24 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
   await new Promise(ok => upstream.listen(0, '127.0.0.1', ok));
   const reserve = createServer(); await new Promise(ok => reserve.listen(0, '127.0.0.1', ok));
   const port = reserve.address().port; await new Promise(ok => reserve.close(ok));
-  const command = join(prefix, 'bin/cpctl');
+  const command = join(prefix, 'bin/censorprivacy');
   const call = (operation, ...args) => exec(command, [operation, '--config-dir', config, ...args], { cwd: directory, timeout: 60000, maxBuffer: 1024 * 1024 });
   try {
-    await exec(join(root, 'cpctl'), ['install', '--tls', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 60000 });
-    for (const binary of ['censorprivacy', 'privacy-run', 'privcalc', 'censorprivacy-mcp', 'tls-run', 'cpctl']) assert.ok((await stat(join(prefix, 'bin', binary))).mode & 0o111);
+    await exec(join(root, 'censorprivacy'), ['install', '--tls', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 60000 });
+    assert.ok((await stat(join(prefix, 'bin/censorprivacy'))).mode & 0o111);
+    for (const legacy of ['cpctl', 'privacy-run', 'privcalc', 'censorprivacy-mcp', 'tls-run']) {
+      await assert.rejects(stat(join(prefix, 'bin', legacy)), { code: 'ENOENT' });
+    }
     await stat(join(prefix, 'share/censorprivacy/docs/usage.md'));
+    await stat(join(prefix, 'share/censorprivacy/config.yaml'));
+    await assert.rejects(stat(join(prefix, 'share/censorprivacy/examples/policy.yaml')), { code: 'ENOENT' });
+    await assert.rejects(stat(join(prefix, 'share/censorprivacy/policy.example.yaml')), { code: 'ENOENT' });
+    const installedSettings = JSON.parse(await readFile(join(prefix, 'share/censorprivacy/config.yaml'), 'utf8'));
+    assert.equal(installedSettings.ner.model_dir, null);
+    assert.equal(installedSettings.server.token_file, null);
+    assert.equal(installedSettings.server.ttl_seconds, 86400);
+    assert.equal(installedSettings.detection.categories, 'all');
+    await stat(join(prefix, 'share/censorprivacy/docs/configuration.md'));
     await stat(join(prefix, 'share/censorprivacy/LICENSE'));
     await stat(join(prefix, 'share/censorprivacy/docs/rust-detector.md'));
     await assert.rejects(stat(join(prefix, 'share/censorprivacy/detector/worker.py')), { code: 'ENOENT' });
@@ -64,15 +76,16 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
     await assert.rejects(call('start'),failure=>/配置格式错误/.test(failure.stderr));
     await writeFile(join(config,'config.json'),before);
     assert.equal((await stat(config)).mode & 0o777, 0o700);
-    for (const file of ['config.json', 'policy.yaml', 'upstream.key', 'gateway.token', 'curl.headers']) assert.equal((await stat(join(config, file))).mode & 0o777, 0o600);
+    for (const file of ['config.json', 'upstream.key', 'gateway.token', 'curl.headers']) assert.equal((await stat(join(config, file))).mode & 0o777, 0o600);
+    await assert.rejects(stat(join(config, 'policy.yaml')), { code: 'ENOENT' });
     if (process.env.CP_TEST_DSH_ROOT) {
-      await writeFile(join(config, 'policy.yaml'), 'epoch: 1\ndictionaries:\n  CUSTOMER: [Fictional Zebra, Fictional Apple]\n');
       await writeFile(join(config, 'private-tools.json'), JSON.stringify({ tools: [{
         name: 'private_sort', description: 'Sort the provided private text references.',
         command: ['/usr/bin/python3', '-I', join(prefix, 'share/censorprivacy/examples/private-tools/sort.py')],
         output: 'order',
       }] }), { mode: 0o600 });
     }
+    await writeFile(join(prefix, 'share/censorprivacy/config.yaml'), 'server: {ttl_seconds: 86400}\ncustom: {epoch: 1, dictionaries: {CUSTOMER: [Fictional Zebra, Fictional Apple]}}\ndetection: {categories: all}\nner: {threads: 3}\n');
     await call('start'); await call('check', '--model'); assert.equal(received, 1);
     assert.deepEqual(captured[0].thinking, { type: 'disabled' });
     if (process.env.CP_TEST_DSH_ROOT) {
@@ -96,7 +109,7 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
         assert.deepEqual(body.tools.map(tool => tool.function.name).sort(), ['private_compute', 'private_sort']);
       }
       const originalRefs = sortRequests[0].messages.flatMap(message => message.role === 'user'
-        ? message.content.match(/<CP_CUSTOMER_[0-9a-f]{32}>/g) || [] : []);
+        ? message.content.match(/<CP_CUSTOMER_[a-z0-9]{8}>/g) || [] : []);
       const toolResult = sortRequests[1].messages.find(message => message.role === 'tool');
       assert.deepEqual(JSON.parse(toolResult.content), { refs: originalRefs.toReversed() });
       await call('dsh', 'run', '--enable-tools', 'Reply with OK and do not use tools.');
@@ -107,7 +120,7 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
     await chmod(config, 0o755);
     await assert.rejects(call('check'), failure => /0700/.test(failure.stderr));
     await chmod(config, 0o700);
-    await assert.rejects(exec(join(root, 'cpctl'), ['install', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 20000 }));
+    await assert.rejects(exec(join(root, 'censorprivacy'), ['install', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 20000 }));
     const firstRun = JSON.parse(await readFile(join(config, 'run.json'))).run_id;
     await assert.rejects(call('start'));
     // A stale process record must never authorize signalling a reused PID.
@@ -118,7 +131,7 @@ test('installed cpctl: initialization, lifecycle, credential routing and fail cl
     const ready=await fetch(`http://127.0.0.1:${port}/ready`, { headers: { authorization: `Bearer ${token}` } });
     assert.equal(ready.status,200);
     const initialNer = await ready.json();
-    assert.equal(initialNer.ner_threads,4); assert.equal(initialNer.ner_device,'cpu'); assert.equal(initialNer.ner_batch_size,1);
+    assert.equal(initialNer.ner_threads,3); assert.equal(initialNer.ner_device,'cpu'); assert.equal(initialNer.ner_batch_size,1);
     await assert.rejects(call('start','--ner-threads','0'));
     await assert.rejects(call('start','--ner-threads','4.5'));
     await writeFile(processPath, ownedProcess); await call('stop'); await call('start','--ner-device','cpu','--ner-threads','2','--ner-batch-size','2');
@@ -149,7 +162,7 @@ http.createServer((req, res) => {
 }).listen(Number(value('--port')), '127.0.0.1');
 `, { mode: 0o700 });
     const customNative = join(directory, 'custom-tls-guard.so');
-    await copyFile(join(prefix, 'lib/censorprivacy/libcp_tls_guard.so'), customNative);
+    await copyFile(join(prefix, 'lib/censorprivacy/libcensorprivacy_tls_guard.so'), customNative);
     const fakeDsh = join(directory, 'failing-dsh');
     const fakeEntry = join(fakeDsh, 'apps/cli/lib/bin.js');
     const capturedPatch = join(directory, 'cloud-patch.yml');
@@ -207,6 +220,9 @@ process.exit(7);
     await unlink(headersPath); await writeFile(headersPath, headers, { mode: 0o600 });
     await chmod(join(config, 'config.json'), 0o644); await assert.rejects(call('start')); await chmod(join(config, 'config.json'), 0o600);
     await assert.rejects(call('start', '--dry-run'));
+    const configuredYaml = await readFile(join(prefix, 'share/censorprivacy/config.yaml'), 'utf8');
+    await exec(join(root, 'censorprivacy'), ['install', '--tls', '--prefix', prefix, '--config-dir', config], { cwd: root, timeout: 60000 });
+    assert.equal(await readFile(join(prefix, 'share/censorprivacy/config.yaml'), 'utf8'), configuredYaml);
     assert.match((await call('demo', 'gateway')).stdout, /通过/);
     assert.match((await call('demo', 'tls')).stdout, /通过/);
   } finally {

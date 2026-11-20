@@ -1,4 +1,4 @@
-"""Drive the actual cpctl xiaoo tui entry in a PTY; no substitute client."""
+"""Drive the actual censorprivacy xiaoo tui entry in a PTY; no substitute client."""
 import fcntl
 import json
 import os
@@ -78,7 +78,7 @@ try:
                       "tools_enabled": tools_enabled,
                       "startup_to_input_seconds": round(input_started-started, 3),
                       "conversation_seconds": round(time.monotonic()-input_started, 3),
-                      "entry": "cpctl xiaoo tui --xiaoO-path"}))
+                      "entry": "censorprivacy xiaoo tui --xiaoO-path"}))
 finally:
     Path(log).write_bytes(output)
     if not exited:

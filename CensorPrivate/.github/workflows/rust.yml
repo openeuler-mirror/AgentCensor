@@ -16,7 +16,7 @@ jobs:
           components: rustfmt, clippy
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.22.3'
+          node-version: '24.21.0'
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libseccomp2 iproute2 nftables util-linux jq curl openssl
       - run: bash scripts/test/rust.sh
       - run: bash scripts/test/native.sh

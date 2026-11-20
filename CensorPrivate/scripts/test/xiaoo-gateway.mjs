@@ -16,7 +16,7 @@ const directory = await mkdtemp(join(tmpdir(), 'cp-xiaoo-'));
 const home = join(directory, 'home'); await mkdir(home, { mode: 0o700 });
 const config = join(directory, 'control');
 const env = { PATH: '/usr/bin:/bin', HOME: home, XDG_CONFIG_HOME: join(home, '.config'), LANG: 'C.UTF-8' };
-const ctl = join(bundle, 'cpctl');
+const ctl = join(bundle, 'censorprivacy');
 const call = (...args) => {
   const pending = exec(ctl, [...args, '--config-dir', config], {
     env, timeout: 240000, maxBuffer: 4 * 1024 * 1024,
@@ -25,8 +25,8 @@ const call = (...args) => {
   pending.child.stdin.end();
   return pending;
 };
-const values = ['张三', '李四', '清华大学', '北京大学', '13800138000', '13900139000',
-  'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '12800.00', '3200.00'];
+const values = ['张三', '李四', '清华大学', '13800138000', '13900139000',
+  'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '860.00', '1240.00'];
 const secret = 'DEMO_SECRET_DO_NOT_SEND';
 const requests = [];
 let provider, succeeded = false;
@@ -74,7 +74,7 @@ try {
         if (demo && !tool) {
           assert.ok(payload.tools.some(tool => tool.function.name === 'file_read'));
           message = { role: 'assistant', content: null, tool_calls: [{ id: 'read_mail', type: 'function',
-            function: { name: 'file_read', arguments: JSON.stringify({ file_path: 'privacy-business.txt' }) } }] };
+            function: { name: 'file_read', arguments: JSON.stringify({ file_path: 'demo.txt' }) } }] };
         } else {
           const content = tool ? JSON.parse(tool.content).content : payload.messages.findLast(message => message.role === 'user').content;
           assert.equal(typeof content, 'string');
