@@ -104,8 +104,6 @@
   inject: [censorguardReady]
 - id: cordis-host-runner
   inject: [censorguardReady]
-- id: code-runtime
-  inject: [censorguardReady]
 - id: subprocess
   inject: [censorguardReady]
 - id: tools

@@ -3234,7 +3234,7 @@ return h('div', { className: 'branch-explore-summary', style: panel },
     // 客户端 cordis 模块规范：模块必须导出 apply(ctx)，
     // 否则浏览器端加载器会报 invalid plugin, expect function or object with an "apply" method。
 
-    // dsh 0.1.5-rc.2：conversationEvents / conversationViews 两个独立服务已并入
+    // dsh 0.2.1-rc.2：conversationEvents / conversationViews 两个独立服务已并入
     // uiConversation 聚合服务（events / views 注册表，
     // 见 dsh 的 packages/client/ui-conversation/src/client/conversation/assembly.ts）。
     var inject = ['uiConversation', 'slots', 'remote', 'remote.commands', 'sessions']

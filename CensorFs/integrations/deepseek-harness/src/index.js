@@ -20,7 +20,7 @@ export const name = 'censorfs-parallel-worlds'
 export const inject = ['tools', 'commands', 'subagents', 'sessions']
 
 // 插件写入会话日志的自定义事件类型（见 src/events.js）。
-// dsh 0.1.5-rc.2：持久化读取器的放行条件是
+// dsh 0.2.1-rc.2：持久化读取器的放行条件是
 // `KNOWN_SESSION_EVENT_TYPES.has(type) || event.ignorable === true`
 // （session-persistence/src/storage-contract.ts），而官方的 ignorable 信封
 // 只能由 Session.append 内部产生、没有公开的插件写入口，事件名注册机制也
@@ -208,7 +208,7 @@ function registerCommands(ctx, runtime, config) {
         && report.fuse === true
       return {
         kind: healthy ? 'success' : 'error',
-        // dsh 0.1.5-rc.2 的 CommandResult 只有 {kind, text}；机器可读的
+        // CommandResult 通过 {kind, text} 返回；机器可读的
         // exitCode 保留在 --json 的文本负载里。
         text: json ? JSON.stringify({ ...report, healthy, exitCode: healthy ? 0 : 1 }) : formatDoctor(report),
       }

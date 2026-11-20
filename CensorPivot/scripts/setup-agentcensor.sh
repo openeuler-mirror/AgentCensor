@@ -320,8 +320,8 @@ check_dsh_environment() {
     [[ -f $dsh_root/package.json ]] || fail "invalid DSH source directory: $dsh_root"
     as_dsh_user bash -c 'node -e "if (+process.versions.node.split(\".\")[0] < 22) process.exit(1)" && command -v pnpm >/dev/null' ||
       fail 'DSH requires Node 22+ and pnpm in the invoking user environment'
-    as_dsh_user bash -c 'set -euo pipefail; cd -- "$1"; pnpm dsh --version | grep -Fx "0.1.5-rc.2" >/dev/null' bash "$dsh_root" ||
-      fail 'DSH source/dependencies must provide version 0.1.5-rc.2 before deployment'
+    as_dsh_user bash -c 'set -euo pipefail; cd -- "$1"; pnpm dsh --version | grep -Fx "0.2.1-rc.2" >/dev/null' bash "$dsh_root" ||
+      fail 'DSH source/dependencies must provide version 0.2.1-rc.2 before deployment'
   fi
 }
 

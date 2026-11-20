@@ -16,7 +16,7 @@ test('publishes one user-facing web bundle', async () => {
   assert.equal(pkg.name, '@agentcensor/censorpivot')
   assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
   assert.deepEqual(pkg.dsh.client.inject, [
-    '@deepseek-ai/dsh-client-runtime',
+    '@deepseek-ai/dsh-api-remotes',
     '@deepseek-ai/dsh-client-ui-settings',
     '@deepseek-ai/dsh-client-ui-conversation',
     '@censorfs/deepseek-harness',

@@ -1,6 +1,6 @@
 {
   "name": "@agentcensor/censorpivot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CensorPivot DSH composite bundle for CensorFS, CensorGuard, and CensorScope",
   "private": true,
   "type": "module",
@@ -13,7 +13,7 @@
   "dsh": {
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-ui-settings",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@censorfs/deepseek-harness"
@@ -32,7 +32,8 @@
     "test": "node --test test/*.test.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": "0.2.1-rc.2"
   },
   "license": "MulanPSL-2.0"
 }
