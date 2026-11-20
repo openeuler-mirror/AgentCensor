@@ -40,16 +40,16 @@ sha256sum -c censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256
 ```bash
 tar -xzf censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz
 cd censorprivacy-0.3.2-linux-x86_64-standalone
-./cpctl self-test
+./censorprivacy self-test
 ```
 
 预期最后输出“完整交付包自检”通过。它依次校验包内文件、检查环境、运行真实本地 NER 与模拟上游的网关/TLS 演示，不调用云模型，结束后自动停止临时子进程。
 
-只检查包内完整性可运行 `./cpctl verify`。这两个命令由**完整包根目录**的 `cpctl` 提供，源码入口和基础安装归档不提供。自检不会启动日常网关，也不会续期已有 run。
+只检查包内完整性可运行 `./censorprivacy verify`。这两个子命令需要完整包的资源布局，可通过包根目录的 `censorprivacy` 或 `bin/censorprivacy` 调用。自检不会启动日常网关，也不会续期已有 run。
 
 包内资源按相对位置定位。初始化前可以整体移动包目录，移动后保留 `bin/`、`lib/`、`runtime/`、`share/` 的布局；不要继承指向其他环境的检测资源变量。
 
-升级或移动已使用的网关前，在旧目录执行 `./cpctl stop`；随后在新目录执行 `./cpctl start`、`./cpctl check`，再重新打开 xiaoO 并新建会话。配置、策略、凭据和已有 Web 记录会保留。0.3.1 修复后续历史消息新增敏感值时第二轮返回 `detection_failed` 的问题，整条请求会统一遮蔽后再接受最终复核。
+升级或移动已使用的网关前，在旧目录执行 `./censorprivacy stop`；随后在新目录执行 `./censorprivacy start`、`./censorprivacy check`，再重新打开 Agent 并新建会话。迁移时保留 `share/censorprivacy/config.yaml` 中的自定义规则与参数；实例凭据和 Web 记录仍位于私有配置目录。
 
 ## 3. 开始使用
 
@@ -62,14 +62,14 @@ cd censorprivacy-0.3.2-linux-x86_64-standalone
 浏览器打开 `http://127.0.0.1:8766/`，Ctrl+C 停止。随后连接实际服务：
 
 ```bash
-./cpctl init --upstream https://api.deepseek.com --model-id deepseek-flash
-./cpctl start
-./cpctl check --model
+./censorprivacy init --upstream https://api.deepseek.com --model-id deepseek-flash
+./censorprivacy start
+./censorprivacy check --model
 ```
 
 按提示输入自己的 API Key；模型请求可能计费。客户端 Base URL 为 `http://127.0.0.1:8775/v1`，认证使用私有配置目录中的 `gateway.token`。
 
-网关同时在 `http://127.0.0.1:8775/` 提供检测台，共用已加载模型。通过 `./cpctl xiaoo tui` 或 `./cpctl xiaoo run` 启动的会话会自动显示原文、实际遮蔽文本、回复和工具交互。测试前可点击“清空记录”并确认；新包默认没有会话或预填文本，用户记录不会被打入交付包。清空 Web 记录后，需要全新上下文时请重新启动 xiaoO。
+网关同时在 `http://127.0.0.1:8775/` 提供检测台，共用已加载模型。通过 `./censorprivacy xiaoo tui` 或 `./censorprivacy xiaoo run` 启动的会话会自动显示原文、实际遮蔽文本、回复和工具交互。测试前可点击“清空记录”并确认；新包默认没有会话或预填文本，用户记录不会被打入交付包。清空 Web 记录后，需要全新上下文时请重新启动 xiaoO。
 
 接入与日常操作见 [使用手册](usage.md)：
 
@@ -84,7 +84,7 @@ cd censorprivacy-0.3.2-linux-x86_64-standalone
 
 ## 4. 从源码打包
 
-以下命令在 **CensorPrivate 源码目录**执行，面向构建者。
+以下命令在 **`CensorPrivate/` 源码目录**执行，面向构建者。
 
 ### 4.1 选择归档类型
 
@@ -98,7 +98,7 @@ cd censorprivacy-0.3.2-linux-x86_64-standalone
 
 ### 4.2 准备完整包输入
 
-构建机需要 Rust/C/OpenSSL 开发环境、Node 22.19+（22.x）或 ≥24、patchelf、readelf，以及 jq、curl、openssl、awk、flock。先完成 [源码构建与模型导出](build-and-deploy.md)。
+构建机需要 Rust/C/OpenSSL 开发环境、Node ≥24.9、patchelf、readelf，以及 jq、curl、openssl、awk、flock。先完成 [源码构建与模型导出](build-and-deploy.md)。
 
 打包器要求原生库和 Node 的许可证位于原发行目录，不能仅传入一份孤立的可执行文件：
 
@@ -148,8 +148,8 @@ CP_TEST_BUNDLE=/path/to/extracted \
 
 | 位置 | 用途 |
 | --- | --- |
-| `cpctl` | 完整包入口，提供 `verify/self-test` 并转发日常运维命令 |
-| `bin/` | 五个 Rust 命令及安装后的运维入口 |
+| `censorprivacy` | 完整包入口，提供 `verify/self-test` 并转发日常运维命令 |
+| `bin/censorprivacy` | 统一 Rust 可执行文件，包含网关、计算、MCP、隔离、TLS 及运维子命令 |
 | `lib/censorprivacy/` | ONNX Runtime、native hook、随包共享库 |
 | `runtime/bin/` | Node 及运维工具 |
 | `share/censorprivacy/` | 模型、文档、插件、CA、许可和 `BUNDLE.json` |
@@ -157,4 +157,4 @@ CP_TEST_BUNDLE=/path/to/extracted \
 
 基础包的 `.sha256` 由源码根目录生成，清单中的文件名带 `dist/`；在源码根目录执行 `sha256sum -c dist/对应文件.sha256`。完整包的外部清单只记录归档文件名，在归档所在目录校验即可。
 
-完整包不包含 Python 迁移资料、Rust 源码或开发虚拟环境。`privacy-run` 需要额外 root/namespace 等系统能力；DSH 与 xiaoO 的安装也属于单独步骤。平台和已执行的验证范围见 [验收记录](validation.md)。
+完整包不包含 Python 迁移资料、Rust 源码或开发虚拟环境。`censorprivacy run` 需要额外 root/namespace 等系统能力；DSH 与 xiaoO 的安装也属于单独步骤。平台和已执行的验证范围见 [验收记录](validation.md)。

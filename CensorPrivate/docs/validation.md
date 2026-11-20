@@ -6,11 +6,74 @@
 
 | 查阅内容 | 入口 |
 | --- | --- |
+| DSH 0.2.2-rc.1 适配 | [2026-11-20 DSH](#2026-11-20-dsh-022-rc1-适配) |
+| CensorPrivacy 命名与统一命令 | [2026-11-20](#2026-11-20-censorprivacy-命名与统一命令) |
+| DSH 0.1.5-rc.2 兼容性 | [2026-11-19](#2026-11-19-dsh-015-rc2-兼容性) |
+| 0.3.2 统一配置与 8 位引用 | [2026-11-18](#2026-11-18-统一配置与-8-位引用) |
 | 当前 detector 与可视化更新 | [2026-11-09](#2026-11-09-detector-更新与可视化入口) |
 | 公开源码收敛与导出复核 | [2026-11-09 源码复核](#2026-11-09-仓库内容收敛) |
 | 完整包平台与交付验收 | [2026-11-05 完整包](#2026-11-05-openeuler-完整二进制包验收) |
 | Rust + ONNX 迁移 | [2026-11-05 迁移](#2026-11-05-rust--onnx-迁移验收) |
 | Python worker 与更早实现 | [历史版本记录](#历史-python-worker-版本验收featcensorprivate-pr10) |
+
+## 2026-11-20 DSH 0.2.2-rc.1 适配
+
+本轮对接目标更新为官方 **`0.2.2-rc.1`**（用户提供的 `0.2.2.rc.1`），对应标签 `dsh-v0.2.2-rc.1`、提交 `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`。本机 `/root/deepseek-harness` 已原位更新至该标签，使用 Node `24.21.0` 和锁定的 pnpm `11.28.5` 安装、构建及验收；源码启动与已构建 CLI 的版本输出均为 `0.2.2-rc.1`。上游跟踪文件无本地改动，原有未跟踪文件 `cp_gateway_fixture.txt` 保留且 SHA-256 未变。
+
+- 适配新版独立 `tool` 消息，保留早期嵌套工具结果支持，补齐图像请求元数据接口；输入能力仍为文本。隔离 profile 同时禁用新增的 DeepSeek 账号模型入口，所有模型调用继续经过 CensorPrivacy。
+- `--dsh-path` 支持官方 npm 安装前缀、包目录、CLI 符号链接和已构建源码目录。DSH 启动检查 Node ≥24.9，CI 和完整包运行时更新至 Node `24.21.0`；普通 Rust 网关不依赖 Node。
+- Shell/JS 检查及 26 项插件、流式、启动器、安装回归通过；覆盖实际 DSH 的 `setup/run`、自定义私密排序、原生工具开关和任务参数转义。
+- 真实 DSH + ONNX 的 gateway、TLS direct 模拟演示通过插件加载及 `private_compute` 两轮往返；上游只有引用，本机恢复客户与 `300.00`，SECRET 保持遮盖。
+- Chromium 对真实 CLI/Web 的验收通过流式显示、分片引用、SECRET、错误日期调用后的有效求和、会话归组、实际遮蔽详情及移动布局检查；CLI 与 Web 均在模拟上游结束前显示首段。源码目录的浏览器自动化使用官方目录选择器覆盖文件，配置仅写入测试专用 DSH_HOME。
+- 现有 standalone 归档独立解压后，使用包内 Node 连接同一 `/root/deepseek-harness`，CLI/Web 的上述验收同样通过。浏览器进程通过本次验收的 `fonts.conf` 加载已有文泉驿字体，已复查中文及移动端截图；不修改系统字体配置。
+
+DSH 的 `pnpm run clean`、冻结锁文件安装和 `pnpm run build:artifacts --serial` 通过，8 个产物构建步骤全部完成。上游聚合类型检查尚未完成：首次检查达到约 3 GiB 的 Node 堆上限，单独重试在可用内存低于 300 MiB 时被本次进程的保护脚本终止；没有修改上游构建默认值或系统配置。已确认相关子进程退出，再串行执行上述运行时验收。
+
+独立安装目录 `.artifacts/dsh-0.2.2-rc.1/` 已删除；本轮原目录验收证据保存在 `.artifacts/dsh-local-20261120/`，前次 npm 环境的验收记录和旧包备份归档至其 `prior-npm-evidence/`。完整包已包含本次 DSH 适配与 Node 24，包内 `BUNDLE.json` 标注对接目标；本轮环境更新不重新生成归档，`dist/` 验收记录追加原目录的实测结果，归档校验和保持不变。测试使用真实 DSH、真实 ONNX 与本机模拟上游，执行 UID 为 0，没有调用云模型；重任务串行执行。默认 shell 的 Node 仍为 `22.22.3`，从源码启动新版 DSH 时需使用 Node ≥24.9。
+
+## 2026-11-20 CensorPrivacy 命名与统一命令
+
+产品名为 **CensorPrivacy**，Cargo 仅声明一个产品可执行文件 **`censorprivacy`**。原运维入口和计算、MCP、隔离、TLS 启动器均归入该命令的子命令，迁移映射见 [脚本说明](scripts.md#旧命令迁移)。源码目录仍为 `CensorPrivate/`；以下较早记录保留当时的命令与版本。
+
+本机按单任务、单 Cargo 构建作业、单测试线程安排验证：
+
+- 格式检查、Clippy 全目标及全部特性（warnings as errors）、Rust 常规工作区测试通过。
+- 24 项插件、流式、启动器和安装回归通过；临时安装只生成 `bin/censorprivacy`，不再安装旧的独立命令。
+- DSH 0.1.5-rc.2 的 gateway/TLS direct 演示通过统一命令完成私密工具往返、合计恢复及 SECRET 遮盖；不强制固定 DSH 版本。
+
+- 真实 HTTPS 进程与 `censorprivacy compute`、native TLS 与 `censorprivacy tls-run`、Linux namespace 隔离与内部 bootstrap 集成测试均通过。
+
+- 新生成的 standalone 完整包通过 20 项验收，包含统一命令帮助、自检、真实 ONNX、网关配置/凭据、重启与过期处理。包内 `bin/` 只有 `censorprivacy`，根入口同名；native 库为 `libcensorprivacy_tls_guard.so`。
+- 解压包的检测页面品牌与真实 ONNX 浏览器验收、DSH CLI/Web 流式/工具/会话验收、初始化后迁移到含中文和空格的目录验收均通过。本轮执行 UID 为 0。
+- 已更新 `dist/censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz`、SHA-256、验收 JSON 及 `使用说明.md`；旧包保存在 `.artifacts/naming-20261120/previous-dist/`。
+
+本轮证据保存在 `.artifacts/naming-20261120/`。
+
+## 2026-11-19 DSH 0.1.5-rc.2 兼容性
+
+本机 `/root/deepseek-harness` 的 HEAD 与 `dsh-v0.1.5-rc.2` 标签均为 `fb2c4b9e698e30edb738bca4cf0618587db7d203`，跟踪文件无改动；源码启动与已构建 CLI 的 `--version` 均输出 `0.1.5-rc.2`，Node 为 `22.22.3`。无需更新 Harness。该版本作为兼容性验证基线，插件与 `cpctl` 不强制限制版本。
+
+本轮对当前 CensorPrivate 源码与临时安装产物串行验证：
+
+- Shell/JS 语法检查、17 项插件/流式测试、6 项启动器测试及 1 项安装回归通过。安装回归覆盖真实 DSH `setup/run`、任务参数转义、自定义私密排序、默认工具限制及 `--enable-tools`。
+- 真实 DSH + ONNX 的 gateway、TLS direct 模拟演示均通过插件加载、模型适配、`private_compute` 两轮往返及 `300.00` 结果恢复；SECRET 保持遮盖。TLS direct 使用实际 `tls-run`、curl 与 OpenSSL hook。
+- Chromium 对真实 CLI/Web 与 ONNX 网关的验收通过 SSE 增量显示、分片引用与 SECRET、错误日期工具调用后的有效求和、自动会话归组、实际遮蔽详情、刷新与移动布局检查。报告及截图位于本机忽略目录 `.artifacts/dsh-compatibility-20261119/`。
+
+当前适配器与该版本的模型、流式事件及工具接口兼容，无需修改对接协议。Web 验收断言已同步当前检测器行为：最终显示为 `内部联调凭据：[REDACTED_SECRET]`，字段中的 `secret=` 也被遮蔽。安装测试需提供本机 `CP_DETECTOR_MODEL_DIR` 与 `CP_DETECTOR_ORT_LIBRARY`；初次缺少资源路径的启动失败不属于 DSH 兼容性失败。
+
+本轮使用本机模拟上游，未调用云模型或重新生成 standalone 归档。复现步骤见 [DSH 使用说明](usage.md#32-deepseek-harness浏览器聊天) 和 [测试入口](scripts.md#4-测试与验收)。
+
+## 2026-11-18 统一配置与 8 位引用
+
+CP 引用的随机后缀统一为 8 位小写字母和数字，覆盖网关、私密工具、TLS 和检测台预览；其他认证与会话标识保持原有长度。检测固定样本仅调整引用文本及其后的 UTF-8 偏移，预期类别和检测文本保留。`custom` 在配置及解析输出中位于 `ner` 后方，两者同级。
+
+- fmt、Clippy `-D warnings` 与 Rust workspace/all-targets 默认回归通过：104 passed、9 ignored。覆盖配置优先级、类别空列表、TTL/重载、协议与恢复、跨 run 授权和短引用。
+- 真实 ONNX 的 5 项网关集成、HTTPS CLI、原生 OpenSSL/TLS、Linux 运行域扩展验收通过；包括 59 组固定参考、长文本、batch/尾窗、SSE、私密计算、等长替换及超时清理。
+- Shell/JS 语法检查及 23 项 Node 插件、启动器与安装回归通过。临时安装验证真实 Harness 私密排序、默认工具限制、`--enable-tools`、NER 设置继承、配置保留及网关/TLS 演示。Chromium 检测台验收覆盖 8 位引用、Unicode、阈值、移动布局与 Host/Origin 校验。
+- 五个 0.3.2 release 命令构建通过；真实 Harness 的 gateway/TLS 模拟演示均完成引用计算与授权恢复。CLI/Web 浏览器验收通过流式引用分片、工具错误后的更正调用、会话同步、实际遮蔽详情、刷新和移动布局检查。
+- 文档本地链接与锚点检查通过，配置文档中的 4 段 YAML 均通过实际 `config-check`。清理了过期默认值、重复命令和旧参数示例；配置说明集中到 [统一配置](configuration.md)。
+
+本机重任务串行执行，Cargo 构建及测试并发均设为 1。Linux 运行域拒绝将工作区外可写文件作为标准输出；测试日志改经管道保存后通过。本轮未调用云模型、未重新导出 ONNX 或生成 standalone 归档，CUDA/CANN 硬件验收未执行。
 
 ## 2026-11-09 detector 更新与可视化入口
 
@@ -65,14 +128,7 @@
 
 本机使用 Rust 1.85.1、ONNX Runtime 1.31.1 CPU；导出使用 torch 2.14.1+cpu、onnx 1.23.2。完整准备和复现步骤见 [Rust 检测器说明](rust-detector.md)。本轮日志、parity.json 位于忽略目录 .artifacts/native-validation/；export-validation.json 位于 models/bert4ner-base-chinese/。
 
-~~~bash
-export CP_DETECTOR_MODEL_DIR=/path/to/onnx/bert4ner-base-chinese
-export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
-bash scripts/test/run-all.sh
-bash scripts/test/detector.sh --integration
-CP_TEST_REAL_DETECTOR=1 bash scripts/test/native.sh
-bash scripts/test/operations.sh
-~~~
+当前回归命令统一见 [测试入口](scripts.md#4-测试与验收)。
 
 ## 2026-11-05 源码分层与复现复核
 
@@ -109,17 +165,7 @@ bash scripts/test/operations.sh
 
 评测中的 NUMBER 金标包含默认 0.6 阈值不保护的泛数字，ID_NUMBER 保守回退及 LOCATION 重叠预测照实计入分类误差。这 10 条合成样例仅验证迁移与评测协议，不代表真实业务精度或完整召回。测试使用本机已有 Python 环境与本地权重，不访问云服务、不自动下载模型。
 
-历史版本的复现命令（须切换到 feat/censorprivate-pr10，不能用于当前源码）：
-
-```bash
-export CP_DETECTOR_PYTHON=/path/to/venv/bin/python
-export CP_DETECTOR_MODEL_DIR=/path/to/bert4ner-base-chinese
-bash scripts/test/detector.sh --integration
-CP_TEST_REAL_DETECTOR=1 bash scripts/test/native.sh
-bash scripts/test/run-all.sh --detector
-```
-
-本节命令和 Python worker 故障测试属于历史版本；当前生产依赖和复现命令见 [检测器说明](rust-detector.md)。
+本节对应历史分支 `feat/censorprivate-pr10`，不能作为当前版本的操作指南。当前运行与验证入口见 [检测器说明](rust-detector.md)。
 
 ## 迁移前的历史验收
 
@@ -148,19 +194,7 @@ bash scripts/test/run-all.sh --detector
 | 真实云服务 | 验收入口与报告已实现；缺有效实际上游/模型/凭据配置，本轮未执行，不计为通过 |
 | 官方接入信息核对 | 已联网读取官方 quickstart 与 providers 页面，确认官方模型要求 API key；不带凭据的官方 `GET /models` 实际返回 401。此项仅核对接入要求，不是模型推理验收 |
 
-可重复执行的本机验收：
-
-```bash
-bash scripts/test/operations.sh --dsh-root /root/deepseek-harness
-```
-
-其中 4 项 Node 测试覆盖插件边界和实际安装/生命周期，随后执行 DSH 的两种完整演示。安装生命周期测试还调用安装产物的网关和 TLS 演示；指定 DSH 路径时加入安装产物的 managed profile 准备及实际 agent 任务，因此同时验证源码和安装后的布局。监听、进程和临时目录仅用于回环测试，测试结束清理。
-
-核心与扩展验收入口：
-
-```bash
-bash scripts/test/run-all.sh --native --runtime --operations
-```
+当时的安装生命周期与 DSH 演示均使用回环测试实例，并在结束后清理。当前可复现命令见 [脚本速查](scripts.md#4-测试与验收)。
 
 格式检查、Clippy `-D warnings`、Rust 核心测试（含真实 native、root 运行域及连续三次超时清理）和运维测试通过。207 组固定样例包括 80 组检测与 127 组精确计算，由 Rust 集成测试读取 `tests/fixtures/*.jsonl` 并比较结果，无需外部语言解释器；十进制比较保留精度与字段集合。
 

@@ -2,7 +2,7 @@
 
 [文档首页](README.md) · [构建与部署](build-and-deploy.md) · [使用手册](usage.md) · [故障排查](troubleshooting.md)
 
-日常操作使用 `cpctl`，开发与交付使用 `scripts/`。下文路径均相对于 `CensorPrivate/`；运行安装、打包或模型验收时，等待当前任务结束再开始下一项。
+日常操作使用 `censorprivacy`，开发与交付使用 `scripts/`。下文路径均相对于 `CensorPrivate/`；运行安装、打包或模型验收时，等待当前任务结束再开始下一项。
 
 ## 1. 先选入口
 
@@ -11,20 +11,22 @@
 | 下载源码 | `git clone https://gitcode.com/coco12373/AgentCensor.git` | AgentCensor checkout，进入 `CensorPrivate/` |
 | 下载原始模型 | `.venv-model/bin/hf download …` | 原始权重目录，完整命令见 [构建步骤](build-and-deploy.md#41-下载原始模型) |
 | 下载完整交付包 | 从发布方提供的地址取得归档与校验文件 | 见 [二进制包](binary-distribution.md#1-获取并校验)；仓库没有自动下载脚本 |
-| 检查/准备系统环境 | `./cpctl doctor`、`./cpctl deps` | 检查结果或系统软件包 |
-| 构建并安装 | `./cpctl install` | 五个命令、`cpctl`、插件、文档 |
+| 检查/准备系统环境 | `./censorprivacy doctor`、`./censorprivacy deps` | 检查结果或系统软件包 |
+| 构建并安装 | `./censorprivacy install` | `censorprivacy` 统一命令、插件、文档 |
 | 导出 ONNX | `scripts/model/export.py` | 模型、tokenizer、manifest、数值报告 |
 | 生成归档 | `bash scripts/package.sh` | `dist/` 下的归档与 SHA-256 |
-| 启停与接入 Agent | `./cpctl …` | 私有配置、实例进程、Agent profile |
+| 启停与接入 Agent | `./censorprivacy …` | 私有配置、实例进程、Agent profile |
 | 回归与验收 | `scripts/test/` | 测试结果；具体资源要求见 [第 4 节](#4-测试与验收) |
 
-## 2. cpctl 命令
+## 2. censorprivacy 命令
 
 ```bash
-./cpctl help
+./censorprivacy help
 ```
 
 源码入口将操作分派给 `scripts/ops/`，不要直接运行其中的 `main.sh`、`common.sh`、`deploy.sh`、`environment.sh` 或 `xiaoo.sh`。它们依赖入口设置的上下文。
+
+DSH 对接基线为 `0.2.2-rc.1`，需要 Node ≥24.9。`--dsh-path` 可指向官方 npm 安装前缀、包目录、CLI 或已构建源码目录；未指定时使用 PATH 中的 `dsh`。
 
 ### 环境与安装
 
@@ -48,7 +50,9 @@
 
 通用选项 `--config-dir /绝对路径` 选择实例，默认 `~/.config/censorprivacy/managed/`。`--prefix /绝对路径` 设置安装前缀；它不改变配置目录。`init` 不保存检测模型与运行库的环境变量，见 [路径说明](rust-detector.md#2-配置路径)。
 
-源码 checkout 的 `cpctl` 优先使用本仓库 `target/release/` 中已构建的程序；显式 `--prefix`（或 `CP_INSTALL_PREFIX`）下已有 `bin/censorprivacy` 时使用该安装。已安装的 `cpctl` 优先使用同目录的程序，standalone 始终使用包内程序，旧 `install.json` 仅作为后备。`start` 会打印实际启动程序路径；更新源码后需重新构建本地二进制。
+`start` 和 `systemd install` 支持 `--config FILE`、`--no-config`，部署参数集中在 [config.yaml](configuration.md)。`doctor` 检查环境变量与默认资源布局；YAML 语法与字段通过 `censorprivacy config-check --config FILE` 校验，模型加载在启动时验证。
+
+源码 checkout 的 `censorprivacy` 优先使用本仓库 `target/release/` 中已构建的程序；显式 `--prefix`（或 `CP_INSTALL_PREFIX`）下已有 `bin/censorprivacy` 时使用该安装。已安装的 `censorprivacy` 优先使用同目录的程序，standalone 始终使用包内程序，旧 `install.json` 仅作为后备。`start` 会打印实际启动程序路径；更新源码后需重新构建本地二进制。
 
 ### 演示与 Agent
 
@@ -59,7 +63,7 @@
 | `dsh web` | `--dsh-path DIR --port 3080 --enable-tools` | 默认仅私密工具；`--enable-tools` 同时开放 DSH 原生工具 |
 | `dsh run` | `--dsh-path DIR --enable-tools`，接任务文本 | 同 Web 的工具策略；使用实际上游，可能计费 |
 | `dsh setup` / `cloud` | `--dsh-path DIR` | `cloud` 继承当前网关实际 NER 设置；使用实际上游，可能计费 |
-| `web` | `--config-dir DIR` | 显示通用隐私检测台地址；自动同步 Harness/xiaoO 会话 |
+| `dashboard` | `--config-dir DIR` | 显示通用隐私检测台地址；自动同步 Harness/xiaoO 会话 |
 | `xiaoo setup` / `tui` / `run` / `demo` / `web` | `--xiaoO-path DIR`，`--enable-tools` | `tui/run/demo` 使用实际上游，可能计费；`web` 显示会话检测台地址 |
 
 NER 线程数范围 1–256，默认 1；`init` 将其保存为配置的 `ner_threads`，`start` 参数仅影响本次进程。xiaoO 每次启动默认关闭工具，显式 `--enable-tools` 时先完成本地工具目录检测与缓存准备，再进入对话；准备不调用上游、不保存 Web 记录。`demo` 必须加 `--enable-tools`。
@@ -67,10 +71,25 @@ NER 线程数范围 1–256，默认 1；`init` 将其保存为配置的 `ner_th
 任务含以 `-` 开头的内容时，用 `--` 分隔；配置选项放在分隔符之前：
 
 ```bash
-./cpctl dsh run --config-dir "$HOME/.config/censorprivacy/managed" -- '--help 是任务文本。'
+./censorprivacy dsh run --config-dir "$HOME/.config/censorprivacy/managed" -- '--help 是任务文本。'
 ```
 
-完整 standalone 包根目录的 `cpctl` 额外支持 `verify` 和 `self-test`。源码与普通安装的 `cpctl` 没有这两个子命令；详见 [包说明](binary-distribution.md)。
+`verify` 和 `self-test` 需要完整 standalone 包的资源布局，可通过包根目录或 `bin/censorprivacy` 调用；详见 [包说明](binary-distribution.md)。
+
+### 旧命令迁移
+
+所有功能统一通过 `censorprivacy` 子命令调用：
+
+| 原命令 | 当前命令 |
+| --- | --- |
+| `cpctl` | `censorprivacy` |
+| `privcalc` | `censorprivacy compute` |
+| `censorprivacy-mcp` | `censorprivacy mcp` |
+| `privacy-run` | `censorprivacy run` |
+| `tls-run` | `censorprivacy tls-run` |
+| `cpctl web` | `censorprivacy dashboard` |
+
+`censorprivacy dashboard` 显示已启动网关的页面地址；`censorprivacy web` 启动独立检测页面。DSH TLS 插件配置使用 `executable` 指向统一命令，环境变量为 `CP_DSH_EXECUTABLE`。native 库名为 `libcensorprivacy_tls_guard.so`。
 
 ## 3. 模型、安装与打包
 
@@ -97,7 +116,7 @@ bash scripts/install.sh --prefix "$HOME/.local"
 DESTDIR=/tmp/censorprivacy-stage bash scripts/install.sh --prefix /usr/local
 ```
 
-上例输出到 `/tmp/censorprivacy-stage/usr/local/`。脚本始终执行 release 构建，默认前缀 `/usr/local`；而 `cpctl install` 默认 `~/.local`，并处理复制提权和安装位置记录。两者均不安装模型或 ONNX Runtime。
+上例输出到 `/tmp/censorprivacy-stage/usr/local/`。脚本始终执行 release 构建，默认前缀 `/usr/local`；而 `censorprivacy install` 默认 `~/.local`，并处理复制提权和安装位置记录。两者均不安装模型或 ONNX Runtime。
 
 ### 打包
 
@@ -122,7 +141,7 @@ bash scripts/package.sh --with-native
 | `bash scripts/test/rust.sh` | 同上 | 上一命令的默认 Rust 检查入口 |
 | `bash scripts/test/detector.sh` | Rust；无需模型或 Python | 原生规则、验证与资源拒绝 |
 | `bash scripts/test/detector.sh --integration` | 真实 ONNX/ORT 路径 | 固定参考样本、网关/SSE、共享 TLS 转换、HTTPS CLI |
-| `bash scripts/test/operations.sh --static` | Node；无需模型 | Shell/JS 语法及插件边界测试 |
+| `bash scripts/test/operations.sh --static` | Node ≥24.9；无需模型 | Shell/JS 语法及插件边界测试 |
 
 ### 环境相关验收
 
@@ -132,7 +151,7 @@ bash scripts/package.sh --with-native
 | `CP_TEST_REAL_DETECTOR=1 bash scripts/test/native.sh` | 上述条件加真实 ONNX/ORT | native 链路使用真实 NER |
 | `bash scripts/test/runtime.sh` | root 与 Linux 隔离能力 | namespace、挂载、网络、清理 |
 | `bash scripts/test/operations.sh` | Node、release 构建环境、ONNX/ORT、OpenSSL | 安装、生命周期、网关/TLS 演示 |
-| `bash scripts/test/operations.sh --dsh-root /path/to/deepseek-harness` | 上述条件加已构建 DSH | 另加 DSH 两种模拟演示 |
+| `bash scripts/test/operations.sh --dsh-path /path/to/deepseek-harness` | 上述条件加 Node ≥24.9、DSH 0.2.2-rc.1（npm 或源码构建） | 另加 DSH 两种模拟演示 |
 
 `run-all.sh` 可追加 `--native`、`--runtime`、`--operations`、`--detector`、`--detector-integration`，分别运行对应层级；这些选项会引入上表条件，不会自动准备环境。
 
@@ -146,13 +165,14 @@ node scripts/test/detector-web.mjs target/debug/censorprivacy
 /path/to/extracted/runtime/bin/node scripts/test/standalone.mjs /path/to/extracted
 
 # 完整包 + 已构建 DSH + 可用浏览器
-node scripts/test/dsh-web.mjs /path/to/extracted /path/to/deepseek-harness
+CP_PLAYWRIGHT_PACKAGE_JSON=/path/to/playwright-host/package.json \
+node scripts/test/dsh-web.mjs /path/to/extracted /path/to/dsh-runtime
 
 # 完整包 + 实际 xiaoO 二进制，本机模拟上游
 node scripts/test/xiaoo-gateway.mjs /path/to/extracted /path/to/xiaoo
 node scripts/test/xiaoo-web.mjs target/debug/censorprivacy /path/to/xiaoO/target/debug/xiaoo
 ```
 
-检测台脚本可用 `CP_PLAYWRIGHT_MODULE` 指定本地 Playwright 模块目录，`CHROMIUM_EXECUTABLE` 指定浏览器，`CP_WEB_SCREENSHOT_DIR` 指定截图目录（默认 `.artifacts/detector-web/`）。DSH 浏览器脚本从 Harness 依赖加载 Playwright，可用 `CP_BROWSER_EXECUTABLE` 指定浏览器。浏览器与系统依赖须自行准备。
+检测台脚本可用 `CP_PLAYWRIGHT_MODULE` 指定本地 Playwright 模块目录，`CHROMIUM_EXECUTABLE` 指定浏览器，`CP_WEB_SCREENSHOT_DIR` 指定截图目录（默认 `.artifacts/detector-web/`）。DSH 浏览器脚本从 Harness 依赖加载 Playwright，可用 `CP_BROWSER_EXECUTABLE` 指定浏览器。DSH 为源码目录时，脚本将官方 `apps/web/tests/pin-browse-picker.overlay.yml` 写入测试专用 DSH_HOME，使用页面内目录选择器完成自动化验收。浏览器与系统依赖须自行准备。
 
 `xiaoo-gateway.mjs` 追加第 3 个参数 `/绝对路径/managed` 时复用该目录的云连接与凭据，另建独立网关，会实际调用模型。其余上述浏览器/包验收默认使用本机模拟上游。实际执行范围与历史结果见 [验收记录](validation.md)。
