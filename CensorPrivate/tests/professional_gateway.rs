@@ -15,6 +15,43 @@ const TOKEN: &str = "professional-local-test-token-01234567890123456789";
 
 #[test]
 #[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
+fn deployment_categories_filter_real_ner_without_disabling_selected_rules() {
+    use censorprivacy::config::AppConfig;
+    let config = AppConfig::from_yaml("detection: {categories: all}").unwrap();
+    let detector = Arc::new(
+        ProfessionalDetector::start(config.detector(None, None, None, None, None).unwrap())
+            .unwrap(),
+    );
+    let text = "张三在清华大学工作，电话13800138000，邮箱a@example.com，数量42。";
+    let all = detector.analyze(text, &AnalyzeOptions::default()).unwrap();
+    for kind in ["PERSON", "ORG", "PHONE", "EMAIL", "NUMBER"] {
+        assert!(all.iter().any(|item| item.entity_type == kind), "{kind}");
+    }
+    for (categories, masked, public) in [
+        ("[PERSON]", "张三", "清华大学"),
+        ("[ORG, EMAIL]", "清华大学", "张三"),
+    ] {
+        let selected =
+            AppConfig::from_yaml(&format!("detection: {{categories: {categories}}}")).unwrap();
+        let gate = PrivacyGate::with_loaded_professional_detector(
+            selected.apply_policy(PrivacyPolicy::default()).unwrap(),
+            GateOptions::default(),
+            detector.clone(),
+        )
+        .unwrap();
+        let protected = gate.protect_text(text, "").unwrap();
+        assert!(!protected.contains(masked));
+        assert!(protected.contains(public));
+        assert!(protected.contains("13800138000"));
+        assert_eq!(
+            protected.contains("a@example.com"),
+            categories == "[PERSON]"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
 fn cpu_batches_preserve_entities_offsets_and_tail_windows() {
     let documents = [
         "😀张三在清华大学工作。".to_owned(),
@@ -169,7 +206,7 @@ fn private_compute_operation_stays_structural_across_model_turns() {
     let permit = gate.protect(Api::Chat, &body, target).unwrap();
     let approved = gate.consume(permit, target, "POST").unwrap();
     let protected: Value = serde_json::from_slice(approved.body()).unwrap();
-    let pattern = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>").unwrap();
+    let pattern = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>").unwrap();
     let refs: Vec<_> = pattern
         .find_iter(protected["messages"][0]["content"].as_str().unwrap())
         .map(|m| m.as_str().to_owned())
@@ -224,7 +261,7 @@ async fn real_bert_gateway_tls_validation_restore_compute_and_reload() {
         assert!(!safe.contains(value));
     }
     assert_eq!(gate.restore_display(&safe).unwrap(), text);
-    let money = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+    let money = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
         .unwrap()
         .find(&safe)
         .unwrap()
