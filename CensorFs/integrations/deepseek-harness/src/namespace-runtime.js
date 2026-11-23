@@ -416,8 +416,8 @@ async runWorker({ mode, agent, runId, strategy, opened, tmpDir, prompt, signal, 
         },
         signal,
       }))
-      this.registerVariantBinding(run.childId, agent, runId, strategy.id)
-      return { sessionId: run.childId, provider: this.inProcessProvider.name, mode, ...(await run.result) }
+      this.registerVariantBinding(runner.sessionId, agent, runId, strategy.id)
+      return { sessionId: runner.sessionId, provider: this.inProcessProvider.name, mode, ...(await run.result) }
     } finally {
       if (run !== undefined) {
         try {
@@ -425,7 +425,7 @@ async runWorker({ mode, agent, runId, strategy, opened, tmpDir, prompt, signal, 
         } catch (error) {
           this.ctx.logger?.warn?.(`worker dispose failed: ${errorText(error)}`)
         }
-        this.unregisterVariantBinding(run.childId)
+        this.unregisterVariantBinding(runner.sessionId)
       } else {
         try {
           await this.runnerManager.disposeRecord(runner)

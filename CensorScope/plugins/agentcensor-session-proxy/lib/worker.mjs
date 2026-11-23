@@ -333,7 +333,7 @@ export async function controlLoop(agent, sessions, asks, frames, rl, selectionRe
           ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
           ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
         })
-        if (event.type === 'model/selection') {
+        if (event.type === 'model/selection' && selectionRef !== undefined) {
           selectionRef.current = {
             provider: event.data.provider,
             model: event.data.model,

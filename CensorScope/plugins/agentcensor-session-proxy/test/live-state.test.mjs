@@ -1,42 +1,63 @@
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import test from 'node:test'
-import { Context } from '@deepseek-ai/cordis'
-import { agentEvents, installModelSelection } from '@deepseek-ai/dsh-agent'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import { Session } from '@deepseek-ai/dsh-session'
+import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { AssistantStreamBridge } from '../lib/assistant-stream-bridge.mjs'
 import { controlLoop } from '../lib/worker.mjs'
+import { nativeHarness } from './native-harness.mjs'
 
-const { SessionAssistantStreamAccumulator } = await import(pathToFileURL(join(
-  process.env.DSH_ROOT, 'packages/api/session-controller/src/assistant-stream.ts',
-)).href)
+const sourceAccumulator = join(process.env.DSH_ROOT, 'packages/api/session-controller/src/assistant-stream.ts')
+const controllerRoot = dirname(fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-api-session-controller/package.json')))
+const accumulatorPath = existsSync(sourceAccumulator)
+  ? sourceAccumulator
+  : join(controllerRoot, 'lib/types/assistant-stream.js')
+const { SessionAssistantStreamAccumulator } = await import(pathToFileURL(accumulatorPath).href)
 
-test('worker model changes affect native prompt assembly and the next request together', async t => {
-  const ctx = new Context()
-  await ctx.plugin(SystemPrompt)
-  t.after(() => ctx.fiber.dispose())
-  const session = Session.create('model-switch')
-  const agent = { session, ctx, cancel() {} }
-  const selection = { current: { provider: 'alpha', model: 'a' }, assembled: undefined }
-  installModelSelection(ctx, selection)
-  const request = () => agentEvents(ctx, agent).waterfall(
-    'agent/request', { turn: 1, step: 1, signal: new AbortController().signal },
-    async () => ({ provider: 'fallback', model: 'fallback', reasoningEffort: 'max' }),
-  )
+test('worker model changes use the native selection for each request and preserve an in-flight request', async t => {
+  const started = Promise.withResolvers()
+  const release = Promise.withResolvers()
+  const requests = []
+  const { ctx, agent, adapter } = await nativeHarness(t, async options => {
+    requests.push({ provider: options.provider, model: options.model, reasoningEffort: options.reasoningEffort })
+    if (requests.length === 1) {
+      started.resolve()
+      await release.promise
+    }
+  })
+  ctx.llm.registerAdapter(['beta', 'gamma'], adapter)
+  installModelSelection(agent.ctx)
   const configFrame = data => JSON.stringify({ type: 'host-session-event', event: { type: 'model/selection', data } })
+  const messageFrame = text => JSON.stringify({
+    type: 'message',
+    message: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }),
+  })
   async function* frames() {
     yield configFrame({ provider: 'beta', model: 'b', reasoningEffort: 'high' })
-    assert.deepEqual((await ctx.systemPrompt.assemble()).variables, { provider: 'beta', model: 'b' })
-    assert.deepEqual(await request(), { provider: 'beta', model: 'b', reasoningEffort: 'high' })
+    assert.deepEqual(agent.model.current(), { provider: 'beta', model: 'b', reasoningEffort: 'high' })
+    yield messageFrame('first request')
+    await started.promise
     yield configFrame({ provider: 'gamma', model: 'c' })
-    assert.deepEqual(await request(), { provider: 'beta', model: 'b', reasoningEffort: 'high' })
-    await ctx.systemPrompt.assemble()
-    assert.deepEqual(await request(), { provider: 'gamma', model: 'c' })
+    assert.deepEqual(agent.model.current(), { provider: 'gamma', model: 'c' })
+    assert.deepEqual(requests, [{ provider: 'beta', model: 'b', reasoningEffort: 'high' }])
+    release.resolve()
+    await agent.whenIdle()
+    yield messageFrame('second request')
+    await agent.whenIdle()
+    yield JSON.stringify({ type: 'shutdown' })
   }
-  await controlLoop(agent, { async flush() {} }, { close() {} }, frames(), { close() {} }, selection)
-  assert.equal(session.snapshotEvents().filter(event => event.type === 'model/selection').length, 2)
+  try {
+    await controlLoop(agent, { async flush() {} }, { close() {} }, frames(), { close() {} })
+  } finally {
+    release.resolve()
+  }
+  assert.deepEqual(requests, [
+    { provider: 'beta', model: 'b', reasoningEffort: 'high' },
+    { provider: 'gamma', model: 'c', reasoningEffort: undefined },
+  ])
+  assert.equal(agent.session.snapshotEvents().filter(event => event.type === 'model/selection').length, 2)
 })
 
 test('live frames survive reconnect and worker restart using the native accumulator', () => {

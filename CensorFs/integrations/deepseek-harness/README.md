@@ -4,7 +4,7 @@
 
 **共同 FUSE 数据面**：每个 variant 一个独立 CensorFS View（copy-on-write 覆盖层），写入私有 Upper/Delta；`prepare`→Candidate→`publish` 才把 delta 合并成新 Generation。无共享文件系统模式、无 git worktree 模式。
 
-当前目标 DeepSeek Harness `0.2.1-rc.2`（git tag `dsh-v0.2.1-rc.2`）。部署前需重跑 unit test、Session event snapshot 和 openEuler 真机 smoke。
+当前目标 DeepSeek Harness `0.2.2-rc.1`（git tag `dsh-v0.2.2-rc.1`）。部署前需重跑 unit test、Session event snapshot 和 openEuler 真机 smoke。
 
 发布 Candidate 后，插件会把新 Generation 的文件覆盖/复制到当前会话工作目录，并清理该 Run/World 专属的验证临时目录。工作目录优先取最近一次工具调用记录的绝对 `cwd`；若该信息不可用，可设置 `CENSORFS_PUBLISH_WORKSPACE` 指定绝对路径。复制失败时 Generation 仍已发布，卡片和命令结果会显示失败原因。目标目录中与 Generation 同名的文件会被覆盖，目标目录中的其他文件会保留。
 
@@ -140,7 +140,7 @@ grep -c 'task-file\|taskFilePath' "$DSH_HOME/profiles/<profile>/node_modules/@ce
 
 ```bash
 pnpm add file:/path/to/CensorFS/integrations/deepseek-harness
-pnpm add @deepseek-ai/dsh-sdk-client@0.2.1-rc.2 @deepseek-ai/dsh-sdk-protocol@0.2.1-rc.2
+pnpm install --auto-install-peers
 ```
 
 装完用入口探针确认可解析：`node -e "import(process.env.HOME + '/.dsh/profiles/<profile>/node_modules/@censorfs/deepseek-harness/src/index.js').then(() => console.log('ENTRY_IMPORT_OK'))"`。

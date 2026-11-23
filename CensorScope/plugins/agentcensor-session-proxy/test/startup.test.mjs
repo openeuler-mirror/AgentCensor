@@ -71,6 +71,7 @@ test('seed launch preserves user configuration and isolates writable session roo
   for (const id of ['credentials', 'authorization', 'deepseek-account']) assert.equal(byId.get(id).disabled, false)
   assert.equal(byId.get('session-persistence-jsonl').config.root, join(state.privHome, 'sessions'))
   assert.equal(byId.get('headless-runner').disabled, true)
+  assert.notEqual(byId.get('headless-startup')?.disabled, true)
   assert.equal(await agent.ensureWorker(), state)
   agent.markBusy()
   agent.markBusy()

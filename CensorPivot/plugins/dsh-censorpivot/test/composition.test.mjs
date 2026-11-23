@@ -45,7 +45,7 @@ test('registers the browser client with its package identity', async () => {
   assert.match(source, /user\/message/)
   assert.match(source, /pivot-scope-scroll/)
   assert.match(source, /isRuntimeContext/)
-  assert.match(source, /closePivotSettings/)
+  assert.match(source, /props\.close\(\)/)
   assert.match(source, /censorguard-read/)
   assert.match(source, /audit\/snapshot/)
 })

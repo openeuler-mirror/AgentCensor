@@ -249,11 +249,11 @@ dsh_root=$setup_test_dsh_root
 run_demo=true
 run_stack
 '''
-    env['setup_test_dsh_version'] = '0.2.1-rc.20'
+    env['setup_test_dsh_version'] = '0.2.2-rc.10'
     result = subprocess.run(['bash','-c',with_dsh,'bash',str(script),str(root)],env=env,capture_output=True)
     assert result.returncode != 0, 'unsupported DSH version passed preflight'
     assert not (root/'calls').exists(), 'failed DSH preflight invoked installer'
-    env['setup_test_dsh_version'] = '0.2.1-rc.2'
+    env['setup_test_dsh_version'] = '0.2.2-rc.1'
     result = subprocess.run(['bash','-c',with_dsh,'bash',str(script),str(root)],env=env,capture_output=True)
     assert result.returncode == 0, result.stderr
     assert (root/'calls').read_text().splitlines() == [

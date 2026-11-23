@@ -318,10 +318,10 @@ check_dsh_environment() {
   if [[ -x ${CARGO_HOME:-$HOME/.cargo}/bin/cargo ]]; then export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"; fi
   if [[ -n $dsh_root ]]; then
     [[ -f $dsh_root/package.json ]] || fail "invalid DSH source directory: $dsh_root"
-    as_dsh_user bash -c 'node -e "if (+process.versions.node.split(\".\")[0] < 22) process.exit(1)" && command -v pnpm >/dev/null' ||
-      fail 'DSH requires Node 22+ and pnpm in the invoking user environment'
-    as_dsh_user bash -c 'set -euo pipefail; cd -- "$1"; pnpm dsh --version | grep -Fx "0.2.1-rc.2" >/dev/null' bash "$dsh_root" ||
-      fail 'DSH source/dependencies must provide version 0.2.1-rc.2 before deployment'
+    as_dsh_user bash -c 'node -e "const [a,b]=process.versions.node.split(\".\").map(Number); if(a<24||(a===24&&b<9)) process.exit(1)" && command -v pnpm >/dev/null' ||
+      fail 'DSH requires Node 24.9+ and pnpm in the invoking user environment'
+    as_dsh_user bash -c 'set -euo pipefail; cd -- "$1"; pnpm dsh --version | grep -Fx "0.2.2-rc.1" >/dev/null' bash "$dsh_root" ||
+      fail 'DSH source/dependencies must provide version 0.2.2-rc.1 before deployment'
   fi
 }
 

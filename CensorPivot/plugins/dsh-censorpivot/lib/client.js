@@ -33,27 +33,6 @@ window.__ModuleLoader__.load({
       subscribe: (listener) => { preferenceListeners.add(listener); return () => preferenceListeners.delete(listener); },
       apply: applyPreferences,
     };
-    function openPivotSettings() {
-      const trigger = document.querySelector('button[aria-haspopup="dialog"]');
-      if (!trigger) return;
-      trigger.click();
-      let attempts = 0;
-      const selectPivot = () => {
-        const pivot = [...document.querySelectorAll('button')].find((button) => button.textContent && button.textContent.trim() === 'Pivot');
-        if (pivot) { pivot.click(); return; }
-        attempts += 1;
-        if (attempts < 10) setTimeout(selectPivot, 16);
-      };
-      setTimeout(selectPivot, 0);
-    }
-    function closePivotSettings() {
-      const close = [...document.querySelectorAll('button')].find((button) => {
-        const label = `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''} ${button.textContent || ''}`.trim().toLowerCase();
-        return label === '×' || label.includes('关闭') || label.includes('close');
-      });
-      if (close) { close.click(); return; }
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
-    }
     function time(ms) { return typeof ms === 'number' ? new Date(ms).toLocaleTimeString() : '—'; }
     function sysTime(raw) {
       const ms = Number(raw) / 1e6;
@@ -449,7 +428,7 @@ window.__ModuleLoader__.load({
       if (!enabled.length) return h('div', { className: 'pivot-root' }, h('div', { className: 'pivot-empty' }, 'Pivot 模块均已关闭。请在设置中启用至少一个模块。'));
       const grid = activeExpanded ? 'pivot-grid expanded' : enabled.length === 1 ? 'pivot-grid one' : pref.scope && pref.fs && pref.guard ? 'pivot-grid triple' : pref.scope ? 'pivot-grid stack' : 'pivot-grid pair';
       return h('div', { className: 'pivot-root' },
-        !activeExpanded ? h('div', { className: 'pivot-head' }, h('span', { className: 'pivot-spacer' }), h('button', { type: 'button', className: 'pivot-button', onClick: openPivotSettings, title: '打开 Pivot 设置' }, '⚙ 设置')) : null,
+        !activeExpanded ? h('div', { className: 'pivot-head' }, h('span', { className: 'pivot-spacer' }), h('button', { type: 'button', className: 'pivot-button', onClick: props.openSettings, title: '打开 Pivot 设置' }, '⚙ 设置')) : null,
         h('div', { className: grid }, (!activeExpanded || activeExpanded === 'fs') && pref.fs ? h(FS, { ledger, sessionId: props.sessionId, useConversation: props.useConversation, executeCommand: props.executeCommand, expanded: activeExpanded === 'fs', collapsing: collapsing === 'fs', onToggle: () => toggleExpanded('fs') }) : null, (!activeExpanded || activeExpanded === 'guard') && pref.guard ? h(Guard, { connection: props.connection, columns: pref.guardColumns, expanded: activeExpanded === 'guard', collapsing: collapsing === 'guard', onToggle: () => toggleExpanded('guard') }) : null, (!activeExpanded || activeExpanded === 'scope') && pref.scope ? h(Scope, { ledger, sessionId: props.sessionId, expanded: activeExpanded === 'scope', collapsing: collapsing === 'scope', onToggle: () => toggleExpanded('scope') }) : null));
     }
     function GuardPolicy({ connection }) {
@@ -470,11 +449,11 @@ window.__ModuleLoader__.load({
         h('section', { className: 'pivot-section' }, h('h3', null, 'Scope 观测等级'), h('p', { className: 'pivot-help' }, '保存为 Pivot 本地展示偏好；不改写 Scope daemon 的采集配置。'), h('div', { className: 'pivot-level' }, ['L1（宽松）', 'L2（标准）', 'L3（严格）'].map((label, i) => { const v = `L${i + 1}`; return h('button', { key: v, className: pref.level === v ? 'active' : '', onClick: () => set({ level: v }) }, label); }))),
         h('section', { className: 'pivot-section' }, h('h3', null, 'Guard 标题栏选项'), h('p', { className: 'pivot-help' }, '勾选 Guard 审计表格中需要展示的列。'), Object.entries({ time: '时间', result: '结果', type: '类型', domain: 'DOMAIN', process: '进程', target: '目标', args: '参数', version: '版本' }).map(([key, label]) => h('label', { key, style: { display: 'inline-flex', gap: '6px', margin: '0 14px 8px 0', alignItems: 'center' } }, h('input', { type: 'checkbox', checked: pref.guardColumns[key] !== false, onChange: (e) => set({ guardColumns: { ...pref.guardColumns, [key]: e.target.checked } }) }), label))),
         h(GuardPolicy, { connection: props.connection }),
-        h('div', { className: 'pivot-actions' }, h('button', { type: 'button', className: 'pivot-button', disabled: !dirty, onClick: () => { preferences.apply(pref); closePivotSettings(); } }, '应用')));
+        h('div', { className: 'pivot-actions' }, h('button', { type: 'button', className: 'pivot-button', disabled: !dirty, onClick: () => { preferences.apply(pref); props.close(); } }, '应用')));
     }
     const inject = ['slots', 'sessions', 'connection', 'remote', 'remote.commands'];
     function apply(ctx) {
-      ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id: 'pivot', order: 15, label: () => 'Pivot', inject: (sessionId) => ({ ledger: makeLedger(ctx, sessionId), sessionId, connection: ctx.connection, executeCommand: (line) => ctx.remote.commands.execute(sessionId, line, []) }) }, PivotView));
+      ctx.slots.inject('conversation.view', () => ctx.slots.register({ name: 'conversation.view', id: 'pivot', order: 15, label: () => 'Pivot', inject: (sessionId) => ({ openSettings: () => ctx.slots.entries('sidebar.settings')[0]?.store?.create().actions.openSection('pivot'), ledger: makeLedger(ctx, sessionId), sessionId, connection: ctx.connection, executeCommand: (line) => ctx.remote.commands.execute(sessionId, line, []) }) }, PivotView));
       ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'pivot', order: 110, label: 'Pivot', inject: () => ({ connection: ctx.connection }) }, PivotSettings));
     }
     module.exports = { name: 'censorpivot-ui', inject, apply };

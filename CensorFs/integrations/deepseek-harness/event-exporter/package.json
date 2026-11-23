@@ -1,7 +1,7 @@
 {
   "name": "@censorfs/event-exporter",
-  "version": "0.2.2",
-  "description": "Child-side DSH 0.2.1-rc.2 plugin for CensorFS Parallel Worlds events",
+  "version": "0.2.3",
+  "description": "Child-side DSH 0.2.2-rc.1 plugin for CensorFS Parallel Worlds events",
   "type": "module",
   "main": "src/index.js",
   "files": ["src/", "cordis.patch.yml"],
@@ -11,7 +11,7 @@
     "directory": "integrations/deepseek-harness/event-exporter"
   },
   "keywords": ["deepseek", "harness", "censorfs", "events", "agent"],
-  "engines": { "node": ">=22.0.0", "dsh": "0.2.1-rc.2" },
+  "engines": { "node": ">=24.9.0", "dsh": "0.2.2-rc.1" },
   "author": "CensorFS Contributors",
   "license": "MulanPSL-2.0",
   "exports": {
@@ -23,7 +23,7 @@
     "bundle": { "patch": "./cordis.patch.yml" }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "4.0.5",
-    "@deepseek-ai/dsh-session": "0.2.1-rc.2"
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.1"
   }
 }
