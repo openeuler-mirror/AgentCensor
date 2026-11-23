@@ -206,7 +206,7 @@ censorfs-commit "$ticket" --message 'agent-a result'
 censorfs-head agent-a
 ```
 
-`censorfs info` 依赖正在运行的 daemon。如果出现 `IoError: No such file or directory`，首先检查 `CENSORFS_SOCKET` 是否与 daemon 使用的路径一致，以及该 Socket 是否存在。完整启动顺序和每个命令的例子见 [CensorFS 命令使用手册](../../../../CensorFs/docs/CensorFS_CLI_GUIDE.md)。
+`censorfs info` 依赖正在运行的 daemon。如果出现 `IoError: No such file or directory`，首先检查 `CENSORFS_SOCKET` 是否与 daemon 使用的路径一致，以及该 Socket 是否存在。完整启动顺序和每个命令的例子见 [CensorFS 命令使用手册](../../../../CensorFs/docs/CENSORFS_CLI_GUIDE.md)。
 
 测试结束后停止这个示例 daemon：
 
@@ -284,7 +284,7 @@ CENSORFS_DEMO_PARENT=/data bash scripts/demo-crash-fsck.sh
 
 ## 文档
 
-- [CensorFS 命令使用手册](../../../../CensorFs/docs/CensorFS_CLI_GUIDE.md)：初始化、daemon、分支、探索、提交、合并、fsck 和错误排查。
+- [CensorFS 命令使用手册](../../../../CensorFs/docs/CENSORFS_CLI_GUIDE.md)：初始化、daemon、分支、探索、提交、合并、fsck 和错误排查。
 - [openEuler 鲲鹏构建与部署](../../../../CensorFs/docs/OPENEULER_AARCH64.md)：依赖、一键/手动/离线构建、运行前检查和真实 FUSE 验证。
 - [架构说明](../../../../CensorFs/docs/ARCHITECTURE.md)：对象模型、发布、Merge、恢复、视图隔离和信任边界。
 - [磁盘格式](../../../../CensorFs/docs/ON_DISK_FORMAT.md)：记录编码、目录布局、原子写入和兼容性规则。

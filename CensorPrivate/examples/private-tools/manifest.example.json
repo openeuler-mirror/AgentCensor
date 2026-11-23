@@ -1,0 +1,18 @@
+{
+  "tools": [
+    {
+      "name": "private_sort",
+      "description": "Stable ascending text sort of private values. Returns the same references in sorted order.",
+      "command": ["/usr/bin/python3", "-I", "/absolute/path/to/sort.py"],
+      "output": "order",
+      "timeout_ms": 3000
+    },
+    {
+      "name": "private_sort_shell",
+      "description": "Stable ascending text sort of private values using jq. Returns the same references in sorted order.",
+      "command": ["/bin/sh", "/absolute/path/to/sort.sh"],
+      "output": "order",
+      "timeout_ms": 3000
+    }
+  ]
+}

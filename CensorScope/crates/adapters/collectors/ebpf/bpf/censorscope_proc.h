@@ -398,10 +398,19 @@ static __always_inline int emit_exec_proc_event(
 
     event = censorscope_event_reserve(sizeof(*event));
     if (!event) {
+        record_loss(LOSS_COUNTER_PROCESS);
         return BPF_STATUS_ERROR;
     }
 
-    init_event(&event->event, PROC_EXEC, pid, trace_id);
+    init_event_from_cache(&event->event, PROC_EXEC, pid, trace_id);
+    __builtin_memset(event->event.call_id, 0, sizeof(event->event.call_id));
+    __u32 context_pid = current_kernel_tgid();
+    bpf_map_delete_elem(&call_ids, &context_pid);
+    __u32 profile = find_context_env(&event->event, bpf_get_current_task());
+    if (profile && !event->event.session[0])
+        bpf_map_delete_elem(&session_ids, &context_pid);
+    cache_session(current_kernel_tgid(), event->event.session);
+    cache_call_id(current_kernel_tgid(), event->event.call_id);
     event->event.aux = (__u32)ctx->old_pid;
     event->filename_size = 0;
     event->filename_flags = 0;

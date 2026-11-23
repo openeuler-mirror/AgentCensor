@@ -277,6 +277,9 @@ pub(crate) fn operation(request: &Request, response: &Response) -> String {
         match request.op {
             Operation::Reload if request.dry_run => "Policy valid (no changes applied)",
             Operation::Reload => "Policy applied",
+            Operation::RuleAppend => "Global rule saved",
+            Operation::RuleRemove => "Global rule removed from configuration",
+            Operation::RuleApply => "Global rules applied",
             Operation::Bind => "Policy bound",
             Operation::Remove if request.domain.is_some() => "Policy unbound",
             Operation::Remove => "Policy removed",
@@ -294,6 +297,12 @@ pub(crate) fn operation(request: &Request, response: &Response) -> String {
             "  Source        {}\n",
             source(request.policy_source.as_ref(), None)
         ));
+    }
+    if let Some(rule) = &request.rule {
+        text.push_str(&format!("  Rule          {rule}\n"));
+    }
+    if let Some(path) = &response.config_path {
+        text.push_str(&format!("  Configuration {path}\n"));
     }
     if let Some(domain) = response
         .domain
@@ -326,6 +335,9 @@ pub(crate) fn operation(request: &Request, response: &Response) -> String {
         text.push_str("  Changes       None; validation only\n");
     } else if response.version > 0 {
         text.push_str(&format!("  Revision      {}\n", response.version));
+    }
+    if matches!(request.op, Operation::RuleAppend | Operation::RuleRemove) {
+        text.push_str("  Saved; takes effect on rule apply or next startup.\n");
     }
     if !response.daemon_ready {
         text.push_str("\n  ! Daemon is not ready; check status or doctor.\n");

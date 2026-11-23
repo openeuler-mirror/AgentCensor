@@ -167,7 +167,7 @@ impl StorageBackend for SqliteStorage {
         started_at_ns: i64,
         ended_at_ns: i64,
         limit: u64,
-    ) -> Result<Vec<(i64, Option<u32>, i64)>, StorageError> {
+    ) -> Result<Vec<(i64, Option<u32>, i64, Option<String>)>, StorageError> {
         SqliteStorage::unassigned_events_in_window(
             self,
             trace_id,

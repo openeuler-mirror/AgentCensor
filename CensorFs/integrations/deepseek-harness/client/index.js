@@ -1057,6 +1057,7 @@ window.__ModuleLoader__.load({
       var resultOutput = (variant.result && variant.result.output) || variant.output
       // summary 降级：后端折叠到 result.summary；老事件仍是顶层 variant.summary。
       var summaryText = (variant.result && variant.result.summary) || variant.summary
+      var materialization = variant.materialization
 
       var actCount = (variant.activities || []).length
       var writeCount = (variant.activities || []).concat(variant.sysActivities || []).filter(function (a) {
@@ -1103,6 +1104,14 @@ window.__ModuleLoader__.load({
         children.push(h('div', { key: 'summary', style: { marginTop: 4, fontSize: 12, color: '#57606a', lineHeight: 1.5 } },
           collapsibleLongText(summaryText, summaryOpen, function () { setSummaryOpen(!summaryOpen) }),
         ))
+      }
+      if (variant.status === 'published' && materialization) {
+        children.push(h('div', {
+          key: 'materialization',
+          style: { marginTop: 6, fontSize: 11, color: materialization.error ? '#b42318' : '#16803c' },
+        }, materialization.error
+          ? '已发布，但写入工作区失败：' + materialization.error
+          : '已实例化到工作区：' + materialization.workspace))
       }
 
       // 实时「执行动态」：最近 3 条有意义的动作（读/写/删/命令/工具），实时随事件变化
@@ -3234,7 +3243,7 @@ return h('div', { className: 'branch-explore-summary', style: panel },
     // 客户端 cordis 模块规范：模块必须导出 apply(ctx)，
     // 否则浏览器端加载器会报 invalid plugin, expect function or object with an "apply" method。
 
-    // dsh 0.1.5-rc.2：conversationEvents / conversationViews 两个独立服务已并入
+    // dsh 0.2.1-rc.2：conversationEvents / conversationViews 两个独立服务已并入
     // uiConversation 聚合服务（events / views 注册表，
     // 见 dsh 的 packages/client/ui-conversation/src/client/conversation/assembly.ts）。
     var inject = ['uiConversation', 'slots', 'remote', 'remote.commands', 'sessions']

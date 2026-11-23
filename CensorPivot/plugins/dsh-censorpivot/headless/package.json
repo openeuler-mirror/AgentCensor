@@ -1,6 +1,6 @@
 {
   "name": "@agentcensor/censorpivot-headless",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Internal headless companion for the CensorPivot DSH composite",
   "private": true,
   "type": "module",
@@ -19,7 +19,8 @@
     "cordis.patch.yml"
   ],
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": "0.2.1-rc.2"
   },
   "license": "MulanPSL-2.0"
 }

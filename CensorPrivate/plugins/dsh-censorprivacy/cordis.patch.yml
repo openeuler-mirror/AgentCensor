@@ -6,7 +6,7 @@
         baseURL: !!js process.env.CP_DSH_BASE_URL
         model: !!js process.env.CP_DSH_MODEL
         broker: !!js process.env.CENSORPRIVACY_URL
-        tlsRun: !!js process.env.CP_DSH_TLS_RUN
+        executable: !!js process.env.CP_DSH_EXECUTABLE
         nativeLibrary: !!js process.env.CP_DSH_NATIVE_LIBRARY
         tokenFile: !!js process.env.CP_DSH_TOKEN_FILE
         runStateFile: !!js process.env.CP_DSH_RUN_STATE_FILE
@@ -22,6 +22,8 @@
     provider: censorprivacy
     model: !!js process.env.CP_DSH_MODEL
 - id: llm-deepseek
+  disabled: true
+- id: llm-deepseek-account
   disabled: true
 - id: llm-pi-ai
   disabled: true

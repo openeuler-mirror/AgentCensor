@@ -1,9 +1,10 @@
 {
   "name": "@censorfs/deepseek-harness",
-  "version": "0.2.0",
-  "description": "CensorFS Parallel Worlds runtime and UI bundle with full FUSE child Harness and in-process Namespace Runner modes (targets dsh 0.1.5-rc.2)",
+  "version": "0.2.2",
+  "description": "CensorFS Parallel Worlds runtime and UI bundle for dsh 0.2.1-rc.2 with workspace materialization",
   "type": "module",
   "main": "src/index.js",
+  "bin": { "dsh-jsonrpc-agent": "./bin/dsh-jsonrpc-agent" },
   "files": ["src/", "client/", "cordis.patch.yml", "bin/"],
   "repository": {
     "type": "git",
@@ -11,7 +12,7 @@
     "directory": "integrations/deepseek-harness"
   },
   "keywords": ["deepseek", "harness", "censorfs", "agent", "sandbox", "fuse"],
-  "engines": { "node": ">=22.0.0" },
+  "engines": { "node": ">=22.0.0", "dsh": "0.2.1-rc.2" },
   "author": "CensorFS Contributors",
   "license": "MulanPSL-2.0",
   "exports": {
@@ -34,19 +35,18 @@
   },
   "scripts": { "test": "node --test" },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-agent": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-api-remotes": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-client-ui-conversation": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-commands": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-llm": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-sdk-client": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-session": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-subagent": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-subagent-in-process-driver": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-subprocess": "0.1.5-rc.2",
-    "@deepseek-ai/dsh-tools": "0.1.5-rc.2",
-    "@deepseek-ai/schemastery": "0.1.5-rc.2",
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-api-remotes": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-commands": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-sdk-client": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-subagent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-subprocess": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "3.18.5",
     "react": "^18.2.0"
   }
 }

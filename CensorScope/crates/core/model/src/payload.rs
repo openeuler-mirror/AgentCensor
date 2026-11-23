@@ -62,6 +62,8 @@ pub struct PayloadSegment {
     pub session_id: Option<SessionIdentity>,
     /// Harness tool call identifier used to correlate payload observations.
     pub call_id: Option<String>,
+    #[serde(default)]
+    pub attribution: crate::attribution::AttributionEvidence,
     pub observed_at: SystemTime,
     pub source: PayloadSourceBoundary,
     pub content_state: PayloadContentState,
@@ -101,6 +103,7 @@ mod tests {
             trace_id: TraceId::new(1),
             process: ProcessIdentity::new(2),
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             observed_at: SystemTime::UNIX_EPOCH,
             source: PayloadSourceBoundary::Stdio,

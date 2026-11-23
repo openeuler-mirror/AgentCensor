@@ -23,6 +23,32 @@ fn events(raw: &[u8]) -> Vec<Value> {
         .map(|line| json::from_slice(line.as_bytes()).unwrap())
         .collect()
 }
+
+#[test]
+fn disabled_tools_reject_partial_calls_before_any_call_bytes_are_released() {
+    let mut gate = gate();
+    for delta in [
+        json!({"tool_calls":[{"index":0,"id":"call"}]}),
+        json!({"tool_calls":[{"index":0,"function":{"name":"file_read","arguments":"{}"}}]}),
+        json!({"function_call":{"name":"file_read","arguments":"{}"}}),
+    ] {
+        let mut stream = SseTransformer::new(Api::Chat, &gate)
+            .unwrap()
+            .with_tools_enabled(false);
+        let wire = event(&json!({"choices":[{"index":0,"delta":delta}]}));
+        assert!(stream.feed(wire.as_bytes(), &mut gate).is_err());
+    }
+    let mut stream = SseTransformer::new(Api::Chat, &gate)
+        .unwrap()
+        .with_tools_enabled(false);
+    let wire = event(
+        &json!({"choices":[{"index":0,"delta":{"content":"normal reply"},"finish_reason":"stop"}]}),
+    );
+    assert_eq!(
+        text(Api::Chat, &stream.feed(wire.as_bytes(), &mut gate).unwrap()),
+        "normal reply"
+    );
+}
 fn text(api: Api, raw: &[u8]) -> String {
     events(raw)
         .iter()

@@ -1,6 +1,6 @@
 # Native TLS transport
 
-本目录提供 Linux x86_64/aarch64 的动态 OpenSSL 接入库。协作客户端通过 `LD_PRELOAD` 加载 `libcp_tls_guard.so`，原 TLS 连接由客户端管理；本机 broker 同步决定哪些请求和响应字节可以继续流动。
+本目录提供 Linux x86_64/aarch64 的动态 OpenSSL 接入库。协作客户端通过 `LD_PRELOAD` 加载 `libcensorprivacy_tls_guard.so`，原 TLS 连接由客户端管理；本机 broker 同步决定哪些请求和响应字节可以继续流动。
 
 ## 构建
 
@@ -10,11 +10,11 @@
 make -C native
 ```
 
-输出为 `native/libcp_tls_guard.so`。通过 [tls-run](../README.md#tls-direct) 的 `--native-library` 指定它；库文件及其所在目录应由可信控制面管理，文件不能被组或其他用户写入。
+输出为 `native/libcensorprivacy_tls_guard.so`。通过 [censorprivacy tls-run](../docs/usage.md#tls-direct) 的 `--native-library` 指定它；库文件及其所在目录应由可信控制面管理，文件不能被组或其他用户写入。
 
 ## 接入
 
-先使用 `censorprivacy serve --tls-direct` 启动 broker，配置固定的 HTTPS IPv4 origin，再由 `tls-run` 启动客户端。launcher 设置以下环境变量：
+先使用 `censorprivacy serve --tls-direct` 启动 broker，配置固定的 HTTPS IPv4 origin，再由 `censorprivacy tls-run` 启动客户端。launcher 设置以下环境变量：
 
 | 变量 | 用途 |
 |---|---|
@@ -33,7 +33,8 @@ make -C native
 - 单个 JSON 正文最多 256 KiB，头部和连接缓冲另有上限。
 - 请求分片先留在本机，完整保护通过后才写入原连接；响应分片先交给 broker，完整安全响应形成后才返回应用。
 - 短别名按敏感 span 的原始 JSON wire 字节预算分配，包括转义；不是按字符数或模型 token 数分配。1–2 字节 span 使用不可恢复遮盖。
+- 本机 broker RPC 最多等待 60 秒，超时拒绝放行。该传输限制独立于 NER 的每窗口预算和上游 HTTP 超时；长文本仍需在此传输时限内完成。
 
 HTTP/2、SSE、gzip、chunked、Upgrade、Expect、流水线、早期数据、sendfile 和 peek 等未支持入口拒绝处理。静态链接、其他 TLS 后端、自定义未暴露入口和通用非阻塞 readiness 兼容不在支持范围内。
 
-本库是进程内协作接入，不提供对任意代码绕过的独立出口保证。需要受管进程的强制出口限制时，使用完整网关和 `privacy-run`。
+本库是进程内协作接入，不提供对任意代码绕过的独立出口保证。需要受管进程的强制出口限制时，使用完整网关和 `censorprivacy run`。

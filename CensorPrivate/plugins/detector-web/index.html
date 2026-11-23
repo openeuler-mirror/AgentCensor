@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <meta name="description" content="发送之前，检查文本中的敏感信息。" />
+    <title>隐私检测台 · CensorPrivacy</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%2327483e'/%3E%3Cpath d='M20 8 30 12v8c0 6-10 12-10 12S10 26 10 20v-8Z' fill='none' stroke='%23fff' stroke-width='2'/%3E%3Cpath d='m15 20 3 3 7-7' fill='none' stroke='%23c9e7ab' stroke-width='2'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/static/app.css" />
+    <script defer src="/static/app.js"></script>
+  </head>
+  <body>
+    <svg
+      class="icon-library"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <symbol id="shield" viewBox="0 0 24 24">
+        <path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Z" />
+        <path d="m8.5 12 2.5 2.5 4.5-5" />
+      </symbol>
+      <symbol id="arrow" viewBox="0 0 24 24">
+        <path d="M5 12h14m-6-6 6 6-6 6" />
+      </symbol>
+      <symbol id="scan" viewBox="0 0 24 24">
+        <path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M3 12h18" />
+      </symbol>
+      <symbol id="sliders" viewBox="0 0 24 24">
+        <path d="M4 7h7m4 0h5M4 17h3m4 0h9" />
+        <circle cx="13" cy="7" r="2" />
+        <circle cx="9" cy="17" r="2" />
+      </symbol>
+      <symbol id="spark" viewBox="0 0 24 24">
+        <path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z" />
+      </symbol>
+      <symbol id="check" viewBox="0 0 24 24">
+        <path d="m5 12 4 4L19 6" />
+      </symbol>
+      <symbol id="copy" viewBox="0 0 24 24">
+        <rect x="8" y="8" width="12" height="13" rx="2" />
+        <path d="M15 8V3H3v12h5" />
+      </symbol>
+      <symbol id="info" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 11v6m0-10v1" />
+      </symbol>
+    </svg>
+
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="隐私检测台首页">
+          <span class="brand-icon"
+            ><svg class="icon"><use href="#shield" /></svg
+          ></span>
+          <span>隐私检测台<small>CensorPrivacy</small></span>
+        </a>
+        <span class="local-badge"
+          ><span class="status-dot"></span> 本地隐私工作台</span
+        >
+      </header>
+
+      <main>
+        <section class="hero" aria-labelledby="page-title">
+          <div>
+            <div class="eyebrow"><span></span> PRIVACY WORKSPACE</div>
+            <h1 id="page-title">
+              让敏感信息，<br class="mobile-break" />止于发送之前<span>。</span>
+            </h1>
+            <p>同步 Agent 对话，查看每次发送前的检测与遮蔽结果，也可粘贴文本独立检测。</p>
+          </div>
+          <div class="hero-note">
+            <svg class="icon"><use href="#shield" /></svg
+            ><span>REGEX / RULES / NER</span>
+          </div>
+        </section>
+
+        <section class="card conversations-card" aria-labelledby="conversations-title">
+          <div class="card-header">
+            <h2 id="conversations-title">Agent 对话记录</h2>
+            <div class="conversation-actions">
+              <span id="conversation-status" class="subtle" role="status">正在连接…</span>
+              <button id="clear-conversations" type="button" class="text-button" disabled>清空记录</button>
+            </div>
+          </div>
+          <p id="conversation-notice" class="conversation-hint" role="status" hidden></p>
+          <div class="conversation-workspace">
+            <nav id="session-list" class="session-list" aria-label="Agent 会话"></nav>
+            <div id="conversation-timeline" class="conversation-timeline" aria-label="对话过程" aria-live="polite">
+              <p class="conversation-hint">通过 CensorPrivacy 网关启动 DeepSeek Harness、xiaoO 或其他 Agent，对话记录会自动出现在这里。</p>
+            </div>
+          </div>
+        </section>
+        <div class="detail-heading">
+          <p id="detail-context">独立文本检测</p>
+          <button id="manual-mode" type="button" class="text-button" hidden>返回独立检测</button>
+        </div>
+        <form id="detector-form" novalidate>
+          <div class="workspace">
+            <section class="card editor-card" aria-labelledby="input-title">
+              <div class="card-header">
+                <h2 id="input-title">
+                  <span class="step">01</span> 待检测文本
+                </h2>
+                <button type="button" id="clear" class="text-button">
+                  清空
+                </button>
+              </div>
+              <label class="sr-only" for="text-input">输入需要检测的文本</label>
+              <textarea
+                id="text-input"
+                spellcheck="false"
+                placeholder="在这里粘贴邮件、消息或任何准备发送的内容…"
+                data-max-length="5000"
+              ></textarea>
+              <div class="editor-meta">
+                <span><span class="tiny-dot"></span> <span id="editor-hint">仅在点击检测后分析</span></span>
+                <span id="char-count">0 / 5000</span>
+              </div>
+              <div class="example-row">
+                <span>试一试</span>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="privacy"
+                >
+                  综合隐私 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="contact"
+                >
+                  联系方式 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="medical"
+                >
+                  医疗信息 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="english"
+                >
+                  英文文本 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="handover"
+                >
+                  项目交接 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="casefile"
+                >
+                  就诊随访 <span>↗</span>
+                </button>
+                <button
+                  type="button"
+                  class="sample-button"
+                  data-sample="english_report"
+                >
+                  英文长邮件 <span>↗</span>
+                </button>
+              </div>
+              <div class="editor-footer">
+                <div class="editor-options">
+                  <span id="active-pipeline" class="pipeline-summary"
+                    >正则 + 精确规则</span
+                  >
+                </div>
+                <div class="submit-group">
+                  <span class="shortcut">⌘ / Ctrl + Enter</span>
+                  <button id="analyze" type="submit" class="primary-button">
+                    <span id="analyze-label">开始检测</span
+                    ><svg class="icon"><use href="#arrow" /></svg>
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <aside class="settings-sidebar" aria-label="检测设置">
+              <section
+                class="card settings-card"
+                aria-labelledby="settings-title"
+              >
+                <div class="card-header">
+                  <h2 id="settings-title">
+                    <svg class="icon"><use href="#sliders" /></svg> 检测设置
+                  </h2>
+                  <span class="subtle">Rust · ONNX</span>
+                </div>
+                <fieldset class="engine-fieldset">
+                  <legend class="sr-only">检测引擎</legend>
+                  <label class="engine-option"
+                    ><span class="engine-glyph">.*</span
+                    ><span class="engine-description"
+                      ><strong>正则匹配</strong
+                      ><small>邮箱、手机号等固定格式</small></span
+                    ><input
+                      type="checkbox"
+                      name="engines"
+                      value="regex"
+                      disabled checked /><span class="switch" aria-hidden="true"></span
+                  ></label>
+                  <label class="engine-option"
+                    ><span class="engine-glyph"
+                      ><svg class="icon"><use href="#scan" /></svg></span
+                    ><span class="engine-description"
+                      ><strong>规则模式</strong
+                      ><small>字段、上下文与格式校验</small></span
+                    ><input
+                      type="checkbox"
+                      name="engines"
+                      value="rule"
+                      disabled checked /><span class="switch" aria-hidden="true"></span
+                  ></label>
+                  <label class="engine-option"
+                    ><span class="engine-glyph ner-glyph">Aa</span
+                    ><span class="engine-description"
+                      ><strong
+                        >实体识别 <span class="mini-badge">NER</span></strong
+                      ><small>人名、地点与组织名称</small></span
+                    ><input type="checkbox" name="engines" value="ner" checked /><span
+                      class="switch"
+                      aria-hidden="true"
+                    ></span
+                  ></label>
+                </fieldset>
+                <div class="settings-body">
+                  <p class="mode-description">正则与精确规则始终启用，实体识别可单独关闭。普通数字作为低分线索展示，默认不遮蔽。</p>
+                </div>
+              </section>
+              <section class="card settings-card" aria-labelledby="mask-title">
+                <div class="card-header">
+                  <h2 id="mask-title">
+                    <svg class="icon"><use href="#shield" /></svg> 遮蔽方式
+                  </h2>
+                </div>
+                <div class="settings-body">
+                  <label for="mask-style" class="sr-only">遮蔽方式</label>
+                  <select id="mask-style" class="mask-style">
+                    <option value="reference">随机引用（CP）</option>
+                    <option value="label">类别占位符</option>
+                    <option value="stars">等字符数星号</option>
+                  </select>
+                  <label
+                    class="mode-label mask-threshold-label"
+                    for="mask-threshold"
+                    >遮蔽分数阈值</label
+                  >
+                  <input
+                    id="mask-threshold"
+                    class="mask-style"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value="0.6"
+                    required
+                    title="分数达到阈值才遮蔽；默认 0.60，普通数字 0.40 保留供复核"
+                  />
+                </div>
+              </section>
+            </aside>
+          </div>
+        </form>
+
+        <div id="error-message" class="error-message" role="alert" hidden></div>
+        <p id="live-message" class="sr-only" aria-live="polite"></p>
+
+        <section
+          class="card results-card"
+          aria-labelledby="results-title"
+          aria-busy="false"
+        >
+          <div class="card-header results-header">
+            <h2 id="results-title">
+              <span class="step">02</span> 检测结果
+              <span id="result-count" class="count-badge" hidden>0</span>
+            </h2>
+            <span id="result-summary" class="subtle">等待检测</span>
+          </div>
+          <div id="empty-state" class="empty-state">
+            <div class="empty-symbol">
+              <svg class="icon"><use href="#scan" /></svg><span></span>
+            </div>
+            <h3 id="empty-title">每一处敏感，都有迹可循</h3>
+            <p id="empty-description">输入文本并开始检测，结果将在这里呈现。</p>
+          </div>
+          <div id="loading-state" class="empty-state" hidden>
+            <span class="loader"></span>
+            <h3>正在检查文本…</h3>
+            <p>使用本地正则、规则与 ONNX 模型，请稍候。</p>
+          </div>
+          <div id="result-content" class="result-content" hidden>
+            <div class="highlight-panel">
+              <div class="panel-heading">
+                <h3>原文标注</h3>
+                <span><span class="legend-dot"></span> 敏感内容</span>
+              </div>
+              <div id="highlighted-text" class="highlighted-text"></div>
+              <p class="highlight-help">点击右侧结果，查看对应位置。</p>
+            </div>
+            <div class="findings-panel">
+              <div class="panel-heading">
+                <h3>发现的线索</h3>
+                <button id="copy-results" type="button" class="text-button">
+                  <svg class="icon"><use href="#copy" /></svg> 复制结果
+                </button>
+              </div>
+              <div id="findings" class="findings"></div>
+            </div>
+          </div>
+        </section>
+        <section
+          id="masked-panel"
+          class="card masked-panel"
+          hidden
+          aria-labelledby="masked-title"
+        >
+          <div class="card-header">
+            <h2 id="masked-title"><span class="step">03</span> 遮蔽后的文本</h2>
+            <button id="copy-masked" type="button" class="text-button">
+              <svg class="icon"><use href="#copy" /></svg> 复制遮蔽文本
+            </button>
+          </div>
+          <label class="sr-only" for="masked-text"
+            >遮蔽结果，可选择并复制</label
+          >
+          <textarea id="masked-text" readonly spellcheck="false"></textarea>
+          <p id="masked-summary" class="mask-help"></p>
+        </section>
+        <div class="page-footnote">
+          <svg class="icon"><use href="#shield" /></svg>
+          <p>
+            独立检测文本不保存，遮蔽为预览。Agent 会话及原文保存在本机私有目录；对话详情展示当次网关实际结果。结果供人工复核。
+          </p>
+        </div>
+      </main>
+      <footer class="footer">
+        <span
+          >CensorPrivacy
+          <span class="footer-separator">/</span> 为每一次发送，多想一步。</span
+        ><span>REGEX · RULES · NER</span>
+      </footer>
+    </div>
+  </body>
+</html>

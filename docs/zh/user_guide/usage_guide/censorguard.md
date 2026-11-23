@@ -70,7 +70,7 @@ rules:
 ```
 
 其它 daemon 字段使用默认值；完整安装样例见 `config/base.yaml` 和
-[命令手册](命令手册.md)。启动配置文件必须存在，未知字段严格拒绝。
+[命令手册](../../../../CensorGuard/docs/命令手册.md)。启动配置文件必须存在，未知字段严格拒绝。
 运行中编辑基线或 daemon 配置不生效，需要 `censorguardd reload` 完整重启。
 
 **附加组文件** 只接受一个 `rules` 字段。例如 `web.yaml`：
@@ -89,7 +89,7 @@ rules:
 ### 3.1 规则语法
 
 保护目录与数据优先使用 `file`；`exec` 参数规则只匹配明确的 token 前缀。
-规则选择、等价选项与通配符边界见 [策略编写与保护范围](策略编写与保护范围.md)。
+规则选择、等价选项与通配符边界见 [策略编写与保护范围](../../../../CensorGuard/docs/策略编写与保护范围.md)。
 
 一行式:`file|exec|net 动作 目标 [掩码]`
 
@@ -357,7 +357,7 @@ daemon 重启)与 `dropped_before`(本订阅者累计丢失)。事件无持久�
 可以同时出现同一 PID 的 `EXEC ALLOW` 和 `FILE DENY`；这与命令报权限错误一致。
 `--kind 2` 会隐藏 FILE DENY，检查整体拦截应使用 `--domain dsh-web --result deny`，
 不要限定 exec。`--pid PID` 可观察同一进程的各类事件，不包含其子进程；过滤条件同时
-指定时取交集。详细示例见[命令手册](命令手册.md#审计判定与过滤)。
+指定时取交集。
 
 ## 9. 测试
 
@@ -375,8 +375,6 @@ sudo make integration
 插件测试使用 `make plugin-test`；也可分别执行 `node plugins/dsh-censorguard/test/audit.test.mjs`、
 `node plugins/dsh-censorguard/test/host.test.mjs`、`node plugins/dsh-censorguard/test/bootstrap.test.mjs`
 核对 11 个实际子测试。完整编译、全量集成与 DSH Web 联调需一起执行；
-[验收记录](策略管理验收.md)单独列出本轮针对性检查，历史单组结果不代替本轮全量测试。
-
 持续交互测试可在一个受控 bash 中执行多次命令：
 
 ```bash

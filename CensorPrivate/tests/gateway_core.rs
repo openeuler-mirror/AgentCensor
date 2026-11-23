@@ -25,6 +25,66 @@ fn request(content: &str) -> Value {
 }
 
 #[test]
+fn later_history_credentials_are_masked_in_earlier_messages_and_recorded_details() {
+    for recorded in [false, true] {
+        let mut gate = gate();
+        let first = request("Please retain the phrase hiddencredential for this conversation.");
+        let permit = gate
+            .protect(Api::Chat, &first, "/v1/chat/completions")
+            .unwrap();
+        assert!(std::str::from_utf8(permit.body())
+            .unwrap()
+            .contains("hiddencredential"));
+        gate.consume(permit, "/v1/chat/completions", "POST")
+            .unwrap();
+        let mut next = first.clone();
+        next["messages"].as_array_mut().unwrap().extend([
+            json!({"role":"assistant","content":"password=hiddencredential"}),
+            json!({"role":"user","content":"Summarize the preceding conversation."}),
+        ]);
+        let (permit, snapshots) = if recorded {
+            gate.protect_recorded(Api::Chat, &next, "/v1/chat/completions")
+                .unwrap()
+        } else {
+            (
+                gate.protect(Api::Chat, &next, "/v1/chat/completions")
+                    .unwrap(),
+                Vec::new(),
+            )
+        };
+        let approved = gate
+            .consume(permit, "/v1/chat/completions", "POST")
+            .unwrap();
+        let wire: Value = serde_json::from_slice(approved.body()).unwrap();
+        assert!(!std::str::from_utf8(approved.body())
+            .unwrap()
+            .contains("hiddencredential"));
+        assert!(wire["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<CP_SECRET_"));
+        assert!(gate
+            .restore_display(wire["messages"][0]["content"].as_str().unwrap())
+            .unwrap()
+            .contains("[REDACTED_SECRET]"));
+        if recorded {
+            assert_eq!(snapshots.len(), 3);
+            for (index, snapshot) in snapshots.iter().enumerate() {
+                assert_eq!(snapshot.path, format!("/messages/{index}/content"));
+                assert_eq!(
+                    snapshot.text,
+                    next["messages"][index]["content"].as_str().unwrap()
+                );
+                assert_eq!(
+                    snapshot.analysis["masked_text"],
+                    wire["messages"][index]["content"]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn whole_field_protection_cannot_downgrade_secret_rules() {
     let gate = PrivacyGate::new(
         PrivacyPolicy::default(),
@@ -288,15 +348,15 @@ fn response_tools_keep_authorized_refs_and_reject_arbitrary_execution() {
     let approved = gate
         .tool_arguments(
             "shell",
-            &json!({"command":format!("privcalc sum '{reference}'")}),
+            &json!({"command":format!("censorprivacy compute sum '{reference}'")}),
         )
         .unwrap();
     assert!(approved["command"].as_str().unwrap().contains(&reference));
     for command in [
         format!("echo '{reference}'"),
-        format!("privcalc sum '{reference}'; id"),
-        format!("privcalc sum '{reference}' $(id)"),
-        format!("privcalc sum '{reference}' > /tmp/out"),
+        format!("censorprivacy compute sum '{reference}'; id"),
+        format!("censorprivacy compute sum '{reference}' $(id)"),
+        format!("censorprivacy compute sum '{reference}' > /tmp/out"),
     ] {
         assert!(gate
             .tool_arguments("shell", &json!({"command":command}))

@@ -46,7 +46,12 @@ fn policy_rejects_invalid_types_unknown_fields_and_unbounded_ttl() {
     ] {
         assert!(PrivacyPolicy::from_yaml(raw).is_err());
     }
-    assert!(PrivacyPolicy::from_yaml(include_str!("../examples/policy.yaml")).is_ok());
+    assert!(
+        censorprivacy::config::AppConfig::from_yaml(include_str!("../config.yaml"))
+            .unwrap()
+            .privacy_policy()
+            .is_ok()
+    );
     let policy =
         PrivacyPolicy::from_json(r#"{"patterns":{"PERSON":["(?<=name:)[A-Z]+"]}}"#).unwrap();
     assert_eq!(

@@ -1,5 +1,6 @@
 //! Authenticated transport: only gate-approved immutable bytes reach a fixed upstream.
 use crate::{
+    conversations::{agent_session_id, valid_id, ConversationStore},
     error::{Error, Result},
     gate::PrivacyGate,
     json,
@@ -35,6 +36,13 @@ pub struct GatewayConfig {
     pub upstream_timeout: Duration,
     pub upstream_ca_pem: Option<Vec<u8>>,
     pub enable_tls_direct: bool,
+    pub conversations: Option<Arc<ConversationStore>>,
+    pub ner_threads: Option<usize>,
+    pub ner_device: Option<String>,
+    pub ner_batch_size: Option<usize>,
+    /// Executable implementing the local private program worker. The stock
+    /// gateway uses its own executable if this is unset.
+    pub private_tool_worker: Option<std::path::PathBuf>,
 }
 impl GatewayConfig {
     pub fn new(
@@ -76,6 +84,11 @@ impl GatewayConfig {
             upstream_timeout: Duration::from_secs(60),
             upstream_ca_pem: None,
             enable_tls_direct: false,
+            conversations: None,
+            ner_threads: None,
+            ner_device: None,
+            ner_batch_size: None,
+            private_tool_worker: None,
         })
     }
 }
@@ -86,6 +99,7 @@ struct ServiceState {
     config: Arc<GatewayConfig>,
     client: reqwest::Client,
     tls: Arc<Mutex<Option<TlsBroker>>>,
+    private_tool_slot: Arc<tokio::sync::Semaphore>,
 }
 pub struct GatewayService {
     state: ServiceState,
@@ -127,6 +141,7 @@ impl GatewayService {
                 config: Arc::new(config),
                 client: client.build().map_err(|_| Error::ServiceUnavailable)?,
                 tls: Arc::new(Mutex::new(tls)),
+                private_tool_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         })
     }
@@ -327,39 +342,128 @@ async fn handle(State(state): State<ServiceState>, request: Request) -> Response
 }
 async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response> {
     authenticate(&request, &state.config)?;
-    let path = request.uri().path().to_owned();
+    let incoming_path = request.uri().path().to_owned();
+    let agent_header = "x-censorprivacy-agent";
+    let session_header = "x-censorprivacy-session";
+    let has_tag = request.headers().contains_key(agent_header)
+        || request.headers().contains_key(session_header);
+    let (mut session, path, tools_enabled, preparing) =
+        if let Some(tagged) = incoming_path.strip_prefix("/xiaoo/") {
+            let (session, route) = tagged
+                .split_once('/')
+                .ok_or_else(|| Failure::bad("invalid_session"))?;
+            if !valid_id(session)
+                || !matches!(
+                    route,
+                    "v1/chat/completions"
+                        | "no-tools/v1/chat/completions"
+                        | "prepare/v1/chat/completions"
+                )
+                || state.config.conversations.is_none()
+                || has_tag
+            {
+                return Err(Failure::bad("invalid_session"));
+            }
+            let preparing = route == "prepare/v1/chat/completions";
+            (
+                (!preparing).then(|| ("xiaoo".to_owned(), session.to_owned())),
+                "/v1/chat/completions".to_owned(),
+                route != "no-tools/v1/chat/completions",
+                preparing,
+            )
+        } else if let Some(tagged) = incoming_path.strip_prefix("/agents/") {
+            let parts: Vec<_> = tagged.split('/').collect();
+            if parts.len() != 5
+                || parts[2..] != ["v1", "chat", "completions"]
+                || state.config.conversations.is_none()
+                || has_tag
+            {
+                return Err(Failure::bad("invalid_session"));
+            }
+            let id = agent_session_id(parts[0], parts[1])
+                .map_err(|_| Failure::bad("invalid_session"))?;
+            (
+                Some((parts[0].to_owned(), id)),
+                "/v1/chat/completions".into(),
+                true,
+                false,
+            )
+        } else {
+            (None, incoming_path.clone(), true, false)
+        };
     match (request.method().as_str(), path.as_str()) {
         ("GET", "/ready") => {
             let gate = lock(&state)?;
             gate.validate()?;
-            return Ok(Json(json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"run_id":gate.run_id()})).into_response());
+            return Ok(Json(json!({"status":"ready","version":env!("CARGO_PKG_VERSION"),"run_id":gate.run_id(),"private_tools":true,"conversation_web":state.config.conversations.is_some(),"xiaoo_web":state.config.conversations.is_some(),"xiaoo_startup_prepare":state.config.conversations.is_some(),"ner_threads":state.config.ner_threads,"ner_device":state.config.ner_device,"ner_batch_size":state.config.ner_batch_size})).into_response());
         }
         ("GET", "/v1/models") => {
             let gate = lock(&state)?;
             gate.validate()?;
             return Ok(Json(json!({"object":"list","data":gate.model_ids().iter().map(|id| json!({"id":id,"object":"model"})).collect::<Vec<_>>()})).into_response());
         }
-        ("POST", "/v1/private_compute") => {
+        ("GET", "/v1/private_tools") => {
+            return Ok(Json(lock(&state)?.private_tools_catalog()?).into_response());
+        }
+        ("POST", tool_path)
+            if tool_path == "/v1/private_compute"
+                || tool_path.starts_with("/v1/private_tools/") =>
+        {
+            let name = tool_path
+                .strip_prefix("/v1/private_tools/")
+                .unwrap_or("private_compute");
             let mut payload = body(request, &state).await?;
-            let gate = lock(&state)?;
-            if let Some(refs) = payload.get_mut("refs").and_then(Value::as_array_mut) {
-                let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
-                if let Some(tls) = tls.as_mut() {
-                    // status revalidates epoch before resolving any alias.
-                    tls.status(&gate)?;
-                    for reference in refs {
-                        if let Some(alias) = reference
-                            .as_str()
-                            .filter(|value| !value.starts_with("<CP_"))
-                        {
-                            *reference = Value::String(
-                                tls.transformer.resolve_alias(&gate, alias)?.to_string(),
-                            );
+            // Keep this permit inside spawn_blocking so a cancelled HTTP
+            // request cannot allow another script to start before cleanup.
+            let slot = if name == "private_compute" {
+                None
+            } else {
+                Some(
+                    state
+                        .private_tool_slot
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| Error::PrivateToolBusy)?,
+                )
+            };
+            let invocation = {
+                let gate = lock(&state)?;
+                if let Some(refs) = payload.get_mut("refs").and_then(Value::as_array_mut) {
+                    let mut tls = state.tls.lock().map_err(|_| Error::ServiceUnavailable)?;
+                    if let Some(tls) = tls.as_mut() {
+                        // status revalidates epoch before resolving any alias.
+                        tls.status(&gate)?;
+                        for reference in refs {
+                            if let Some(alias) = reference
+                                .as_str()
+                                .filter(|value| !value.starts_with("<CP_"))
+                            {
+                                *reference = Value::String(
+                                    tls.transformer.resolve_alias(&gate, alias)?.to_string(),
+                                );
+                            }
                         }
                     }
                 }
-            }
-            return Ok(Json(gate.compute(&payload)?).into_response());
+                if name == "private_compute" {
+                    return Ok(Json(gate.compute(&payload)?).into_response());
+                }
+                gate.prepare_private_tool(name, &payload)?
+            };
+            let helper = match &state.config.private_tool_worker {
+                Some(path) => path.clone(),
+                None => std::env::current_exe().map_err(|_| Error::PrivateToolFailed)?,
+            };
+            let (invocation, output) = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                let output = invocation.execute(helper)?;
+                Ok::<_, Error>((invocation, output))
+            })
+            .await
+            .map_err(|_| Error::PrivateToolFailed)??;
+            return Ok(
+                Json(lock(&state)?.publish_private_tool(&invocation, output)?).into_response(),
+            );
         }
         ("GET", "/v1/tls/status") => {
             let gate = lock(&state)?;
@@ -405,12 +509,46 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
         "/v1/responses" => Api::Responses,
         _ => Api::Messages,
     };
+    // These are local transport parameters, never part of the approved model
+    // payload or the upstream headers. An unconfigured gateway keeps recording
+    // off, allowing the adapter to work with ordinary gateway deployments too.
+    if has_tag && state.config.conversations.is_some() {
+        if api != Api::Chat {
+            return Err(Failure::bad("recording_api_not_supported"));
+        }
+        let read_tag = |name| {
+            let mut values = request.headers().get_all(name).iter();
+            let value = values
+                .next()
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| Failure::bad("invalid_session"))?;
+            if values.next().is_some() {
+                return Err(Failure::bad("invalid_session"));
+            }
+            Ok(value)
+        };
+        let agent = read_tag(agent_header)?;
+        let id = agent_session_id(agent, read_tag(session_header)?)
+            .map_err(|_| Failure::bad("invalid_session"))?;
+        session = Some((agent.to_owned(), id));
+    }
     if api == Api::Messages
         && header_value(request.headers(), "anthropic-version", "2023-06-01")? != "2023-06-01"
     {
         return Err(Failure::bad("version_not_supported"));
     }
     let mut payload = body(request, &state).await?;
+    if !tools_enabled {
+        disable_request_tools(&mut payload)?;
+    }
+    if preparing
+        && payload
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+    {
+        return Err(Failure::bad("tool_preparation_requires_tools"));
+    }
     // This gateway supports visible text and tools, not opaque reasoning.
     // Some OpenAI-compatible clients (including xiaoO) omit DeepSeek's
     // provider-specific switch even when their reasoning setting is off.
@@ -431,12 +569,52 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
         .trim_end_matches('/')
         .to_owned()
         + &path;
+    let mut recording = match session {
+        Some((agent, session)) => Some(
+            state
+                .config
+                .conversations
+                .as_ref()
+                .ok_or(Error::ServiceUnavailable)?
+                .begin_for_agent(&session, &agent, &payload)?,
+        ),
+        None => None,
+    };
     let approved = {
         let mut gate = lock(&state)?;
-        let permit = gate.protect(api, &payload, &target)?;
+        let permit = if let Some(recording) = &mut recording {
+            let (permit, snapshots) =
+                gate.protect_recorded(api, &payload, &target)
+                    .inspect_err(|error| {
+                        recording.fail(error.code());
+                    })?;
+            recording.protected(snapshots)?;
+            permit
+        } else {
+            gate.protect(api, &payload, &target)?
+        };
         gate.consume(permit, &target, "POST")?
     };
     let (target, protected) = approved.into_parts();
+    if preparing {
+        // Exercise the actual detector/cache without cloud traffic or a
+        // conversation record. The launcher uses the real xiaoO tool catalog.
+        if payload.get("stream").and_then(Value::as_bool) == Some(true) {
+            let frame = json!({"id":"cp-prepare","object":"chat.completion.chunk","created":0,
+                "model":payload["model"],"choices":[{"index":0,"delta":{"role":"assistant","content":"READY"},"finish_reason":null}]});
+            let end = json!({"id":"cp-prepare","object":"chat.completion.chunk","created":0,
+                "model":payload["model"],"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+            return Ok((
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                format!("data: {frame}\n\ndata: {end}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response());
+        }
+        return Ok(Json(json!({"choices":[{"index":0,"message":{"role":"assistant","content":"READY"},"finish_reason":"stop"}]})).into_response());
+    }
     let mut upstream = state
         .client
         .post(&target)
@@ -489,11 +667,19 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
         return Ok(Json(value).into_response());
     }
     if content_type == "text/event-stream" {
-        let processor = SseTransformer::new(api, &*lock(&state)?)?;
+        let processor =
+            SseTransformer::new(api, &*lock(&state)?)?.with_tools_enabled(tools_enabled);
         let limit = state.config.max_decoded_bytes;
         let output = stream::unfold(
-            (upstream.bytes_stream(), processor, state, 0usize, false),
-            move |(mut source, mut processor, state, mut seen, finished)| async move {
+            (
+                upstream.bytes_stream(),
+                processor,
+                state,
+                0usize,
+                false,
+                recording,
+            ),
+            move |(mut source, mut processor, state, mut seen, finished, mut recording)| async move {
                 if finished {
                     return None;
                 }
@@ -511,27 +697,47 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
                     }
                     Some(Err(_)) => Err(Error::ServiceUnavailable),
                     None => {
-                        let output = match state.gate.lock() {
+                        let mut output = match state.gate.lock() {
                             Ok(gate) => processor.finish(&gate),
                             Err(_) => Err(Error::ServiceUnavailable),
                         };
+                        if let Some(recording) = &mut recording {
+                            output = output.and_then(|bytes| {
+                                recording.feed(&bytes)?;
+                                recording.complete(None)?;
+                                Ok(bytes)
+                            });
+                            if let Err(error) = &output {
+                                recording.fail(error.code());
+                            }
+                        }
                         return match output {
                             Ok(output) if output.is_empty() => None,
                             other => Some((
                                 other
                                     .map(Bytes::from)
                                     .map_err(|_| std::io::Error::other("stream_blocked")),
-                                (source, processor, state, seen, true),
+                                (source, processor, state, seen, true, recording),
                             )),
                         };
                     }
+                };
+                let output = if let Some(recording) = &mut recording {
+                    output
+                        .and_then(|bytes| {
+                            recording.feed(&bytes)?;
+                            Ok(bytes)
+                        })
+                        .inspect_err(|error| recording.fail(error.code()))
+                } else {
+                    output
                 };
                 let failed = output.is_err();
                 Some((
                     output
                         .map(Bytes::from)
                         .map_err(|_| std::io::Error::other("stream_blocked")),
-                    (source, processor, state, seen, failed),
+                    (source, processor, state, seen, failed, recording),
                 ))
             },
         );
@@ -549,6 +755,59 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
     }
     let raw = Zeroizing::new(bounded_response(upstream, state.config.max_decoded_bytes).await?);
     let decoded = json::from_slice(&raw)?;
+    if !tools_enabled
+        && decoded
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices
+                    .iter()
+                    .any(|choice| has_tool_call(&choice["message"]))
+            })
+    {
+        if let Some(recording) = &mut recording {
+            recording.fail("tools_disabled");
+        }
+        return Err(Failure::bad("tools_disabled"));
+    }
     let restored = lock(&state)?.restore(api, &decoded)?;
+    if let Some(recording) = &mut recording {
+        recording.complete(Some(&restored))?;
+    }
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(restored)).into_response())
+}
+
+fn has_tool_call(message: &Value) -> bool {
+    ["tool_calls", "function_call"]
+        .iter()
+        .any(|field| message.get(field).is_some_and(|value| !value.is_null()))
+}
+
+fn disable_request_tools(payload: &mut Value) -> HttpResult<()> {
+    if payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                matches!(message["role"].as_str(), Some("tool" | "function"))
+                    || has_tool_call(message)
+            })
+        })
+    {
+        return Err(Failure::bad("tools_disabled"));
+    }
+    // TUI versions without a native global switch still advertise their
+    // catalog. Keep it local and enforce the disabled mode on replies too.
+    if let Some(object) = payload.as_object_mut() {
+        for field in [
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "functions",
+            "function_call",
+        ] {
+            object.remove(field);
+        }
+    }
+    Ok(())
 }

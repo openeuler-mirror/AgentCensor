@@ -6,7 +6,7 @@ use crate::{
     gate::PrivacyGate,
     json,
     protocols::{self, Api, RequestProtector},
-    references::{random_hex, Reference, TOKEN_RE},
+    references::{Reference, TOKEN_RE},
     response::{self, ResponseRestorer},
 };
 use serde_json::{Number, Value};
@@ -642,7 +642,7 @@ fn add_candidate(
         return Err(Error::ResourceLimit);
     }
     let marker = loop {
-        let marker = format!("<CP_TLS_{}>", random_hex::<16>()?);
+        let marker = Reference::issue("TLS")?.to_string();
         if !payload
             .windows(marker.len())
             .any(|window| window == marker.as_bytes())

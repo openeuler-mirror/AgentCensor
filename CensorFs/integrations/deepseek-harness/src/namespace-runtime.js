@@ -10,6 +10,8 @@ import { detectRunnerEnvironment, probeRunnerEnvironment } from './runner-enviro
 import { foldExploration, rankVariants, ACTIVITY_EVENT_TYPES, summarizeActivityEvent, PROCESS_STARTED_AT, reconcileInterruptedSubagents } from './events.js'
 import { prepareVariantTmp, resolveValidationProfile, validateCandidate, safeSegment } from './validation.js'
 import { losslessJson } from './lossless-json.js'
+import { startWorldActivation } from './world-activation.js'
+import { materializePublishedGeneration, resolvePublishWorkspace } from './materialize.js'
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
@@ -335,14 +337,14 @@ async runWorker({ mode, agent, runId, strategy, opened, tmpDir, prompt, signal, 
       tmpDir,
     }
     if (mode === 'external') {
-      const run = await this.provider.withBinding(binding, () => this.ctx.subagents.start(this.provider.name, {
+      const run = await this.provider.withBinding(binding, () => startWorldActivation(this.ctx.subagents, {
+        provider: this.provider.name,
         label: strategy.label,
-        prompt,
-        parent: agent,
+        request: { parent: agent, prompt },
         signal,
       }))
       try {
-        return { sessionId: run.id, provider: this.provider.name, mode, ...(await run.result) }
+        return { sessionId: run.childId, provider: this.provider.name, mode, ...(await run.result) }
       } finally {
         try {
           await run.dispose()
@@ -404,19 +406,18 @@ async runWorker({ mode, agent, runId, strategy, opened, tmpDir, prompt, signal, 
     }
     let run
     try {
-      run = await this.inProcessProvider.withBinding({ ...binding, runner }, () => this.ctx.subagents.start(
-        this.inProcessProvider.name,
-        {
-          label: strategy.label,
-          prompt,
-          parent: agent,
-          signal,
+      run = await this.inProcessProvider.withBinding({ ...binding, runner }, () => startWorldActivation(this.ctx.subagents, {
+        provider: this.inProcessProvider.name,
+        label: strategy.label,
+        request: {
+          parent: agent, prompt,
           maxDepth: this.config.inProcessMaxDepth,
-           ...(maxTokens === undefined ? {} : { maxTokens }),
+          ...(maxTokens === undefined ? {} : { agentOptions: { maxTokens } }),
         },
-      ))
-this.registerVariantBinding(run.id, agent, runId, strategy.id)
-      return { sessionId: run.id, provider: this.inProcessProvider.name, mode, ...(await run.result) }
+        signal,
+      }))
+      this.registerVariantBinding(run.childId, agent, runId, strategy.id)
+      return { sessionId: run.childId, provider: this.inProcessProvider.name, mode, ...(await run.result) }
     } finally {
       if (run !== undefined) {
         try {
@@ -424,7 +425,7 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
         } catch (error) {
           this.ctx.logger?.warn?.(`worker dispose failed: ${errorText(error)}`)
         }
-        this.unregisterVariantBinding(run.id)
+        this.unregisterVariantBinding(run.childId)
       } else {
         try {
           await this.runnerManager.disposeRecord(runner)
@@ -588,6 +589,7 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
     }
     const decisionId = `session:${agent.session.id}:run:${runId}:variant:${variantId}`
     try {
+      const workspace = await resolvePublishWorkspace(agent, this.config.publishWorkspacePath)
       const result = await this.cli.publish({
         candidateId: variant.candidate.candidate_id,
         expectedHead: state.expectedHead,
@@ -595,12 +597,23 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
         runId,
         variantId,
       })
+      let materialization
+      try {
+        materialization = await materializePublishedGeneration({
+          cli: this.cli, config: this.config, generationId: result.receipt.new_generation,
+          runId, variantId, workspace,
+        })
+      } catch (error) {
+        materialization = { error: errorText(error), workspace }
+        this.ctx.logger.error(`published generation ${result.receipt.new_generation} but could not materialize it: ${materialization.error}`)
+      }
       append(agent.session, 'variant-published', {
         runId,
         variantId,
         candidateId: variant.candidate.candidate_id,
         generationId: result.receipt.new_generation,
         receipt: result.receipt,
+        materialization,
         publishedAt: Date.now(),
       })
       for (const loser of Object.values(state.variants)) {
@@ -610,7 +623,7 @@ this.registerVariantBinding(run.id, agent, runId, strategy.id)
         ))
       }
       await this.ctx.sessions.flush(agent.session)
-      return result
+      return { ...result, materialization }
     } catch (error) {
       if (error instanceof CensorFsCommandError && error.stale) {
         append(agent.session, 'variant-stale', {

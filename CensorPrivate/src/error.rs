@@ -3,10 +3,15 @@ use std::fmt;
 /// Public failures carry fixed reason codes, never request data or library errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    ConfigInvalid,
     PolicyInvalid,
     DetectionFailed,
+    NerConfigInvalid,
+    NerDeviceUnavailable,
     VaultDenied,
     ComputeInvalid,
+    PrivateToolFailed,
+    PrivateToolBusy,
     InvalidReference,
     InvalidJson,
     DuplicateJsonKey,
@@ -25,10 +30,15 @@ pub enum Error {
 impl Error {
     pub const fn code(self) -> &'static str {
         match self {
+            Self::ConfigInvalid => "config_invalid",
             Self::PolicyInvalid => "policy_invalid",
             Self::DetectionFailed => "detection_failed",
+            Self::NerConfigInvalid => "ner_config_invalid",
+            Self::NerDeviceUnavailable => "ner_device_unavailable",
             Self::VaultDenied => "vault_denied",
             Self::ComputeInvalid => "compute_invalid",
+            Self::PrivateToolFailed => "private_tool_failed",
+            Self::PrivateToolBusy => "private_tool_busy",
             Self::InvalidReference => "invalid_reference",
             Self::InvalidJson => "invalid_json",
             Self::DuplicateJsonKey => "duplicate_json_key",

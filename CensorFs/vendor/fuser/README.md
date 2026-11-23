@@ -118,7 +118,7 @@ Developed and tested on Linux. Tested under [Linux][FUSE for Linux] and [FreeBSD
 
 ## License
 
-Licensed under [MIT License](LICENSE.md), except for those files in `examples/` that explicitly contain a different license.
+Licensed under MIT License, except for those files in `examples/` that explicitly contain a different license.
 
 ## Contribution
 

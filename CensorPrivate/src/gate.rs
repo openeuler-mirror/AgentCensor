@@ -1,19 +1,22 @@
 //! Complete-message privacy gate. This module performs no network operations.
 use crate::{
     compute::{self, ComputeResult, Operation},
+    conversations::TextSnapshot,
     detection::{DetectionEngine, DetectorSpec, Span},
     error::{Error, Result},
     json,
     policy::PrivacyPolicy,
+    private_tools::{self, Invocation, Output, Registry},
     professional::{ProfessionalConfig, ProfessionalDetector},
     protocols::{self, Api, RequestProtector},
-    references::{random_hex, Reference, TOKEN_PATTERN, TOKEN_RE},
+    references::{random_hex, Reference, TLS_TOOL_REFERENCE_PATTERN, TOKEN_PATTERN, TOKEN_RE},
     vault::{Clock, MonotonicClock, Registration, RunCapability, RunVault},
 };
 use regex::Regex;
 use serde_json::{Number, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap},
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
@@ -89,6 +92,7 @@ pub struct PrivacyGate {
     observed_ids: BTreeSet<String>,
     disabled: bool,
     clock: Arc<dyn Clock>,
+    private_tools: Registry,
 }
 impl PrivacyGate {
     pub fn new(policy: PrivacyPolicy, options: GateOptions) -> Result<Self> {
@@ -144,6 +148,7 @@ impl PrivacyGate {
             observed_ids: BTreeSet::new(),
             disabled: false,
             clock,
+            private_tools: Registry::default(),
         })
     }
     pub fn run_id(&self) -> &str {
@@ -151,6 +156,89 @@ impl PrivacyGate {
     }
     pub fn epoch(&self) -> u64 {
         self.policy.epoch()
+    }
+    /// Definitions are local administrator configuration, never model input.
+    pub fn configure_private_tools(&mut self, raw: &str) -> Result<()> {
+        self.private_tools = Registry::from_json(raw)?;
+        Ok(())
+    }
+    pub fn private_tools_catalog(&self) -> Result<Value> {
+        self.validate()?;
+        Ok(self.private_tools.catalog())
+    }
+    pub(crate) fn prepare_private_tool(&self, name: &str, payload: &Value) -> Result<Invocation> {
+        self.validate()?;
+        let program = self
+            .private_tools
+            .program(name)
+            .ok_or(Error::ComputeInvalid)?;
+        let refs = private_tools::references(payload)?;
+        let entries = self.vault.resolve_compute_bounded(
+            &self.cap,
+            self.epoch(),
+            &refs,
+            private_tools::MAX_IO,
+        )?;
+        Ok(Invocation {
+            program,
+            epoch: self.epoch(),
+            refs,
+            entries,
+        })
+    }
+    pub(crate) fn publish_private_tool(
+        &self,
+        invocation: &Invocation,
+        output: Output,
+    ) -> Result<Value> {
+        self.validate()?;
+        // Revalidate under the original epoch and re-resolve every dependency:
+        // reload, run expiry and revocation while the program ran reject output.
+        let entries = self.vault.resolve_compute_bounded(
+            &self.cap,
+            invocation.epoch,
+            &invocation.refs,
+            private_tools::MAX_IO,
+        )?;
+        let values = match output {
+            Output::Order(order) => {
+                return Ok(
+                    serde_json::json!({"refs": order.into_iter().map(|i| &invocation.refs[i]).collect::<Vec<_>>()}),
+                );
+            }
+            Output::Values(values) => values,
+        };
+        let mut labels = self.policy.labels().clone();
+        labels.extend(
+            entries
+                .iter()
+                .flat_map(|entry| entry.labels.iter().cloned()),
+        );
+        for value in &values {
+            if self
+                .credential_spans(value)?
+                .iter()
+                .any(|span| span.entity_type == "SECRET" || span.labels.contains("secret"))
+            {
+                return Err(Error::VaultDenied);
+            }
+        }
+        let expression =
+            serde_json::to_vec(&invocation.refs).map_err(|_| Error::PrivateToolFailed)?;
+        let digest = Sha256::digest(expression);
+        let mut refs = Vec::new();
+        for value in values {
+            let mut registration = Registration::new("PRIVATE_RESULT", labels.clone());
+            registration.metadata.entity_id = Some(format!("private_tools:{digest:x}"));
+            registration.depends_on = invocation.refs.clone();
+            refs.push(self.vault.register_value(
+                &self.cap,
+                invocation.epoch,
+                &value,
+                registration,
+            )?);
+        }
+        Ok(serde_json::json!({"refs": refs}))
     }
     pub fn model_ids(&self) -> &[String] {
         &self.options.public_identifiers
@@ -271,7 +359,32 @@ impl PrivacyGate {
     }
     pub fn protect(&mut self, api: Api, body: &Value, target: &str) -> Result<ReleasePermit> {
         self.validate()?;
+        // Later messages can identify values as sensitive that also occur in
+        // earlier history. Discover the complete request before emitting any
+        // replacements; final validation must see one consistent vault state.
+        protocols::protect_request(api, body, self)?;
         let transformed = protocols::protect_request(api, body, self)?;
+        self.permit(api, transformed, target)
+    }
+    /// Observe the release's spans and replacements, without independent
+    /// preview inference or generating preview-only references.
+    pub fn protect_recorded(
+        &mut self,
+        api: Api,
+        body: &Value,
+        target: &str,
+    ) -> Result<(ReleasePermit, Vec<TextSnapshot>)> {
+        self.validate()?;
+        protocols::protect_request(api, body, self)?;
+        let observer = RecordingProtector {
+            gate: self,
+            snapshots: RefCell::new(Vec::new()),
+        };
+        let transformed = protocols::protect_request(api, body, &observer)?;
+        let snapshots = observer.snapshots.into_inner();
+        Ok((self.permit(api, transformed, target)?, snapshots))
+    }
+    fn permit(&mut self, api: Api, transformed: Value, target: &str) -> Result<ReleasePermit> {
         let body = serde_json::to_vec(&transformed).map_err(|_| Error::InvalidJson)?;
         if body.len() > self.options.max_body_bytes {
             return Err(Error::ResourceLimit);
@@ -497,6 +610,16 @@ impl crate::response::ResponseRestorer for PrivacyGate {
     }
     fn tool_arguments(&self, name: &str, arguments: &Value) -> Result<Value> {
         self.validate()?;
+        if self.private_tools.program(name).is_some() {
+            let refs = private_tools::references(arguments)?;
+            self.vault.resolve_compute_bounded(
+                &self.cap,
+                self.epoch(),
+                &refs,
+                private_tools::MAX_IO,
+            )?;
+            return Ok(arguments.clone());
+        }
         let encoded = serde_json::to_string(arguments).map_err(|_| Error::ProtocolBlocked)?;
         if !TOKEN_RE.is_match(&encoded) {
             return Ok(arguments.clone());
@@ -527,21 +650,23 @@ impl crate::response::ResponseRestorer for PrivacyGate {
                 return Err(Error::ProtocolBlocked);
             }
             let argv = shlex::split(command).ok_or(Error::ProtocolBlocked)?;
-            if argv.len() < 3
-                || argv[0] != "privcalc"
+            if argv.len() < 4
+                || argv[0] != "censorprivacy"
+                || argv[1] != "compute"
                 || !["sum", "mean", "min", "max", "aggregate", "date_diff"]
-                    .contains(&argv[1].as_str())
+                    .contains(&argv[2].as_str())
             {
                 return Err(Error::ProtocolBlocked);
             }
-            let refs: Vec<_> = argv[2..].iter().cloned().map(Value::String).collect();
+            let refs: Vec<_> = argv[3..].iter().cloned().map(Value::String).collect();
             self.validate_refs(&refs)?;
             let mut approved = arguments.clone();
-            let quoted: Vec<_> = argv[2..]
+            let quoted: Vec<_> = argv[3..]
                 .iter()
                 .map(|reference| format!("'{reference}'"))
                 .collect();
-            approved["command"] = format!("privcalc {} {}", argv[1], quoted.join(" ")).into();
+            approved["command"] =
+                format!("censorprivacy compute {} {}", argv[2], quoted.join(" ")).into();
             return Ok(approved);
         }
         Err(Error::ProtocolBlocked)
@@ -598,7 +723,9 @@ impl RequestProtector for PrivacyGate {
             )
         });
         let exempt = (leaf == "pattern"
-            && (text == TOKEN_PATTERN || text == format!("^{TOKEN_PATTERN}$")))
+            && (text == TOKEN_PATTERN
+                || text == format!("^{TOKEN_PATTERN}$")
+                || (schema && text == TLS_TOOL_REFERENCE_PATTERN)))
             || ([
                 "minItems",
                 "maxItems",
@@ -642,6 +769,32 @@ impl RequestProtector for PrivacyGate {
     }
 }
 struct FinalCheck<'a>(&'a PrivacyGate);
+struct RecordingProtector<'a> {
+    gate: &'a PrivacyGate,
+    snapshots: RefCell<Vec<TextSnapshot>>,
+}
+impl RequestProtector for RecordingProtector<'_> {
+    fn text(&self, text: &str, path: &str) -> Result<String> {
+        let spans = self.gate.spans(text, path, true)?;
+        let masked =
+            self.gate
+                .vault
+                .protect_text(&self.gate.cap, self.gate.epoch(), text, spans.clone())?;
+        if path.starts_with("/messages/") {
+            let merged = crate::detection::merge_spans(text, spans)?;
+            self.snapshots
+                .borrow_mut()
+                .push(TextSnapshot::new(path, text, &masked, &merged));
+        }
+        Ok(masked)
+    }
+    fn structural(&self, text: &str, path: &str) -> Result<()> {
+        self.gate.structural(text, path)
+    }
+    fn number(&self, value: &Number, path: &str) -> Result<()> {
+        self.gate.number(value, path)
+    }
+}
 impl RequestProtector for FinalCheck<'_> {
     fn text(&self, text: &str, path: &str) -> Result<String> {
         if !self.0.spans(text, path, false)?.is_empty() {

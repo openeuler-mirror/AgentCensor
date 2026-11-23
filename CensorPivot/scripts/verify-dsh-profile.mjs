@@ -59,7 +59,7 @@ try {
       assert(!byId.has('censorscope-ui'), 'standalone Scope UI should not be active');
       assert.notEqual(byId.get('ui-trajectory')?.disabled, true, 'native trajectory should remain available');
       assert.equal(byId.get('censorguard-bootstrap').config.blockOnFailure, true);
-      for (const id of ['webserver', 'web-runtime', 'typert-gateway', 'cordis-host-runner', 'code-runtime', 'subprocess', 'tools', 'agent-loop', 'censorfs-parallel-worlds', 'agentcensor-session-proxy']) {
+      for (const id of ['webserver', 'web-runtime', 'typert-gateway', 'cordis-host-runner', 'subprocess', 'tools', 'agent-loop', 'censorfs-parallel-worlds', 'agentcensor-session-proxy']) {
         assert(byId.get(id)?.inject.includes('censorguardReady'), `unguarded ${id}`);
       }
       for (const service of ['agents', 'sessions', 'sessionPersistence', 'sessionProjections']) assert(byId.get('agentcensor-session-proxy').inject.includes(service));

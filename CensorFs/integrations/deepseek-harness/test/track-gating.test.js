@@ -44,7 +44,7 @@ function fakeRuntime(tag) {
 }
 
 function agentWithRun(runId, mode) {
-  return { session: { events: [{ type: 'exploration-started', data: { runId, mode } }] } }
+  return { session: { snapshotEvents: () => [{ type: 'exploration-started', data: { runId, mode } }] } }
 }
 
 test('resolveEnabledTracks: both tracks by default', () => {
@@ -115,7 +115,7 @@ test('run-scoped operations route by recorded mode and fail closed cross-track',
 test('unknown runs keep delegating to the FUSE runtime state lookup', () => {
   const fuse = fakeRuntime('fuse')
   const combined = new CombinedBranchExploreRuntime(fuse, fakeRuntime('runner'), minimalConfig({}))
-  assert.equal(combined.state({ session: { events: [] } }, 'nope').track, 'fuse')
+  assert.equal(combined.state({ session: { snapshotEvents: () => [] } }, 'nope').track, 'fuse')
 })
 
 test('tracking fan-out and dispose tolerate missing tracks', async () => {

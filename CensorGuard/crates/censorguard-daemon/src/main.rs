@@ -1,6 +1,7 @@
 mod event;
 mod lifecycle;
 mod procfs;
+mod rules;
 mod runtime;
 mod server;
 
@@ -828,6 +829,16 @@ mod tests {
             serde_yaml::to_string(&saved.to_root())?,
         )?;
         assert_eq!(load_startup_policy(&config, &state)?.1, 7);
+        rules::edit(&config, "exec deny /bin/echo", true)?;
+        rules::edit(&config, "exec deny /bin/false", false)?;
+        let (edited, edited_revision) = load_startup_policy(&config, &state)?;
+        assert_eq!(edited_revision, 8);
+        assert_eq!(edited.to_root().rules, vec!["exec deny /bin/echo"]);
+        assert_eq!(edited.daemon, saved.daemon);
+        assert_eq!(edited.domains, saved.domains);
+        assert_eq!(edited.group_definitions, saved.group_definitions);
+        assert_eq!(edited.group_sources, saved.group_sources);
+        assert_eq!(fs::read_to_string(state.join("current"))?, "7\n");
         fs::write(
             &config,
             "daemon:\n  audit_exec: true\n  enable_net: false\nrules:\n  - exec deny /bin/echo\n",

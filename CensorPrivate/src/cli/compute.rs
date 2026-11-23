@@ -2,11 +2,10 @@ use censorprivacy::{
     json,
     mcp::{validate_arguments, HttpPrivateComputeClient, PrivateComputeClient},
 };
-use clap::Parser;
+use clap::Args;
 
-#[derive(Parser)]
-#[command(name = "privcalc", about = "Compute locally using private references")]
-struct Cli {
+#[derive(Args)]
+pub struct Options {
     #[arg(value_parser=["sum","mean","min","max","aggregate","date_diff"])]
     operation: String,
     #[arg(required = true)]
@@ -15,11 +14,10 @@ struct Cli {
     options: String,
 }
 #[tokio::main]
-async fn main() {
+pub async fn run(cli: Options) {
     std::panic::set_hook(Box::new(|_| {
         eprintln!("{{\"error\":{{\"code\":\"private_compute_failed\"}}}}")
     }));
-    let cli = Cli::parse();
     let result = async {
         let client = HttpPrivateComputeClient::from_environment()?;
         let options = json::from_slice(cli.options.as_bytes())?;

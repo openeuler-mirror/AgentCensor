@@ -33,7 +33,9 @@ rules:
 `allow+audit` 的规则审计独立于 enable；只有命中 deny 且对应 enable 开启才主动阻断。
 `strict` 保留路径/参数检查失败后的拒绝，`permissive` 对检查失败放行并累计诊断计数。
 基线规则为空，部署后需通过 `policy apply` + `bind` 显式下发拒绝策略。
-基线和 daemon 设置运行中不可热改，修改后用 `censorguardd reload` 完整重启。
+全局基线通过 `rule append/remove '规则'` 修改并保存到启动 YAML，`rule apply` 热更新到
+所有已纳管进程树；不执行 apply，下次启动也会自动加载已保存规则。daemon 设置修改后仍需
+用 `censorguardd reload` 完整重启。
 附加组可热更新；domain 支持多个组，任一层 deny 即拒绝。`remove` 移除域内一个组，
 `policy remove` 删除未被引用的组。`status` 显示简洁摘要，`status --json` 包含 PID 进程树，`doctor` 检查组件。
 
@@ -71,6 +73,9 @@ make all
 
 ```bash
 censorguardctl --config config/base.yaml status
+censorguardctl --config config/base.yaml rule append 'file deny /etc/shadow'
+censorguardctl --config config/base.yaml rule remove 'file deny /etc/shadow'
+censorguardctl --config config/base.yaml rule apply
 censorguardctl --config config/base.yaml policy apply --policy lab-policy --file group.yaml
 censorguardctl --config config/base.yaml bind --domain lab-agent --policy lab-policy
 censorguardctl --config config/base.yaml attach --pid PID --domain lab-agent
@@ -177,7 +182,6 @@ docs/                        架构、迁移、验证文档
 
 ## 文档
 
-- [全流程摸底测试报告](docs/全流程摸底测试报告.md)：验收范围、实机证据、缺陷与修复
 - [代码库结构与系统原理](docs/代码库结构与系统原理.md)：结构图、系统架构及模块实现分析
 - [命令手册](docs/命令手册.md)：当前 CLI、命名与策略管理规范
 - [构建指南](docs/构建指南.md)：从源码构建全部组件与离线打包

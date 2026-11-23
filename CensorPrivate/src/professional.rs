@@ -1,6 +1,9 @@
 //! Native privacy detection using local ONNX resources.
+mod batch;
+mod config;
 mod model;
 mod rules;
+pub use config::{configured_ner_batch_size, configured_ner_device, NerDevice};
 
 use crate::{
     detection::{validate_spans, Span},
@@ -19,6 +22,13 @@ pub const MODEL_ID: &str = "shibing624/bert4ner-base-chinese";
 pub struct ProfessionalConfig {
     pub model_directory: Option<PathBuf>,
     pub runtime_library: Option<PathBuf>,
+    /// ONNX intra-op threads; inter-op remains one to avoid oversubscription.
+    pub ner_threads: usize,
+    pub ner_device: NerDevice,
+    /// Maximum windows per inference, per device; incomplete batches run immediately.
+    pub ner_batch_size: usize,
+    pub window_timeout_seconds: u64,
+    pub categories: crate::categories::Categories,
 }
 impl Default for ProfessionalConfig {
     fn default() -> Self {
@@ -26,6 +36,11 @@ impl Default for ProfessionalConfig {
             .ok()
             .and_then(|p| p.parent()?.parent().map(PathBuf::from));
         Self {
+            ner_threads: 1,
+            ner_device: NerDevice::Cpu,
+            ner_batch_size: 1,
+            window_timeout_seconds: 16,
+            categories: None,
             model_directory: std::env::var_os("CP_DETECTOR_MODEL_DIR")
                 .map(PathBuf::from)
                 .or_else(|| {
@@ -45,6 +60,36 @@ impl Default for ProfessionalConfig {
                 .map(PathBuf::from)
                 .or_else(|| prefix.map(|p| p.join("lib/censorprivacy/libonnxruntime.so"))),
         }
+    }
+}
+
+/// CLI overrides the environment. Invalid configuration must never silently
+/// select a different inference setup.
+pub fn configured_ner_threads(explicit: Option<u16>) -> Result<usize> {
+    let threads = match explicit {
+        Some(value) => usize::from(value),
+        None => match std::env::var("CP_NER_THREADS") {
+            Ok(value) => value.parse().map_err(|_| Error::DetectionFailed)?,
+            Err(std::env::VarError::NotPresent) => 1,
+            Err(_) => return Err(Error::DetectionFailed),
+        },
+    };
+    if !(1..=256).contains(&threads) {
+        return Err(Error::DetectionFailed);
+    }
+    Ok(threads)
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    #[test]
+    fn explicit_thread_configuration_is_bounded_and_overrides_environment() {
+        assert_eq!(configured_ner_threads(Some(4)).unwrap(), 4);
+        assert_eq!(configured_ner_threads(Some(1)).unwrap(), 1);
+        assert_eq!(configured_ner_threads(Some(256)).unwrap(), 256);
+        assert!(configured_ner_threads(Some(0)).is_err());
+        assert!(configured_ner_threads(Some(257)).is_err());
     }
 }
 
@@ -91,7 +136,7 @@ pub struct NerEntity {
 }
 struct Native {
     rules: rules::Rules,
-    ner: model::NerModel,
+    ner: Option<model::NerModel>,
     failed: bool,
     // Only hashes and offsets/metadata, never source text or vault references.
     cache: VecDeque<([u8; 32], Vec<Prediction>)>,
@@ -99,13 +144,27 @@ struct Native {
 }
 pub struct ProfessionalDetector {
     native: Mutex<Native>,
+    categories: crate::categories::Categories,
 }
 impl ProfessionalDetector {
     pub fn start(config: ProfessionalConfig) -> Result<Self> {
+        if !(1..=3600).contains(&config.window_timeout_seconds)
+            || !(1..=256).contains(&config.ner_threads)
+            || !(1..=256).contains(&config.ner_batch_size)
+        {
+            return Err(Error::NerConfigInvalid);
+        }
+        config.ner_device.validate()?;
         let rules = rules::Rules::new()?;
-        let mut ner = model::NerModel::load(&config)?;
-        ner.predict("张三在北京工作。")?;
+        let ner = if crate::categories::uses_ner(&config.categories) {
+            let mut model = model::NerModel::load(&config)?;
+            model.warmup()?;
+            Some(model)
+        } else {
+            None
+        };
         Ok(Self {
+            categories: config.categories,
             native: Mutex::new(Native {
                 rules,
                 ner,
@@ -117,6 +176,20 @@ impl ProfessionalDetector {
     }
     /// Original UTF-8 byte offsets, not Python character positions.
     pub fn analyze(&self, text: &str, options: &AnalyzeOptions) -> Result<Vec<Prediction>> {
+        let mut options = options.clone();
+        if self.categories.is_some() {
+            options.mask_money = crate::categories::allows(&self.categories, "MONEY");
+            options.mask_dates = crate::categories::allows(&self.categories, "DATE");
+            options.mask_all_numbers = crate::categories::allows(&self.categories, "NUMBER");
+        }
+        self.analyze_selected(text, &options, &self.categories)
+    }
+    fn analyze_selected(
+        &self,
+        text: &str,
+        options: &AnalyzeOptions,
+        categories: &crate::categories::Categories,
+    ) -> Result<Vec<Prediction>> {
         if text.len() > 1024 * 1024 || options.field.len() > 8192 {
             return Err(Error::ResourceLimit);
         }
@@ -128,6 +201,8 @@ impl ProfessionalDetector {
         digest.update((text.len() as u64).to_le_bytes());
         digest.update(text.as_bytes());
         digest.update(options.field.as_bytes());
+        // Policy reload can narrow categories while reusing the loaded model.
+        digest.update(serde_json::to_vec(categories).map_err(|_| Error::DetectionFailed)?);
         digest.update([
             u8::from(options.structural),
             u8::from(options.mask_money),
@@ -139,7 +214,7 @@ impl ProfessionalDetector {
             return Ok(cached.clone());
         }
         let Native { rules, ner, .. } = &mut *native;
-        let result = rules.analyze(text, options, Some(ner));
+        let result = rules.analyze_selected(text, options, ner.as_mut(), categories);
         match &result {
             Ok(spans) if spans.len() <= 4096 => {
                 // Agent tool schemas have many small fields. Keep the system
@@ -170,7 +245,11 @@ impl ProfessionalDetector {
         if native.failed {
             return Err(Error::DetectionFailed);
         }
-        let result = native.ner.predict(text);
+        let result = native
+            .ner
+            .as_mut()
+            .ok_or(Error::DetectionFailed)?
+            .predict(text);
         if result.is_err() {
             native.failed = true;
         }
@@ -191,7 +270,8 @@ impl ProfessionalDetector {
             mask_all_numbers: policy.mask_all_numbers(),
         };
         let mut spans = Vec::new();
-        for item in self.analyze(text, &options)? {
+        let categories = crate::categories::intersect(&self.categories, policy.categories());
+        for item in self.analyze_selected(text, &options, &categories)? {
             if !item.score.is_finite() || !(0.0..=1.0).contains(&item.score) {
                 return Err(Error::DetectionFailed);
             }

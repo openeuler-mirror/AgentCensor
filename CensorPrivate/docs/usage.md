@@ -1,81 +1,71 @@
-# Rust 部署与使用手册
+# 使用手册
 
-按“部署 → 策略、凭据、agent 准备 → 本机网关/TLS 演示 → DSH 网关/TLS 演示 → 真实云服务验收”操作。第一次可以只做到本机演示，不需要云账号。CensorPrivate 是 AgentCensor 的模型数据隐私子项目。
+[文档首页](README.md) · [构建与部署](build-and-deploy.md) · [脚本速查](scripts.md) · [故障排查](troubleshooting.md)
 
-源码目录使用 `./cpctl`。安装后可在任意目录使用 `~/.local/bin/cpctl`；若已将 `~/.local/bin` 加入 PATH，直接使用 `cpctl`。脚本保存配置，不依赖上一终端的 `CP_BIN`、`CP_RUST_SRC` 等变量。底层长命令见 [Rust 构建教程](build-and-deploy.md)。
+本页按 **检测 → 网关 → Agent → 日常管理** 排列。首次获取源码或准备模型，先完成 [构建与部署](build-and-deploy.md)；已收到完整包，先完成 [解压自检](binary-distribution.md)。
 
-## 1. 检查、安装依赖和部署
+源码和完整包目录均用 `./cpctl`。源码安装后可用 `~/.local/bin/cpctl`；加入 PATH 后可直接用 `cpctl`。除包内专有的 `verify/self-test` 外，下文短命令共用同一套私有配置。
 
-在仓库根目录执行：
+- [1. 打开隐私检测台](#1-打开隐私检测台)
+- [2. 启动实际模型网关](#2-启动实际模型网关)
+- [3. 接入 Agent](#3-接入-agent)
+- [4. 日常管理](#4-日常管理)
+- [5. 本机演示与验收](#5-本机演示与验收)
+- [6. 可选模式](#6-可选模式)
+- [7. 配置与行为参考](#7-配置与行为参考)
 
-```bash
-./cpctl doctor --tls --demo
-./cpctl deps --tls --demo --dry-run
-./cpctl deps --tls --demo
-./cpctl install --tls
-```
+## 1. 打开隐私检测台
 
-`doctor` 只检查并列出缺失项，首次失败时先补依赖，再重新检查。`deps` 为 Debian/Ubuntu、openEuler/RHEL 系安装系统软件包，自动选择 apt 或 dnf，需要时使用 sudo。`--dry-run` 只显示安装命令。Rust 工具链需要 ≥1.85，按 [官方说明](https://www.rust-lang.org/tools/install) 预先安装；发行版提供的 Node 版本也需满足下表，不能仅以包安装成功判断版本合格。
-
-| 用途 | 依赖 |
-| --- | --- |
-| 从源码构建 | Rust ≥1.85、C 链接器、make、pkg-config |
-| 运维命令 | Linux、Bash、curl、jq、openssl、coreutils、flock |
-| TLS 演示 | OpenSSL 开发库、`/usr/bin/curl` 使用动态 OpenSSL |
-| 本机演示、DSH 插件 | Node `^22.19` 或 `>=24`；DSH 演示还需已安装或已构建的 DSH |
-| 可选强制隔离 | `doctor/deps --runtime` 检查/安装 iproute2、nftables、unshare、libseccomp；实际启动还需 root 和内核能力 |
-
-普通网关不需要 OpenSSL 开发库，省略 `--tls` 即可。Node 用于演示与 DSH 适配，Rust 产品运行不依赖 Python 或 Node。
-
-源码目录的 `doctor` 检查构建工具链；安装后的 `cpctl doctor` 只检查运行所需依赖，不要求安装 Rust 编译器。
-
-`install` 构建五个 Rust 命令，安装 `cpctl`、可选 native 库、运维脚本、插件和文档，默认前缀为 `~/.local`。公共安装使用：
+源码构建后，在已配置模型和运行库的终端执行：
 
 ```bash
-./cpctl install --tls --prefix /usr/local
+./target/release/censorprivacy web
 ```
 
-构建以当前账户进行，仅向受保护安装目录复制时提权。`bash scripts/package.sh --with-native` 生成的发布归档也包含这些运维文件；从预编译归档安装后无需再运行源码构建命令。
-
-## 2. 前期准备：策略、凭据和 agent
-
-### 2.1 本机演示的准备内容
-
-后文四个 `demo` 命令都会自动准备以下内容，执行结束清理临时进程和目录；失败时保留 0700 诊断目录供本机排查。
-
-| 项目 | 自动准备的内容 |
-| --- | --- |
-| 策略 | CUSTOMER 词典包含 `DemoCustomerOrchid`；SECRET 词典包含 `DEMO_SECRET_DO_NOT_SEND`；启用金额和日期识别 |
-| 输入 | 虚构客户、`100.00元`、`200.00元` 和虚构 SECRET |
-| 凭据 | 随机本机 gateway token，不需要 provider key |
-| 上游 | 独立回环端口上的确定性模拟模型；TLS 演示另生成短期证书并校验证书 |
-| agent | 本机直接演示由脚本发请求；DSH 演示启动真实 headless agent 并注册 `private_compute` |
-| 目录 | 配置与 agent workspace 分开；DSH 使用独立 DSH_HOME/profile |
-
-模拟上游只回显或按固定规则发起工具调用。它用于观察实际出网内容，不能代表真实模型推理效果。
-
-### 2.2 实际服务的策略和凭据
+完整包中使用 `./bin/censorprivacy web`；源码安装后使用 `~/.local/bin/censorprivacy web`。开发调试也可执行：
 
 ```bash
-./cpctl init
+CARGO_BUILD_JOBS=1 cargo run --locked --bin censorprivacy -- web
 ```
 
-按提示填写 `gateway` 或 `tls`、真实上游 **origin**、服务商提供的实际模型 ID 和 provider key。origin 不包含 `/v1`、其他路径、查询参数或凭据；例如服务商文档中的 API base URL 以 `/v1` 结尾时，只填其 origin。`.example` 是文档占位域名，不能使用。
+浏览器打开终端打印的 `http://127.0.0.1:8766/`，粘贴文本并点击检测。页面展示 `REGEX / RULES / NER` 的命中、原文高亮和三种遮蔽预览；无需配置上游或密钥。更换端口用 `web --port 8767`，按 Ctrl+C 停止。
 
-provider key 无回显输入。若已有 0600 凭据文件，可使用 `--key-file /绝对路径/upstream.key`；它需要属于当前用户。无认证的本机开发上游可显式使用 `--no-key`。不要将 key 放入命令行、仓库或 agent workspace。
+服务器通过 SSH 使用时，在自己电脑的终端建立转发，再打开本机地址：
 
-默认目录：`~/.config/censorprivacy/managed`，权限 0700；内部文件为 0600：
+```bash
+ssh -N -L 8766:127.0.0.1:8766 用户@服务器IP
+```
 
-| 文件 | 用途 |
-| --- | --- |
-| `config.json` | 模式、origin、模型、端口、凭据是否启用、native 库路径 |
-| `policy.yaml` | 从仓库示例复制的策略，需按业务修改 |
-| `gateway.token` / `curl.headers` | 本机客户端认证 |
-| `upstream.key` | 可选 provider key |
-| `run.json` | 启动后生成的本次 run ID；原值映射只在网关内存中 |
-| `service.log` | 服务诊断，使用固定错误码 |
+检测页面与聊天网关独立。预览引用不能用于网关恢复；详细参数与范围见 [检测台说明](../plugins/detector-web/README.md)。
 
-先编辑 `policy.yaml`，加入需要保护的业务客户与秘密。系统只能按已配置的规则识别，示例词典不会自动覆盖业务数据。重复 `init` 保留已有配置和凭据；独立部署使用通用选项 `--config-dir /绝对路径/私有目录`。它不会自动导入旧教程的 `~/.config/censorprivacy/rust` 配置。
+## 2. 启动实际模型网关
+
+### 2.1 初始化连接
+
+下面以 DeepSeek 为例；其他服务替换 origin 与实际模型 ID：
+
+```bash
+./cpctl init --upstream https://api.deepseek.com --model-id deepseek-flash
+```
+
+按提示输入 provider API Key，输入不回显。上游只填 **origin**，不附加 `/v1`、其他路径或查询参数。也可运行 `./cpctl init` 交互填写全部连接信息。
+
+已有当前用户所有的 0600 凭据文件时，追加 `--key-file /绝对路径/upstream.key`；受信任的无认证本机上游可用 `--no-key`。已有配置不会被再次 `init` 覆盖。
+
+### 2.2 配置业务策略
+
+初始化后编辑 `~/.config/censorprivacy/managed/policy.yaml`，补充业务词典和秘密。例如替换其中的 `dictionaries` 段：
+
+```yaml
+dictionaries:
+  PERSON: [示例联系人]
+  ORG: [示例客户甲]
+  SECRET: [DEMO_SECRET_DO_NOT_SEND]
+```
+
+保留文件中的其他策略项。内置规则和 NER 负责通用检测，业务秘密仍需按实际场景配置。不要把上游 Key 写入策略或 Agent 工作目录。
+
+### 2.3 启动并检查
 
 ```bash
 ./cpctl start
@@ -83,135 +73,257 @@ provider key 无回显输入。若已有 0600 凭据文件，可使用 `--key-fi
 ./cpctl check --model
 ```
 
-默认网关为 `http://127.0.0.1:8775`。`check` 检查版本、目录/文件权限、认证、run ID；它不调用上游。`check --model` 额外通过网关发送无敏感数据的 Chat Completions 请求，会使用真实上游并可能计费。TLS 模式的实际模型检查使用后文 `dsh cloud`。
+预期网关地址为 `http://127.0.0.1:8775`。源码安装方式启动时，当前终端须仍配置 `CP_DETECTOR_MODEL_DIR` 与 `CP_DETECTOR_ORT_LIBRARY`；完整包自动定位包内资源。
 
-`/ready` 成功和 `/v1/models` 返回配置模型，只能说明本机控制面可用。模型请求 502 时检查实际 origin、模型 ID、凭据和网络；具体错误保存在私有 `probe-response.json`。`.example` 或任意自造模型名不会变成可用云服务。
+`check` 验证本机认证、权限、版本和 run ID；`check --model` 额外发送实际 Chat Completions 请求，**会使用真实模型并可能计费**。成功后再接入 Agent。模型请求失败时见 [上游与协议排查](troubleshooting.md#3-上游与协议)。
 
-### 2.3 agent 配置
+## 3. 接入 Agent
 
-普通 agent 使用 `http://127.0.0.1:8775/v1` 作为 Chat Completions base URL，API key 使用本机 `gateway.token`，模型使用 `config.json` 中的模型 ID。网关模式由 Rust 服务持有 provider key。DSH 的配置由后文 `dsh setup` 自动生成，无需手写环境变量或修改 harness。
+保持第 2 节的网关运行，选择一种客户端。DSH、xiaoO 需另行获取和构建，本项目不会自动下载或升级它们。
 
-TLS direct 的应用保留真实 HTTPS origin，通过 `tls-run` 加载 hook；客户端需要其上游认证凭据。它当前只支持固定 IPv4 peer、HTTP/1.1、Content-Length、非流式未压缩 JSON，证书必须匹配该 IP。不能把域名简单换成解析出来的 IP 后关闭证书校验。DSH 插件替换传输以满足这些要求。
+### 3.1 通用客户端
 
-### 2.4 长期托管与停止
+| 配置项 | 填写内容 |
+| --- | --- |
+| Chat Completions Base URL | `http://127.0.0.1:8775/v1` |
+| API Key | `~/.config/censorprivacy/managed/gateway.token` 的内容 |
+| 模型 ID | 与 `init --model-id` 一致 |
 
-本用户实例停止：
+客户端连接本机网关，provider Key 由网关持有。Responses/Messages 客户端按自身路径拼接方式配置，支持入口见 [接口与显示恢复](#接口与显示恢复)。
+
+### 3.2 DeepSeek Harness：浏览器聊天
+
+先按 [DSH 官方源码运行说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/README.zh.md#run-from-source) 完成 `pnpm install` 和 `pnpm run build`，再执行：
 
 ```bash
+./cpctl dsh web --dsh-path /path/to/deepseek-harness
+```
+
+打开日志中**带 token 的完整网址**，默认端口为 `3080`。首次点击“继续”，选择测试工作目录，确认模型为 `CensorPrivacy / <已配置模型ID>`。模型和凭据自动取自当前网关，无需再次填写 API Key。
+
+在聊天框发送下列任务，并粘贴 [虚构项目邮件](../examples/privacy-business.txt)：
+
+```text
+请逐字复述以下邮件，保留段落和完整占位符（包括尖括号），使用普通文本，不使用代码块、表格或链接，不计算金额。
+```
+
+普通隐私应在本机显示中恢复，`DEMO_SECRET_DO_NOT_SEND` 保持遮盖。模型必须完整保留占位符才能恢复。SSH 服务器另在自己电脑执行：
+
+```bash
+ssh -N -L 3080:127.0.0.1:3080 用户@服务器IP
+```
+
+PATH 已有可用 `dsh` 时可省略 `--dsh-path`；旧参数 `--dsh-root` 仍可用。更换端口用 `--port 3081`；Ctrl+C 只停止 Web，网关继续运行。该 Web 是聊天入口，与第 1 节的检测台不同。
+
+### 3.3 DeepSeek Harness：命令行与工具验收
+
+```bash
+./cpctl dsh setup --dsh-path /path/to/deepseek-harness
+./cpctl dsh run '请整理以下虚构交接信息，保留完整占位符，使用普通文本：张三在清华大学工作，电话13800138000，测试报告待确认。'
+./cpctl dsh cloud
+```
+
+`setup` 准备独立 profile 并记住 DSH 路径；`run` 执行实际任务。任务含命令行选项时用 `--` 分隔，例如 `./cpctl dsh run -- '--help 是任务文本，请解释。'`。
+
+`run` 和 `web` 默认只提供 CensorPrivacy 的私密工具。需要 DSH 自带工具时，在本次启动加 `--enable-tools`，例如 `./cpctl dsh web --dsh-path /path/to/deepseek-harness --enable-tools`。这些原生工具按 DSH 自身权限运行，不会获得替换隐私引用所需的原值。下一次启动仍默认只提供私密工具。
+
+`cloud` 使用独立临时网关和虚构策略验证真实模型的 `private_compute sum`，预期恢复客户 `DemoCustomerOrchid` 与合计 `300.00`，SECRET 不恢复。它从当前网关的认证 `/ready` 继承实际 NER 线程、设备和 batch 设置（包括 `start` 临时覆盖），并将请求值与实际值写入私有的 `dsh/cloud-report.json`。设置不一致会在请求模型前停止。`run/cloud` 均会调用真实模型；`cloud` 验收期间会额外加载一份检测模型，请确认本机有足够资源。
+
+### 3.4 openEuler xiaoO：终端与文件任务
+
+从 [xiaoO 官方仓库](https://atomgit.com/openeuler/xiaoO) 获取源码，使用 Rust **≥1.88** 在其仓库执行：
+
+```bash
+CARGO_BUILD_JOBS=1 cargo build --locked --release -p xiaoo-endside
+```
+
+回到 CensorPrivate 或完整包目录，启动终端界面：
+
+```bash
+./cpctl xiaoo tui --xiaoO-path /path/to/xiaoO
+```
+
+默认关闭 xiaoO 自身的工具，适合普通文本对话。需要工具时运行 `./cpctl xiaoo tui --enable-tools --xiaoO-path /path/to/xiaoO`：启动器会先加载真实工具目录并预热本地隐私检测，显示准备进度后才进入界面。准备请求不访问云模型、不进入 Web 记录；新的用户文本仍会正常检测。
+
+在 TUI 中粘贴同一封虚构邮件。`--xiaoO-path` 指定源码目录，依次查找 `target/release/xiaoo`、`target/debug/xiaoo`，成功后会记住可执行文件路径。已有 `xiaoo` 命令可省略此参数；旧参数 `--xiaoo-root` 和 `--xiaoo-bin` 仍兼容。
+
+终端同时输出隐私检测台地址，默认 `http://127.0.0.1:8775/`，端口与当前网关一致。也可运行 `./cpctl xiaoo web` 查看地址。网页自动同步每次启动的会话，显示用户输入、Agent 回复、工具调用和工具结果；点击消息下的“查看检测与遮蔽”，查看发送前原文、命中位置及当次真正发给上游的遮蔽文本。记录详情只读，点击“返回独立检测”可继续使用原来的文本检测功能。
+
+更新前已启动的网关需要先 `./cpctl stop` 再 `./cpctl start`，再新建 xiaoO 会话。网关和网页共用一个本地模型实例，无需另外启动 `censorprivacy web`。浏览器刷新和网关重启后均可回看记录；旧 CP 引用仅供回看，不能跨网关 run 使用。
+
+会话包含原始隐私文本，用户实例保存在当前配置目录的 `xiaoo/records/`（systemd 实例位于 `/var/lib/censorprivacy/<实例名>.xiaoo-records/`），目录权限 0700、文件权限 0600；带 Agent 会话标识的请求（包括 Harness 自动传递的标识）会被保存，普通网关请求与独立检测文本不保存。记录不自动过期。测试前可点击对话记录右上角的“清空记录”，确认后永久删除当前实例的全部会话及检测详情，页面同步恢复空白；刷新或重启不会恢复，清空前已开始的请求也不会重新写回旧记录。此操作保留网关策略和凭据，不清除 xiaoO 自身上下文；开始新一轮测试请退出并重新运行 `./cpctl xiaoo tui`，避免原对话历史随新请求再次发送。网页仅允许本机同源访问。
+
+```bash
+./cpctl xiaoo demo --enable-tools
+./cpctl xiaoo run --enable-tools '读取 privacy-business.txt，概括交付安排，不计算金额。'
+```
+
+`demo` 让真实 Agent 调用 `file_read` 读取虚构邮件并复述；`run` 执行日常任务，也可从 stdin 读取文本。只准备配置用 `./cpctl xiaoo setup`。这些命令复用网关模型与凭据，原 xiaoO 配置保留。
+
+### 3.5 通用 Agent 会话检测台
+
+`./cpctl start` 启动的网关也提供隐私检测台，运行 `./cpctl web` 查看地址（默认 `http://127.0.0.1:8775/`）。通过当前 CensorPrivacy 插件运行的 DeepSeek Harness CLI/Web 会自动按真实会话标识同步，页面标明来源，支持流式回复、工具结果和点击查看当次检测与遮蔽。xiaoO 历史与新记录可在同一页面查看。
+
+其他 OpenAI Chat Completions Agent 可设置 Base URL 为 `http://127.0.0.1:8775/agents/my-agent/session-001/v1`；若需要完整端点则加 `/chat/completions`。也可继续使用标准端点并增加 `X-CensorPrivacy-Agent: my-agent`、`X-CensorPrivacy-Session: session-001` 两个请求头。两种方式选一种；同一会话复用标识，新会话换标识。来源最多 64 字符、会话最多 128 字符，均使用 ASCII 字母、数字、`-_.:`。来源和会话参数只在本机使用，不发给模型。
+
+底层 `serve/web` 使用 `--conversation-records-dir /绝对路径`；旧 `--xiaoo-records-dir` 参数与记录目录继续兼容。未携带会话标识的请求不记录；不扫描、导入之前的 Harness 原生日志。当前记录支持 gateway 的 Chat Completions，TLS direct 及 Messages/Responses 协议尚不提供会话记录。更多接入说明见 [检测台说明](../plugins/detector-web/README.md)。
+
+## 4. 日常管理
+
+NER 默认使用 1 个 intra-op 线程，inter-op 固定为 1。4 核 CPU 可在首次初始化时添加 `--ner-threads 4`，已有实例可执行 `./cpctl stop` 后用 `./cpctl start --ner-threads 4` 临时覆盖。要持久保存，修改私有 `config.json` 的 `ner_threads` 为 `4`，再重启；`init` 不覆盖已有配置。
+
+GPU 设备和每卡 batch 可在网关启动时配置，所有 Harness 共用检测核心，分窗保持 512/64：
+
+```bash
+./cpctl start --ner-device cpu --ner-threads 4
+./cpctl start --ner-device cuda --ner-batch-size 4
+./cpctl start --ner-device cuda:0,1,2,3 --ner-batch-size 4
+./cpctl start --ner-device cann --ner-batch-size 4
+```
+
+默认 CPU、batch 1；`cuda` 等同 `cuda:0`，`cann` 等同 `cann:0`，两者均支持多卡列表。`init` 可保存配置，`start` 临时覆盖。CUDA 需要 GPU 原生运行库及匹配驱动/CUDA/cuDNN，完整包默认附带 CPU 运行库；资源设置和多卡行为见 [检测器配置](rust-detector.md#2-配置路径)。昇腾需含 CANN provider 的 ORT、匹配的 Ascend 驱动与 CANN Toolkit；两种加速后端均需在对应硬件上验收。
+
+
+### 检查、停止与重启
+
+```bash
+./cpctl check
 ./cpctl stop
+./cpctl start
 ```
 
-即使连接配置已损坏，`stop` 仍会核对原进程身份后停止实例，无需先修复上游配置。
+每次重启产生新 run，原值映射清空。重启后重新打开 Agent 并新建会话；DSH headless 接入重新执行 `dsh setup`。默认 `ttl_seconds: 3600` 表示 run 自启动起一小时有效，到期后进程可能仍在，但请求被拒绝；处理方式见 [有效期排查](troubleshooting.md#2-认证与实例)。
 
-系统实例先安装到 `/usr/local`，再执行：
+系统服务使用 `systemd start/check/stop`，部署过程见 [构建与部署](build-and-deploy.md#6-部署为系统服务)。同一实例选择一种托管方式。
+
+### 多实例
+
+初始化、启动、检查和停止均使用同一个绝对配置目录，初始化时分配不同端口：
 
 ```bash
-./cpctl systemd install --dry-run
-./cpctl systemd install
-./cpctl systemd start
-./cpctl systemd check
-./cpctl systemd stop
+./cpctl init --config-dir "$HOME/.config/censorprivacy/test" --port 8776
+./cpctl start --config-dir "$HOME/.config/censorprivacy/test"
+./cpctl check --config-dir "$HOME/.config/censorprivacy/test"
+./cpctl stop --config-dir "$HOME/.config/censorprivacy/test"
 ```
 
-系统服务使用 `censorprivacy` 专用账户，unit 名按配置目录生成，避免不同实例同名。`start` 会停止同配置的用户实例，启动后自动检查；不会自动设为开机启动。`systemd check` 将验证后的本次 run 文件同步到私有配置目录，供 DSH/TLS 控制面使用。两种托管方式共用端口，选择一种运行。
+Agent、演示以外的日常命令和 systemd 命令也应带上该实例的 `--config-dir`。
 
-`systemd install --dry-run` 将 unit 正文写入标准输出，说明写入标准错误，可重定向保存后用 `systemd-analyze verify` 检查。
+## 5. 本机演示与验收
 
-修改配置、策略或凭据后，停止并重新启动；系统服务需要停止、重新 `systemd install` 后启动。每次重启产生新 run，旧引用失效，agent 应开启新会话。默认不自动重启，避免让已有会话悄然使用失效引用。首次迁移到系统服务也需重新准备 agent。
-
-## 3. 本机网关演示
+**无需云凭据、无需先执行 `init/start`** 的本机演示：
 
 ```bash
 ./cpctl demo gateway
 ```
 
-链路：演示脚本 → Rust 网关 → 本机模拟上游 → Rust 网关 → 本机显示。命令会展示并断言：
+该命令运行真实 Rust/ONNX 检测器与模拟上游，展示项目邮件的检测、上游占位符、本机恢复和引用求和 `16000.00`；SECRET 始终遮盖。结束后自动停止临时进程，失败时保留私有诊断目录。需要 Node，运行前可用 `./cpctl doctor --demo` 检查。
 
-1. 输入包含虚构客户、两笔金额和 SECRET。
-2. 上游实际收到 `<CP_CUSTOMER_…>`、`<CP_MONEY_…>`、`<CP_SECRET_…>`，没有这些原值。
-3. 被动显示恢复客户和金额，SECRET 显示为 `[REDACTED_SECRET]`。
-4. `private_compute sum` 接收两个引用，先返回派生金额引用；最终本机显示 `300.00`。
-5. 无认证返回 401；带未授权业务数值的请求被拒绝且没有到达上游。
+其他验收按需执行：
 
-普通网关只保护发到这个入口的流量。需要封闭 agent 绕过网关的网络出口时使用 [privacy-run](../README.md#linux-受管启动)，并满足其 root/namespace 等要求；这些演示没有建立强制隔离域。
+| 命令 | 验证内容 | 前置条件 |
+| --- | --- | --- |
+| `./cpctl demo tls` | 原 OpenSSL 连接、等长替换与恢复 | native、动态 OpenSSL curl、Node |
+| `./cpctl demo dsh-gateway --dsh-path /path/to/deepseek-harness` | 真实 Agent 与模拟上游的工具往返 | 已构建 DSH、Node |
+| `./cpctl demo dsh-tls --dsh-path /path/to/deepseek-harness` | DSH 的 TLS direct 适配 | 上述条件加 native/OpenSSL |
+| `./cpctl self-test` | 完整包校验及网关/TLS 演示 | **仅完整 standalone 包**提供 |
+| `./cpctl check --model` | 当前配置的实际模型连通性 | 已初始化并启动；可能计费 |
+| `./cpctl dsh cloud` | 实际模型的引用计算与最终显示 | 当前服务、DSH 和有效云凭据；可能计费 |
 
-## 4. 本机 TLS direct 演示
+本机模拟演示可以观察实际发给测试上游的内容；真实模型验收检查工具与显示结果。测试不证明任意业务召回率，也不能观测云服务内部存储。开发回归入口见 [脚本速查](scripts.md#4-测试与验收)。
 
-```bash
-./cpctl demo tls
-```
+## 6. 可选模式
 
-链路：动态 OpenSSL curl → hook 与 Rust broker 批准 → 原 HTTPS 连接 → hook 与 broker 批准响应 → 本机显示。演示使用本机测试 CA，不使用 `-k`。
+### TLS direct
 
-检查点与网关相同。上游看到的是与原始字节等长的短别名，例如 `~P…` 或 `~…`；SECRET 可能显示为星号。派生 CP 引用恢复后可能保留填充空格，这是维持 wire 长度的要求。输出还包含 broker 的请求保护、响应恢复和拒绝计数。
+希望保留受支持客户端的原 TLS 连接时，按 [native 说明](../native/README.md) 构建 hook，再以独立配置使用 `init --mode tls`。该模式需要匹配证书的固定 HTTPS IPv4 origin、动态 OpenSSL、HTTP/1.1、Content-Length、非流式未压缩 JSON。
 
-不支持的协议、长度或响应会被拒绝，不会回退成原文直连。`tls-run` 是协作式接入，不替代强制进程隔离。
+本机示例用 `./cpctl demo tls`；实际模型检查用 `dsh cloud`，不使用 `check --model`。普通网关、检测页面及 xiaoO 接入无需 native。
 
-## 5. DSH 插件适配演示
-
-DSH 即 [DeepSeek Harness，官方运行说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/README.zh.md#run)。先按官方说明安装 DSH；源码方式先执行官方 `pnpm install`、`pnpm run build`。本项目不修改 harness 源码，不向已有 profile 安装插件，也不自动下载或升级 DSH。
-
-已于 2026-10-16 联网核对 [官方快速入门](https://deepseek-harness.github.io/deepseek-harness/en/guide/quickstart#configure-a-model)：其模型配置步骤明确要求 “Open Settings → Models, enter a DeepSeek API key, and save it.”。[官方模型配置页](https://deepseek-harness.github.io/deepseek-harness/en/guide/providers#configure-deepseek) 说明凭据保存在 `$DSH_HOME/.credentials.yaml`，界面只返回脱敏描述；该页目前也说明 OAuth 登录的提供方尚不支持。
-
-不需要真实 provider key 的是启动 DSH 界面和后文的本机模拟演示；调用 DeepSeek 官方云模型需要有效 key。官方适配器默认 origin 是 `https://api.deepseek.com`，模型应从实际可用目录选择；安装包中的建议目录不能证明某个账户可调用该模型。无凭据访问官方 `GET /models` 的本次只读检查返回 401，未发起模型推理。
-
-`cpctl` 使用独立 DSH_HOME，不自动导入已有 DSH 的凭据文件。接入本项目时，用前文 `./cpctl init` 无回显输入 key，或指定私有 key 文件路径即可；无需将密钥内容发给他人。DSH 模拟演示仍然无需这些云端凭据。
-
-源码方式检查和演示：
+底层接入时，先用 `censorprivacy serve --tls-direct` 启动 broker，再用 `tls-run` 启动协作客户端：
 
 ```bash
-./cpctl doctor --tls --demo --dsh --dsh-root /path/to/deepseek-harness
-./cpctl demo dsh-gateway --dsh-root /path/to/deepseek-harness
-./cpctl demo dsh-tls --dsh-root /path/to/deepseek-harness
+tls-run \
+  --broker http://127.0.0.1:8775 \
+  --token-file "$CONTROL_DIR/gateway.token" \
+  --run-state-file "$CONTROL_DIR/run.json" \
+  --upstream-key-file "$CONTROL_DIR/upstream.key" \
+  --native-library "$PWD/native/libcp_tls_guard.so" \
+  --workspace "$AGENT_WORKSPACE" \
+  --timeout 120 \
+  -- "$CLIENT_EXECUTABLE" CLIENT_ARGS
 ```
 
-若 PATH 中已有可用的 `dsh` 命令，省略 `--dsh-root`。仓库脚本直接使用已构建 CLI；不会重新构建 DSH。
+`CONTROL_DIR` 指向实际实例的私有配置目录，`AGENT_WORKSPACE` 是客户端工作目录；可执行文件及参数替换为实际程序。此示例从 CensorPrivate 源码目录运行，native 库须先构建；安装后将库路径改为可信安装位置。TLS 客户端自行完成正确的 CA 与目标身份校验，launcher 不建立强制网络隔离域。
 
-两种演示都运行真实 headless agent，通过 Cordis 插件注册 `censorprivacy` 模型路由与精确命名的 `private_compute` 工具。agent 请求模型发起求和，工具经本机认证计算，模型再将派生引用放入最终回复。验收同时检查模拟上游无原值、工具往返记录和最终客户名/`300.00` 显示。
+### Linux 受管运行域
 
-插件使用完整 JSON 请求并适配为 DSH 的块事件；不把 DSH 默认 SSE 传输直接套进 TLS hook。独立 profile 关闭自带模型适配器、辅助模型调用和对应遥测插件，限制工具为 `private_compute`。这些配置用于演示，不能代替 OS 级隔离。图片、opaque reasoning、未知内容块或不支持的输出会拒绝，模型应支持非 reasoning 的 Chat Completions 与工具调用。
-
-实际 agent 的准备与使用：
+需要约束 Agent 绕过网关的独立网络出口时，使用 `privacy-run`。它另需 root、namespace/mount/nft 能力及受控工作目录。`demo`、DSH profile 和 `tls-run` 本身不建立这一运行域。
 
 ```bash
-./cpctl dsh setup --dsh-root /path/to/deepseek-harness
-./cpctl dsh run '请介绍当前可用的 private_compute 工具。'
+sudo privacy-run \
+  --run-state-file "$CONTROL_DIR/run.json" \
+  --token-file "$CONTROL_DIR/gateway.token" \
+  --workspace "$AGENT_WORKSPACE" \
+  --uid "$AGENT_UID" --gid "$AGENT_GID" \
+  --gateway-port 8775 \
+  --read-only-path "$AGENT_RUNTIME" \
+  --timeout 300 \
+  -- "$AGENT_EXECUTABLE" AGENT_ARGS
 ```
 
-任务以 `-` 开头或包含命令行选项时，用 `--` 分隔，例如 `./cpctl dsh run -- '--help 是任务的一部分，请原样解释。'`。配置选项放在 `--` 之前，后面的内容全部作为任务文本。
+上例变量须设置为实际控制目录、专属工作区、非 root UID/GID、可信只读运行依赖及可执行文件。launcher 的控制文件必须由 root 或目标 UID 持有；服务账户不同时由管理员提供独立受控文件。网关须能从宿主 readiness 探测和受管 veth 两侧访问，单独监听宿主 loopback 不足以服务运行域。内核还需支持 `mount_setattr`、`close_range`、pidfd 和密封 memfd；依赖准备见 [构建参考](build-and-deploy.md#用途与依赖)。
 
-先启动当前网关并通过 `check`；系统实例先通过 `systemd check`。`setup` 在私有配置目录的 `dsh/` 下创建隔离 profile、patch 和 workspace，保存 DSH 源码路径；后续无需重复提供。`run` 使用实际上游，会产生真实模型调用。每次命令运行新会话；策略和 run 改动后重新执行 `setup`。
+### 私密计算与 MCP
 
-插件源码、标准 bundle 安装方式和配置字段见 [插件说明](../plugins/dsh-censorprivacy/README.md)。模型返回的代码、链接与普通工具参数不获得显示恢复权限。
-
-## 6. DSH 真实云服务效果验收
-
-前提是四个本机演示通过、实际上游和凭据有效、当前服务已启动、DSH 可用。执行：
+DSH profile 已注册 `private_compute`。其他客户端可配置 `privcalc` 或 stdio MCP，提供当前实例的 `CENSORPRIVACY_URL`、`CENSORPRIVACY_TOKEN` 和 `CENSORPRIVACY_RUN_ID`。这些环境由 launcher 或可信控制面提供，TLS direct 模式另需 `CENSORPRIVACY_MODE=tls-direct`。
 
 ```bash
-./cpctl dsh cloud
+privcalc aggregate "$REF_A" "$REF_B"
 ```
 
-命令会发起真实模型请求并可能计费。它建立临时独立 Rust run，使用相同 origin、模型和凭据，配上虚构验收策略；不会修改生产策略或业务映射。它要求模型执行 `private_compute sum`，检查引用输入、引用结果、授权客户名与 `300.00` 显示，并确保最终回复不含虚构 SECRET。
+`REF_A`、`REF_B` 必须为当前实例已签发且授权有效的引用。CLI 支持 `sum`、`mean`、`min`、`max`、`aggregate`、`date_diff`；工具调用本机 `/v1/private_compute`，返回继承敏感标签的派生引用。stdio MCP 入口为 `censorprivacy-mcp`，在客户端已有 MCP 配置中注册，实际操作由 `tools/list` 返回。普通 Shell/Python 工具不获得原值读取权限。
 
-结果写入 `dsh/cloud-report.json`（0600），包括模式、模型、origin、run ID、时间、工具执行记录、回复哈希及通过/失败状态；不会记录 key。失败时另保留私有临时诊断。它不会把回环模拟上游计为云验收，模型没有正确调用工具时也不会只因 HTTP 200 而通过。
+### 注册自定义私密工具
 
-网关模式支持域名 HTTPS。TLS direct 的云端还需支持匹配证书的固定 IPv4 origin 及前述 HTTP 限制；很多公有模型接口不满足这些条件，应按实际服务测试。任一约束不满足时拒绝，不降级保护。
+1. 把 [注册表样例](../examples/private-tools/manifest.example.json) 复制到管理目录下的 `private-tools.json`，权限设为 `0600`。管理目录默认是 `${XDG_CONFIG_HOME:-$HOME/.config}/censorprivacy/managed`，也可用 `--config-dir` 指定。
+2. 修改 `command` 中的绝对路径，指向本机可信的 [Python 排序脚本](../examples/private-tools/sort.py) 或 [Shell 排序脚本](../examples/private-tools/sort.sh)。Python 样例使用 Python 3；Shell 样例使用 `jq`。`command` 是固定的程序和参数列表，工具名称使用 `private_*`，不要把密钥、路径或业务数据写进模型可见的 `description`。
+3. 重启网关和 DSH。DSH 会自动发现登记的工具；不需要 `--enable-tools`。直接启动网关时可用 `censorprivacy serve --private-tools-file /绝对路径/private-tools.json ...`。systemd 用户修改后需要重新执行 `cpctl systemd install`，并确保服务账号能读取脚本及依赖。
 
-TLS 云端验收沿用 `init` 保存的 native 库路径；自定义安装位置通过 `init --native-library /绝对路径/libcp_tls_guard.so` 配置。
+本机认证接口 `GET /v1/private_tools` 列出工具；`POST /v1/private_tools/<name>` 对自定义工具仅接受 `{"refs":[...]}`。网关验证当前 run 的引用、排除 SECRET，再通过标准输入将 `{"inputs":[{"value":"…","entity_type":"…","unit":null}]}` 交给程序。标准输出必须是单个 JSON 对象：
 
-真实云检查验证本机插件、工具调用和回复效果；出网正文无原值的直接观测由本机模拟验收提供，不能据此声称观测到了云服务内部存储。没有有效配置或无法访问上游时，真实云验收应保持未完成。
+- `"output": "order"`：输出 `{"order":[1,0]}` 等从零开始的完整排列。网关按该顺序返回原有引用。
+- `"output": "values"`：输出 `{"values":["…"]}`。网关把结果注册为继承输入依赖的 `PRIVATE_RESULT` 引用；检测到凭据时拒绝发布。
 
-## 7. 维护与回归
+两种调用结果都只含 `{"refs":[...]}`。每次最多 256 个输入、256 KiB 标准输入和标准输出，单个派生值最多 16 KiB。程序默认 3 秒超时（可配置 100–30000 毫秒），每个网关同一时间只运行一个自定义程序。工具运行时不继承凭据环境，也不能打开网络套接字；Linux 需要 libseccomp。脚本使用网关账号的文件访问权限，因此只应登记经本机管理员审核的程序及其依赖。旧 `private_compute`、`privcalc` 和 stdio MCP 保持兼容；自定义工具通过 DSH 或上述 HTTP 接口调用。
 
-```bash
-./cpctl help
-bash scripts/test/operations.sh
-bash scripts/test/operations.sh --dsh-root /path/to/deepseek-harness
-```
+## 7. 配置与行为参考
 
-入口 `cpctl` 只定位安装位置；环境检查、部署和演示分别在 `scripts/ops/`，DSH 适配在 `plugins/dsh-censorprivacy/`。配置按 JSON/YAML 读取，不执行 shell 配置。配置目录加锁，进程停止核对 PID、启动时间与可执行文件；凭据和输出拒绝叶子符号链接。
+### 私有文件
 
-运维回归覆盖安装后的目录布局、初始化保留、凭据路由、进程启停、认证、失效 PID、坏连接配置下停止、文件权限、符号链接、网关/TLS 演示，以及插件拒绝未知内容、原值计算结果和取消时的进程清理。指定 `--dsh-root` 后还验证安装产物的 `dsh setup/run`、任务选项分隔和两种 DSH 演示，不将外部 DSH 作为 Rust 产品编译依赖。
+默认目录 `~/.config/censorprivacy/managed/` 为 0700，内部文件为 0600：
 
-验收环境、核心回归与实际通过项见 [验收记录](validation.md)，模块职责见 [架构说明](architecture.md)。正式系统服务和真实云请求的状态分别记录，不能用本机模拟结果替代。
+| 文件或目录 | 用途 |
+| --- | --- |
+| `config.json` | 模式、上游 origin、模型、端口、native/CA 路径 |
+| `policy.yaml` | 本地业务策略 |
+| `gateway.token`、`curl.headers` | 本机客户端认证 |
+| `upstream.key` | 可选 provider Key |
+| `run.json` | 当前 run ID，不能据此恢复内存映射 |
+| `service.log`、`probe-response.json` | 启动诊断与实际模型检查结果 |
+| `dsh/`、`dsh-web/` | 独立 DSH profile、工作区及验收报告 |
+| `xiaoo/` | 独立 xiaoO 配置、已记住的路径、工作区和私有对话记录 |
+
+配置由 JSON 读取，不作为 Shell 执行。`init` 保留已有配置；更新连接配置或策略后停止并重启，系统服务重新执行 `systemd install`。
+
+### 接口与显示恢复
+
+支持 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`、`/v1/messages/count_tokens`。普通网关支持已实现的 JSON 与文本 SSE 格式。只有授权的被动显示位置可以恢复；代码、链接目标、普通工具参数和未知通道不会恢复原值。
+
+网关对未指定 `thinking` 的 `deepseek-*` Chat Completions 请求补充 `{"type":"disabled"}`。显式开启思考或非空 `reasoning_content` 会被拒绝；TLS direct 字节流不自动添加该字段。
+
+### Agent 接入范围
+
+DSH 使用独立 profile，演示仅开放 `private_compute`；支持非 reasoning Chat Completions 与工具调用，未知内容块拒绝处理。gateway 模式的 Web 与 `dsh run` 使用真实 SSE，校验后的文字逐段显示；CLI 不再等待 headless 最终总结，也不重复打印。工具调用在完整参数与流结束校验后交给 DSH。TLS direct 保留完整 JSON 校验。线程数仍在网关启动时设置 `./cpctl start --ner-threads 4`。插件字段见 [DSH 插件说明](../plugins/dsh-censorprivacy/README.md)。
+
+xiaoO 使用网关与原生 SSE，配置的 `api_base` 是带本次启动会话标识的完整 `/xiaoo/<session>/no-tools/v1/chat/completions` 地址（开启工具时省略 `no-tools/`）；会话标识仅用于本机记录，不发送给上游。TUI 中的模型请求归属本次启动，重新启动 xiaoO 会创建另一条会话。网关记录实际模型交互，未发送给模型的 TUI 编辑、界面命令不在记录范围内。普通工具参数不恢复隐私原值，尚未注册 DSH 的 `private_compute`。`demo --enable-tools` 仅开放 `file_read`。`run/TUI` 默认不向上游提供工具定义，并阻止工具调用；显式启用后，其工具权限由实际运行环境管理。准备将工具目录检测移至进入对话前，耗时仍取决于 CPU 和目录大小；TUI 自身的系统提示与新文本仍需在请求时检测。

@@ -273,19 +273,15 @@ pub fn extract_http2_messages_with_decoder(
                 ..State::default()
             });
             state.last_offset = end;
-            let mut payload_start = cursor + 9;
-            let mut payload_end = end;
-            if matches!(frame_type, 0x0 | 0x1) && flags & 0x8 != 0 {
-                let Some(padding) = bytes.get(payload_start).copied().map(usize::from) else {
+            let payload = &bytes[cursor + 9..end];
+            let payload = if matches!(frame_type, 0x0 | 0x1) {
+                let Some(unpadded) = http2_payload_without_padding(payload, flags) else {
                     break;
                 };
-                payload_start += 1;
-                if padding > payload_end.saturating_sub(payload_start) {
-                    break;
-                }
-                payload_end -= padding;
-            }
-            let payload = &bytes[payload_start..payload_end];
+                unpadded
+            } else {
+                payload
+            };
             match frame_type {
                 0x0 => state.body.extend_from_slice(payload),
                 0x1 | 0x9 => {
@@ -1265,6 +1261,7 @@ mod tests {
             trace_id: TraceId::new(4),
             process: ProcessIdentity::new(9),
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             observed_at: SystemTime::UNIX_EPOCH,
             source: model_core::payload::PayloadSourceBoundary::Uprobe,

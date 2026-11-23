@@ -34,11 +34,13 @@ doctor() {
     else note '缺失：TLS 演示需要 OpenSSL curl'; missing=1; fi
   fi
   if $dsh; then
-    if [[ -n $dsh_root && -f $dsh_root/apps/cli/lib/bin.js ]]; then note 'OK DSH 已构建源码';
-    elif command -v dsh >/dev/null; then note 'OK DSH CLI'; else note '缺失：DSH CLI 或 --dsh-root 已构建目录'; missing=1; fi
+    if ! command -v node >/dev/null || ! node "$CP_REPO_ROOT/scripts/ops/dsh.mjs" "$dsh_root"; then
+      note '需要 Node >=24.9 和有效的 DSH 路径'; missing=1
+    elif [[ -n $dsh_root ]] || command -v dsh >/dev/null; then note 'OK DSH CLI';
+    else note '缺失：DSH CLI 或 --dsh-path npm 安装目录/已构建源码'; missing=1; fi
   fi
   note "磁盘剩余：$(df -h "$CP_REPO_ROOT" | awk 'NR==2 {print $4}')"
-  (( missing == 0 )) || fail '检查未通过；./cpctl deps 可安装系统包，Rust/DSH 按手册准备'
+  (( missing == 0 )) || fail '检查未通过；./censorprivacy deps 可安装系统包，Rust/DSH 按手册准备'
 }
 deps() {
   local family
@@ -63,6 +65,6 @@ deps() {
     *) fail "不支持自动安装此发行版：$family；按手册安装依赖" ;;
   esac
   if $dry_run; then note '仅预览，未安装依赖。'; else note '系统依赖安装完成；请重新运行 doctor 验证版本。'; fi
-  note '若发行版 Node 太旧，请安装 Node ^22.19 或 >=24。'
+  note '若发行版 Node 太旧，请安装 Node ^22.19 或 >=24；DSH 0.2.2-rc.1 需要 Node >=24.9。'
   note 'Rust 需要 >=1.85；本工具不以 root 下载执行 rustup 安装脚本。'
 }

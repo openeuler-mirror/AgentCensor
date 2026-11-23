@@ -159,8 +159,40 @@ install_runtime() {
   shift
   local profile_dir="$dsh_home/profiles/$profile"
   initialize_profile "$profile"
+  # pnpm keeps the old lockfile integrity for a changed tarball at the same
+  # file: path, even with --force. Remove the installed package first.
+  local archive package_name
+  for archive in "$@"; do
+    package_name=$(tar -xOf "$archive" package/package.json | node -e \
+      'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>process.stdout.write(JSON.parse(s).name))')
+    if node - "$profile_dir/package.json" "$package_name" <<'NODE'
+const fs = require('node:fs')
+const [file, name] = process.argv.slice(2)
+const pkg = JSON.parse(fs.readFileSync(file, 'utf8'))
+process.exit(pkg.dependencies?.[name] ? 0 : 1)
+NODE
+    then
+      pnpm --dir "$profile_dir" "${pnpm_store_args[@]}" remove --ignore-scripts "$package_name"
+    fi
+  done
   pnpm --dir "$profile_dir" "${pnpm_store_args[@]}" \
     add --save-exact --force --ignore-scripts "$@"
+}
+
+refresh_meta() {
+  local profile=$1 package_name=$2 archive=$3
+  local profile_dir="$dsh_home/profiles/$profile"
+  if node - "$profile_dir/package.json" "$package_name" <<'NODE'
+const fs = require('node:fs')
+const [file, name] = process.argv.slice(2)
+const pkg = JSON.parse(fs.readFileSync(file, 'utf8'))
+process.exit(pkg.dependencies?.[name] ? 0 : 1)
+NODE
+  then
+    pnpm --dir "$profile_dir" "${pnpm_store_args[@]}" remove --ignore-scripts "$package_name"
+  fi
+  "${dsh_command[@]}" plugin --profile "$profile" add "${pnpm_store_args[@]}" \
+    --force --ignore-scripts "$archive"
 }
 
 # Remove the retired split Guard packages through DSH so its bundle roster is
@@ -192,16 +224,14 @@ install_runtime web \
   "$package_dir/censorguard-web.tgz" \
   "$package_dir/censorscope-host.tgz" \
   "$package_dir/censorscope-session-proxy.tgz"
-"${dsh_command[@]}" plugin --profile web add "${pnpm_store_args[@]}" \
-  --force --ignore-scripts "$package_dir/censorpivot-web.tgz"
+refresh_meta web '@agentcensor/censorpivot' "$package_dir/censorpivot-web.tgz"
 
 retire_component_bundles headless
 install_runtime headless \
   "$package_dir/censorfs-web.tgz" \
   "$package_dir/censorfs-headless.tgz" \
   "$package_dir/censorscope-host.tgz"
-"${dsh_command[@]}" plugin --profile headless add "${pnpm_store_args[@]}" \
-  --force --ignore-scripts "$package_dir/censorpivot-headless.tgz"
+refresh_meta headless '@agentcensor/censorpivot-headless' "$package_dir/censorpivot-headless.tgz"
 
 # CensorFS's full child-Harness path needs this adapter on PATH. The three
 # native module daemons/binaries remain owned by their normal system install.

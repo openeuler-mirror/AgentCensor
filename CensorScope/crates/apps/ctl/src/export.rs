@@ -270,6 +270,23 @@ fn stream_export_to_path(
     Ok(())
 }
 
+fn attribution_sql(connection: &Connection, sql: &str) -> Result<String, rusqlite::Error> {
+    let table = if sql.contains("FROM events_read") {
+        "events"
+    } else {
+        "payload_segments"
+    };
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(if columns.iter().any(|column| column == "attribution") {
+        sql.to_owned()
+    } else {
+        sql.replace(", attribution", ", '{}' AS attribution")
+    })
+}
+
 fn stream_events<W: Write>(
     out: &mut W,
     connection: &Connection,
@@ -282,7 +299,7 @@ fn stream_events<W: Write>(
     after_event: Option<u64>,
 ) -> Result<Option<(u64, u64)>, Box<dyn std::error::Error>> {
     let mut sql = String::from(
-        "SELECT event_id, trace_id, observed_at, process_id, kind, flags, operation, path, fd, size_bytes, endpoint, direction, result, stream, protocol, loss_reason, dropped, dropped_bytes, session_id, call_id, metadata, collector, parent_process_id, executable, argv, argv_flags, channel, resource FROM events_read WHERE trace_id=?1 AND session_id=?2",
+        "SELECT event_id, trace_id, observed_at, process_id, kind, flags, operation, path, fd, size_bytes, endpoint, direction, result, stream, protocol, loss_reason, dropped, dropped_bytes, session_id, call_id, metadata, collector, parent_process_id, executable, argv, argv_flags, channel, resource, attribution FROM events_read WHERE trace_id=?1 AND session_id=?2",
     );
     if call_id.is_some() {
         sql.push_str(" AND call_id=?3");
@@ -299,6 +316,7 @@ fn stream_events<W: Write>(
     if let Some(limit) = page_size {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
+    let sql = attribution_sql(connection, &sql)?;
     let mut stmt = connection.prepare(&sql)?;
     let mut rows = match call_id {
         Some(call) => stmt.query(params![trace_id, session_id, call])?,
@@ -321,7 +339,7 @@ fn stream_events<W: Write>(
             .get("guard.decision")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let event = json!({"event_id": row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"observed_at":ns(row.get(2)?),"process_id":row.get::<_,u64>(3)?,"kind":kind,"kind_name":event_kind_name(kind),"observation_category":observation_category(kind,&operation),"syscall_name":(matches!(kind,1..=5)&&!operation.is_empty()).then_some(operation.clone()),"flags":row.get::<_,u32>(5)?,"operation":operation,"path":row.get::<_,Option<String>>(7)?,"fd":row.get::<_,Option<i32>>(8)?,"size":row.get::<_,Option<u64>>(9)?,"endpoint":row.get::<_,Option<String>>(10)?,"direction":row.get::<_,i64>(11)?,"result":row.get::<_,Option<i64>>(12)?,"stream":row.get::<_,Option<String>>(13)?,"protocol":row.get::<_,Option<String>>(14)?,"loss_reason":row.get::<_,Option<String>>(15)?,"dropped":row.get::<_,Option<u64>>(16)?,"dropped_bytes":row.get::<_,Option<u64>>(17)?,"session_id":row.get::<_,Option<String>>(18)?,"call_id":row.get::<_,Option<String>>(19)?,"metadata":metadata,"decision":guard_decision.clone(),"security_category":metadata.get("guard.category").cloned(),"blocked":guard_decision.as_deref() == Some("deny"),"collector":row.get::<_,String>(21)?,"parent_process_id":row.get::<_,Option<u64>>(22)?,"executable":executable,"argv":row.get::<_,Option<String>>(24)?,"argv_flags":row.get::<_,u32>(25)?,"channel":row.get::<_,Option<String>>(26)?,"resource":row.get::<_,Option<String>>(27)?});
+        let event = json!({"event_id": row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"observed_at":ns(row.get(2)?),"process_id":row.get::<_,u64>(3)?,"kind":kind,"kind_name":event_kind_name(kind),"observation_category":observation_category(kind,&operation),"syscall_name":(matches!(kind,1..=5)&&!operation.is_empty()).then_some(operation.clone()),"flags":row.get::<_,u32>(5)?,"operation":operation,"path":row.get::<_,Option<String>>(7)?,"fd":row.get::<_,Option<i32>>(8)?,"size":row.get::<_,Option<u64>>(9)?,"endpoint":row.get::<_,Option<String>>(10)?,"direction":row.get::<_,i64>(11)?,"result":row.get::<_,Option<i64>>(12)?,"stream":row.get::<_,Option<String>>(13)?,"protocol":row.get::<_,Option<String>>(14)?,"loss_reason":row.get::<_,Option<String>>(15)?,"dropped":row.get::<_,Option<u64>>(16)?,"dropped_bytes":row.get::<_,Option<u64>>(17)?,"session_id":row.get::<_,Option<String>>(18)?,"call_id":row.get::<_,Option<String>>(19)?,"metadata":metadata,"decision":guard_decision.clone(),"security_category":metadata.get("guard.category").cloned(),"blocked":guard_decision.as_deref() == Some("deny"),"collector":row.get::<_,String>(21)?,"parent_process_id":row.get::<_,Option<u64>>(22)?,"executable":executable,"argv":row.get::<_,Option<String>>(24)?,"argv_flags":row.get::<_,u32>(25)?,"channel":row.get::<_,Option<String>>(26)?,"resource":row.get::<_,Option<String>>(27)?,"attribution":parse_event_metadata(&row.get::<_,String>(28)?)});
         if let (Some(observed_at), Some(event_id)) = (
             event["observed_at"].as_str().and_then(|v| v.parse().ok()),
             event["event_id"].as_u64(),
@@ -356,7 +374,7 @@ fn stream_payloads<W: Write>(
     page_size: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut sql = format!(
-        "SELECT segment_id, trace_id, process_id, session_id, observed_at, source, content_state, direction, stream_key, sequence, operation_id, offset_bytes, completed, operation_completion_state, truncation_state, redaction_state, original_size, captured_size, library, symbol, protocol_hint, loss_reason, {}, call_id FROM payload_segments WHERE trace_id=?1 AND session_id=?2",
+        "SELECT segment_id, trace_id, process_id, session_id, observed_at, source, content_state, direction, stream_key, sequence, operation_id, offset_bytes, completed, operation_completion_state, truncation_state, redaction_state, original_size, captured_size, library, symbol, protocol_hint, loss_reason, {}, call_id, attribution FROM payload_segments WHERE trace_id=?1 AND session_id=?2",
         if full { "bytes" } else { "NULL" }
     );
     if call_id.is_some() {
@@ -366,6 +384,7 @@ fn stream_payloads<W: Write>(
     if let Some(limit) = page_size {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
+    let sql = attribution_sql(connection, &sql)?;
     let mut stmt = connection.prepare(&sql)?;
     let mut rows = match call_id {
         Some(call) => stmt.query(params![trace_id, session_id, call])?,
@@ -375,7 +394,7 @@ fn stream_payloads<W: Write>(
     write!(out, "[")?;
     while let Some(row) = rows.next()? {
         let bytes: Option<Vec<u8>> = row.get(22)?;
-        let value = json!({"segment_id":row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"process_id":row.get::<_,u64>(2)?,"session_id":row.get::<_,Option<String>>(3)?,"observed_at":ns(row.get(4)?),"source":row.get::<_,i64>(5)?,"content_state":row.get::<_,i64>(6)?,"direction":row.get::<_,i64>(7)?,"stream_key":row.get::<_,Option<String>>(8)?,"sequence":row.get::<_,u64>(9)?,"operation_id":row.get::<_,Option<u64>>(10)?,"offset":row.get::<_,Option<u64>>(11)?,"completed":row.get::<_,Option<i64>>(12)?.unwrap_or(0) != 0,"operation_completion_state":row.get::<_,Option<i64>>(13)?.unwrap_or(0),"truncation_state":row.get::<_,Option<i64>>(14)?.unwrap_or(0),"redaction_state":row.get::<_,Option<i64>>(15)?.unwrap_or(1),"original_size":row.get::<_,u64>(16)?,"captured_size":row.get::<_,u64>(17)?,"library":row.get::<_,Option<String>>(18)?,"symbol":row.get::<_,Option<String>>(19)?,"protocol_hint":row.get::<_,Option<String>>(20)?,"loss_reason":row.get::<_,Option<String>>(21)?,"bytes_hex":full.then(||bytes.as_deref().map(hex)).flatten(),"call_id":row.get::<_,Option<String>>(23)?});
+        let value = json!({"segment_id":row.get::<_,u64>(0)?,"trace_id":row.get::<_,u64>(1)?,"process_id":row.get::<_,u64>(2)?,"session_id":row.get::<_,Option<String>>(3)?,"observed_at":ns(row.get(4)?),"source":row.get::<_,i64>(5)?,"content_state":row.get::<_,i64>(6)?,"direction":row.get::<_,i64>(7)?,"stream_key":row.get::<_,Option<String>>(8)?,"sequence":row.get::<_,u64>(9)?,"operation_id":row.get::<_,Option<u64>>(10)?,"offset":row.get::<_,Option<u64>>(11)?,"completed":row.get::<_,Option<i64>>(12)?.unwrap_or(0) != 0,"operation_completion_state":row.get::<_,Option<i64>>(13)?.unwrap_or(0),"truncation_state":row.get::<_,Option<i64>>(14)?.unwrap_or(0),"redaction_state":row.get::<_,Option<i64>>(15)?.unwrap_or(1),"original_size":row.get::<_,u64>(16)?,"captured_size":row.get::<_,u64>(17)?,"library":row.get::<_,Option<String>>(18)?,"symbol":row.get::<_,Option<String>>(19)?,"protocol_hint":row.get::<_,Option<String>>(20)?,"loss_reason":row.get::<_,Option<String>>(21)?,"bytes_hex":full.then(||bytes.as_deref().map(hex)).flatten(),"call_id":row.get::<_,Option<String>>(23)?,"attribution":parse_event_metadata(&row.get::<_,String>(24)?)});
         if !first {
             write!(out, ",")?;
         }
@@ -545,12 +564,13 @@ fn export_with_paging_inner(
         "SELECT event_id, trace_id, observed_at, process_id, kind, flags, operation,
                 path, fd, size_bytes, endpoint, direction, result, stream, protocol,
                 loss_reason, dropped, dropped_bytes, session_id, call_id, metadata,
-                collector, parent_process_id, executable, argv, argv_flags, channel, resource
+                collector, parent_process_id, executable, argv, argv_flags, channel, resource, attribution
          FROM events_read WHERE (?1 IS NULL OR trace_id = ?1)
            AND (?2 IS NULL OR session_id = ?2)
            AND (?3 IS NULL OR call_id = ?3){event_after}
          ORDER BY trace_id, observed_at, event_id{event_limit}"
     );
+    let event_sql = attribution_sql(connection, &event_sql)?;
     let mut events = query_json_with_call(
         connection,
         &event_sql,
@@ -593,6 +613,7 @@ fn export_with_paging_inner(
                 "argv_flags": row.get::<_, u32>(25)?,
                 "channel": row.get::<_, Option<String>>(26)?,
                 "resource": row.get::<_, Option<String>>(27)?,
+                "attribution": parse_event_metadata(&row.get::<_, String>(28)?),
             }))
         },
     )?;
@@ -615,12 +636,13 @@ fn export_with_paging_inner(
                 direction, stream_key, sequence, operation_id, offset_bytes, completed,
                 operation_completion_state, truncation_state, redaction_state,
                 original_size, captured_size, library, symbol, protocol_hint, loss_reason,
-                {payload_bytes}, call_id
+                {payload_bytes}, call_id, attribution
          FROM payload_segments WHERE (?1 IS NULL OR trace_id = ?1)
            AND (?2 IS NULL OR session_id = ?2)
            AND (?3 IS NULL OR call_id = ?3)
          ORDER BY trace_id, sequence, segment_id{payload_limit}"
     );
+    let payload_sql = attribution_sql(connection, &payload_sql)?;
     let mut payloads = query_json_with_call(
         connection,
         &payload_sql,
@@ -645,6 +667,7 @@ fn export_with_paging_inner(
                 "loss_reason": row.get::<_, Option<String>>(21)?,
                 "bytes_hex": full.then(|| bytes.as_deref().map(hex)).flatten(),
                 "call_id": row.get::<_, Option<String>>(23)?,
+                "attribution": parse_event_metadata(&row.get::<_, String>(24)?),
             }))
         },
     )?;

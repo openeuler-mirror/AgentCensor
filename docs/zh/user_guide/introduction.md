@@ -29,11 +29,9 @@ Agent Runtime
 | 组件 | 主要职责 | 文档 |
 | --- | --- | --- |
 | **CensorPivot** | 统一接入层和批次事务编排；把多个工具调用收束为一个可恢复的提交或放弃决定 | [组件 README](../../../CensorPivot/README.md) · [安装与使用](../../../CensorPivot/docs/INSTALL.zh-CN.md) · [完整运行流程](../../../CensorPivot/docs/flow.md) · [设计与状态机](../../../CensorPivot/docs/DESIGN.zh-CN.md) |
-| **CensorFS** | 分支式、可回滚、可恢复的文件系统；为每个批次提供隔离的 `/workspace` | [组件 README](../../../CensorFs/README.md) · [架构](../../../CensorFs/docs/ARCHITECTURE.md) · [CLI 指南](../../../CensorFs/docs/CensorFS_CLI_GUIDE.md) |
+| **CensorFS** | 分支式、可回滚、可恢复的文件系统；为每个批次提供隔离的 `/workspace` | [组件 README](../../../CensorFs/README.md) · [架构](../../../CensorFs/docs/ARCHITECTURE.md) · [CLI 指南](../../../CensorFs/docs/CENSORFS_CLI_GUIDE.md) |
 | **CensorGuard** | eBPF LSM 进程级安全强制；策略覆盖文件、执行和网络，并沿进程树继承 | [组件 README](../../../CensorGuard/README.md) |
 | **CensorScope** | 无需被观测程序链接 SDK 的被动式主机观测和只读导出 | [组件 README](../../../CensorScope/README.md) · [插件说明](../../../CensorScope/plugins/README.md) |
-
-组件接口和 Pivot 责任边界的逐项核对见 [组件功能与接口说明](../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
 
 ## CensorPivot 如何编排一次批次
 
@@ -202,6 +200,6 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 
 ## 致谢
 
-感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](../../../CensorPivot/docs/flow.md) 与 [组件接口说明](../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
+感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](../../../CensorPivot/docs/flow.md)。
 
 同时感谢 Rust、Linux、eBPF、FUSE、systemd、SQLite 以及 DeepSeek Harness 社区提供的基础设施和工具。

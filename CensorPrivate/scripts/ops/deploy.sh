@@ -2,10 +2,10 @@
 op_install() (
   [[ -f $CP_REPO_ROOT/Cargo.toml ]] || fail '预编译安装已含可执行文件；重新构建请从源码 checkout 执行 install'
   need cargo; need jq; need cc
-  if $dry_run; then note "暂存构建并复制五个命令、cpctl 和手册到 $prefix（--tls=$tls）"; return; fi
+  if $dry_run; then note "暂存构建并复制 censorprivacy 统一命令和手册到 $prefix（--tls=$tls）"; return; fi
   if [[ -f $config_dir/process.json ]]; then
     find_bins
-    if process_matches; then fail '本实例正在运行；先 ./cpctl stop 再更新安装'; fi
+    if process_matches; then fail '本实例正在运行；先 ./censorprivacy stop 再更新安装'; fi
   fi
   local stage
   stage=$(mktemp -d)
@@ -14,28 +14,32 @@ op_install() (
   $tls && args+=(--with-native)
   DESTDIR="$stage" bash "$CP_REPO_ROOT/scripts/install.sh" "${args[@]}"
   local command
-  for command in censorprivacy privacy-run privcalc censorprivacy-mcp tls-run cpctl; do
+  for command in censorprivacy; do
     if [[ -w $prefix || $prefix == "$HOME/"* ]]; then
       install -d -m 0755 "$prefix/bin"
       install -m 0755 "$stage$prefix/bin/$command" "$prefix/bin/$command"
     else admin install -D -m 0755 "$stage$prefix/bin/$command" "$prefix/bin/$command"; fi
   done
   if $tls; then
-    if [[ -w $prefix ]]; then install -D -m 0755 "$stage$prefix/lib/censorprivacy/libcp_tls_guard.so" "$prefix/lib/censorprivacy/libcp_tls_guard.so"
-    else admin install -D -m 0755 "$stage$prefix/lib/censorprivacy/libcp_tls_guard.so" "$prefix/lib/censorprivacy/libcp_tls_guard.so"; fi
+    if [[ -w $prefix ]]; then install -D -m 0755 "$stage$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so" "$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so"
+    else admin install -D -m 0755 "$stage$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so" "$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so"; fi
+  fi
+  # Upgrades preserve the operator's custom rules and deployment settings.
+  if [[ -e $prefix/share/censorprivacy/config.yaml || -L $prefix/share/censorprivacy/config.yaml ]]; then
+    rm -- "$stage$prefix/share/censorprivacy/config.yaml"
   fi
   if [[ -w $prefix ]]; then install -d -m 0755 "$prefix/share"; cp -R --preserve=mode "$stage$prefix/share/censorprivacy" "$prefix/share/"
   else admin install -d -m 0755 "$prefix/share"; admin cp -R --preserve=mode "$stage$prefix/share/censorprivacy" "$prefix/share/"; fi
   private_dir "$config_dir"
-  jq -n --arg bin "$prefix/bin" --arg library "$prefix/lib/censorprivacy/libcp_tls_guard.so" \
+  jq -n --arg bin "$prefix/bin" --arg library "$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so" \
     '{bin_dir:$bin,native_library:$library}' > "$config_dir/install.json"
   "$prefix/bin/censorprivacy" --version
-  note '安装完成；下一步：./cpctl demo gateway 或 ./cpctl init'
+  note "安装完成：$prefix"
 )
 op_init() {
   need jq; need openssl
   private_dir "$config_dir"
-  [[ ! -e $config_dir/config.json ]] || { note '已有配置，保留策略和凭据。直接 ./cpctl start；独立实例用 --config-dir。'; return; }
+  [[ ! -e $config_dir/config.json ]] || { note '已有配置，保留配置和凭据。'; return; }
   if [[ -z $upstream ]]; then
     local selected_mode
     read -r -p "模式 gateway/tls [$mode]: " selected_mode; mode=${selected_mode:-$mode}
@@ -43,9 +47,10 @@ op_init() {
   fi
   [[ -n $model ]] || read -r -p '实际模型 ID: ' model
   validate_connection
+  ner_threads=${ner_threads:-1}; ner_device=${ner_device:-cpu}; ner_batch_size=${ner_batch_size:-1}; validate_ner_options
   find_bins
-  local native=${native_library:-${bin_dir%/bin}/lib/censorprivacy/libcp_tls_guard.so}
-  if [[ -z $native_library && ! -f $native ]]; then native=$CP_REPO_ROOT/native/libcp_tls_guard.so; fi
+  local native=${native_library:-${bin_dir%/bin}/lib/censorprivacy/libcensorprivacy_tls_guard.so}
+  if [[ -z $native_library && ! -f $native ]]; then native=$CP_REPO_ROOT/native/libcensorprivacy_tls_guard.so; fi
   if [[ $mode == tls ]]; then [[ $upstream =~ ^https://[0-9.]+(:[0-9]+)?/?$ && -f $native ]] || fail 'TLS 需要 HTTPS IPv4 origin 和已构建的 native 库'; fi
   if [[ -f $native ]]; then native=$(readlink -f "$native"); fi
   local has_key=false secret
@@ -63,37 +68,83 @@ op_init() {
     [[ -f $ca_file && ! -L $ca_file ]] || fail 'CA 文件必须是普通文件'
     install -m 0600 "$ca_file" "$config_dir/upstream-ca.crt"; ca_file=$config_dir/upstream-ca.crt
   fi
-  [[ -e $config_dir/policy.yaml ]] || install -m 0600 "$CP_REPO_ROOT/examples/policy.yaml" "$config_dir/policy.yaml"
   [[ -e $config_dir/gateway.token ]] || openssl rand -hex 32 > "$config_dir/gateway.token"
   private_file "$config_dir/gateway.token"
   printf 'Authorization: Bearer %s\n' "$(cat "$config_dir/gateway.token")" > "$config_dir/curl.headers"
   jq -n --arg mode "$mode" --arg upstream "$upstream" --arg model "$model" --argjson port "$port" \
-    --argjson has_key "$has_key" --arg native "$native" --arg ca "$ca_file" \
-    '{mode:$mode,upstream:$upstream,model:$model,port:$port,has_key:$has_key,native_library:$native,ca_file:$ca}' > "$config_dir/config.json"
-  note "已准备：$config_dir（policy.yaml / 私有凭据 / config.json）；下一步 ./cpctl start"
+    --argjson has_key "$has_key" --arg native "$native" --arg ca "$ca_file" --argjson threads "$ner_threads" \
+    --arg device "$ner_device" --argjson batch "$ner_batch_size" \
+    '{mode:$mode,upstream:$upstream,model:$model,port:$port,has_key:$has_key,native_library:$native,ca_file:$ca,ner_threads:$threads,ner_device:$device,ner_batch_size:$batch}' > "$config_dir/config.json"
+  note "已准备：$config_dir"
 }
 op_start() {
   load_config; find_bins; need curl
   if process_matches; then
-    if service_ready; then fail '本实例已经运行且就绪；可执行 ./cpctl check'; fi
+    if service_ready; then fail '本实例已经运行且就绪'; fi
     fail "本实例进程仍在运行；$readiness_error"
   fi
-  local args=(serve --policy "$config_dir/policy.yaml" --upstream "$upstream" --model "$model"
-    --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port")
-  [[ $(jq -r .has_key "$config_dir/config.json") == false ]] || args+=(--upstream-key-file "$config_dir/upstream.key")
+  # Do not replace an existing instance's ownership record or load a second
+  # detector when a stale installation selected a different executable.
+  if curl --noproxy '*' --silent --connect-timeout 1 --max-time 2 --output /dev/null "http://127.0.0.1:$port/ready"; then
+    fail "端口 $port 已有 HTTP 服务，但进程记录不匹配；请先用原启动目录的 censorprivacy stop 停止，未覆盖进程记录"
+  fi
+  local args=(serve --upstream "$upstream" --model "$model"
+    --token-file "$config_dir/gateway.token" --run-state-file "$config_dir/run.json" --host 127.0.0.1 --port "$port"
+    --conversation-records-dir "$config_dir/xiaoo/records")
+  if [[ -n ${deployment_config:-} ]]; then
+    args+=(--config "$deployment_config")
+    if [[ -e $config_dir/policy.yaml ]]; then
+      note "旧 $config_dir/policy.yaml 不再读取。"
+    fi
+    # YAML overrides stored defaults; explicit start options have priority.
+    export CP_NER_THREADS=$ner_threads CP_NER_DEVICE=$ner_device CP_NER_BATCH_SIZE=$ner_batch_size
+    local option
+    for option in "${options_seen[@]}"; do
+      case "$option" in
+        --ner-threads) args+=(--ner-threads "$ner_threads") ;;
+        --ner-device) args+=(--ner-device "$ner_device") ;;
+        --ner-batch-size) args+=(--ner-batch-size "$ner_batch_size") ;;
+      esac
+    done
+  else
+    args+=(--no-config --ner-threads "$ner_threads" --ner-device "$ner_device" --ner-batch-size "$ner_batch_size")
+    if [[ -e $config_dir/policy.yaml || -L $config_dir/policy.yaml ]]; then
+      private_file "$config_dir/policy.yaml"
+      args+=(--policy "$config_dir/policy.yaml")
+    fi
+  fi
+  if [[ -e $config_dir/private-tools.json || -L $config_dir/private-tools.json ]]; then
+    private_file "$config_dir/private-tools.json"
+    args+=(--private-tools-file "$config_dir/private-tools.json")
+  fi
+  if [[ $(jq -r .has_key "$config_dir/config.json") == false ]]; then args+=(--no-upstream-key)
+  else args+=(--upstream-key-file "$config_dir/upstream.key"); fi
   [[ $upstream != http://* ]] || args+=(--allow-http-test-upstream)
   [[ $mode != tls ]] || args+=(--tls-direct)
   [[ -z $ca_file ]] || args+=(--upstream-ca-file "$ca_file")
-  local pid ticks code previous_run=
+  local pid ticks code exit_code executable previous_run=
   if [[ -f $config_dir/run.json ]]; then previous_run=$(jq -r .run_id "$config_dir/run.json"); fi
+  executable=$(readlink -f "$bin_dir/censorprivacy")
+  if [[ -n ${deployment_config:-} ]]; then note "启动程序：$executable（配置：$deployment_config）"
+  else note "启动程序：$executable（NER 设备：$ner_device，CPU 线程：$ner_threads，每卡 batch：$ner_batch_size）"; fi
   nohup "$bin_dir/censorprivacy" "${args[@]}" 9>&- </dev/null > "$config_dir/service.log" 2>&1 &
   pid=$!
-  ticks=$(awk '{print $22}' "/proc/$pid/stat")
-  jq -n --argjson pid "$pid" --arg ticks "$ticks" '{pid:$pid,start_ticks:$ticks}' > "$config_dir/process.json"
+  if ! ticks=$(process_start_ticks "$pid"); then
+    exit_code=0; wait "$pid" || exit_code=$?
+    fail "服务启动失败（程序：$executable，退出码：$exit_code）；查看 $config_dir/service.log"
+  fi
+  jq -n --argjson pid "$pid" --arg ticks "$ticks" --arg executable "$executable" \
+    '{pid:$pid,start_ticks:$ticks,executable:$executable}' > "$config_dir/process.json"
   for _ in {1..1200}; do
-    if ! kill -0 "$pid" 2>/dev/null; then fail "服务启动失败，查看 $config_dir/service.log 中固定错误码"; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      exit_code=0; wait "$pid" || exit_code=$?
+      fail "服务启动失败（程序：$executable，退出码：$exit_code）；查看 $config_dir/service.log"
+    fi
     code=$(auth_curl --max-time 1 --output "$config_dir/ready.json" --write-out '%{http_code}' "http://127.0.0.1:$port/ready" 2>/dev/null) || code=000
-    if [[ $code == 200 ]] && process_matches && jq -e --arg previous "$previous_run" --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id and .run_id != $previous' "$config_dir/ready.json" >/dev/null; then note "已启动：http://127.0.0.1:$port（$mode）；./cpctl check"; return; fi
+    if [[ $code == 200 ]] && process_matches && jq -e --arg previous "$previous_run" --slurpfile run "$config_dir/run.json" '.run_id == $run[0].run_id and .run_id != $previous' "$config_dir/ready.json" >/dev/null; then
+      note "已启动：http://127.0.0.1:$port（$mode）"
+      return
+    fi
     sleep 0.1
   done
   op_stop; fail '启动等待超时'
@@ -124,7 +175,7 @@ op_check() {
   [[ $code == 401 ]] || fail '无认证探测未返回 401'
   note '通过：安装版本、0600 凭据/状态、0700 目录、认证、run ID（未验证真实上游）'
   if $probe_model; then
-    [[ $mode == gateway ]] || fail 'TLS 模式请运行 ./cpctl demo tls 或 ./cpctl dsh cloud'
+    [[ $mode == gateway ]] || fail 'TLS 模式请运行 ./censorprivacy demo tls 或 ./censorprivacy dsh cloud'
     jq -n --arg model "$model" '
       {model:$model,messages:[{role:"user",content:"Please reply OK."}],stream:false}
       + (if ($model | startswith("deepseek-")) then {thinking:{type:"disabled"}} else {} end)
@@ -160,23 +211,54 @@ op_systemd() (
       # Give this trusted control user a private copy for tls-run/DSH readiness.
       admin cat "$state_path" > "$config_dir/run.json"
       private_file "$config_dir/run.json"
-      note '通过：系统服务存活、认证与 run ID；已同步本次私有 run 文件，可运行 dsh setup。'
+      note '通过：系统服务存活、认证与 run ID；已同步本次私有 run 文件。'
       return
       ;;
   esac
   stage=$(mktemp -d)
   trap 'rm -rf -- "$stage"' EXIT
-  [[ $bin_dir == /usr/* || $bin_dir == /opt/* ]] || fail '系统服务需要 /usr 或 /opt 下的公共安装；先 ./cpctl install --prefix /usr/local'
+  [[ $bin_dir == /usr/* || $bin_dir == /opt/* ]] || fail '系统服务需要 /usr 或 /opt 下的公共安装；先 ./censorprivacy install --prefix /usr/local'
   [[ $bin_dir =~ ^/[a-zA-Z0-9_./-]+$ ]] || fail 'systemd 可执行文件路径含不支持的字符'
   unit=$stage/$service
   sed -e "s|%i|$instance|g" -e "s|/usr/local/bin/censorprivacy|$bin_dir/censorprivacy|g" "$CP_REPO_ROOT/deploy/censorprivacy@.service" > "$unit"
-  if [[ $(jq -r .has_key "$config_dir/config.json") == false ]]; then sed -i "s| --upstream-key-file /etc/censorprivacy/$instance.upstream-key||" "$unit"; fi
+  sed -i "/^ExecStart=/ s|$| --ner-threads $ner_threads --ner-device $ner_device --ner-batch-size $ner_batch_size|" "$unit"
+  if [[ -n ${deployment_config:-} ]]; then
+    "$bin_dir/censorprivacy" config-check --config "$deployment_config" --print-resolved > "$stage/deployment.yaml"
+    if [[ -e $config_dir/policy.yaml ]]; then
+      note "旧 $config_dir/policy.yaml 不再读取。" >&2
+    fi
+    # Preserve per-instance NER values as environment fallbacks, leaving YAML
+    # and explicit CLI overrides in their documented order of precedence.
+    local flag value
+    for flag in threads device batch-size; do
+      value=$ner_threads; [[ $flag != device ]] || value=$ner_device; [[ $flag != batch-size ]] || value=$ner_batch_size
+      if [[ ! " ${options_seen[*]} " == *" --ner-$flag "* ]]; then
+        sed -i "s| --ner-$flag $value||" "$unit"
+      fi
+    done
+  else
+    printf 'detection: {categories: all}\n' > "$stage/base.yaml"
+    local legacy_policy=()
+    if [[ -e $config_dir/policy.yaml || -L $config_dir/policy.yaml ]]; then
+      private_file "$config_dir/policy.yaml"
+      legacy_policy=(--policy "$config_dir/policy.yaml")
+    fi
+    "$bin_dir/censorprivacy" config-check --config "$stage/base.yaml" "${legacy_policy[@]}" --print-resolved > "$stage/deployment.yaml"
+  fi
+  if [[ $(jq -r .has_key "$config_dir/config.json") == false ]]; then
+    sed -i "s| --upstream-key-file /etc/censorprivacy/$instance.upstream-key| --no-upstream-key|" "$unit"
+  fi
   if [[ $mode == tls ]]; then sed -i '/^ExecStart=/ s|$| --tls-direct|' "$unit"; fi
   if [[ $upstream == http://* ]]; then sed -i '/^ExecStart=/ s|$| --allow-http-test-upstream|' "$unit"; fi
   if [[ -n $ca_file ]]; then sed -i "/^ExecStart=/ s|$| --upstream-ca-file /etc/censorprivacy/$instance.ca.crt|" "$unit"; fi
+  if [[ -e $config_dir/private-tools.json || -L $config_dir/private-tools.json ]]; then
+    private_file "$config_dir/private-tools.json"
+    sed -i "/^ExecStart=/ s|$| --private-tools-file /etc/censorprivacy/$instance.private-tools.json|" "$unit"
+  fi
   printf 'CP_UPSTREAM=%s\nCP_BIND=127.0.0.1\nCP_PORT=%s\nCP_MODEL=%s\n' "$upstream" "$port" "$model" > "$stage/config.env"
+  printf 'CP_NER_THREADS=%s\nCP_NER_DEVICE=%s\nCP_NER_BATCH_SIZE=%s\n' "$ner_threads" "$ner_device" "$ner_batch_size" >> "$stage/config.env"
   if $dry_run; then cat "$unit"; note '仅预览，未安装或启动服务。' >&2; return; fi
-  if admin systemctl is-active --quiet "$service"; then fail '先 ./cpctl systemd stop，再重新安装配置'; fi
+  if admin systemctl is-active --quiet "$service"; then fail '先 ./censorprivacy systemd stop，再重新安装配置'; fi
   getent group censorprivacy >/dev/null || admin groupadd --system censorprivacy
   id -u censorprivacy >/dev/null 2>&1 || admin useradd --system --gid censorprivacy --home-dir /var/lib/censorprivacy --no-create-home --shell /sbin/nologin censorprivacy
   admin install -d -o root -g censorprivacy -m 0750 /etc/censorprivacy
@@ -188,11 +270,16 @@ op_systemd() (
     fi
   done
   admin install -o root -g censorprivacy -m 0640 "$stage/config.env" "/etc/censorprivacy/$instance.env"
-  admin install -o root -g censorprivacy -m 0640 "$config_dir/policy.yaml" "/etc/censorprivacy/$instance.policy.yaml"
+  if [[ -f $stage/deployment.yaml ]]; then
+    admin install -o root -g censorprivacy -m 0640 "$stage/deployment.yaml" "/etc/censorprivacy/$instance.config.yaml"
+  fi
   admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/gateway.token" "/etc/censorprivacy/$instance.token"
+  if [[ -f $config_dir/private-tools.json ]]; then
+    admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/private-tools.json" "/etc/censorprivacy/$instance.private-tools.json"
+  fi
   if [[ $(jq -r .has_key "$config_dir/config.json") == true ]]; then admin install -o censorprivacy -g censorprivacy -m 0600 "$config_dir/upstream.key" "/etc/censorprivacy/$instance.upstream-key"; fi
   if [[ -n $ca_file ]]; then admin install -o censorprivacy -g censorprivacy -m 0600 "$ca_file" "/etc/censorprivacy/$instance.ca.crt"; fi
   admin install -m 0644 "$unit" /etc/systemd/system/
   admin systemctl daemon-reload
-  note "已安装 $service；下一步 ./cpctl systemd start（启动后自动检查）"
+  note "已安装：$service"
 )

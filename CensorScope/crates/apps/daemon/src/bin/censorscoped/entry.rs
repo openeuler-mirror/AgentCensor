@@ -113,7 +113,6 @@ fn run_foreground(config: &OperatorConfig) -> Result<(), String> {
         resolution.config,
         config.writer,
         config.active_trace_max,
-        config.session_env_name.clone(),
         config.external_events.clone(),
     )
     .map_err(|error| format!("daemon build failed: {}: {}", error.code, error.message))?;
