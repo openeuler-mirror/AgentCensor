@@ -10,7 +10,8 @@
 #   O4  daemon 不可达时 runtime AttachSelfClient 报 connect 错误 (C8 等价,
 #       blockOnFailure 语义: DSH 不进 Ready)
 #   O5  bundle 静态一致性: cordis.patch.yml 三个插件行 + 8 个 inject 闸门,
-#       与 dump-config.mjs 的 REQUIRED 列表一致
+#       与 dump-config.mjs 的 REQUIRED 列表一致; dsh 可定位时再校验这些闸门
+#       目标在真实 --dump-config entry 集中存在 (查 entry 改名导致的静默空转)
 #
 # 用法: bash scripts/censorguard-dsh-offline.sh   (免 root)
 
@@ -106,20 +107,20 @@ else
     fail "degraded 路径异常: $OUT"
 fi
 
-echo "=== O5: bundle 静态一致性 ==="
+echo "=== O5: bundle 静态一致性 + 闸门目标实际存在性 ==="
 PATCH=plugins/dsh-censorguard/cordis.patch.yml
 DUMP=plugins/dsh-censorguard/bin/dump-config.mjs
+GATES="webserver web-runtime typert-gateway cordis-host-runner ptc-runtime subprocess tools agent-loop"
 O5_OK=1
 for line in censorguard-bootstrap censorguard-host censorguard-ui; do
     grep -q "$line" "$PATCH" || { fail "patch 缺插件行 $line"; O5_OK=0; }
 done
-for target in webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+for target in $GATES; do
     grep -A1 "^- id: $target\$" "$PATCH" | grep -q 'censorguardReady' \
         || { fail "patch 缺 inject 闸门 $target"; O5_OK=0; }
 done
 # dump-config.mjs 的 REQUIRED 列表与 patch 文件一致 (防两处漂移)
-for line in censorguard-bootstrap censorguard-host censorguard-ui \
-            webserver web-runtime typert-gateway cordis-host-runner code-runtime subprocess tools agent-loop; do
+for line in censorguard-bootstrap censorguard-host censorguard-ui $GATES; do
     grep -q "'$line'" "$DUMP" || { fail "dump-config.mjs REQUIRED 缺 $line"; O5_OK=0; }
 done
 # 官方 subprocess 不得被 disable (整树包裹模式保留官方 entry); 匹配 yaml 键,
@@ -128,6 +129,20 @@ if grep -qE '^\s*disabled:' "$PATCH"; then
     fail "patch 含 disabled: 行, 会禁用官方插件入口"; O5_OK=0
 fi
 [ "$O5_OK" -eq 1 ] && pass "cordis.patch.yml 与 dump-config.mjs 一致, 无 disable 残留"
+
+# 静态 grep 只能证明"我们写了什么", 证明不了"dsh 里还有没有这个 id":
+# entry 改名时 applyEntryPatches 只 warn 后 continue, 闸门静默空转
+# (code-runtime → ptc-runtime 就是这么漏掉的)。这里对真实 dump 的顶层
+# entry 集再校验一遍; 探测不到可用 dsh 时跳过, 不算失败。
+node "$DUMP" --check-targets --profile "${CENSORGUARD_DSH_PROFILE:-web}" >"$TDIR/o5-targets.log" 2>&1
+O5_RC=$?
+if [ "$O5_RC" -eq 0 ]; then
+    pass "闸门目标在 dsh 真实 entry 集中全部存在"
+elif [ "$O5_RC" -eq 2 ]; then
+    echo "  [SKIP] 未定位到可用 dsh (设 DSH_BIN 指向源码仓库或安装 dsh 后可校验)"
+else
+    fail "闸门目标校验失败: $(tr '\n' ' ' <"$TDIR/o5-targets.log" | cut -c1-400)"
+fi
 
 echo
 if [ "$FAILS" -eq 0 ]; then
