@@ -20,7 +20,7 @@ export const name = 'censorfs-parallel-worlds'
 export const inject = ['tools', 'commands', 'subagents', 'sessions']
 
 // 插件写入会话日志的自定义事件类型（见 src/events.js）。
-// dsh 0.1.5-rc.2：持久化读取器的放行条件是
+// dsh 0.2.1-rc.2：持久化读取器的放行条件是
 // `KNOWN_SESSION_EVENT_TYPES.has(type) || event.ignorable === true`
 // （session-persistence/src/storage-contract.ts），而官方的 ignorable 信封
 // 只能由 Session.append 内部产生、没有公开的插件写入口，事件名注册机制也
@@ -87,6 +87,14 @@ export function normalizeConfig(config) {
     && (!Number.isSafeInteger(config.inProcessMaxDepth) || config.inProcessMaxDepth < 0 || config.inProcessMaxDepth > 1)) {
     throw new TypeError('dsh-branch-explore inProcessMaxDepth must be 0 or 1; nested Runner depth > 1 is not supported')
   }
+  if (config.publishWorkspacePath !== undefined
+    && (typeof config.publishWorkspacePath !== 'string' || config.publishWorkspacePath.length === 0)) {
+    throw new TypeError('dsh-branch-explore publishWorkspacePath must be an absolute path')
+  }
+  if (config.materializeTimeoutMs !== undefined
+    && (!Number.isSafeInteger(config.materializeTimeoutMs) || config.materializeTimeoutMs <= 0)) {
+    throw new TypeError('dsh-branch-explore materializeTimeoutMs must be a positive safe integer')
+  }
   if (typeof config.validationProfiles !== 'object' || config.validationProfiles === null) {
     throw new TypeError('dsh-branch-explore validationProfiles is required')
   }
@@ -128,6 +136,8 @@ export function normalizeConfig(config) {
     previewProfiles: config.previewProfiles ?? {},
     defaultPreviewProfile,
     tmpRoot: config.tmpRoot ?? '/tmp/dsh-branch-explore',
+    publishWorkspacePath: config.publishWorkspacePath,
+    materializeTimeoutMs: config.materializeTimeoutMs ?? 120000,
     providerName: config.providerName ?? 'branch-explore',
     inProcessProviderName: config.inProcessProviderName ?? 'censorfs-inprocess',
     inProcessOnly,
@@ -208,7 +218,7 @@ function registerCommands(ctx, runtime, config) {
         && report.fuse === true
       return {
         kind: healthy ? 'success' : 'error',
-        // dsh 0.1.5-rc.2 的 CommandResult 只有 {kind, text}；机器可读的
+        // CommandResult 通过 {kind, text} 返回；机器可读的
         // exitCode 保留在 --json 的文本负载里。
         text: json ? JSON.stringify({ ...report, healthy, exitCode: healthy ? 0 : 1 }) : formatDoctor(report),
       }
@@ -364,7 +374,7 @@ function registerCommands(ctx, runtime, config) {
               'After the tool returns, do not reproduce detailed World summaries, diffs, validation logs, or ranking in chat. Reply briefly that the exploration is complete and can be reviewed in Worlds. Do not publish automatically.',
             ].join('\n\n'),
           }],
-          source: { kind: 'plugin', plugin: name },
+          source: { kind: `plugin:${name}` },
         }))
         return { kind: 'success', text: `Starting ${count} branch exploration worlds (${mode}) for: ${task}` }
       } catch (error) {
@@ -384,9 +394,14 @@ function registerCommands(ctx, runtime, config) {
       if (values.length !== 2) return { kind: 'error', text: 'Usage: /censorfs-publish <run-id> <variant-id> [--force]' }
       try {
         const result = await runtime.publish(invocation.agent, values[0], values[1], force)
+        const materialized = result.materialization?.workspace
+          ? ` Materialized into ${result.materialization.workspace}.`
+          : result.materialization?.error
+            ? ` Published, but workspace materialization failed: ${result.materialization.error}`
+            : ''
         return {
           kind: 'success',
-          text: `Published ${values[1]} as Generation ${result.receipt.new_generation}; Head sequence is ${result.receipt.head_seq}.`,
+          text: `Published ${values[1]} as Generation ${result.receipt.new_generation}; Head sequence is ${result.receipt.head_seq}.${materialized}`,
         }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }

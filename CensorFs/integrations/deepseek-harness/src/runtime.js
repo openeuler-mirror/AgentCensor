@@ -5,10 +5,12 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { temporaryEnvironment } from './environment.js'
+import { startWorldActivation } from './world-activation.js'
 import { CensorFsCommandError } from './censorfs-cli.js'
 import { foldExploration, rankVariants, ACTIVITY_EVENT_TYPES, summarizeActivityEvent, labelFromDescriptor, subagentNodeStatus, projectFuseEvent, PROCESS_STARTED_AT, reconcileInterruptedSubagents } from './events.js'
 import { prepareVariantTmp, resolveValidationProfile, validateCandidate, safeSegment } from './validation.js'
 import { resolveMounterCommand } from './fuse-provider.js'
+import { materializePublishedGeneration, resolvePublishWorkspace } from './materialize.js'
 
 function errorText(error) {
   return error instanceof Error ? error.message : String(error)
@@ -560,7 +562,7 @@ const settled = await Promise.all(strategies.map((strategy) =>
       variants: settled.map((variant) => ({
         variantId: variant.variantId,
         label: variant.label,
-        childSessionId: variant.childSessionId,
+        childSessionId: variant.childSessionId ?? null,
         candidateId: variant.candidate?.candidate_id ?? null,
         generationId: variant.generation?.generation_id ?? null,
         requiredPassed: variant.validation?.requiredPassed ?? null,
@@ -626,14 +628,14 @@ const settled = await Promise.all(strategies.map((strategy) =>
         tmpDir,
         // 实时事件回调：子进程跑动中每条事件到达即落盘，面板/图流式更新。
         onEvent: (raw, providerSessionId) => this.relayFuseEvent(agent, providerSessionId, runId, strategy.id, raw),
-      }, () => this.ctx.subagents.start(this.provider.name, {
+      }, () => startWorldActivation(this.ctx.subagents, {
+        provider: this.provider.name,
         label: strategy.label,
-        prompt: workerPrompt,
-        parent: agent,
+        request: { parent: agent, prompt: workerPrompt },
         signal,
       }))
 
-      childSessionId = run.id
+      childSessionId = run.childId
       // 注册 variant 绑定，使全局活动追踪能持久化为 variant-activity 事件
       this.registerVariantBinding(childSessionId, agent, runId, strategy.id, strategy.label, task)
 
@@ -879,6 +881,7 @@ const settled = await Promise.all(strategies.map((strategy) =>
     }
     const decisionId = `session:${agent.session.id}:run:${runId}:variant:${variantId}`
     try {
+      const workspace = await resolvePublishWorkspace(agent, this.config.publishWorkspacePath)
       const result = await this.cli.publish({
         candidateId: variant.candidate.candidate_id,
         expectedHead: state.expectedHead,
@@ -886,12 +889,23 @@ const settled = await Promise.all(strategies.map((strategy) =>
         runId,
         variantId,
       })
+      let materialization
+      try {
+        materialization = await materializePublishedGeneration({
+          cli: this.cli, config: this.config, generationId: result.receipt.new_generation,
+          runId, variantId, workspace,
+        })
+      } catch (error) {
+        materialization = { error: errorText(error), workspace }
+        this.ctx.logger.error(`published generation ${result.receipt.new_generation} but could not materialize it: ${materialization.error}`)
+      }
       append(agent.session, 'variant-published', {
         runId,
         variantId,
         candidateId: variant.candidate.candidate_id,
         generationId: result.receipt.new_generation,
         receipt: result.receipt,
+        materialization,
         publishedAt: Date.now(),
       })
       for (const loser of Object.values(state.variants)) {
@@ -902,7 +916,7 @@ const settled = await Promise.all(strategies.map((strategy) =>
         ))
       }
       await this.ctx.sessions.flush(agent.session)
-      return result
+      return { ...result, materialization }
     } catch (error) {
       if (error instanceof CensorFsCommandError && error.stale) {
         append(agent.session, 'variant-stale', {

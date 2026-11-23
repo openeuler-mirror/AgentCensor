@@ -53,7 +53,7 @@ function debugSpan(kind, fields) {
 }
 
 function isWorker() {
-  return process.env.AGENTCENSOR_SESSION_ID !== undefined
+  return process.env.AGENTCENSOR_SESSION_ID !== undefined || process.env.CENSORSCOPE_HOST_ROLE === 'worker'
 }
 
 function censorscopectl() {
