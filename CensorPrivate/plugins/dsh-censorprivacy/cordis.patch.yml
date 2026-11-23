@@ -16,7 +16,7 @@
         timeoutMs: 90000
         maxTokens: 512
         contextWindow: 32768
-        privateToolsOnly: true
+        privateToolsOnly: false
 - id: agent-default-model
   config:
     provider: censorprivacy

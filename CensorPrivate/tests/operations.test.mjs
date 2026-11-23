@@ -98,7 +98,8 @@ test('installed censorprivacy: initialization, lifecycle, credential routing and
       });
       assert.equal(result.stdout.trim(), 'OK');
       assert.ok(captured.at(-1).messages.some(message => message.role === 'user' && message.content.includes(literalTask)));
-      assert.deepEqual(captured.at(-1).tools.map(tool => tool.function.name).sort(), ['private_compute', 'private_sort']);
+      assert.ok(['private_compute', 'private_sort', 'read', 'bash'].every(name =>
+        captured.at(-1).tools.some(tool => tool.function.name === name)));
       const beforeSort = captured.length;
       const sort = await call('dsh', 'run', 'cp_custom_sort_probe Fictional Zebra; Fictional Apple');
       assert.equal(sort.stdout.trim(), 'Fictional Apple, Fictional Zebra');
@@ -106,16 +107,18 @@ test('installed censorprivacy: initialization, lifecycle, credential routing and
       assert.equal(sortRequests.length, 2);
       for (const body of sortRequests) {
         assert.ok(!JSON.stringify(body).includes('Fictional Zebra') && !JSON.stringify(body).includes('Fictional Apple'));
-        assert.deepEqual(body.tools.map(tool => tool.function.name).sort(), ['private_compute', 'private_sort']);
+        assert.ok(['private_compute', 'private_sort', 'read', 'bash'].every(name =>
+          body.tools.some(tool => tool.function.name === name)));
       }
       const originalRefs = sortRequests[0].messages.flatMap(message => message.role === 'user'
         ? message.content.match(/<CP_CUSTOMER_[a-z0-9]{8}>/g) || [] : []);
       const toolResult = sortRequests[1].messages.find(message => message.role === 'tool');
       assert.deepEqual(JSON.parse(toolResult.content), { refs: originalRefs.toReversed() });
-      await call('dsh', 'run', '--enable-tools', 'Reply with OK and do not use tools.');
-      assert.ok(captured.at(-1).tools.some(tool => !['private_compute', 'private_sort'].includes(tool.function.name)));
-      assert.ok(captured.at(-1).tools.some(tool => tool.function.name === 'private_compute'));
+      await call('dsh', 'run', '--disable_tool', 'Reply with OK and do not use tools.');
+      assert.deepEqual(captured.at(-1).tools.map(tool => tool.function.name).sort(), ['private_compute', 'private_sort']);
       await assert.rejects(call('dsh', 'run', '--enable-tools', '--no-tools', 'task'));
+      await assert.rejects(call('dsh', 'run', '--disable_tool', '--enable-tools', 'task'));
+      await assert.rejects(call('dsh', 'run', '--enable-tools', '--disable_tool', 'task'));
     }
     await chmod(config, 0o755);
     await assert.rejects(call('check'), failure => /0700/.test(failure.stderr));

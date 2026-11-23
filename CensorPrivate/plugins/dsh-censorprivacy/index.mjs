@@ -107,7 +107,7 @@ export function serialize(options, config) {
   // DSH may add agent-scoped tools after the global restriction was applied.
   // Keep the actual model-facing catalog consistent with the execution guard.
   const allowed = config.privateToolNames ?? new Set(['private_compute', ...programs(config.privateTools).keys()]);
-  const tools = config.privateToolsOnly !== false ? options.tools?.filter(tool => allowed.has(tool.name)) : options.tools;
+  const tools = config.privateToolsOnly === true ? options.tools?.filter(tool => allowed.has(tool.name)) : options.tools;
   return { model: options.model, messages, stream: config.mode !== 'tls',
     ...(typeof options.model === 'string' && options.model.startsWith('deepseek-') ? { thinking: { type: 'disabled' } } : {}),
     ...(tools?.length ? { tools: tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.parameters } })) } : {}),
@@ -174,7 +174,7 @@ export class PrivacyAdapter {
 }
 
 export function apply(ctx, supplied) {
-  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, privateToolsOnly: true, ...supplied };
+  const config = { timeoutMs: 90000, maxTokens: 512, contextWindow: 32768, privateToolsOnly: false, ...supplied };
   if (!['gateway', 'tls'].includes(config.mode) || !config.baseURL || !config.model || !config.broker || !process.env.CENSORPRIVACY_TOKEN) throw error('CONFIGURATION_REQUIRED');
   if (config.mode === 'gateway' && !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.baseURL)) throw error('LOCAL_GATEWAY_REQUIRED');
   if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(config.broker)) throw error('LOCAL_BROKER_REQUIRED');
