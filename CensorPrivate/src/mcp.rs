@@ -346,7 +346,7 @@ impl<C: PrivateComputeClient> StdioBridge<C> {
                     return Some(Self::error(id, -32602, "Unsupported initialization"));
                 }
                 self.initialized = true;
-                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"censorprivacy-private-compute","version":env!("CARGO_PKG_VERSION")}})
+                json!({"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"censorprivacy","version":env!("CARGO_PKG_VERSION")}})
             }
             "ping" => json!({}),
             _ if !self.ready => return Some(Self::error(id, -32002, "Server not initialized")),

@@ -6,14 +6,10 @@ mod linux {
         json,
         runtime::{LinuxRuntime, RuntimePlan, RuntimeSpec, ENV_ALLOWLIST},
     };
-    use clap::Parser;
+    use clap::Args;
     use std::{collections::BTreeMap, path::PathBuf, time::Duration};
-    #[derive(Parser)]
-    #[command(
-        name = "privacy-run",
-        about = "Launch an agent inside a fail-closed Linux run domain"
-    )]
-    struct Cli {
+    #[derive(Args)]
+    pub struct Options {
         #[arg(long)]
         run_id: Option<String>,
         #[arg(long, alias = "state-file")]
@@ -39,7 +35,7 @@ mod linux {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     }
-    async fn run(cli: Cli) -> Result<i32> {
+    async fn run(cli: Options) -> Result<i32> {
         let timeout = cli
             .timeout
             .map(Duration::try_from_secs_f64)
@@ -129,25 +125,23 @@ mod linux {
             )
             .await
     }
-    pub fn main() -> i32 {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("--internal-bootstrap") {
-            // Do not create threads before mount/credential/seccomp preparation.
-            let result = (|| {
-                if args.len() != 4 {
-                    return Err(Error::RuntimeBlocked);
-                }
-                censorprivacy::runtime::bootstrap::run(
-                    args[2].parse().map_err(|_| Error::RuntimeBlocked)?,
-                    args[3].parse().map_err(|_| Error::RuntimeBlocked)?,
-                )
-            })();
-            if result.is_err() {
-                eprintln!("{{\"error\":{{\"code\":\"runtime_blocked\"}}}}");
+    pub fn bootstrap(args: &[String]) -> i32 {
+        // Do not create threads before mount/credential/seccomp preparation.
+        let result = (|| {
+            if args.len() != 4 {
+                return Err(Error::RuntimeBlocked);
             }
-            return 125;
+            censorprivacy::runtime::bootstrap::run(
+                args[2].parse().map_err(|_| Error::RuntimeBlocked)?,
+                args[3].parse().map_err(|_| Error::RuntimeBlocked)?,
+            )
+        })();
+        if result.is_err() {
+            eprintln!("{{\"error\":{{\"code\":\"runtime_blocked\"}}}}");
         }
-        let cli = Cli::parse();
+        125
+    }
+    pub fn execute(cli: Options) -> i32 {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -168,15 +162,22 @@ mod linux {
         }
     }
 }
-fn main() {
-    std::panic::set_hook(Box::new(|_| {
-        eprintln!("{{\"error\":{{\"code\":\"runtime_blocked\"}}}}")
-    }));
-    #[cfg(target_os = "linux")]
-    std::process::exit(linux::main());
-    #[cfg(not(target_os = "linux"))]
-    {
-        eprintln!("{{\"error\":{{\"code\":\"runtime_blocked\"}}}}");
-        std::process::exit(125);
-    }
+#[cfg(target_os = "linux")]
+pub use linux::Options;
+#[cfg(target_os = "linux")]
+pub fn run(options: Options) -> i32 {
+    linux::execute(options)
+}
+#[cfg(not(target_os = "linux"))]
+#[derive(clap::Args)]
+pub struct Options {}
+#[cfg(not(target_os = "linux"))]
+pub fn run(_: Options) -> i32 {
+    eprintln!("Linux required");
+    125
+}
+
+#[cfg(target_os = "linux")]
+pub fn bootstrap(args: &[String]) -> i32 {
+    linux::bootstrap(args)
 }

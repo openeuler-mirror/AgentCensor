@@ -45,17 +45,9 @@ impl LocalDaemonServer {
         ebpf: EbpfCollectorConfig,
         writer: WriterConfig,
         active_trace_max: u32,
-        session_env_name: String,
         external_events: ExternalEventsConfig,
     ) -> Result<Self, ControlError> {
-        let host = DaemonServiceHost::build(
-            storage,
-            writer,
-            profile,
-            ebpf,
-            active_trace_max,
-            session_env_name,
-        )?;
+        let host = DaemonServiceHost::build(storage, writer, profile, ebpf, active_trace_max)?;
         let queue_capacity = usize::try_from(external_events.queue_capacity).unwrap_or(8_192);
         let (control_tx, control_rx) = mpsc::sync_channel(queue_capacity.max(1_024));
         let worker = thread::Builder::new()

@@ -445,6 +445,36 @@ pub fn read_process_session(pid: u32, env_name: &str) -> Option<SessionIdentity>
         .map(SessionIdentity::new)
 }
 
+pub fn read_process_session_from_rules(
+    pid: u32,
+    rules: &[config_core::daemon::ContextEnvRule],
+) -> Option<SessionIdentity> {
+    use config_core::daemon::ContextEnvKind;
+    let content = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut selected = None;
+    for entry in content.split(|byte| *byte == 0) {
+        for rule in rules
+            .iter()
+            .filter(|rule| rule.kind == ContextEnvKind::Session)
+        {
+            let Some(value) = entry
+                .strip_prefix(rule.name.as_bytes())
+                .and_then(|rest| rest.strip_prefix(b"="))
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if selected
+                .as_ref()
+                .is_none_or(|(priority, _): &(u8, String)| rule.priority > *priority)
+            {
+                selected = Some((rule.priority, String::from_utf8_lossy(value).into_owned()));
+            }
+        }
+    }
+    selected.map(|(_, value)| SessionIdentity::new(value))
+}
+
 #[cfg(test)]
 mod tests {
     use process_identity::ProcessIdentityReader;

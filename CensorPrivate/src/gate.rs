@@ -9,7 +9,7 @@ use crate::{
     private_tools::{self, Invocation, Output, Registry},
     professional::{ProfessionalConfig, ProfessionalDetector},
     protocols::{self, Api, RequestProtector},
-    references::{random_hex, Reference, TOKEN_PATTERN, TOKEN_RE},
+    references::{random_hex, Reference, TLS_TOOL_REFERENCE_PATTERN, TOKEN_PATTERN, TOKEN_RE},
     vault::{Clock, MonotonicClock, Registration, RunCapability, RunVault},
 };
 use regex::Regex;
@@ -650,21 +650,23 @@ impl crate::response::ResponseRestorer for PrivacyGate {
                 return Err(Error::ProtocolBlocked);
             }
             let argv = shlex::split(command).ok_or(Error::ProtocolBlocked)?;
-            if argv.len() < 3
-                || argv[0] != "privcalc"
+            if argv.len() < 4
+                || argv[0] != "censorprivacy"
+                || argv[1] != "compute"
                 || !["sum", "mean", "min", "max", "aggregate", "date_diff"]
-                    .contains(&argv[1].as_str())
+                    .contains(&argv[2].as_str())
             {
                 return Err(Error::ProtocolBlocked);
             }
-            let refs: Vec<_> = argv[2..].iter().cloned().map(Value::String).collect();
+            let refs: Vec<_> = argv[3..].iter().cloned().map(Value::String).collect();
             self.validate_refs(&refs)?;
             let mut approved = arguments.clone();
-            let quoted: Vec<_> = argv[2..]
+            let quoted: Vec<_> = argv[3..]
                 .iter()
                 .map(|reference| format!("'{reference}'"))
                 .collect();
-            approved["command"] = format!("privcalc {} {}", argv[1], quoted.join(" ")).into();
+            approved["command"] =
+                format!("censorprivacy compute {} {}", argv[2], quoted.join(" ")).into();
             return Ok(approved);
         }
         Err(Error::ProtocolBlocked)
@@ -721,7 +723,9 @@ impl RequestProtector for PrivacyGate {
             )
         });
         let exempt = (leaf == "pattern"
-            && (text == TOKEN_PATTERN || text == format!("^{TOKEN_PATTERN}$")))
+            && (text == TOKEN_PATTERN
+                || text == format!("^{TOKEN_PATTERN}$")
+                || (schema && text == TLS_TOOL_REFERENCE_PATTERN)))
             || ([
                 "minItems",
                 "maxItems",

@@ -4,7 +4,9 @@
 //! access. Secret values have no public serialization or Debug implementation.
 #![forbid(unsafe_code)]
 
+pub mod categories;
 pub mod compute;
+pub mod config;
 #[cfg(target_os = "linux")]
 pub mod control;
 pub mod conversations;

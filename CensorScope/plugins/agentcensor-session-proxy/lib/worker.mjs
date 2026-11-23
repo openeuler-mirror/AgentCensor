@@ -81,8 +81,13 @@
 import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { installModelSelection } from '@deepseek-ai/dsh-agent'
+// Namespace import: dsh 0.2.2 added `AgentModel`, and a static named import of
+// an export the running dsh does not provide fails at link time instead of
+// yielding `undefined`. The worker keys its selection strategy off that symbol.
+import * as dshAgent from '@deepseek-ai/dsh-agent'
 import { applyInboxCommand } from './inbox.mjs'
+
+const { installModelSelection } = dshAgent
 
 export const name = 'agentcensor-worker'
 export const inject = ['agentDefaultModel', 'agents', 'sessions']
@@ -255,7 +260,14 @@ async function run(ctx) {
   // rebuilt from the host seed: the newest `model/selection` or `request/header`
   // config in the conversation wins.
   const selection = durableSelection(agent.session) ?? fallback
-  installModelSelection(agent.ctx)
+  const selectionRef = { current: selection, assembled: undefined }
+  // dsh 0.2.2 retired the mutable ref: `installModelSelection(ctx)` now only
+  // appends the model-switch notice, and routing comes from the Agent's own
+  // durable selection. Both runtimes still append `model/selection` natively,
+  // so the projection the loop reads stays correct either way; the ref survives
+  // on 0.2.1 as the driver and on 0.2.2 as the value echoed in the ready frame.
+  if (dshAgent.AgentModel === undefined) installModelSelection(agent.ctx, selectionRef)
+  else installModelSelection(agent.ctx)
 
   // Register the human-interaction answerers BEFORE any turn can run: a tool
   // call in the first message must already be able to reach the browser.
@@ -274,14 +286,14 @@ async function run(ctx) {
   })}\n`)
 
   try {
-    return await controlLoop(agent, sessions, asks, frames, rl)
+    return await controlLoop(agent, sessions, asks, frames, rl, selectionRef)
   } finally {
     await handle.dispose()
   }
 }
 
 /** Serve messages, cancellations, and interaction answers until shutdown or EOF. */
-export async function controlLoop(agent, sessions, asks, frames, rl) {
+export async function controlLoop(agent, sessions, asks, frames, rl, selectionRef) {
   const pending = new Set()
   const reportIdle = () => {
     const activity = (async () => {
@@ -321,6 +333,13 @@ export async function controlLoop(agent, sessions, asks, frames, rl) {
           ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
           ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
         })
+        if (event.type === 'model/selection') {
+          selectionRef.current = {
+            provider: event.data.provider,
+            model: event.data.model,
+            ...(event.data.reasoningEffort === undefined ? {} : { reasoningEffort: event.data.reasoningEffort }),
+          }
+        }
         continue
       }
       if (frame?.type === 'message') {

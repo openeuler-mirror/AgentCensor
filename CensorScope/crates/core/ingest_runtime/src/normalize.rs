@@ -87,6 +87,7 @@ pub fn normalize_event(
         kind: model_core::event::EventKind::Unknown,
         flags,
         session_id: None,
+        attribution: Default::default(),
         call_id: raw_event.envelope.call_id.clone(),
     };
     let payload = match raw_event.payload {

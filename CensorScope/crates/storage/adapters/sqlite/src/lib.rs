@@ -41,8 +41,60 @@ pub struct SqliteStorage {
     connection: Rc<RefCell<Connection>>,
 }
 
+fn validate_call_identity(
+    session: Option<&str>,
+    call: &str,
+    pid: u32,
+) -> Result<(), rusqlite::Error> {
+    if pid == 0
+        || call.is_empty()
+        || call.len() > 127
+        || call.contains('\0')
+        || session.is_some_and(|s| s.is_empty() || s.len() > 127 || s.contains('\0'))
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_call_close(
+    connection: &Connection,
+    trace: model_core::ids::TraceId,
+    session: Option<&str>,
+    call: &str,
+    pid: u32,
+    end: SystemTime,
+    status: &str,
+) -> Result<bool, rusqlite::Error> {
+    let row = connection.query_row(
+        "SELECT session_id,host_pid,started_at,ended_at,status FROM call_spans WHERE trace_id=?1 AND call_id=?2",
+        params![trace.get(), call],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, u32>(1)?, row.get::<_, i64>(2)?, row.get::<_, Option<i64>>(3)?, row.get::<_, Option<String>>(4)?)),
+    ).optional()?;
+    let Some((stored_session, stored_pid, start, stored_end, stored_status)) = row else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    if stored_session.as_deref() != session
+        || stored_pid != pid
+        || encode_time(end) < start
+        || !matches!(status, "success" | "error" | "cancelled" | "timeout")
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    match stored_end {
+        None => Ok(true),
+        Some(previous)
+            if previous == encode_time(end) && stored_status.as_deref() == Some(status) =>
+        {
+            Ok(false)
+        }
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 impl SqliteStorage {
-    /// Start or replace a Harness tool call span.
+    /// Register an immutable Harness tool call start; exact retries are idempotent.
     pub fn call_start(
         &mut self,
         trace_id: model_core::ids::TraceId,
@@ -51,11 +103,23 @@ impl SqliteStorage {
         host_pid: u32,
         started_at: SystemTime,
     ) -> Result<(), rusqlite::Error> {
-        if call_id.len() > 128 {
-            return Err(rusqlite::Error::InvalidQuery);
+        validate_call_identity(session_id, call_id, host_pid)?;
+        let existing = self
+            .list_call_spans(trace_id)?
+            .into_iter()
+            .find(|span| span.call_id == call_id);
+        if let Some(span) = existing {
+            return if span.session_id.as_deref() == session_id
+                && span.host_pid == host_pid
+                && span.started_at == started_at
+            {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            };
         }
         self.execute_cached(
-            "INSERT OR REPLACE INTO call_spans(trace_id,session_id,call_id,host_pid,started_at,ended_at,status) VALUES (?1,?2,?3,?4,?5,NULL,NULL)",
+            "INSERT INTO call_spans(trace_id,session_id,call_id,host_pid,started_at,ended_at,status) VALUES (?1,?2,?3,?4,?5,NULL,NULL)",
             params![trace_id.get(), session_id, call_id, host_pid, encode_time(started_at)],
         )?;
         Ok(())
@@ -71,8 +135,17 @@ impl SqliteStorage {
         ended_at: SystemTime,
         status: &str,
     ) -> Result<(), rusqlite::Error> {
-        if call_id.len() > 128 {
-            return Err(rusqlite::Error::InvalidQuery);
+        validate_call_identity(session_id, call_id, host_pid)?;
+        if !validate_call_close(
+            &self.connection.borrow(),
+            trace_id,
+            session_id,
+            call_id,
+            host_pid,
+            ended_at,
+            status,
+        )? {
+            return Ok(());
         }
         self.execute_cached(
             "UPDATE call_spans SET ended_at=?1,status=?2,session_id=COALESCE(session_id,?3) WHERE trace_id=?4 AND call_id=?5 AND host_pid=?6",
@@ -89,10 +162,10 @@ impl SqliteStorage {
         started_at_ns: i64,
         ended_at_ns: i64,
         limit: u64,
-    ) -> Result<Vec<(i64, Option<u32>, i64)>, rusqlite::Error> {
+    ) -> Result<Vec<(i64, Option<u32>, i64, Option<String>)>, rusqlite::Error> {
         let connection = self.connection.borrow();
         let mut statement = connection.prepare(
-            "SELECT e.event_id, p.host_pid, e.observed_at
+            "SELECT e.event_id, p.host_pid, e.observed_at, e.session_id
                FROM events e
                LEFT JOIN processes p ON p.process_id = e.process_id
               WHERE e.trace_id = ?1
@@ -110,7 +183,7 @@ impl SqliteStorage {
                 session_id,
                 i64::try_from(limit).unwrap_or(i64::MAX)
             ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         rows.collect()
     }
@@ -151,9 +224,7 @@ impl SqliteStorage {
         status: &str,
         jobs: &[BackfillJob],
     ) -> Result<Vec<i64>, rusqlite::Error> {
-        if call_id.len() > 128 {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
+        validate_call_identity(session_id, call_id, host_pid)?;
         for job in jobs {
             if job.state != BackfillJobState::Pending {
                 return Err(rusqlite::Error::InvalidQuery);
@@ -161,6 +232,17 @@ impl SqliteStorage {
         }
         let mut connection = self.connection.borrow_mut();
         let transaction = connection.transaction()?;
+        if !validate_call_close(
+            &transaction,
+            trace_id,
+            session_id,
+            call_id,
+            host_pid,
+            ended_at,
+            status,
+        )? {
+            return Ok(Vec::new());
+        }
         transaction.execute(
             "UPDATE call_spans SET ended_at=?1,status=?2,session_id=COALESCE(session_id,?3) WHERE trace_id=?4 AND call_id=?5 AND host_pid=?6",
             params![encode_time(ended_at), status, session_id, trace_id.get(), call_id, host_pid],
@@ -823,9 +905,9 @@ impl SqliteStorage {
                 event_id, trace_id, observed_at, process_id, collector, kind, flags,
                 operation, parent_process_id, executable, argv, argv_flags, path, fd,
                 size_bytes, endpoint, direction, result, channel, stream, protocol,
-                resource, loss_reason, dropped, dropped_bytes, session_id, call_id, metadata
+                resource, loss_reason, dropped, dropped_bytes, session_id, call_id, metadata, attribution
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
+                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 event.envelope.event_id.get(),
                 event.envelope.trace_id.get(),
@@ -859,6 +941,7 @@ impl SqliteStorage {
                     .map(|value| value.as_str()),
                 event.envelope.call_id.as_deref(),
                 metadata,
+                serde_json::to_string(&event.envelope.attribution).map_err(|_| rusqlite::Error::InvalidQuery)?,
             ],
         )?;
         if let model_core::event::EventPayload::Application(payload) = &event.payload
@@ -983,8 +1066,8 @@ impl SqliteStorage {
                 stream_key, sequence, operation_id, offset_bytes, completed,
                 operation_completion_state, truncation_state, redaction_state,
                 original_size, captured_size, library, symbol, protocol_hint,
-                loss_reason, bytes, call_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                loss_reason, bytes, call_id, attribution
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 segment.trace_id.get(),
                 segment.process.get(),
@@ -1009,6 +1092,7 @@ impl SqliteStorage {
                 segment.loss_reason,
                 segment.bytes,
                 segment.call_id,
+                serde_json::to_string(&segment.attribution).map_err(|_| rusqlite::Error::InvalidQuery)?,
             ],
         )?;
         Ok(())
@@ -1758,7 +1842,7 @@ mod tests {
             .borrow()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1775,6 +1859,7 @@ mod tests {
                     kind: EventKind::Guard,
                     flags: EventFlags::empty(),
                     session_id: None,
+                    attribution: Default::default(),
                     call_id: None,
                 },
                 EventPayload::Guard(Box::new(GuardPayload {
@@ -1842,6 +1927,7 @@ mod tests {
                     collector: CollectorName::new("ebpf"),
                     kind: EventKind::Unknown,
                     session_id: None,
+                    attribution: Default::default(),
                     call_id: None,
                     flags: EventFlags::empty(),
                 },
@@ -2011,6 +2097,7 @@ mod tests {
             collector: CollectorName::new("test"),
             kind: EventKind::Unknown,
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             flags: EventFlags::empty(),
         };
@@ -2099,6 +2186,7 @@ mod tests {
             trace_id: TraceId::new(1),
             process: ProcessIdentity::new(2),
             session_id: Some(model_core::process::SessionIdentity::new("sess-1")),
+            attribution: Default::default(),
             call_id: None,
             observed_at: SystemTime::UNIX_EPOCH,
             source: PayloadSourceBoundary::Stdio,
@@ -2390,6 +2478,94 @@ mod tests {
     }
 
     #[test]
+    fn call_lifecycle_retries_preserve_terminal_state_and_reject_conflicts() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let trace = TraceId::new(1);
+        let at = |s| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        storage.call_start(trace, Some("s"), "c", 1, at(1)).unwrap();
+        storage
+            .call_end(trace, Some("s"), "c", 1, at(2), "success")
+            .unwrap();
+        storage.call_start(trace, Some("s"), "c", 1, at(1)).unwrap();
+        storage
+            .call_end(trace, Some("s"), "c", 1, at(2), "success")
+            .unwrap();
+        assert_eq!(
+            storage.list_call_spans(trace).unwrap()[0].ended_at,
+            Some(at(2))
+        );
+        assert!(
+            storage
+                .call_start(trace, Some("other"), "c", 1, at(1))
+                .is_err()
+        );
+        assert!(
+            storage
+                .call_end(trace, Some("s"), "c", 2, at(2), "success")
+                .is_err()
+        );
+        assert!(
+            storage
+                .call_end(trace, Some("s"), "c", 1, at(3), "error")
+                .is_err()
+        );
+        assert!(
+            storage
+                .call_end(trace, Some("s"), "missing", 1, at(3), "error")
+                .is_err()
+        );
+        assert!(
+            storage
+                .call_start(trace, None, &"a".repeat(128), 1, at(1))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn storage_preserves_captured_context_separately_from_resolution() {
+        let mut storage = super::SqliteStorage::open_in_memory().unwrap();
+        let mut event = DomainEvent::new(
+            model_core::event::EventEnvelope {
+                event_id: model_core::ids::EventId::new(1),
+                trace_id: TraceId::new(1),
+                observed_at: SystemTime::UNIX_EPOCH,
+                process: ProcessIdentity::new(1),
+                collector: model_core::ids::CollectorName::new("test"),
+                kind: model_core::event::EventKind::Unknown,
+                flags: model_core::event::EventFlags::empty(),
+                session_id: None,
+                call_id: None,
+                attribution: Default::default(),
+            },
+            model_core::event::EventPayload::Process(model_core::event::ProcessPayload {
+                operation: "exec".into(),
+                parent: None,
+                executable: None,
+                argv: None,
+                metadata: BTreeMap::new(),
+            }),
+        );
+        event.envelope.attribution = model_core::attribution::AttributionEvidence {
+            captured_session_id: Some("s".into()),
+            session_basis: model_core::attribution::AttributionBasis::CollectorContext,
+            call_basis: model_core::attribution::AttributionBasis::TimeWindow,
+            candidate_call_ids: vec!["inferred".into()],
+            ..Default::default()
+        };
+        event.envelope.call_id = Some("inferred".into());
+        storage.append_event(&event).unwrap();
+        let json: String = storage
+            .connection
+            .borrow()
+            .query_row("SELECT attribution FROM events", [], |row| row.get(0))
+            .unwrap();
+        let evidence: model_core::attribution::AttributionEvidence =
+            serde_json::from_str(&json).unwrap();
+        assert_eq!(evidence, event.envelope.attribution);
+        assert_eq!(evidence.captured_call_id, None);
+    }
+
+    #[test]
     fn window_backfill_selects_and_assigns_unassigned_events() {
         use model_core::event::{
             DomainEvent, EventEnvelope, EventFlags, EventKind, EventPayload, FilePayload,
@@ -2406,6 +2582,7 @@ mod tests {
                 collector: CollectorName::new("test"),
                 kind: EventKind::Unknown,
                 session_id: session.map(model_core::process::SessionIdentity::new),
+                attribution: Default::default(),
                 call_id: call.map(str::to_string),
                 flags: EventFlags::empty(),
             }
@@ -2463,6 +2640,8 @@ mod tests {
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].0, 1);
         assert_eq!(candidates[1].0, 2);
+        assert_eq!(candidates[0].3.as_deref(), Some("sess-1"));
+        assert_eq!(candidates[1].3, None);
         storage
             .assign_event_call_ids(&[(1, "call-new".to_string()), (2, "call-new".to_string())])
             .unwrap();
@@ -2788,6 +2967,7 @@ mod ancillary_batch_tests {
             collector: model_core::ids::CollectorName::new("test"),
             kind: EventKind::Unknown,
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             flags: EventFlags::empty(),
         };
@@ -2846,6 +3026,7 @@ mod ancillary_batch_tests {
                 collector: model_core::ids::CollectorName::new("test"),
                 kind: EventKind::Unknown,
                 session_id: None,
+                attribution: Default::default(),
                 call_id: None,
                 flags: EventFlags::empty(),
             },
@@ -2973,6 +3154,7 @@ mod storage_bench {
             collector: CollectorName::new("bench"),
             kind: EventKind::Unknown,
             session_id: Some(SessionIdentity::new("sess")),
+            attribution: Default::default(),
             call_id: Some("call".to_string()),
             flags: EventFlags::empty(),
         };
@@ -3017,6 +3199,7 @@ mod storage_bench {
                 trace_id: TraceId::new(1),
                 process: ProcessIdentity::new(50),
                 session_id: Some(SessionIdentity::new("sess")),
+                attribution: Default::default(),
                 call_id: Some("call".to_string()),
                 observed_at: base + Duration::from_nanos(sequence),
                 source: PayloadSourceBoundary::Uprobe,

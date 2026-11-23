@@ -46,6 +46,8 @@ pub const DEFAULT_SOCKET_MODE: u32 = 0o666;
 pub const DEFAULT_SESSION_ENV_NAME: &str = "DSH_SESSION_ID";
 pub const DEFAULT_EXTERNAL_EVENT_SOCKET_MODE: u32 = 0o660;
 pub const DEFAULT_EXTERNAL_EVENT_QUEUE_CAPACITY: u32 = 8_192;
+pub const MAX_CONTEXT_ENV_RULES: usize = 5;
+pub const MAX_CONTEXT_ENV_NAME_BYTES: usize = 63;
 
 /// Result of initializing an operator configuration file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -170,6 +172,23 @@ pub struct EbpfCollectorConfig {
     pub tls_dynamic_loading: bool,
     pub tls_scan_debounce: TlsScanDebounce,
     pub tls_scan_interval_ms: u64,
+    pub context_env_rules: Vec<ContextEnvRule>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextEnvKind {
+    Session,
+    Call,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEnvRule {
+    pub name: String,
+    pub kind: ContextEnvKind,
+    pub profile: String,
+    pub priority: u8,
 }
 
 /// Validated daemon configuration consumed by ctl and censorscoped.
@@ -455,6 +474,104 @@ struct EbpfDocument {
     tls_scan_debounce: String,
     #[serde(default = "default_tls_scan_interval_ms")]
     tls_scan_interval_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_env: Option<Vec<ContextEnvRule>>,
+}
+
+pub fn default_context_env_rules(session_env_name: &str) -> Vec<ContextEnvRule> {
+    let mut rules = vec![
+        ContextEnvRule {
+            name: "CENSORSCOPE_SESSION_ID".to_string(),
+            kind: ContextEnvKind::Session,
+            profile: "censorscope".to_string(),
+            priority: 100,
+        },
+        ContextEnvRule {
+            name: "CENSORSCOPE_CALL_ID".to_string(),
+            kind: ContextEnvKind::Call,
+            profile: "censorscope".to_string(),
+            priority: 100,
+        },
+        ContextEnvRule {
+            name: "DSH_CENSORSCOPE_CALL_ID".to_string(),
+            kind: ContextEnvKind::Call,
+            profile: "dsh".to_string(),
+            priority: 50,
+        },
+    ];
+    if session_env_name != "CENSORSCOPE_SESSION_ID" {
+        rules.insert(
+            2,
+            ContextEnvRule {
+                name: session_env_name.to_string(),
+                kind: ContextEnvKind::Session,
+                profile: "dsh".to_string(),
+                priority: 50,
+            },
+        );
+    }
+    rules
+}
+
+fn validate_context_env_rules(rules: &[ContextEnvRule]) -> Result<(), String> {
+    if rules.len() > MAX_CONTEXT_ENV_RULES {
+        return Err(format!(
+            "ebpf.context_env supports at most {MAX_CONTEXT_ENV_RULES} rules"
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut profiles = std::collections::BTreeMap::new();
+    let mut priorities = std::collections::BTreeMap::new();
+    let mut fields = std::collections::BTreeSet::new();
+    for rule in rules {
+        if rule.priority == 0 {
+            return Err("ebpf.context_env priority must be greater than zero".to_string());
+        }
+        let bytes = rule.name.as_bytes();
+        let valid_name = !bytes.is_empty()
+            && bytes.len() <= MAX_CONTEXT_ENV_NAME_BYTES
+            && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if !valid_name {
+            return Err(format!(
+                "invalid ebpf.context_env variable name: {:?}",
+                rule.name
+            ));
+        }
+        if rule.profile.is_empty() || rule.profile.len() > 63 || !rule.profile.is_ascii() {
+            return Err("ebpf.context_env profile must contain 1..63 ASCII bytes".to_string());
+        }
+        if !names.insert(rule.name.as_str()) {
+            return Err(format!(
+                "duplicate ebpf.context_env variable name: {}",
+                rule.name
+            ));
+        }
+        if profiles
+            .insert(rule.profile.as_str(), rule.priority)
+            .is_some_and(|priority| priority != rule.priority)
+        {
+            return Err(format!(
+                "ebpf.context_env rules in profile {} must share one priority",
+                rule.profile
+            ));
+        }
+        if priorities
+            .insert(rule.priority, rule.profile.as_str())
+            .is_some_and(|profile| profile != rule.profile)
+        {
+            return Err("ebpf.context_env profiles must have distinct priorities".to_string());
+        }
+        if !fields.insert((rule.profile.as_str(), rule.kind)) {
+            return Err(format!(
+                "ebpf.context_env profile {} has more than one {:?} variable",
+                rule.profile, rule.kind
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn default_tls_scan_debounce() -> String {
@@ -501,6 +618,7 @@ impl Default for OperatorDocument {
                 tls_dynamic_loading: false,
                 tls_scan_debounce: default_tls_scan_debounce(),
                 tls_scan_interval_ms: default_tls_scan_interval_ms(),
+                context_env: None,
             },
             session: SessionDocument::default(),
             payload: PayloadDocument::default(),
@@ -597,6 +715,12 @@ impl OperatorConfig {
         if document.external_events.enabled && !document.external_events.socket_path.is_absolute() {
             return Err("external_events.socket_path must be absolute".to_string());
         }
+        let context_env_rules = document
+            .ebpf
+            .context_env
+            .clone()
+            .unwrap_or_else(|| default_context_env_rules(&document.session.env_name));
+        validate_context_env_rules(&context_env_rules)?;
         Ok(Self {
             socket_path: document.daemon.socket_path,
             socket_permissions: SocketPermissions {
@@ -630,6 +754,7 @@ impl OperatorConfig {
                 tls_dynamic_loading: document.ebpf.tls_dynamic_loading,
                 tls_scan_debounce,
                 tls_scan_interval_ms: document.ebpf.tls_scan_interval_ms,
+                context_env_rules,
             },
             startup_wait_ms: document.daemon.startup_wait_ms,
             shutdown_wait_ms: document.daemon.shutdown_wait_ms,
@@ -685,6 +810,7 @@ impl OperatorConfig {
                 tls_dynamic_loading: self.ebpf_config.tls_dynamic_loading,
                 tls_scan_debounce: self.ebpf_config.tls_scan_debounce.to_string(),
                 tls_scan_interval_ms: self.ebpf_config.tls_scan_interval_ms,
+                context_env: Some(self.ebpf_config.context_env_rules.clone()),
             },
             session: SessionDocument {
                 env_name: self.session_env_name.clone(),
@@ -730,7 +856,7 @@ fn merge_toml(base: &mut toml::Value, patch: toml::Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::OperatorConfig;
+    use super::{ContextEnvKind, ContextEnvRule, OperatorConfig, validate_context_env_rules};
 
     #[test]
     fn default_config_round_trips() {
@@ -810,6 +936,45 @@ mod tests {
             super::TlsScanDebounce::Interval
         );
         assert_eq!(patched.ebpf_config.tls_scan_interval_ms, 1000);
+    }
+
+    #[test]
+    fn context_environment_rules_allow_zero_through_five_entries() {
+        let config = OperatorConfig::init().unwrap();
+        assert_eq!(config.ebpf_config.context_env_rules.len(), 4);
+        let empty = config.patch("[ebpf]\ncontext_env = []\n").unwrap();
+        assert!(empty.ebpf_config.context_env_rules.is_empty());
+        let configured = config
+            .patch(
+                "[[ebpf.context_env]]\nname = \"CODEX_SESSION_ID\"\nkind = \"session\"\nprofile = \"codex\"\npriority = 80\n",
+            )
+            .unwrap();
+        assert_eq!(configured.ebpf_config.context_env_rules.len(), 1);
+        assert!(configured.dump().unwrap().contains("CODEX_SESSION_ID"));
+    }
+
+    #[test]
+    fn context_environment_rules_reject_verifier_unsafe_or_ambiguous_config() {
+        let config = OperatorConfig::init().unwrap();
+        assert!(config
+            .patch(
+                "[[ebpf.context_env]]\nname = \"BAD-NAME\"\nkind = \"session\"\nprofile = \"codex\"\npriority = 80\n",
+            )
+            .is_err());
+        assert!(config
+            .patch(
+                "[[ebpf.context_env]]\nname = \"CODEX_SESSION_ID\"\nkind = \"session\"\nprofile = \"codex\"\npriority = 0\n",
+            )
+            .is_err());
+        let too_many = (0..=super::MAX_CONTEXT_ENV_RULES)
+            .map(|index| ContextEnvRule {
+                name: format!("HARNESS_{index}"),
+                kind: ContextEnvKind::Session,
+                profile: format!("profile_{index}"),
+                priority: index as u8 + 1,
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_context_env_rules(&too_many).is_err());
     }
 
     #[test]

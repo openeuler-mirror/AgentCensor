@@ -348,15 +348,15 @@ fn response_tools_keep_authorized_refs_and_reject_arbitrary_execution() {
     let approved = gate
         .tool_arguments(
             "shell",
-            &json!({"command":format!("privcalc sum '{reference}'")}),
+            &json!({"command":format!("censorprivacy compute sum '{reference}'")}),
         )
         .unwrap();
     assert!(approved["command"].as_str().unwrap().contains(&reference));
     for command in [
         format!("echo '{reference}'"),
-        format!("privcalc sum '{reference}'; id"),
-        format!("privcalc sum '{reference}' $(id)"),
-        format!("privcalc sum '{reference}' > /tmp/out"),
+        format!("censorprivacy compute sum '{reference}'; id"),
+        format!("censorprivacy compute sum '{reference}' $(id)"),
+        format!("censorprivacy compute sum '{reference}' > /tmp/out"),
     ] {
         assert!(gate
             .tool_arguments("shell", &json!({"command":command}))
