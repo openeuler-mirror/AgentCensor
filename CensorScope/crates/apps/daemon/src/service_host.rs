@@ -18,8 +18,8 @@ use control_contract::reply::{
 use control_contract::selector::TraceSelector;
 use ebpf_collector::EbpfCollector;
 use ebpf_collector::procfs::{
-    ProcfsIdentityReader, ProcfsTreeSnapshotter, read_container_identity, read_process_session,
-    resolve_namespaced_pid,
+    ProcfsIdentityReader, ProcfsTreeSnapshotter, read_container_identity,
+    read_process_session_from_rules, resolve_namespaced_pid,
 };
 use ingest_runtime::fd_lineage::FdLineage;
 use ingest_runtime::retention::PayloadRetention;
@@ -154,7 +154,7 @@ pub struct DaemonServiceHost {
     payload_reassembly: BTreeMap<(TraceId, String), StreamPlaintext>,
     payload_call_buffers: BTreeMap<(TraceId, String, u64), Vec<u8>>,
     command_heads: BTreeMap<(TraceId, u64), String>,
-    session_env_name: String,
+    context_env_rules: Vec<config_core::daemon::ContextEnvRule>,
     call_spans: Vec<CallSpanRecord>,
     pending_events: Vec<model_core::event::DomainEvent>,
     pending_payloads: Vec<model_core::payload::PayloadSegment>,
@@ -191,7 +191,6 @@ impl DaemonServiceHost {
         profile: CaptureProfile,
         ebpf_config: EbpfCollectorConfig,
         active_trace_max: u32,
-        session_env_name: String,
     ) -> Result<Self, ControlError> {
         // Boot-time persistence runs on a temporary connection before the
         // writer thread owns the only read-write connection.
@@ -206,6 +205,7 @@ impl DaemonServiceHost {
             ProcessIdentityManager::with_reserved_block(block_start, block_end, records)
                 .map_err(|error| control_error("process_identity", error))?;
         let descriptor = EbpfCollector::new(ebpf_config.clone()).descriptor().clone();
+        let context_env_rules = ebpf_config.context_env_rules.clone();
         let spool_path = storage_config.path().with_extension("spool");
         // Spool data is scoped to one daemon lifetime; stale records are not
         // replayed after restart.
@@ -274,7 +274,7 @@ impl DaemonServiceHost {
             payload_reassembly: BTreeMap::new(),
             payload_call_buffers: BTreeMap::new(),
             command_heads: BTreeMap::new(),
-            session_env_name,
+            context_env_rules,
             call_spans: Vec::new(),
             pending_events: Vec::new(),
             pending_payloads: Vec::new(),
@@ -1858,8 +1858,7 @@ impl DaemonServiceHost {
     }
 
     fn read_process_session(&self, pid: u32) -> Option<SessionIdentity> {
-        read_process_session(pid, "CENSORSCOPE_SESSION_ID")
-            .or_else(|| read_process_session(pid, &self.session_env_name))
+        read_process_session_from_rules(pid, &self.context_env_rules)
     }
 
     /// Session lookup for one process, reusing the result for its lifetime.
@@ -3200,9 +3199,9 @@ mod test_harness {
                 tls_dynamic_loading: false,
                 tls_scan_debounce: TlsScanDebounce::None,
                 tls_scan_interval_ms: 1000,
+                context_env_rules: Vec::new(),
             },
             4,
-            "DSH_CENSORSCOPE_SESSION_ID".to_string(),
         )
         .expect("build host");
         (host, path)

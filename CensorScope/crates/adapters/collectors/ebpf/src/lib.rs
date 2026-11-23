@@ -25,7 +25,10 @@ use collector_instance::{
     CollectorError, CollectorInstance, CollectorPollBatch, CollectorRawBatch,
 };
 use collector_stats::CollectorStats;
-use config_core::daemon::{EbpfCollectorConfig, MemlockRlimit, TlsScanDebounce};
+use config_core::daemon::{
+    ContextEnvKind, ContextEnvRule, EbpfCollectorConfig, MAX_CONTEXT_ENV_NAME_BYTES,
+    MAX_CONTEXT_ENV_RULES, MemlockRlimit, TlsScanDebounce,
+};
 use libbpf_rs::{
     Link, MapCore, MapFlags, MapHandle, Object, ObjectBuilder, PrintLevel, RingBuffer,
     RingBufferBuilder, set_print,
@@ -66,6 +69,8 @@ const TLS_EVENT_SIZE: usize = PROCESS_EVENT_SIZE + 48 + TLS_PAYLOAD_MAX;
 /// Bound one userspace drain so decoding and spooling cannot monopolize the
 /// collector thread while the kernel ring buffer is receiving new events.
 const MAX_EVENTS_PER_POLL: usize = 1024;
+const CONTEXT_ENV_RULE_SIZE: usize = 80;
+const CONTEXT_ENV_CONFIG_SIZE: usize = 4 + MAX_CONTEXT_ENV_RULES * CONTEXT_ENV_RULE_SIZE;
 
 fn libbpf_log(level: PrintLevel, message: String) {
     let message = message.trim_end();
@@ -217,6 +222,14 @@ impl EbpfRuntime {
                 ),
             )
         })?;
+        let context_env_config = map_handle(&object, "context_env_config")?;
+        context_env_config
+            .update(
+                &0_u32.to_ne_bytes(),
+                &encode_context_env_config(&config.context_env_rules)?,
+                MapFlags::ANY,
+            )
+            .map_err(|error| LoaderError::new("context_env_config", error.to_string()))?;
         let trace_bindings = map_handle(&object, "trace_bindings")?;
         let session_ids = map_handle(&object, "session_ids")?;
         let call_ids = map_handle(&object, "call_ids")?;
@@ -2795,6 +2808,81 @@ fn map_handle(object: &Object, name: &str) -> Result<MapHandle, LoaderError> {
         .find(|map| map.name() == OsStr::new(name))
         .ok_or_else(|| LoaderError::new("bpf_map", format!("missing map {name}")))?;
     MapHandle::try_from(&map).map_err(|error| LoaderError::new("bpf_map", error.to_string()))
+}
+
+fn encode_context_env_config(rules: &[ContextEnvRule]) -> Result<Vec<u8>, LoaderError> {
+    if rules.len() > MAX_CONTEXT_ENV_RULES {
+        return Err(LoaderError::new(
+            "context_env_config",
+            format!("at most {MAX_CONTEXT_ENV_RULES} rules are supported"),
+        ));
+    }
+    let mut profile_ids = BTreeMap::new();
+    for rule in rules {
+        let next = u32::try_from(profile_ids.len() + 1)
+            .map_err(|error| LoaderError::new("context_env_config", error.to_string()))?;
+        profile_ids.entry(rule.profile.as_str()).or_insert(next);
+    }
+    let mut encoded = vec![0_u8; CONTEXT_ENV_CONFIG_SIZE];
+    encoded[..4].copy_from_slice(&(rules.len() as u32).to_ne_bytes());
+    for (index, rule) in rules.iter().enumerate() {
+        let name = rule.name.as_bytes();
+        if name.is_empty() || name.len() > MAX_CONTEXT_ENV_NAME_BYTES {
+            return Err(LoaderError::new(
+                "context_env_config",
+                format!("invalid environment name length for {:?}", rule.name),
+            ));
+        }
+        let offset = 4 + index * CONTEXT_ENV_RULE_SIZE;
+        encoded[offset..offset + name.len()].copy_from_slice(name);
+        let name_len = u32::try_from(name.len())
+            .map_err(|error| LoaderError::new("context_env_config", error.to_string()))?;
+        let kind = match rule.kind {
+            ContextEnvKind::Session => 1_u32,
+            ContextEnvKind::Call => 2_u32,
+        };
+        let profile_id = *profile_ids
+            .get(rule.profile.as_str())
+            .ok_or_else(|| LoaderError::new("context_env_config", "missing profile id"))?;
+        for (field, value) in [
+            (64, name_len),
+            (68, kind),
+            (72, u32::from(rule.priority)),
+            (76, profile_id),
+        ] {
+            let field = offset + field;
+            encoded[field..field + 4].copy_from_slice(&value.to_ne_bytes());
+        }
+    }
+    Ok(encoded)
+}
+
+#[cfg(test)]
+mod context_env_config_tests {
+    use super::*;
+
+    #[test]
+    fn map_config_has_fixed_size_and_disabled_slots_are_zeroed() {
+        let rules = vec![ContextEnvRule {
+            name: "CODEX_SESSION_ID".into(),
+            kind: ContextEnvKind::Session,
+            profile: "codex".into(),
+            priority: 80,
+        }];
+        let encoded = encode_context_env_config(&rules).unwrap();
+        assert_eq!(encoded.len(), CONTEXT_ENV_CONFIG_SIZE);
+        assert_eq!(u32::from_ne_bytes(encoded[..4].try_into().unwrap()), 1);
+        assert_eq!(&encoded[4..20], b"CODEX_SESSION_ID");
+        assert_eq!(u32::from_ne_bytes(encoded[68..72].try_into().unwrap()), 16);
+        assert_eq!(u32::from_ne_bytes(encoded[72..76].try_into().unwrap()), 1);
+        assert_eq!(u32::from_ne_bytes(encoded[76..80].try_into().unwrap()), 80);
+        assert_eq!(u32::from_ne_bytes(encoded[80..84].try_into().unwrap()), 1);
+        assert!(
+            encoded[4 + CONTEXT_ENV_RULE_SIZE..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
 }
 
 fn apply_memlock_rlimit(limit: MemlockRlimit) -> Result<(), LoaderError> {

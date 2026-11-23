@@ -390,6 +390,26 @@ struct censorscope_env_scratch {
     char value[ENV_BUF_LEN];
 };
 
+struct censorscope_context_env_rule {
+    char name[CONTEXT_ENV_NAME_LEN];
+    __u32 name_len;
+    __u32 kind;
+    __u32 priority;
+    __u32 profile_id;
+};
+
+struct censorscope_context_env_config {
+    __u32 rule_count;
+    struct censorscope_context_env_rule rules[MAX_CONTEXT_ENV_RULES];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct censorscope_context_env_config);
+} context_env_config SEC(".maps");
+
 /* Per-CPU exec-name scratch for the self-noise filter: the exec filename
  * basename is compared against the excluded tools (censorscopectl/
  * censorscoped); kept off the BPF stack. */
@@ -613,150 +633,128 @@ static __noinline void copy_cached_call_id(struct censorscope_event *event,
                          sizeof(event->call_id));
 }
 
-/* Read the agent-provided SessionId from the current task's env at
- * observation time (no later /proc read).  Kept a separate BPF subprogram:
- * inlining this scan into TLS payload probes would multiply verifier state
- * with the payload chunk loop. */
-static __noinline void find_session(struct censorscope_event *event,
-                                    struct task_struct *task) {
-    struct mm_struct *mm = 0;
-    struct censorscope_env_scratch *scratch;
+/* Keep environment iteration bounded while allowing daemon-configured names. */
+struct censorscope_env_scan {
+    struct censorscope_event *event;
     unsigned long cursor;
     unsigned long end;
-    __u32 zero = 0;
-    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
-        return;
-    if (CORE_READ(&cursor, mm, env_start) != 0 ||
-        CORE_READ(&end, mm, env_end) != 0 || !cursor || cursor >= end)
-        return;
-    scratch = bpf_map_lookup_elem(&env_scratch, &zero);
-    if (!scratch)
-        return;
+    struct censorscope_context_env_config *config;
+    __u32 session_priority;
+    __u32 session_profile;
+    __u32 call_priority;
+    __u32 call_profile;
+};
+
+static __noinline int context_env_match(
+    struct censorscope_env_scratch *scratch,
+    long entry_size,
+    struct censorscope_context_env_rule *rule,
+    __u32 *value_offset) {
+    if (!rule->name_len || rule->name_len >= CONTEXT_ENV_NAME_LEN ||
+        rule->name_len + 1 >= entry_size || rule->kind == 0 ||
+        rule->kind > CONTEXT_ENV_CALL || !rule->profile_id ||
+        rule->profile_id > MAX_CONTEXT_ENV_RULES)
+        return 0;
 #pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_ENV_VARS; i++) {
-        long n;
-        if (cursor >= end)
+    for (__u32 i = 0; i < CONTEXT_ENV_NAME_LEN; i++) {
+        if (i >= rule->name_len)
             break;
-        n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
-                                    (const void *)cursor);
-        if (n <= 1)
-            break;
-        __u32 value_offset = 0;
-        if (scratch->value[0] == 'C' && scratch->value[1] == 'E' &&
-            scratch->value[2] == 'N' && scratch->value[3] == 'S' &&
-            scratch->value[4] == 'O' && scratch->value[5] == 'R' &&
-            scratch->value[6] == 'S' && scratch->value[7] == 'C' &&
-            scratch->value[8] == 'O' && scratch->value[9] == 'P' &&
-            scratch->value[10] == 'E' && scratch->value[11] == '_' &&
-            scratch->value[12] == 'S' && scratch->value[13] == 'E' &&
-            scratch->value[14] == 'S' && scratch->value[15] == 'S' &&
-            scratch->value[16] == 'I' && scratch->value[17] == 'O' &&
-            scratch->value[18] == 'N' && scratch->value[19] == '_' &&
-            scratch->value[20] == 'I' && scratch->value[21] == 'D' &&
-            scratch->value[22] == '=' && scratch->value[23] != '\0') {
-            value_offset = 23;
-        } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
-                   scratch->value[2] == 'H' && scratch->value[3] == '_' &&
-                   scratch->value[4] == 'S' && scratch->value[5] == 'E' &&
-                   scratch->value[6] == 'S' && scratch->value[7] == 'S' &&
-                   scratch->value[8] == 'I' && scratch->value[9] == 'O' &&
-                   scratch->value[10] == 'N' && scratch->value[11] == '_' &&
-                   scratch->value[12] == 'I' && scratch->value[13] == 'D' &&
-                   scratch->value[14] == '=' && scratch->value[15] != '\0') {
-            value_offset = 15;
-        }
-        if (value_offset != 0) {
-#pragma clang loop unroll(full)
-            for (int j = 0; j < SESSION_LEN - 1; j++) {
-                char c = scratch->value[j + value_offset];
-                event->session[j] = c;
-                if (!c)
-                    break;
-            }
-            event->session[SESSION_LEN - 1] = '\0';
-            if (value_offset == 23)
-                break;
-        }
-        cursor += n;
+        if (scratch->value[i] != rule->name[i])
+            return 0;
     }
+    if (scratch->value[rule->name_len] != '=')
+        return 0;
+    *value_offset = rule->name_len + 1;
+    return 1;
 }
 
-/* Per-tool Harness CallId, read while current (mirrors find_session) and
- * cached per process for later events, including TLS uprobes. */
-static __noinline void find_call_id(struct censorscope_event *event,
-                                    struct task_struct *task) {
-    struct mm_struct *mm = 0;
+static __noinline long scan_context_env(__u32 index, void *context) {
+    struct censorscope_env_scan *scan = context;
+    struct censorscope_event *event = scan->event;
     struct censorscope_env_scratch *scratch;
-    unsigned long cursor;
-    unsigned long end;
+    struct censorscope_context_env_rule *rule;
     __u32 zero = 0;
-    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
-        return;
-    if (CORE_READ(&cursor, mm, env_start) != 0 ||
-        CORE_READ(&end, mm, env_end) != 0 || !cursor || cursor >= end)
-        return;
+    long n;
+
+    if (index >= MAX_ENV_VARS || scan->cursor >= scan->end)
+        return 1;
     scratch = bpf_map_lookup_elem(&env_scratch, &zero);
     if (!scratch)
-        return;
+        return 1;
+    n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
+                                (const void *)scan->cursor);
+    if (n <= 1 || n == sizeof(scratch->value))
+        return 1;
+    if (!scan->config)
+        return 1;
 #pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_ENV_VARS; i++) {
-        long n;
-        if (cursor >= end)
+    for (__u32 rule_index = 0; rule_index < MAX_CONTEXT_ENV_RULES; rule_index++) {
+        __u32 value_offset = 0;
+        if (rule_index >= scan->config->rule_count)
             break;
-        n = bpf_probe_read_user_str(scratch->value, sizeof(scratch->value),
-                                    (const void *)cursor);
-        if (n <= 1)
-            break;
-        int value_offset = 0;
-        if (scratch->value[0] == 'C' &&
-            scratch->value[1] == 'E' &&
-            scratch->value[2] == 'N' &&
-            scratch->value[3] == 'S' &&
-            scratch->value[4] == 'O' &&
-            scratch->value[5] == 'R' &&
-            scratch->value[6] == 'S' &&
-            scratch->value[7] == 'C' &&
-            scratch->value[8] == 'O' &&
-            scratch->value[9] == 'P' &&
-            scratch->value[10] == 'E' &&
-            scratch->value[11] == '_' &&
-            scratch->value[12] == 'C' &&
-            scratch->value[13] == 'A' &&
-            scratch->value[14] == 'L' &&
-            scratch->value[15] == 'L' &&
-            scratch->value[16] == '_' &&
-            scratch->value[17] == 'I' &&
-            scratch->value[18] == 'D' &&
-            scratch->value[19] == '=') {
-            value_offset = 20;
-        } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
-            scratch->value[2] == 'H' && scratch->value[3] == '_' &&
-            scratch->value[4] == 'C' && scratch->value[5] == 'E' &&
-            scratch->value[6] == 'N' && scratch->value[7] == 'S' &&
-            scratch->value[8] == 'O' && scratch->value[9] == 'R' &&
-            scratch->value[10] == 'S' && scratch->value[11] == 'C' &&
-            scratch->value[12] == 'O' && scratch->value[13] == 'P' &&
-            scratch->value[14] == 'E' && scratch->value[15] == '_' &&
-            scratch->value[16] == 'C' && scratch->value[17] == 'A' &&
-            scratch->value[18] == 'L' && scratch->value[19] == 'L' &&
-            scratch->value[20] == '_' && scratch->value[21] == 'I' &&
-            scratch->value[22] == 'D' && scratch->value[23] == '=') {
-            value_offset = 24;
-        }
-        if (value_offset != 0) {
-#pragma clang loop unroll(full)
-            for (int j = 0; j < CALL_ID_LEN - 1; j++) {
-                char c = scratch->value[j + value_offset];
-                event->call_id[j] = c;
-                if (!c)
-                    break;
+        rule = &scan->config->rules[rule_index];
+        if (!context_env_match(scratch, n, rule, &value_offset))
+            continue;
+        if (scratch->value[value_offset] == '\0')
+            continue;
+        if (rule->kind == CONTEXT_ENV_SESSION) {
+            if (rule->priority < scan->session_priority)
+                continue;
+            if (rule->priority > scan->session_priority) {
+                scan->session_priority = rule->priority;
+                scan->session_profile = rule->profile_id;
+                event->session[0] = '\0';
             }
-            event->call_id[CALL_ID_LEN - 1] = '\0';
-            if (value_offset == 19)
-                break;
+            if (rule->priority == scan->session_priority &&
+                scan->session_profile != rule->profile_id)
+                continue;
+            bpf_probe_read_kernel_str(event->session, SESSION_LEN,
+                                      scratch->value + value_offset);
+        } else {
+            if (rule->priority < scan->call_priority)
+                continue;
+            if (rule->priority > scan->call_priority) {
+                scan->call_priority = rule->priority;
+                scan->call_profile = rule->profile_id;
+                event->call_id[0] = '\0';
+            }
+            if (rule->priority == scan->call_priority &&
+                scan->call_profile != rule->profile_id)
+                continue;
+            bpf_probe_read_kernel_str(event->call_id, CALL_ID_LEN,
+                                      scratch->value + value_offset);
         }
-        cursor += n;
     }
+    scan->cursor += n;
+    return 0;
+}
+
+static __noinline __u32 find_context_env(struct censorscope_event *event,
+                                        struct task_struct *task) {
+    struct censorscope_env_scan scan = { .event = event };
+    struct censorscope_context_env_config *config;
+    struct mm_struct *mm = 0;
+    __u32 zero = 0;
+
+    if (!task || CORE_READ(&mm, task, mm) != 0 || !mm)
+        return 0;
+    if (CORE_READ(&scan.cursor, mm, env_start) != 0 ||
+        CORE_READ(&scan.end, mm, env_end) != 0 || !scan.cursor ||
+        scan.cursor >= scan.end)
+        return 0;
+    config = bpf_map_lookup_elem(&context_env_config, &zero);
+    if (!config || config->rule_count > MAX_CONTEXT_ENV_RULES)
+        return 0;
+    scan.config = config;
+    bpf_loop(MAX_ENV_VARS, scan_context_env, &scan, 0);
+    if (event->session[0] && event->call_id[0] &&
+        scan.session_profile != scan.call_profile) {
+        event->session[0] = '\0';
+        event->call_id[0] = '\0';
+    }
+    return scan.session_profile == scan.call_profile
+        ? scan.session_profile
+        : 0;
 }
 
 static __always_inline void init_event_from_cache(struct censorscope_event *event,
@@ -777,12 +775,14 @@ static __always_inline void init_event_from_cache(struct censorscope_event *even
 static __always_inline void
 init_event(struct censorscope_event *event, __u32 kind, __u32 pid, __u64 trace_id) {
     init_event_from_cache(event, kind, pid, trace_id);
-    if (!event->session[0]) {
-        find_session(event, bpf_get_current_task());
+    if (!event->session[0] || !event->call_id[0]) {
+        __u32 profile = find_context_env(event, bpf_get_current_task());
+        __u32 context_pid = current_kernel_tgid();
+        if (profile && !event->session[0])
+            bpf_map_delete_elem(&session_ids, &context_pid);
+        if (profile && !event->call_id[0])
+            bpf_map_delete_elem(&call_ids, &context_pid);
         cache_session(current_kernel_tgid(), event->session);
-    }
-    if (!event->call_id[0]) {
-        find_call_id(event, bpf_get_current_task());
         cache_call_id(current_kernel_tgid(), event->call_id);
     }
 }
