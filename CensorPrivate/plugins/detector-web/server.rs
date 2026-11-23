@@ -1,12 +1,10 @@
 //! Local visualization of the production detector; assets originate at detector 007c7ea.
 use crate::{
+    config::ConfigArgs,
     conversations::ConversationStore,
     detection::{merge_spans, Span},
     error::{Error, Result},
-    professional::{
-        configured_ner_batch_size, configured_ner_device, configured_ner_threads, AnalyzeOptions,
-        NerDevice, Prediction, ProfessionalConfig, ProfessionalDetector, MODEL_ID,
-    },
+    professional::{AnalyzeOptions, NerDevice, Prediction, ProfessionalDetector, MODEL_ID},
 };
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, Path, Request, State},
@@ -28,19 +26,21 @@ use tokio::sync::Semaphore;
 
 #[derive(clap::Args)]
 pub struct WebArgs {
-    #[arg(long, default_value_t = 8766)]
-    port: u16,
+    #[command(flatten)]
+    deployment: ConfigArgs,
+    #[arg(long)]
+    port: Option<u16>,
     #[arg(long)]
     detector_model_dir: Option<PathBuf>,
     #[arg(long)]
     detector_ort_library: Option<PathBuf>,
-    /// ONNX intra-op threads (1–256); defaults to CP_NER_THREADS, then 1.
+    /// ONNX intra-op threads (1–256); defaults to YAML, CP_NER_THREADS, then 1.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
     ner_threads: Option<u16>,
     /// cpu (default), cuda[:ids], or cann[:ids]; unnumbered accelerators use device 0; CP_NER_DEVICE overrides the default.
     #[arg(long)]
     ner_device: Option<NerDevice>,
-    /// Maximum windows per device inference (1–256); CP_NER_BATCH_SIZE, then 1.
+    /// Maximum windows per device inference (1–256); YAML, CP_NER_BATCH_SIZE, then 1.
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
     ner_batch_size: Option<u16>,
     /// Read Agent conversations recorded by the gateway.
@@ -300,9 +300,7 @@ fn preview(text: &str, predictions: Vec<Prediction>, style: &str, threshold: f64
             if !replacements.contains_key(&key) {
                 let replacement = loop {
                     let candidate = if style == "reference" {
-                        let mut bytes = [0u8; 16];
-                        getrandom::getrandom(&mut bytes).map_err(|_| Error::ServiceUnavailable)?;
-                        format!("<CP_{kind}_{:032x}>", u128::from_be_bytes(bytes))
+                        crate::references::Reference::issue(kind)?.to_string()
                     } else {
                         let counter = counters.entry(kind).or_default();
                         *counter += 1;
@@ -350,35 +348,40 @@ fn preview(text: &str, predictions: Vec<Prediction>, style: &str, threshold: f64
 }
 
 pub async fn serve(args: WebArgs) -> Result<()> {
-    let mut config = ProfessionalConfig {
-        ner_threads: configured_ner_threads(args.ner_threads)?,
-        ner_device: configured_ner_device(args.ner_device)?,
-        ner_batch_size: configured_ner_batch_size(args.ner_batch_size)?,
-        ..Default::default()
-    };
-    if let Some(path) = args.detector_model_dir {
-        config.model_directory = Some(path);
+    let loaded = args.deployment.load()?;
+    let deployment = loaded.clone().unwrap_or_default();
+    deployment.privacy_policy()?;
+    let mut config = deployment.detector(
+        args.ner_threads,
+        args.ner_device,
+        args.ner_batch_size,
+        args.detector_model_dir,
+        args.detector_ort_library,
+    )?;
+    if loaded.is_none() {
+        config.categories = None;
     }
-    if let Some(path) = args.detector_ort_library {
-        config.runtime_library = Some(path);
-    }
-    if config.model_directory.as_ref().is_none_or(|directory| {
-        [
-            "manifest.json",
-            "model.onnx",
-            "tokenizer.json",
-            "config.json",
-        ]
-        .iter()
-        .any(|name| !directory.join(name).is_file())
-    }) {
+    let port = args.port.unwrap_or(8766);
+    if crate::categories::uses_ner(&config.categories)
+        && config.model_directory.as_ref().is_none_or(|directory| {
+            [
+                "manifest.json",
+                "model.onnx",
+                "tokenizer.json",
+                "config.json",
+            ]
+            .iter()
+            .any(|name| !directory.join(name).is_file())
+        })
+    {
         eprintln!("未找到完整的 ONNX 模型包；请设置 CP_DETECTOR_MODEL_DIR 或 --detector-model-dir。准备方法见 docs/rust-detector.md。");
         return Err(Error::DetectionFailed);
     }
-    if config
-        .runtime_library
-        .as_ref()
-        .is_none_or(|library| !library.is_file())
+    if crate::categories::uses_ner(&config.categories)
+        && config
+            .runtime_library
+            .as_ref()
+            .is_none_or(|library| !library.is_file())
     {
         eprintln!("未找到 ONNX Runtime 原生运行库；请设置 CP_DETECTOR_ORT_LIBRARY 或 --detector-ort-library，指向 libonnxruntime.so（也支持版本文件名）。Cargo 构建不会下载此运行库。");
         return Err(Error::DetectionFailed);
@@ -386,17 +389,18 @@ pub async fn serve(args: WebArgs) -> Result<()> {
     let detector = Arc::new(ProfessionalDetector::start(config)?);
     let conversations = args
         .conversation_records_dir
+        .or(deployment.conversation_records_dir)
         .map(ConversationStore::open)
         .transpose()?
         .map(Arc::new);
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, args.port))
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
         .await
         .map_err(|_| Error::ServiceUnavailable)?;
     let port = listener
         .local_addr()
         .map_err(|_| Error::ServiceUnavailable)?
         .port();
-    println!("Privacy Detector: http://127.0.0.1:{port}/");
+    println!("CensorPrivacy: http://127.0.0.1:{port}/");
     axum::serve(listener, workspace(detector, conversations, port)).with_graceful_shutdown(async {
         let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
         tokio::select! {
@@ -410,6 +414,31 @@ pub async fn serve(args: WebArgs) -> Result<()> {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[test]
+    fn preview_reuses_short_references_for_repeated_values() {
+        let text = "alice@example.com alice@example.com";
+        let predictions = [(0, 17), (18, 35)]
+            .into_iter()
+            .map(|(start, end)| Prediction {
+                entity_type: "EMAIL".into(),
+                start,
+                end,
+                score: 1.0,
+                sources: vec![],
+                validation: "not_checked".into(),
+                evidence: vec![],
+                unit: None,
+            })
+            .collect();
+        let result = preview(text, predictions, "reference", 0.6).unwrap();
+        let masked = result["masked_text"].as_str().unwrap();
+        let references: Vec<_> = masked.split_whitespace().collect();
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0], references[1]);
+        assert!(crate::references::Reference::parse(references[0]).is_ok());
+        assert_eq!(references[0].len(), "<CP_EMAIL_>".len() + 8);
+    }
 
     #[tokio::test]
     async fn clearing_recordings_requires_confirmed_same_origin_json_and_survives_reopen() {

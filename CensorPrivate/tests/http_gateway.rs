@@ -563,7 +563,7 @@ async fn real_upstream_only_sees_protected_context_and_service_credentials() {
     }
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
-    let tokens = regex::Regex::new(r"<CP_[A-Z][A-Z0-9_]*_[0-9a-f]{32}>").unwrap();
+    let tokens = regex::Regex::new(r"<CP_[A-Z][A-Z0-9_]*_[a-z0-9]{8}>").unwrap();
     for (path, headers, body) in &*calls {
         let encoded = body.to_string();
         assert!(!encoded.contains("张三"));
@@ -727,7 +727,7 @@ async fn real_sse_restores_before_the_client_receives_it_and_compute_stays_local
     let reference = {
         let calls = mock.calls.lock().unwrap();
         let text = calls[0].2["messages"][0]["content"].as_str().unwrap();
-        regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+        regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
             .unwrap()
             .find(text)
             .unwrap()

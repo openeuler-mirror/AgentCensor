@@ -44,10 +44,12 @@ pub fn agent_session_id(agent: &str, session: &str) -> Result<String> {
     hash.update(agent.as_bytes());
     hash.update(b"\0");
     hash.update(session.as_bytes());
-    Ok(hash.finalize()[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    use std::fmt::Write;
+    let mut id = String::with_capacity(32);
+    for byte in &hash.finalize()[..16] {
+        write!(&mut id, "{byte:02x}").expect("writing to a String");
+    }
+    Ok(id)
 }
 
 fn legacy_agent() -> String {

@@ -28,7 +28,7 @@ fn private_bonus_workflow_keeps_operands_and_results_out_of_model_context() {
     for secret in ["张三", "李四", "10000", "20000"] {
         assert!(!protected.contains(secret));
     }
-    let refs: Vec<_> = regex::Regex::new(r"<CP_MONEY_[0-9a-f]{32}>")
+    let refs: Vec<_> = regex::Regex::new(r"<CP_MONEY_[a-z0-9]{8}>")
         .unwrap()
         .find_iter(&protected)
         .map(|m| Reference::parse(m.as_str()).unwrap())
