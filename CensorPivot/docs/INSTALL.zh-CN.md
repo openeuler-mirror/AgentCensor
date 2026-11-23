@@ -234,7 +234,3 @@ Web 与 headless worker 使用同一 DSH 源码目录。
 `events.guard_ingress_socket` 保持一致。Pivot 关联事务、trace 和工具调用后，转发到
 `events.scope_ingest_socket` 指定的 Scope 外部事件入口。独立 Guard 默认不转发；
 设为 `null` 可关闭转发。修改后按上述 stop/start 重启统一服务。
-
-可选原生事务验证：`setup-agentcensor.sh start --demo`，会向 FS `main` 发布测试结果。
-当前 DSH 普通对话尚未自动提交 Pivot `BatchRequest`；完整事务接入范围见
-[验收报告](ACCEPTANCE.zh-CN.md)，Scope 改动见[维护交接说明](SCOPE-CHANGES.zh-CN.md)。
