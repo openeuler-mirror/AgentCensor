@@ -59,7 +59,7 @@
     {
       "name": "secret_prefix",
       "entity_type": "SECRET",
-      "expression": "(?<![A-Za-z0-9])(?:sk|pk|api|token|key|secret|bearer)[-_][A-Za-z0-9_-]{8,}",
+      "expression": "(?<![A-Za-z0-9])(?:sk|pk)[-_][A-Za-z0-9_-]{8,}",
       "score": 0.95,
       "group": 0,
       "evidence": []
@@ -107,7 +107,7 @@
     {
       "name": "money_suffix",
       "entity_type": "MONEY",
-      "expression": "(?<![A-Za-z0-9_.])[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\s*(?:万|亿)?(?:元|人民币|美元|欧元|英镑|日元|港币|CNY|RMB|USD|EUR|GBP|JPY|HKD)(?![A-Za-z])",
+      "expression": "(?<![A-Za-z0-9_.])[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\\s*(?:万|亿)?(?:元(?!素|组|数据)|人民币|美元|欧元|英镑|日元|港币|CNY|RMB|USD|EUR|GBP|JPY|HKD)(?![A-Za-z])",
       "score": 0.85,
       "group": 0,
       "evidence": []
@@ -496,7 +496,7 @@
       "pattern": {
         "name": "secret_assignment",
         "entity_type": "SECRET",
-        "expression": "(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|tokens|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"(?:[^\"\\\\\\r\\n]|\\\\[^\\r\\n])+\"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])+'|[^\\s\"'`,，;；。}\\]\\)<>&]+)",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:(?:[A-Za-z0-9]+[_-])+|[A-Za-z0-9]*(?-i:[a-z0-9])(?=(?-i:[A-Z]))|(?-i:[A-Z]+)(?=(?-i:[A-Z][a-z])))?(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"(?:[^\"\\\\\\r\\n]|\\\\[^\\r\\n])+\"|'(?:[^'\\\\\\r\\n]|\\\\[^\\r\\n])+'|[^\\s\"'`,，;；。}\\]\\)<>&]+)",
         "score": 0.95,
         "group": "value",
         "evidence": [
@@ -543,7 +543,7 @@
       "pattern": {
         "name": "labelled_person",
         "entity_type": "PERSON",
-        "expression": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name|name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[\\u3400-\\u9fff·]{2,12}|[A-Za-z][A-Za-z.'’-]*(?:[ \\t]+[A-Za-z][A-Za-z.'’-]*){0,4})",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))[\"']?[ \\t]*[:：=][ \\t]*[\"']?(?P<value>[\\u3400-\\u9fff·]{2,12}|[A-Za-z][A-Za-z.'’-]*(?:[ \\t]+[A-Za-z][A-Za-z.'’-]*){0,4})",
         "score": 0.85,
         "group": "value",
         "evidence": [
@@ -560,7 +560,7 @@
       "pattern": {
         "name": "labelled_money",
         "entity_type": "MONEY",
-        "expression": "(?:(?<![A-Za-z0-9_])(?:balance|salary|amount|bonus|price)(?![A-Za-z0-9_])|(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪))[\"']?\\s*[:：=]?\\s*[\"']?(?P<value>[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?:万|亿|[kKmM])?)(?![0-9])",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:balance|salary|amount|bonus|price)(?![A-Za-z0-9_])|(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪))[\"']?\\s*[:：=]?\\s*[\"']?(?P<value>[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?(?:万|亿|[kKmM])?)(?![0-9]|\\.[0-9])",
         "score": 0.85,
         "group": "value",
         "evidence": [
@@ -607,26 +607,9 @@
     },
     {
       "pattern": {
-        "name": "labelled_medical",
-        "entity_type": "MEDICAL_INFO",
-        "expression": "(?:(?<![A-Za-z0-9_])(?:medical[ \\t_-]*history|medical[ \\t_-]*record|test[ \\t_-]*result|medication|diagnosis)(?![A-Za-z0-9_])|(?:检查结果|诊疗记录|既往病史|诊断|疾病|病史|病历|用药))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"[^\"\\r\\n]+\"|'[^'\\r\\n]+'|[^\\r\\n;；。]+)",
-        "score": 0.8,
-        "group": "value",
-        "evidence": [
-          "field"
-        ]
-      },
-      "context": null,
-      "context_window": 32,
-      "validator": null,
-      "failure_score": null,
-      "failure_entity_type": null
-    },
-    {
-      "pattern": {
         "name": "labelled_organization",
         "entity_type": "ORGANIZATION",
-        "expression": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|单位|机构|组织|雇主))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"[^\"\\r\\n]+\"|'[^'\\r\\n]+'|[^\\r\\n,，;；。]+)",
+        "expression": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|机构|组织|雇主))[\"']?[ \\t]*[:：=][ \\t]*(?P<value>\"[^\"\\r\\n]+\"|'[^'\\r\\n]+'|[^\\r\\n,，;；。]+)",
         "score": 0.8,
         "group": "value",
         "evidence": [
@@ -676,14 +659,13 @@
   ],
   "fields": {
     "PASSWORD": "(?:(?<![A-Za-z0-9_])(?:passphrase|passwords|password|passcode|pin[ \\t_-]*code|passwd|pwd|pin)(?![A-Za-z0-9_])|(?:个人识别码|通行口令|通行码|解锁码|密码|口令))",
-    "SECRET": "(?:(?<![A-Za-z0-9_])(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|tokens|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))",
+    "SECRET": "(?:(?<![A-Za-z0-9_])(?:authentication[ \\t_-]*credentials|authentication[ \\t_-]*credential|authentication[ \\t_-]*secret|personal[ \\t_-]*access[ \\t_-]*token|authentication[ \\t_-]*token|authorization[ \\t_-]*token|service[ \\t_-]*credentials|authentication[ \\t_-]*key|application[ \\t_-]*secret|access[ \\t_-]*credentials|client[ \\t_-]*credentials|service[ \\t_-]*credential|secret[ \\t_-]*access[ \\t_-]*key|access[ \\t_-]*credential|login[ \\t_-]*credentials|client[ \\t_-]*credential|login[ \\t_-]*credential|auth[ \\t_-]*credentials|consumer[ \\t_-]*secret|auth[ \\t_-]*credential|encryption[ \\t_-]*key|security[ \\t_-]*token|access[ \\t_-]*key[ \\t_-]*id|client[ \\t_-]*secret|shared[ \\t_-]*secret|refresh[ \\t_-]*token|session[ \\t_-]*token|private[ \\t_-]*keys|access[ \\t_-]*token|bearer[ \\t_-]*token|access[ \\t_-]*keys|private[ \\t_-]*key|secret[ \\t_-]*keys|signing[ \\t_-]*key|session[ \\t_-]*key|auth[ \\t_-]*secret|credentials|api[ \\t_-]*secret|access[ \\t_-]*key|secret[ \\t_-]*key|app[ \\t_-]*secret|auth[ \\t_-]*token|credential|api[ \\t_-]*token|api[ \\t_-]*keys|auth[ \\t_-]*key|id[ \\t_-]*token|api[ \\t_-]*key|secrets|secret|token)(?![A-Za-z0-9_])|(?:访问密钥|接口密钥|应用密钥|鉴权密钥|加密密钥|签名密钥|共享密钥|访问令牌|授权令牌|认证令牌|鉴权令牌|刷新令牌|会话令牌|安全令牌|身份令牌|访问凭据|访问凭证|认证凭据|认证凭证|授权凭据|授权凭证|身份凭据|身份凭证|登录凭据|登录凭证|鉴权凭据|鉴权凭证|密钥|秘钥|私钥|令牌|凭据|凭证))",
     "CREDIT_CARD": "(?:(?<![A-Za-z0-9_])(?:primary[ \\t_-]*account[ \\t_-]*number|payment[ \\t_-]*card[ \\t_-]*number|credit[ \\t_-]*card[ \\t_-]*number|debit[ \\t_-]*card[ \\t_-]*number|bank[ \\t_-]*card[ \\t_-]*number|american[ \\t_-]*express|credit[ \\t_-]*card[ \\t_-]*no|payment[ \\t_-]*card|credit[ \\t_-]*card|card[ \\t_-]*number|debit[ \\t_-]*card|mastercard|bank[ \\t_-]*card|unionpay|card[ \\t_-]*no|card|visa|amex|pan)(?![A-Za-z0-9_])|(?:信用卡号码|还款卡号|收款卡号|银行卡号|信用卡号|借记卡号|储蓄卡号|支付卡号|付款卡号|还款卡|收款卡|这个卡|银行卡|信用卡|借记卡|储蓄卡|贷记卡|支付卡|付款卡|银联卡|卡号码|卡号))",
     "CHINA_ID": "(?:(?<![A-Za-z0-9_])(?:china[ \\t_-]*id)(?![A-Za-z0-9_])|(?:身份证号码|居民身份证|身份证号|身份证))",
     "LICENSE_PLATE": "(?:(?<![A-Za-z0-9_])(?:license[ \\t_-]*plate|number[ \\t_-]*plate)(?![A-Za-z0-9_])|(?:新能源车牌|车牌号码|车牌号|车牌|牌照))",
-    "PERSON": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name|name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))",
+    "PERSON": "(?:(?<![A-Za-z0-9_])(?:customer[ \\t_-]*name|contact[ \\t_-]*name|patient[ \\t_-]*name|full[ \\t_-]*name)(?![A-Za-z0-9_])|(?:患者姓名|员工姓名|客户姓名|联系人|收件人|姓名))",
     "ADDRESS": "(?:(?<![A-Za-z0-9_])(?:residential[ \\t_-]*address|shipping[ \\t_-]*address|mailing[ \\t_-]*address|home[ \\t_-]*address|address)(?![A-Za-z0-9_])|(?:家庭住址|收货地址|联系地址|通讯地址|通信地址|居住地址|邮寄地址|住址|地址))",
-    "MEDICAL_INFO": "(?:(?<![A-Za-z0-9_])(?:medical[ \\t_-]*history|medical[ \\t_-]*record|test[ \\t_-]*result|medication|diagnosis)(?![A-Za-z0-9_])|(?:检查结果|诊疗记录|既往病史|诊断|疾病|病史|病历|用药))",
-    "ORGANIZATION": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|单位|机构|组织|雇主))",
+    "ORGANIZATION": "(?:(?<![A-Za-z0-9_])(?:organization|organisation|employer|company)(?![A-Za-z0-9_])|(?:工作单位|公司|机构|组织|雇主))",
     "MONEY": "(?:(?<![A-Za-z0-9_])(?:balance|salary|amount|bonus|price)(?![A-Za-z0-9_])|(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|年薪|月薪))",
     "ACCOUNT": "(?:(?<![A-Za-z0-9_])(?:account[ \\t_-]*number|bank[ \\t_-]*account|account[ \\t_-]*id|account[ \\t_-]*no|account|iban)(?![A-Za-z0-9_])|(?:银行账号|银行账户|账户号码|账号|账户))",
     "ID_NUMBER": "(?:(?<![A-Za-z0-9_])(?:social[ \\t_-]*security[ \\t_-]*number|passport[ \\t_-]*number|passport[ \\t_-]*no|passport|ssn)(?![A-Za-z0-9_])|(?:社会安全号|护照号码|证件号码|护照号|证件号))"

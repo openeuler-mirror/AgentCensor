@@ -21,7 +21,6 @@ pub const BUILTIN_CATEGORIES: &[&str] = &[
     "IP_ADDRESS",
     "MAC_ADDRESS",
     "LICENSE_PLATE",
-    "MEDICAL_INFO",
     "CONFIDENTIAL",
 ];
 

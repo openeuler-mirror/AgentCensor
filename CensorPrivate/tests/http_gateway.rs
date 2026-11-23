@@ -112,6 +112,60 @@ async fn setup(limit: usize) -> (GatewayService, Mock, tokio::task::JoinHandle<(
 }
 
 #[tokio::test]
+async fn ordinary_value_propagation_is_session_scoped_even_without_recording() {
+    let (service, mock, handle) = setup(1_048_576).await;
+    for (agent, session, text, expected) in [
+        ("dsh", "one", "姓名：代号", "PERSON"),
+        ("dsh", "one", "代号", "PERSON"),
+        ("dsh", "two", "代号", "plain"),
+        ("other", "one", "代号", "plain"),
+        ("dsh", "one", "代号", "PERSON"),
+        ("dsh", "one", "password=hiddencredential", "SECRET"),
+        ("dsh", "two", "hiddencredential", "SECRET"),
+        ("dsh", "one", "1.3元", "MONEY"),
+        ("dsh", "one", "1.13和1.3哪个大", "plain"),
+        ("dsh", "two", "1.13和1.3哪个大", "plain"),
+        ("", "", "代号", "plain"),
+        ("", "", "姓名：未名", "PERSON"),
+        ("", "", "未名", "plain"),
+    ] {
+        let mut req = request(
+            "/v1/chat/completions",
+            json!({"model":"configured-model","messages":[{"role":"user","content":text}]}),
+        );
+        if !agent.is_empty() {
+            req.headers_mut()
+                .insert("x-censorprivacy-agent", agent.parse().unwrap());
+            req.headers_mut()
+                .insert("x-censorprivacy-session", session.parse().unwrap());
+        }
+        let response = service.router().oneshot(req).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{agent}/{session}: {text}"
+        );
+        let restored = decode(response).await;
+        let calls = mock.calls.lock().unwrap();
+        let wire = &calls.last().unwrap().2["messages"][0]["content"];
+        if expected == "plain" {
+            assert_eq!(wire, text, "{agent}/{session}");
+        } else {
+            assert!(
+                wire.as_str().unwrap().contains(&format!("<CP_{expected}_")),
+                "{wire}"
+            );
+        }
+        if expected == "SECRET" {
+            assert!(!restored.to_string().contains("hiddencredential"));
+        } else {
+            assert_eq!(restored["choices"][0]["message"]["content"], text);
+        }
+    }
+    handle.abort();
+}
+
+#[tokio::test]
 async fn xiaoo_preparation_stays_local_and_disabled_tools_are_enforced() {
     let directory = std::env::temp_dir().join(format!(
         "cp-tool-switch-{}",

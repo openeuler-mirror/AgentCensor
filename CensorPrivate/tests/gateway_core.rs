@@ -25,6 +25,60 @@ fn request(content: &str) -> Value {
 }
 
 #[test]
+fn known_money_never_reclassifies_plain_numbers_in_history_or_later_requests() {
+    let mut gate = gate();
+    let mut body = request("1.13和1.3哪个大");
+    body["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"user","content":"金额：1.3元，工资：1.18"}));
+    let (_, snapshots) = gate
+        .protect_recorded(Api::Chat, &body, "/v1/chat/completions")
+        .unwrap();
+    assert_eq!(snapshots[0].analysis["masked_text"], "1.13和1.3哪个大");
+    assert_eq!(snapshots[1].analysis["masked_count"], 2);
+    let (_, snapshots) = gate
+        .protect_recorded(
+            Api::Chat,
+            &request("1.3和1.18哪个大"),
+            "/v1/chat/completions",
+        )
+        .unwrap();
+    assert_eq!(snapshots[0].analysis["masked_text"], "1.3和1.18哪个大");
+}
+
+#[test]
+fn money_field_requires_a_complete_financial_key_not_a_technical_substring() {
+    let mut gate = gate();
+    for key in [
+        "total",
+        "mean",
+        "average",
+        "total_calls",
+        "salary_count",
+        "mean_time",
+    ] {
+        let body = json!({"messages":[],"metadata":{key:42}});
+        assert!(
+            gate.protect(Api::Chat, &body, "/v1/chat/completions")
+                .is_ok(),
+            "{key}"
+        );
+    }
+    for key in ["salary", "price", "金额"] {
+        let body = json!({"messages":[],"metadata":{key:42}});
+        assert!(
+            gate.protect(Api::Chat, &body, "/v1/chat/completions")
+                .is_err(),
+            "{key}"
+        );
+    }
+    for text in ["api-response-handler", "100元素", "1.3元组", "价格：1.3.2"] {
+        assert_eq!(gate.protect_text(text, "").unwrap(), text);
+    }
+}
+
+#[test]
 fn later_history_credentials_are_masked_in_earlier_messages_and_recorded_details() {
     for recorded in [false, true] {
         let mut gate = gate();

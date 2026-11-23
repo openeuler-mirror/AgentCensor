@@ -61,7 +61,16 @@ pub(super) struct Rules {
     passport: Regex,
     email: Regex,
     number: Regex,
+    postal_address: Regex,
+    network_address: regex::Regex,
 }
+
+// A generic `address` label is also common in network and tool configuration.
+// Require postal structure and reject network endpoints independently of the
+// IP_ADDRESS category, even when the candidate came from a labelled JSON field.
+const POSTAL_ADDRESS: &str = r"[\u3400-\u9fff]{2,40}[0-9一二三四五六七八九十百零〇-]+号|[\u3400-\u9fff]{2,40}(?:村|小区|花园|公寓|大厦|园区)[ \t]*[A-Za-z0-9一二三四五六七八九十百零〇-]+(?:栋|幢|座|楼|单元|室)|\b[0-9][A-Za-z0-9/-]*[ \t]+(?:[\p{L}\p{N}.'’-]+[ \t]+){0,8}(?:street|st|road|rd|avenue|ave|boulevard|blvd|lane|ln|drive|dr|way|court|ct|square|sq|place|pl|terrace|ter|highway|hwy|parkway|pkwy)\b|\bP\.?[ \t]*O\.?[ \t]*Box[ \t]+[0-9]+\b";
+// Keep this on the non-backtracking engine: it scans arbitrary agent context.
+const NETWORK_ADDRESS: &str = r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>，；。,;]+|(?:[0-9]{1,3}\.){3}[0-9]{1,3}|(?:[0-9A-F]{0,4}:){2,7}[0-9A-F]{0,4}|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|(?:[\p{L}\p{N}-]+\.)+[\p{L}]{2,}(?::[0-9]+)?|(?:[A-Za-z]:[\\/]|(?:^|[^\p{L}\p{N}_])(?:[~.\p{L}_-][\p{L}\p{N}_.-]*[\\/]|[\\/]))[^\s"'<>，；。,;]+"#;
 fn compile(expression: &str, insensitive: bool) -> Result<Regex> {
     let unicode = regex::Regex::new(r"\\u([0-9a-fA-F]{4})").map_err(|_| Error::PolicyInvalid)?;
     let ascii = expression.contains("(?a:");
@@ -194,9 +203,14 @@ fn credit_card(value: &str) -> bool {
         == 0
 }
 impl Rules {
+    #[cfg(test)]
     pub(super) fn new() -> Result<Self> {
+        Self::new_selected(&None)
+    }
+    pub(super) fn new_selected(categories: &crate::categories::Categories) -> Result<Self> {
         let data: Catalog =
             serde_json::from_str(include_str!("catalog.json")).map_err(|_| Error::PolicyInvalid)?;
+        let allows = |kind: &str| crate::categories::allows(categories, kind);
         let email = compile(
             &data
                 .patterns
@@ -208,6 +222,9 @@ impl Rules {
         )?;
         let mut rules = Vec::new();
         for pattern in data.patterns {
+            if !allows(&pattern.entity_type) {
+                continue;
+            }
             rules.push(Rule {
                 expression: compile(&pattern.expression, true)?,
                 pattern,
@@ -220,6 +237,11 @@ impl Rules {
             });
         }
         for spec in data.rules {
+            if !allows(&spec.pattern.entity_type)
+                && !spec.failure_entity_type.as_deref().is_some_and(allows)
+            {
+                continue;
+            }
             rules.push(Rule {
                 expression: compile(&spec.pattern.expression, true)?,
                 pattern: spec.pattern,
@@ -240,24 +262,36 @@ impl Rules {
             fields: data
                 .fields
                 .into_iter()
+                .filter(|(kind, _)| allows(kind))
                 .map(|(k, p)| Ok((k, compile(&p, true)?)))
                 .collect::<Result<_>>()?,
             addresses: data
                 .addresses
                 .iter()
+                .filter(|_| allows("ADDRESS") || allows("LOCATION"))
                 .map(|p| compile(p, false))
                 .collect::<Result<_>>()?,
             plate: compile(&data.plate, true)?,
             passport: compile(&format!("\\A(?:{})\\z", data.passport), true)?,
             email,
             number: compile(&data.number, false)?,
+            postal_address: compile(POSTAL_ADDRESS, true)?,
+            network_address: regex::Regex::new(&format!("(?i){NETWORK_ADDRESS}"))
+                .map_err(|_| Error::PolicyInvalid)?,
         })
+    }
+    fn non_postal_ranges(&self, text: &str) -> Vec<(usize, usize)> {
+        self.network_address
+            .find_iter(text)
+            .map(|matched| (matched.start(), matched.end()))
+            .collect()
     }
     fn process(
         &self,
         text: &str,
         mut p: Prediction,
         rule: Option<&Rule>,
+        non_postal: &[(usize, usize)],
     ) -> Result<Option<Prediction>> {
         let original = (p.start, p.end);
         if p.entity_type == "ADDRESS" {
@@ -278,6 +312,32 @@ impl Rules {
         }
         if p.start >= p.end || text.get(p.start..p.end).is_none() {
             return Ok(None);
+        }
+        if p.entity_type == "ADDRESS" {
+            let value = &text[p.start..p.end];
+            let path = value.starts_with(['/', '\\', '~'])
+                || value.starts_with("./")
+                || value.starts_with("../")
+                || (value.as_bytes().get(1) == Some(&b':')
+                    && value
+                        .as_bytes()
+                        .get(2)
+                        .is_some_and(|c| matches!(c, b'/' | b'\\')));
+            if path
+                || !self
+                    .postal_address
+                    .is_match(value)
+                    .map_err(|_| Error::DetectionFailed)?
+            {
+                return Ok(None);
+            }
+            let next = non_postal.partition_point(|(_, end)| *end <= p.start);
+            if non_postal
+                .get(next)
+                .is_some_and(|(start, _)| *start < p.end)
+            {
+                return Ok(None);
+            }
         }
         if p.entity_type == "PERSON" {
             for matched in self.email.find_iter(text) {
@@ -395,6 +455,11 @@ impl Rules {
         categories: &crate::categories::Categories,
     ) -> Result<Vec<Prediction>> {
         let mut output = Vec::new();
+        let non_postal = if crate::categories::allows(categories, "ADDRESS") {
+            self.non_postal_ranges(text)
+        } else {
+            Vec::new()
+        };
         for rule in &self.rules {
             if !crate::categories::allows(categories, &rule.pattern.entity_type)
                 && !rule
@@ -438,7 +503,7 @@ impl Rules {
                     },
                     unit: None,
                 };
-                if let Some(p) = self.process(text, p, Some(rule))? {
+                if let Some(p) = self.process(text, p, Some(rule), &non_postal)? {
                     if crate::categories::allows(categories, &p.entity_type) {
                         output.push(p);
                     }
@@ -473,7 +538,7 @@ impl Rules {
                     evidence: vec!["ner".into()],
                     unit: None,
                 };
-                if let Some(p) = self.process(text, p, None)? {
+                if let Some(p) = self.process(text, p, None, &non_postal)? {
                     if p.score >= 0.5 && crate::categories::allows(categories, &p.entity_type) {
                         output.push(p);
                     }
@@ -527,6 +592,12 @@ impl Rules {
         mut ner: Option<&mut NerModel>,
         categories: &crate::categories::Categories,
     ) -> Result<Vec<Prediction>> {
+        if self.rules.is_empty()
+            && self.fields.is_empty()
+            && !crate::categories::uses_ner(categories)
+        {
+            return Ok(Vec::new());
+        }
         let references: Vec<_> = TOKEN_RE
             .find_iter(text)
             .map(|m| (m.start(), m.end()))
@@ -605,7 +676,12 @@ impl Rules {
                         evidence: vec!["field".into()],
                         unit: None,
                     };
-                    if let Some(p) = self.process(&scan, p, Some(&spec))? {
+                    let non_postal = if kind == "ADDRESS" {
+                        self.non_postal_ranges(&scan)
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(p) = self.process(&scan, p, Some(&spec), &non_postal)? {
                         if crate::categories::allows(categories, &p.entity_type) {
                             results.push(p);
                         }
@@ -661,6 +737,13 @@ impl Rules {
                         .len_utf8();
             }
         }
+        // Repeated-value propagation must not reintroduce a postal match inside
+        // a URL or path which was rejected during candidate validation.
+        let non_postal = if results.iter().any(|p| p.entity_type == "ADDRESS") {
+            self.non_postal_ranges(text)
+        } else {
+            Vec::new()
+        };
         let mut output = Vec::new();
         for p in results {
             let mut ranges = vec![(p.start, p.end)];
@@ -672,6 +755,12 @@ impl Rules {
                     .collect();
             }
             for (start, end) in ranges {
+                if p.entity_type == "ADDRESS" {
+                    let next = non_postal.partition_point(|(_, upper)| *upper <= start);
+                    if non_postal.get(next).is_some_and(|(lower, _)| *lower < end) {
+                        continue;
+                    }
+                }
                 if text[start..end].trim().is_empty() {
                     continue;
                 }
@@ -775,6 +864,80 @@ mod tests {
     #[test]
     fn bundled_rules_compile() {
         assert!(Rules::new().is_ok());
+    }
+
+    #[test]
+    fn technical_fields_and_words_do_not_supply_person_org_secret_or_money_context() {
+        for text in [
+            "1.13和1.3哪个大",
+            "version 1.3.2; pid 12345; port 3080",
+            "name: read",
+            "{\"name\":\"bash\",\"description\":\"Run commands\"}",
+            "单位：ms",
+            "单位：字节",
+            "max_tokens: 4096",
+            "tokens: 4096",
+            "key-examplevalue",
+            "api-response-handler",
+            "secret-assignment-test",
+            "100元素",
+            "1.3元组",
+            "3元数据",
+            "价格：1.3.2",
+            "salary_count=42",
+        ] {
+            assert!(structural(text).is_empty(), "{text}");
+        }
+        for (text, kind) in [
+            ("customer name: Alice Smith", "PERSON"),
+            ("姓名：张三", "PERSON"),
+            ("工作单位：示例研究所", "ORG"),
+            ("company: Example Inc", "ORG"),
+            ("api_key=unprefixedcredential", "SECRET"),
+            ("sk-synthetic123456", "SECRET"),
+            ("工资：125", "MONEY"),
+            ("price: 1.3", "MONEY"),
+            ("100元", "MONEY"),
+            ("USD 12.50", "MONEY"),
+        ] {
+            assert!(
+                structural(text).iter().any(|p| p.entity_type == kind),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn category_selection_skips_compilation_of_unused_rules() {
+        let none = Some(BTreeSet::new());
+        let rules = Rules::new_selected(&none).unwrap();
+        assert!(rules.rules.is_empty() && rules.fields.is_empty() && rules.addresses.is_empty());
+        assert!(rules
+            .analyze_selected(
+                "姓名：张三 42 test_result: passed",
+                &AnalyzeOptions::default(),
+                None,
+                &none
+            )
+            .unwrap()
+            .is_empty());
+
+        let email = Some(BTreeSet::from(["EMAIL".into()]));
+        let rules = Rules::new_selected(&email).unwrap();
+        assert!(!rules.rules.is_empty());
+        assert!(rules
+            .rules
+            .iter()
+            .all(|r| crate::categories::canonical(&r.pattern.entity_type) == "EMAIL"));
+        assert!(rules.fields.is_empty() && rules.addresses.is_empty());
+    }
+
+    #[test]
+    fn software_test_results_and_diagnoses_have_no_builtin_medical_rule() {
+        assert!(
+            structural("test_result: passed; diagnosis: flu; 诊断：感冒；用药：示例药物")
+                .is_empty()
+        );
     }
     #[test]
     fn validation_checks() {
@@ -1019,12 +1182,12 @@ mod tests {
         let rules = Rules::new().unwrap();
         let text = "张三的邮箱 alice@example.com";
         assert!(rules
-            .process(text, candidate("PERSON", 0, "张三".len()), None)
+            .process(text, candidate("PERSON", 0, "张三".len()), None, &[])
             .unwrap()
             .is_some());
         let start = text.find("alice").unwrap();
         assert!(rules
-            .process(text, candidate("PERSON", start, start + 5), None)
+            .process(text, candidate("PERSON", start, start + 5), None, &[])
             .unwrap()
             .is_none());
         let address = "广东省广州市荔湾区人民路68号27栋1442室";
@@ -1035,6 +1198,7 @@ mod tests {
                 &text,
                 candidate("LOCATION", start, start + "荔湾区".len()),
                 None,
+                &[],
             )
             .unwrap()
             .unwrap();

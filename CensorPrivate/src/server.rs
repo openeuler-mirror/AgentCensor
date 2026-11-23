@@ -359,25 +359,20 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
                         | "no-tools/v1/chat/completions"
                         | "prepare/v1/chat/completions"
                 )
-                || state.config.conversations.is_none()
                 || has_tag
             {
                 return Err(Failure::bad("invalid_session"));
             }
             let preparing = route == "prepare/v1/chat/completions";
             (
-                (!preparing).then(|| ("xiaoo".to_owned(), session.to_owned())),
+                Some(("xiaoo".to_owned(), session.to_owned())),
                 "/v1/chat/completions".to_owned(),
                 route != "no-tools/v1/chat/completions",
                 preparing,
             )
         } else if let Some(tagged) = incoming_path.strip_prefix("/agents/") {
             let parts: Vec<_> = tagged.split('/').collect();
-            if parts.len() != 5
-                || parts[2..] != ["v1", "chat", "completions"]
-                || state.config.conversations.is_none()
-                || has_tag
-            {
+            if parts.len() != 5 || parts[2..] != ["v1", "chat", "completions"] || has_tag {
                 return Err(Failure::bad("invalid_session"));
             }
             let id = agent_session_id(parts[0], parts[1])
@@ -512,7 +507,7 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
     // These are local transport parameters, never part of the approved model
     // payload or the upstream headers. An unconfigured gateway keeps recording
     // off, allowing the adapter to work with ordinary gateway deployments too.
-    if has_tag && state.config.conversations.is_some() {
+    if has_tag {
         if api != Api::Chat {
             return Err(Failure::bad("recording_api_not_supported"));
         }
@@ -569,30 +564,30 @@ async fn dispatch(state: ServiceState, request: Request) -> HttpResult<Response>
         .trim_end_matches('/')
         .to_owned()
         + &path;
-    let mut recording = match session {
-        Some((agent, session)) => Some(
-            state
-                .config
-                .conversations
-                .as_ref()
-                .ok_or(Error::ServiceUnavailable)?
-                .begin_for_agent(&session, &agent, &payload)?,
-        ),
-        None => None,
+    let mut recording = match (&state.config.conversations, &session) {
+        (Some(store), Some((agent, id))) if !preparing => {
+            Some(store.begin_for_agent(id, agent, &payload)?)
+        }
+        _ => None,
     };
     let approved = {
         let mut gate = lock(&state)?;
-        let permit = if let Some(recording) = &mut recording {
-            let (permit, snapshots) =
-                gate.protect_recorded(api, &payload, &target)
-                    .inspect_err(|error| {
-                        recording.fail(error.code());
-                    })?;
+        let (permit, snapshots) = gate
+            .protect_for_session(
+                api,
+                &payload,
+                &target,
+                session.as_ref().map(|(_, id)| id.as_str()),
+                recording.is_some(),
+            )
+            .inspect_err(|error| {
+                if let Some(recording) = &mut recording {
+                    recording.fail(error.code());
+                }
+            })?;
+        if let Some(recording) = &mut recording {
             recording.protected(snapshots)?;
-            permit
-        } else {
-            gate.protect(api, &payload, &target)?
-        };
+        }
         gate.consume(permit, &target, "POST")?
     };
     let (target, protected) = approved.into_parts();

@@ -223,7 +223,7 @@ impl RuleDetector {
             ("ID", r"(?<!\d)\d{17}[\dXx](?!\d)", 0),
             (
                 "SECRET",
-                r"(?i)(?<![A-Za-z0-9])(?:sk|pk|api|token|key|secret|bearer)[-_][A-Za-z0-9_-]{8,}",
+                r"(?i)(?<![A-Za-z0-9])(?:sk|pk)[-_][A-Za-z0-9_-]{8,}",
                 0,
             ),
             (
@@ -260,10 +260,13 @@ impl RuleDetector {
                     Some("CNY"),
                 ),
                 (format!(r"(?i)(?:USD|\$)\s*({number})"), Some("USD")),
-                (format!(r"({number})\s*(?:元|人民币)"), Some("CNY")),
+                (
+                    format!(r"(?<![A-Za-z0-9_.])({number})\s*(?:元(?!素|组|数据)|人民币)"),
+                    Some("CNY"),
+                ),
                 (
                     format!(
-                        r"(?i)(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|salary|bonus)\s*[:：=]?\s*({number})"
+                        r"(?i)(?:工资|薪资|薪酬|奖金|报价|价格|金额|余额|salary|bonus)\s*[:：=]?\s*({number})(?![0-9]|\.[0-9])"
                     ),
                     None,
                 ),
@@ -306,6 +309,9 @@ impl RuleDetector {
         unit: Option<&str>,
         budget: usize,
     ) -> Result<()> {
+        if !self.policy.allows_category(kind) {
+            return Ok(());
+        }
         // Fancy-regex's backtracking limit is mandatory: an exhausted rule
         // aborts required detection instead of silently returning no matches.
         let expression = fancy_regex::RegexBuilder::new(expression)

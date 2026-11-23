@@ -24,7 +24,7 @@ use std::{
 
 static MONEY_FIELD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)(salary|bonus|amount|price|balance|money|total|average|mean|工资|薪|金额|奖金|报价)",
+        r"(?i)/(?:salary|bonus|amount|price|balance|money|工资|薪资|薪酬|金额|奖金|报价|价格|余额|年薪|月薪)$",
     )
     .expect("constant field grammar")
 });
@@ -365,6 +365,30 @@ impl PrivacyGate {
         protocols::protect_request(api, body, self)?;
         let transformed = protocols::protect_request(api, body, self)?;
         self.permit(api, transformed, target)
+    }
+    /// Session tags scope propagation, independently of optional recordings.
+    /// Untagged HTTP requests have no shared ordinary-value history.
+    pub(crate) fn protect_for_session(
+        &mut self,
+        api: Api,
+        body: &Value,
+        target: &str,
+        session: Option<&str>,
+        recorded: bool,
+    ) -> Result<(ReleasePermit, Vec<TextSnapshot>)> {
+        let session = match session {
+            Some(id) => id.to_owned(),
+            None => format!("request:{}", random_hex::<16>()?),
+        };
+        let previous = self.vault.select_session(Some(session));
+        let result = if recorded {
+            self.protect_recorded(api, body, target)
+        } else {
+            self.protect(api, body, target)
+                .map(|permit| (permit, Vec::new()))
+        };
+        self.vault.select_session(previous);
+        result
     }
     /// Observe the release's spans and replacements, without independent
     /// preview inference or generating preview-only references.
@@ -797,7 +821,10 @@ impl RequestProtector for RecordingProtector<'_> {
 }
 impl RequestProtector for FinalCheck<'_> {
     fn text(&self, text: &str, path: &str) -> Result<String> {
-        if !self.0.spans(text, path, false)?.is_empty() {
+        // NER already checked the original request. Masking changes its context
+        // and can invent entities such as "元\nMAC" between two references.
+        // Retain rule, external-detector and known-value checks on released text.
+        if !self.0.spans_context(text, path, false, true)?.is_empty() {
             return Err(Error::DetectionFailed);
         }
         Ok(text.into())

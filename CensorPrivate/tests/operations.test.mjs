@@ -54,10 +54,12 @@ test('installed censorprivacy: initialization, lifecycle, credential routing and
     await assert.rejects(stat(join(prefix, 'share/censorprivacy/examples/policy.yaml')), { code: 'ENOENT' });
     await assert.rejects(stat(join(prefix, 'share/censorprivacy/policy.example.yaml')), { code: 'ENOENT' });
     const installedSettings = JSON.parse(await readFile(join(prefix, 'share/censorprivacy/config.yaml'), 'utf8'));
+    const sourceSettings = JSON.parse((await exec(join(root, 'target/release/censorprivacy'),
+      ['config-check', '--config', join(root, 'config.yaml'), '--print-resolved'])).stdout);
     assert.equal(installedSettings.ner.model_dir, null);
     assert.equal(installedSettings.server.token_file, null);
     assert.equal(installedSettings.server.ttl_seconds, 86400);
-    assert.equal(installedSettings.detection.categories, 'all');
+    assert.deepEqual(installedSettings.detection.categories, sourceSettings.detection.categories);
     await stat(join(prefix, 'share/censorprivacy/docs/configuration.md'));
     await stat(join(prefix, 'share/censorprivacy/LICENSE'));
     await stat(join(prefix, 'share/censorprivacy/docs/rust-detector.md'));
