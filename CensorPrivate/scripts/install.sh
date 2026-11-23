@@ -14,21 +14,26 @@ done
 [[ "$prefix" == /* ]] || { printf 'prefix must be absolute\n' >&2; exit 2; }
 cargo build --locked --release --bins
 install -d -m 0755 "$destdir$prefix/bin"
-for binary in censorprivacy privacy-run privcalc censorprivacy-mcp tls-run; do
-  install -m 0755 "${CARGO_TARGET_DIR:-target}/release/$binary" "$destdir$prefix/bin/$binary"
-done
-install -m 0755 cpctl "$destdir$prefix/bin/cpctl"
+install -m 0755 "${CARGO_TARGET_DIR:-target}/release/censorprivacy" "$destdir$prefix/bin/censorprivacy"
 if $with_native; then
   make -C native
   install -d -m 0755 "$destdir$prefix/lib/censorprivacy"
-  install -m 0755 native/libcp_tls_guard.so "$destdir$prefix/lib/censorprivacy/libcp_tls_guard.so"
+  install -m 0755 native/libcensorprivacy_tls_guard.so "$destdir$prefix/lib/censorprivacy/libcensorprivacy_tls_guard.so"
 fi
 install -d -m 0755 "$destdir$prefix/share/censorprivacy"
-install -m 0644 examples/policy.yaml "$destdir$prefix/share/censorprivacy/policy.example.yaml"
+if [[ ! -e $destdir$prefix/share/censorprivacy/config.yaml && ! -L $destdir$prefix/share/censorprivacy/config.yaml ]]; then
+  # Installed deployments must not inherit paths into the source user's home.
+  "${CARGO_TARGET_DIR:-target}/release/censorprivacy" config-check --config config.yaml --print-resolved |
+    jq '.server.token_file = null | .server.upstream_key_file = null |
+        .server.upstream_ca_file = null | .server.tls_cert = null | .server.tls_key = null |
+        .server.run_state_file = null | .ner.model_dir = null | .ner.ort_library = null |
+        .private_tools_file = null | .conversation_records_dir = null' > "$destdir$prefix/share/censorprivacy/config.yaml"
+  chmod 0644 "$destdir$prefix/share/censorprivacy/config.yaml"
+fi
 for directory in scripts/ops plugins/dsh-censorprivacy plugins/detector-web docs deploy examples/private-tools native; do
   install -d -m 0755 "$destdir$prefix/share/censorprivacy/$directory"
 done
-for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md plugins/detector-web/README.md docs/*.md deploy/censorprivacy@.service examples/policy.yaml examples/*.txt examples/private-tools/* native/README.md README.md; do
+for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md plugins/detector-web/README.md docs/*.md deploy/censorprivacy@.service examples/*.txt examples/private-tools/* native/README.md README.md; do
   install -m 0644 "$file" "$destdir$prefix/share/censorprivacy/$file"
 done
 # Core inference has no Python worker. Optional private-tool examples are scripts.

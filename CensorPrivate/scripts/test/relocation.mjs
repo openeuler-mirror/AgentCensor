@@ -19,7 +19,7 @@ const destination = join(dirname(original), 'relocated 迁移后的目录');
 let bundle = original;
 const checks = [];
 const call = async (...args) => {
-  const result = await exec(join(bundle,'cpctl'), [...args,'--config-dir',config],
+  const result = await exec(join(bundle,'censorprivacy'), [...args,'--config-dir',config],
     {env,cwd:directory,timeout:180000,maxBuffer:4*1024*1024});
   return result;
 };
@@ -37,8 +37,8 @@ try {
   await call('init','--upstream',`http://127.0.0.1:${provider.address().port}`,
     '--model-id','relocation-model','--no-key','--port',String(port));
   await writeFile(join(config,'install.json'),JSON.stringify({bin_dir:join(original,'bin'),
-    native_library:join(original,'lib/censorprivacy/libcp_tls_guard.so')}),{mode:0o600});
-  const policy = await readFile(join(config,'policy.yaml'));
+    native_library:join(original,'lib/censorprivacy/libcensorprivacy_tls_guard.so')}),{mode:0o600});
+  const policy = await readFile(join(bundle,'share/censorprivacy/config.yaml'));
   const token = await readFile(join(config,'gateway.token'),'utf8');
   await call('start');await call('check');await call('stop');
   await rename(original,destination);bundle=destination;
@@ -55,12 +55,12 @@ try {
   assert.ok(completion.choices[0].message.content.includes('alice@example.com'));
   assert.ok(!JSON.stringify(requests.at(-1)).includes('alice@example.com'));
   assert.ok(!JSON.stringify(requests.at(-1)).includes('张三'));
-  assert.deepEqual(await readFile(join(config,'policy.yaml')),policy);
+  assert.deepEqual(await readFile(join(bundle,'share/censorprivacy/config.yaml')),policy);
   assert.equal(await readFile(join(config,'gateway.token'),'utf8'),token);
   checks.push('move_after_init_preserves_config_and_credentials','spaces_and_chinese_path',
     'ignores_stale_install_path','loads_onnx_from_new_directory','real_detection_and_restoration_after_move');
   await call('stop');
-  const selfTest = await exec(join(bundle,'cpctl'),['self-test'],{env,cwd:directory,timeout:180000,maxBuffer:4*1024*1024});
+  const selfTest = await exec(join(bundle,'censorprivacy'),['self-test'],{env,cwd:directory,timeout:180000,maxBuffer:4*1024*1024});
   assert.match(selfTest.stdout,/完整交付包自检/);
   checks.push('complete_rootless_gateway_and_tls_self_test_after_move');
   await writeFile(report,JSON.stringify({passed:true,timestamp:new Date().toISOString(),uid:process.getuid(),

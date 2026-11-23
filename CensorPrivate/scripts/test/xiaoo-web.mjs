@@ -12,7 +12,7 @@ process.umask(0o077);
 const exec = promisify(execFile);
 const root = resolve(import.meta.dirname, '../..');
 const bundle = process.env.CP_TEST_BUNDLE ? resolve(process.env.CP_TEST_BUNDLE) : null;
-const ctl = join(bundle || root, 'cpctl');
+const ctl = join(bundle || root, 'censorprivacy');
 const binary = resolve(process.argv[2] || 'target/debug/censorprivacy');
 const xiaoo = resolve(process.argv[3] || '/root/xiaoO/target/debug/xiaoo');
 const { chromium } = createRequire(import.meta.url)(process.env.CP_PLAYWRIGHT_MODULE || 'playwright');
@@ -41,7 +41,7 @@ const provider = createServer(async (request, response) => {
     captured.push(payload);
     const tool = payload.messages.findLast(message => message.role === 'tool');
     const demo = payload.messages.some(message => message.role === 'user' && message.content?.includes('file_read'));
-    const message = demo && !tool ? {tool_calls:[{id:'read_mail',type:'function',function:{name:'file_read',arguments:'{"file_path":"privacy-business.txt"}'}}]}
+    const message = demo && !tool ? {tool_calls:[{id:'read_mail',type:'function',function:{name:'file_read',arguments:'{"file_path":"demo.txt"}'}}]}
       : {content:tool ? JSON.parse(tool.content).content : payload.messages.findLast(message => message.role === 'user').content};
     response.writeHead(200, {'content-type':'text/event-stream',connection:'close'});
     const event = (delta, finish = null) => response.write('data: ' + JSON.stringify({id:'fixture',created:0,object:'chat.completion.chunk',model:payload.model,

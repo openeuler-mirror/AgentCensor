@@ -117,11 +117,11 @@ export async function tlsJSON(config, body, signal) {
   if (target.protocol !== 'https:' || !/^\d+\.\d+\.\d+\.\d+$/.test(target.hostname) || target.pathname !== '/' || target.search || target.hash || target.username || target.password) throw new Error('tls_ipv4_origin_required');
   const timeoutMs = config.timeoutMs ?? 90000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 180000 || Buffer.byteLength(JSON.stringify(body)) > 1024 * 1024) throw new Error('request_limit');
-  const args = ['--broker', config.broker, '--token-file', config.tokenFile,
+  const args = ['tls-run', '--broker', config.broker, '--token-file', config.tokenFile,
     '--run-state-file', config.runStateFile, '--native-library', config.nativeLibrary,
     '--workspace', config.workspace, '--timeout', String(Math.ceil(timeoutMs / 1000) + 5)];
   if (config.upstreamKeyFile) args.push('--upstream-key-file', config.upstreamKeyFile);
-  const bundledCurl = resolve(dirname(config.tlsRun), '../runtime/bin/curl');
+  const bundledCurl = resolve(dirname(config.executable), '../runtime/bin/curl');
   args.push('--', existsSync(bundledCurl) ? bundledCurl : '/usr/bin/curl', '--config', '-');
   // curl config travels through stdin, so neither body nor credential enters argv.
   const lines = ['silent', 'show-error', 'fail', 'http1.1', 'noproxy = "*"',
@@ -133,7 +133,7 @@ export async function tlsJSON(config, body, signal) {
   if (config.upstreamKeyFile) lines.push(`header = ${JSON.stringify(`Authorization: Bearer ${await privateKey(config.upstreamKeyFile)}`)}`);
   signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
-    const child = spawn(config.tlsRun, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(config.executable, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks = []; let size = 0; let exceeded = false; let launchFailed = false;
     const abort = () => child.kill('SIGTERM');
     signal?.addEventListener('abort', abort, { once: true });

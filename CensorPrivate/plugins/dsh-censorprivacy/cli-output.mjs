@@ -1,5 +1,5 @@
 // The native DSH headless runner prints a final summary only. A separate pipe
-// carries approved live text to cpctl without duplicating that summary.
+// carries approved live text to censorprivacy without duplicating that summary.
 import { createWriteStream } from 'node:fs';
 
 export function cliOutput(enabled) {

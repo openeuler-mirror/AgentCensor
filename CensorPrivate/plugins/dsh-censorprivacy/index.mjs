@@ -6,13 +6,13 @@ import { constants } from 'node:fs';
 
 export const name = 'censorprivacy';
 export const inject = ['llm', 'tools'];
-const ref = /^(?:<CP_[A-Z][A-Z0-9_]*_[0-9a-f]{32}>|~P[A-Z]{10,}|~[A-Z]{5,10}|[A-Z]{3,5})$/;
+const ref = /^(?:<CP_[A-Z][A-Z0-9_]*_[a-z0-9]{8}>|~P[A-Z]{10,}|~[A-Z]{5,10}|[A-Z]{3,5})$/;
 const error = code => Object.assign(new Error(`CensorPrivacy: ${code}`), { code });
 const operations = ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'];
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const keys = (value, allowed) => object(value) && Object.keys(value).every(key => allowed.includes(key));
 const programName = /^private_[a-z][a-z0-9_]{0,55}$/;
-const canonicalRef = /^<CP_[A-Z][A-Z0-9_]*_[0-9a-f]{32}>$/;
+const canonicalRef = /^<CP_[A-Z][A-Z0-9_]*_[a-z0-9]{8}>$/;
 const refsValid = (refs, pattern) => Array.isArray(refs) && refs.length >= 1 && refs.length <= 256 &&
   refs.every(value => typeof value === 'string' && pattern.test(value));
 
@@ -76,10 +76,16 @@ export function serialize(options, config) {
   const messages = [];
   if (options.system !== undefined) messages.push({ role: 'system', content: options.system });
   for (const message of options.messages) {
-    if (!['system', 'user', 'assistant'].includes(message.role)) throw error('UNSUPPORTED_CONTENT');
+    if (!['system', 'user', 'assistant', 'tool'].includes(message.role)) throw error('UNSUPPORTED_CONTENT');
     const blocks = message.content;
     if (!Array.isArray(blocks)) throw error('UNSUPPORTED_CONTENT');
-    if (message.role === 'assistant') {
+    if (message.role === 'tool') {
+      // DSH 0.2.2 promotes tool results to first-class messages. Keep the
+      // earlier nested tool-result projection below for existing profiles.
+      if (typeof message.toolCallId !== 'string' || !message.toolCallId ||
+          (message.isError !== undefined && typeof message.isError !== 'boolean')) throw error('UNSUPPORTED_CONTENT');
+      messages.push({ role: 'tool', tool_call_id: message.toolCallId, content: text(blocks) });
+    } else if (message.role === 'assistant') {
       const calls = blocks.filter(block => block.type === 'tool-call');
       if (calls.some(call => !keys(call, ['type', 'id', 'name', 'arguments']) || ![call.id, call.name, call.arguments].every(value => typeof value === 'string'))) throw error('UNSUPPORTED_CONTENT');
       const content = text(blocks.filter(block => block.type !== 'tool-call'));
@@ -115,6 +121,7 @@ export class PrivacyAdapter {
   providerInfo(provider) { return { id: provider, name: 'CensorPrivacy' }; }
   providerRetryPolicy() { return undefined; }
   imageRequestPricing() { return undefined; }
+  imageRequestTarget(_provider, _model, image) { return { width: image.width, height: image.height, maxBytes: image.bytes }; }
   async listModels(provider) { return [{ provider, id: this.config.model, name: this.config.model, inputModalities: ['text'] }]; }
   async resolveModel(provider, model) {
     if (model !== this.config.model) throw error('MODEL_NOT_CONFIGURED');
@@ -172,7 +179,7 @@ export function apply(ctx, supplied) {
   if (config.mode === 'gateway' && !/^http:\/\/127\.0\.0\.1:\d+$/.test(config.baseURL)) throw error('LOCAL_GATEWAY_REQUIRED');
   if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(config.broker)) throw error('LOCAL_BROKER_REQUIRED');
   if (![config.timeoutMs, config.maxTokens, config.contextWindow].every(value => Number.isSafeInteger(value) && value > 0) || config.timeoutMs > 180000 || config.maxTokens > 8192) throw error('CONFIGURATION_INVALID');
-  if (config.mode === 'tls' && ['tlsRun', 'nativeLibrary', 'tokenFile', 'runStateFile', 'workspace'].some(key => !config[key])) throw error('TLS_CONFIGURATION_REQUIRED');
+  if (config.mode === 'tls' && ['executable', 'nativeLibrary', 'tokenFile', 'runStateFile', 'workspace'].some(key => !config[key])) throw error('TLS_CONFIGURATION_REQUIRED');
   if (config.conversationSession !== undefined && (typeof config.conversationSession !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(config.conversationSession))) throw error('CONFIGURATION_INVALID');
   if (typeof config.privateToolsOnly !== 'boolean') throw error('CONFIGURATION_INVALID');
   const localPrograms = programs(config.privateTools);
@@ -183,7 +190,7 @@ export function apply(ctx, supplied) {
     description: 'Compute only when the user requests arithmetic. Use current private references only; copy each complete reference, including leading < and trailing >. date_diff requires exactly two DATE references and returns the second date minus the first in days. There is no implicit today/current-date operand: if a date is missing, ask the user instead of guessing. sum/mean/min/max accept numeric references and no options; aggregate optionally accepts operations. Never invent references or send raw operands. Results remain private references.',
     parameters: { type: 'object', properties: {
       operation: { type: 'string', enum: ['sum', 'mean', 'min', 'max', 'aggregate', 'date_diff'] },
-      refs: { type: 'array', items: { type: 'string', pattern: ref.source }, minItems: 1, maxItems: 256 },
+      refs: { type: 'array', items: { type: 'string', pattern: (config.mode === 'tls' ? ref : canonicalRef).source }, minItems: 1, maxItems: 256 },
       options: { type: 'object', description: 'Omit for sum/mean/min/max. date_diff: optional unit days only. aggregate: optional operations only. No other keys are supported.',
         properties: { unit: { type: 'string', enum: ['days'] },
           operations: { type: 'array', items: { type: 'string', enum: ['sum', 'mean', 'min', 'max'] }, minItems: 1, maxItems: 256 } },

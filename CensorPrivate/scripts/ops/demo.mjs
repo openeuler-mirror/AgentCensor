@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
 import assert from 'node:assert/strict';
 import { requestJSON, tlsJSON } from '../../plugins/dsh-censorprivacy/transport.mjs';
+import { dshCommand } from './dsh.mjs';
 
 process.umask(0o077);
 const positionals = []; const flags = {};
@@ -158,14 +159,14 @@ async function ready(base, token, child, runFile) {
 }
 async function nativeLibrary() {
   let library = flags['native-library'];
-  const bundled = join(bin, '../lib/censorprivacy/libcp_tls_guard.so');
+  const bundled = join(bin, '../lib/censorprivacy/libcensorprivacy_tls_guard.so');
   // A standalone bundle must pair its binary with its own hook, even when
   // this account has an install.json from an older system installation.
   if (!library && await exists(join(root, 'BUNDLE.json')) && await exists(bundled)) library = bundled;
   if (!library && await exists(join(configDir, 'install.json'))) library = JSON.parse(await privateText(join(configDir, 'install.json'))).native_library;
   if (!library && await exists(bundled)) library = bundled;
-  library ||= join(root, 'native/libcp_tls_guard.so');
-  if (!await exists(library)) throw new Error('native_library_missing_run_cpctl_install_--tls');
+  library ||= join(root, 'native/libcensorprivacy_tls_guard.so');
+  if (!await exists(library)) throw new Error('native_library_missing_run_censorprivacy_install_--tls');
   return resolve(library);
 }
 const nerKeys = ['ner_threads', 'ner_device', 'ner_batch_size'];
@@ -178,11 +179,14 @@ async function fixture(mode, agent, actual, report) {
   const token = randomBytes(32).toString('hex'); const tokenFile = join(directory, 'gateway.token');
   const runFile = join(directory, 'run.json');
   await writeFile(tokenFile, token, { mode: 0o600 });
-  await writeFile(join(directory, 'policy.yaml'), `epoch: 1\nmask_money: true\nmask_dates: true\ndictionaries:\n  CUSTOMER: [${customer}]\n  SECRET: [${secret}]\n`, { mode: 0o600 });
+  await writeFile(join(directory, 'config.yaml'), JSON.stringify({
+    detection: { categories: 'all' },
+    custom: { epoch: 1, dictionaries: { CUSTOMER: [customer], SECRET: [secret] } },
+  }), { mode: 0o600 });
   const port = await freePort(); const base = `http://127.0.0.1:${port}`;
   const model = actual?.model ?? 'cp-demo';
-  const args = ['serve', '--upstream', provider.origin, '--model', model, '--token-file', tokenFile,
-    '--run-state-file', runFile, '--policy', join(directory, 'policy.yaml'), '--host', '127.0.0.1', '--port', String(port)];
+  const args = ['serve', '--config', join(directory, 'config.yaml'), '--upstream', provider.origin, '--model', model, '--token-file', tokenFile,
+    '--run-state-file', runFile, '--host', '127.0.0.1', '--port', String(port)];
   if (mode === 'tls') args.push('--tls-direct');
   if (provider.origin.startsWith('http:')) args.push('--allow-http-test-upstream');
   if (actual?.has_key) args.push('--upstream-key-file', join(configDir, 'upstream.key'));
@@ -201,7 +205,7 @@ async function fixture(mode, agent, actual, report) {
     }
   } catch (failure) { await writeFile(join(directory, 'gateway.log'), stderr); throw failure; }
   const config = { mode, baseURL: mode === 'tls' ? provider.origin : base, broker: base, model,
-    tlsRun: join(bin, 'tls-run'), nativeLibrary: mode === 'tls' ? (actual?.native_library || await nativeLibrary()) : '', tokenFile,
+    executable: join(bin, 'censorprivacy'), nativeLibrary: mode === 'tls' ? (actual?.native_library || await nativeLibrary()) : '', tokenFile,
     runStateFile: runFile, workspace, caFile: mode === 'tls' ? (actual?.ca_file ?? (actual ? '' : join(directory, 'server.crt'))) : '',
     upstreamKeyFile: mode === 'tls' && actual?.has_key ? join(configDir, 'upstream.key') : '',
     receiptFile: join(directory, 'receipts.jsonl'), timeoutMs: 90000, contextWindow: 32768, maxTokens: 512 };
@@ -215,11 +219,11 @@ function assertProtected(captured, values = [customer, secret, '100.00', '200.00
 }
 async function directDemo(mode) {
   log(`本机 ${mode} 演示：启动真实 Rust 网关和本机模拟上游（无云调用）`);
+  const businessInput = (await readFile(join(root, 'examples/demo.txt'), 'utf8')).trim();
   const f = await fixture(mode, false);
   const body = content => ({ model: 'cp-demo', messages: [{ role: 'user', content }], stream: false });
-  const businessInput = (await readFile(join(root, 'examples/privacy-business.txt'), 'utf8')).trim();
-  const protectedValues = ['张三', '李四', '清华大学', '北京大学', '13800138000', '13900139000',
-    'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '12800.00', '3200.00'];
+  const protectedValues = ['张三', '李四', '清华大学', '13800138000', '13900139000',
+    'zhangsan@example.com', 'lisi@example.org', '北京市海淀区中关村东路1号', '2026年11月5日', '860.00', '1240.00'];
   const response = await f.send(body(businessInput));
   const displayed = response.choices[0].message.content;
   assertProtected(f.provider.captured, [...protectedValues, secret]);
@@ -231,14 +235,14 @@ async function directDemo(mode) {
   log(`原始输入（虚构）：\n${businessInput}`);
   log(`上游收到：${f.provider.captured[0].messages[0].content}`);
   log(`本机显示：${displayed}`);
-  const amounts = ['首期服务费', '后续支持费'].map(label =>
-    upstreamText.match(new RegExp(`${label}：([^；。\\n]+)`))?.[1].trim().replace(/元$/, ''));
+  const amounts = ['交通费', '资料制作费'].map(label =>
+    upstreamText.match(new RegExp(`${label}为([^，。\\n]+)`))?.[1].trim().replace(/元$/, ''));
   assertion(amounts.every(value => typeof value === 'string' && value.length > 0), 'business_amount_references_missing');
   const result = await requestJSON(`${f.base}/v1/private_compute`, { operation: 'sum', refs: amounts }, { token: f.token });
   assertion(/^<CP_/.test(result.results?.sum), 'compute_did_not_return_reference');
   log(`私密计算返回：${JSON.stringify(result)}`);
   const derived = await f.send(body(`Total ${result.results.sum}`));
-  assertion(derived.choices[0].message.content.includes('16000'), 'derived_display_failed');
+  assertion(derived.choices[0].message.content.includes('2100.00'), 'derived_display_failed');
   log(`派生结果本机显示：${derived.choices[0].message.content}`);
   assertion((await fetch(`${f.base}/ready`)).status === 401, 'authentication_not_enforced');
   const before = f.provider.captured.length;
@@ -251,20 +255,12 @@ async function directDemo(mode) {
   }
   log('通过：上游无原值、授权显示、SECRET 遮盖、派生引用、认证及非法数值请求拒绝。');
 }
-async function dshCommand(givenRoot) {
-  if (givenRoot) {
-    const entry = join(resolve(givenRoot), 'apps/cli/lib/bin.js');
-    assertion(await exists(entry), 'dsh_root_not_built');
-    return [process.execPath, entry];
-  }
-  return ['dsh'];
-}
 async function overlay(directory, config) {
   const content = [
     '- insert:', '    - id: censorprivacy', `      name: ${JSON.stringify(join(root, 'plugins/dsh-censorprivacy/index.mjs'))}`, '      config:',
     ...Object.entries({ privateToolsOnly: true, ...config }).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`),
     '- id: agent-default-model', '  config:', '    provider: censorprivacy', `    model: ${JSON.stringify(config.model)}`,
-    ...['llm-deepseek', 'llm-pi-ai', 'session-title-llm', 'session-log-deepseek', 'session-telemetry-otel'].flatMap(id => [`- id: ${id}`, '  disabled: true']),
+    ...['llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'session-title-llm', 'session-log-deepseek', 'session-telemetry-otel'].flatMap(id => [`- id: ${id}`, '  disabled: true']),
   ].join('\n') + '\n';
   const path = join(directory, config.privateToolsOnly === false ? 'censorprivacy-tools-enabled.patch.yml' : 'censorprivacy.patch.yml');
   await writeFile(path, content, { mode: 0o600 }); return path;
@@ -372,7 +368,7 @@ async function managedDsh() {
   assertion(Array.isArray(privateTools), 'private_tools_catalog_invalid');
   const transport = { mode: config.mode, baseURL: config.mode === 'tls' ? config.upstream : base, model: config.model,
     privateToolsOnly: flags.tools !== '--enable-tools', privateTools,
-    broker: base, tlsRun: join(bin, 'tls-run'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
+    broker: base, executable: join(bin, 'censorprivacy'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
     runStateFile, upstreamKeyFile: config.has_key ? join(configDir, 'upstream.key') : '', caFile: config.ca_file ?? '', workspace,
     timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512, cliStream: action === 'run' };
   let dshRoot = flags['dsh-root'];
@@ -381,7 +377,6 @@ async function managedDsh() {
   if (action === 'web') {
     const { command, args, env } = await prepareDsh(directory, transport, token, dshRoot, 'web');
     await writeFile(join(directory, 'setup.json'), JSON.stringify({ dshRoot, workspace }));
-    log('DSH Web：复用当前网关；打开下方带 token 的完整网址。按 Ctrl+C 停止 Web，网关继续运行。');
     const child = start(command[0], [...args, '--', '--no-open', '--port', flags['web-port'] ?? '3080'],
       { env, cwd: workspace, stdio: 'inherit' });
     await new Promise((ok, no) => {
@@ -391,7 +386,7 @@ async function managedDsh() {
     return;
   }
   const invoke = await dshProfile(directory, transport, token, dshRoot, true);
-  if (action === 'setup') { log(`DSH 独立 profile 就绪：${directory}；./cpctl dsh run '任务'`); return; }
+  if (action === 'setup') { log(`DSH 独立 profile 就绪：${directory}`); return; }
   if (action === 'run') { assertion(taskParts.length > 0, 'task_required'); await invoke(taskParts.join(' '), true); return; }
   throw new Error('use_dsh_web_setup_run_or_cloud');
 }

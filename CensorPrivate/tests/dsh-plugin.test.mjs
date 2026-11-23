@@ -8,7 +8,23 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { serialize, privateResult, PrivacyAdapter, apply } from '../plugins/dsh-censorprivacy/index.mjs';
 import { requestJSON, tlsJSON } from '../plugins/dsh-censorprivacy/transport.mjs';
 
-const reference = '<CP_MONEY_0123456789abcdef0123456789abcdef>';
+const reference = '<CP_MONEY_0123wxyz>';
+test('DSH 0.2.2 tool messages preserve call identity, reference results and recoverable errors', () => {
+  const messages = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'compute-one', name: 'private_compute', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'compute-one', content: [{ type: 'text', text: JSON.stringify({ result: reference }) }] },
+    { role: 'tool', toolCallId: 'compute-two', isError: true, content: [{ type: 'text', text: 'DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES' }] },
+  ];
+  const wire = serialize({ model: 'model', messages }, {});
+  assert.deepEqual(wire.messages.slice(1), [
+    { role: 'tool', tool_call_id: 'compute-one', content: JSON.stringify({ result: reference }) },
+    { role: 'tool', tool_call_id: 'compute-two', content: 'DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES' },
+  ]);
+  for (const tool of [
+    { ...messages[1], toolCallId: undefined }, { ...messages[1], toolCallId: '' },
+    { ...messages[1], isError: 'yes' }, { ...messages[1], content: [{ type: 'image' }] },
+  ]) assert.throws(() => serialize({ model: 'model', messages: [tool] }, {}), /UNSUPPORTED_CONTENT/);
+});
 test('Harness automatically attaches real session metadata locally, with an explicit fallback for older versions', async () => {
   const calls = [];
   const server = createServer(async (request, response) => {
@@ -103,6 +119,8 @@ test('private tool catalog drives advertisement and execution independently of t
       assert.deepEqual(serialize(options, adapter.config).tools.map(tool => tool.function.name),
         enabled ? ['private_compute', 'private_sort', 'bash'] : ['private_compute', 'private_sort']);
       const sort = registered.get('private_sort');
+      assert.equal(registered.get('private_compute').parameters.properties.refs.items.pattern,
+        '^<CP_[A-Z][A-Z0-9_]*_[a-z0-9]{8}>$');
       if (enabled) { assert.equal(guard, undefined); continue; }
       assert.deepEqual(allowed, ['private_compute', 'private_sort']);
       assert.equal(guard({ name: 'private_sort' }), undefined);
@@ -223,7 +241,7 @@ test('TLS cancellation waits for the client process to close', { timeout: 10000 
   const directory = await mkdtemp(join(tmpdir(), 'cp-plugin-test-')); const executable = join(directory, 'client'); const pidFile = join(directory, 'pid');
   await writeFile(executable, `#!/usr/bin/env node\nimport('node:fs').then(fs => fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)));\nsetInterval(() => {}, 1000);\n`, { mode: 0o700 });
   const controller = new AbortController();
-  const pending = tlsJSON({ baseURL: 'https://127.0.0.1', tlsRun: executable, broker: 'http://127.0.0.1:1', tokenFile: '/unused', runStateFile: '/unused', nativeLibrary: '/unused', workspace: directory }, {}, controller.signal);
+  const pending = tlsJSON({ baseURL: 'https://127.0.0.1', executable: executable, broker: 'http://127.0.0.1:1', tokenFile: '/unused', runStateFile: '/unused', nativeLibrary: '/unused', workspace: directory }, {}, controller.signal);
   try {
     let pid;
     for (let i = 0; i < 100; i++) { try { pid = Number(await readFile(pidFile, 'utf8')); break; } catch { await delay(10); } }
