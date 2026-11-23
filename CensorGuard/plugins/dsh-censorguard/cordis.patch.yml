@@ -52,7 +52,11 @@
 - id: cordis-host-runner
   inject: [censorguardReady]
 
-- id: code-runtime
+# ptc-runtime: 代码执行运行时。dsh 自 dsh-v0.1.6-alpha.1 起把它从
+# code-runtime 改名为 ptc-runtime (refactor(ptc): align runtime packages and
+# services with PTC naming), 现挂在 @deepseek-ai/dsh-ptc-runtime-node 上,
+# 原名不再存在 —— 写成 code-runtime 只会得到一行 warn 并静默空转。
+- id: ptc-runtime
   inject: [censorguardReady]
 
 # 官方 subprocess 保留, 仅加闸门
