@@ -1,108 +1,89 @@
-# CensorPrivate
+# CensorPrivacy
 
 **在本机识别隐私，保护发给模型的内容。**
 
-CensorPrivate 是 AgentCensor 的模型数据隐私组件。它在本地检测敏感信息，将原文替换为随机引用后发送给模型，再在授权的回复显示位置恢复；密码、密钥等 SECRET 始终遮盖。核心与服务使用 Rust，NER 使用本地 ONNX，生产运行无需 Python。
+CensorPrivacy 是 AgentCensor 的模型数据隐私组件。它在本地检测敏感信息，将原文替换为随机引用后发送给模型，再在授权的回复显示位置恢复；密码、密钥等 SECRET 始终遮盖。核心与服务使用 Rust，NER 使用本地 ONNX，生产运行无需 Python。
 
-[快速开始](#快速开始) · [隐私检测台](#隐私检测台) · [模型网关](#模型网关) · [Agent 接入](#agent-接入) · [完整文档](docs/README.md)
+产品名统一为 **CensorPrivacy**，命令与发行包使用 **`censorprivacy`**。网关、运维、私密计算、MCP 和客户端隔离功能均通过同一个命令的子命令使用；源码目录仍为 `AgentCensor/CensorPrivate/`。
 
-## 快速开始
+[使用完整包](#使用完整包) · [开始使用](#开始使用) · [Agent 接入](#agent-接入) · [日常管理](#日常管理) · [从源码构建](#从源码构建) · [完整文档](docs/README.md)
 
-| 使用方式 | 准备内容 |
-| --- | --- |
-| [源码构建](#从源码构建) | Linux、Rust ≥1.85、C 链接器、模型与运行库，适合开发和自行部署 |
-| [完整包](#使用完整包) | standalone 归档与 SHA-256，包含模型和运行库，适合在已验收平台直接运行 |
+## 使用完整包
 
-### 从源码构建
+推荐使用 **standalone 完整包**，内置可执行程序、ONNX 模型、ONNX Runtime、Node 和运维依赖，解压后即可使用。已验收平台为 **openEuler 24.03 LTS / x86_64 / glibc 2.38+**；DSH 和 xiaoO 需另行安装。
 
-**1. 下载并编译**
-
-```bash
-git clone https://gitcode.com/coco12373/AgentCensor.git
-cd AgentCensor/CensorPrivate
-./cpctl deps --dry-run
-./cpctl deps
-cargo build --locked --release --bins
-```
-
-先安装 [Rust 工具链](https://www.rust-lang.org/tools/install)。`deps` 按系统选择 apt/dnf，安装系统包时可能使用 sudo；`--dry-run` 只预览。后续源码命令均在 `CensorPrivate/` 目录执行。
-
-**2. 准备检测模型与运行库**
-
-按 [模型下载与 ONNX 导出步骤](docs/build-and-deploy.md#4-准备检测资源) 准备资源，已有可信 ONNX 包时可以直接使用。将下面的路径替换为实际位置：
-
-```bash
-export CP_DETECTOR_MODEL_DIR="$PWD/models/bert4ner-base-chinese"
-export CP_DETECTOR_ORT_LIBRARY=/path/to/libonnxruntime.so
-./cpctl doctor
-```
-
-**Cargo 编译不下载或生成模型、ONNX Runtime。** 从原始权重导出 ONNX 才需要 Python；运行 Rust 服务只需导出的模型包与原生库。资源路径需在每个启动终端配置，也可采用 [默认安装布局](docs/rust-detector.md#2-配置路径)。
-
-**3. 开始使用**
-
-先运行下节的检测台，无需云账号；需要模型交互时再启动网关。可选安装到当前用户目录：
-
-```bash
-./cpctl install
-```
-
-安装后可在任意目录运行 `~/.local/bin/cpctl`。安装脚本复制命令、插件和文档，模型与 ONNX Runtime 单独准备。系统服务、公共安装和完整依赖见 [构建与部署](docs/build-and-deploy.md)。
-
-### 使用完整包
-
-从发布方取得匹配版本的归档与 `.sha256` 文件，在两者所在目录执行：
+从发布方取得以下同版本归档与 `.sha256` 文件，在文件所在目录执行：
 
 ```bash
 sha256sum -c censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz.sha256
 tar -xzf censorprivacy-0.3.2-linux-x86_64-standalone.tar.gz
 cd censorprivacy-0.3.2-linux-x86_64-standalone
-./cpctl self-test
 ```
 
-完整包已验收平台为 **openEuler 24.03 LTS / x86_64 / glibc 2.38+**。自检使用真实本地检测器和模拟上游，无云调用；结束后自动停止临时进程。`self-test` 仅完整包提供，下载、版本与重新打包见 [二进制包说明](docs/binary-distribution.md)。
+后续命令均在解压后的包目录执行。获取方式、包内自检与版本兼容性见 [二进制包说明](docs/binary-distribution.md)。需要自行编译时，转到 [从源码构建](#从源码构建)。
 
-## 隐私检测台
+## 开始使用
 
-资源就绪后启动：
+### 1. 初始化模型连接
+
+以下以 DeepSeek 为例，其他服务替换为实际 origin 与模型 ID：
 
 ```bash
-# 源码构建产物
-./target/release/censorprivacy web
+./censorprivacy init --upstream https://api.deepseek.com --model-id deepseek-flash
 ```
 
-完整包使用 `./bin/censorprivacy web`；源码安装后使用 `~/.local/bin/censorprivacy web`。
+按提示输入 provider API Key，输入不回显。上游地址不加 `/v1`；`--model-id` 指上游聊天模型，本地隐私检测使用 `bert4ner-base-chinese`。已有实例再次执行 `init` 会保留配置和凭据。
 
-打开 **http://127.0.0.1:8766/**，粘贴文本并检测，即可查看：
+### 2. 调整配置
 
-- **原文高亮**：定位命中的隐私范围。
-- **检测依据**：展示 REGEX / RULES / NER 来源、分数与校验状态。
-- **遮蔽预览**：切换随机引用、类别占位符或等字符数星号，调整遮蔽阈值。
+按使用方式找到配置文件：
 
-检测台不需要上游或 API Key，预览引用不能用于网关恢复。Ctrl+C 停止；内存较小时，先停止检测台再启动网关。服务器访问使用 [SSH 端口转发](docs/usage.md#1-打开隐私检测台)，详细交互见 [检测台说明](plugins/detector-web/README.md)。
+| 使用方式 | 配置文件 |
+| --- | --- |
+| 完整包 | `share/censorprivacy/config.yaml` |
+| 源码目录 | `config.yaml` |
+| 默认用户安装 | `~/.local/share/censorprivacy/config.yaml` |
 
-## 模型网关
+在 `custom` 中补充业务词典、正则和秘密；`detection.categories` 选择检测类别，随附配置为 `all`，省略、`null` 或 `[]` 表示关闭按类别检测。`ner` 管理线程、设备、batch 与每窗口超时，`server.ttl_seconds` 设置运行有效期。字段说明、优先级与 Kubernetes 挂载见 [统一配置](docs/configuration.md)。
 
-准备好本地检测资源后，按 **初始化 → 配置策略 → 启动 → 检查** 操作。以下以 DeepSeek 为例，其他服务替换为实际 origin 与模型 ID：
+### 3. 启动网关
 
 ```bash
-./cpctl init --upstream https://api.deepseek.com --model-id deepseek-flash
+./censorprivacy start
+./censorprivacy check
 ```
 
-按提示输入 provider API Key，输入不回显。上游地址不加 `/v1`；`--model-id` 指上游聊天模型，本地隐私检测模型固定为 `bert4ner-base-chinese`。
+启动日志会输出网关地址，默认 [http://127.0.0.1:8775/](http://127.0.0.1:8775/)。直接点击或复制到浏览器，即可查看隐私检测与 Agent 会话，页面共用网关已加载的模型。远程服务器通过 [SSH 端口转发](docs/usage.md#23-启动并检查) 访问。
 
-初始化后编辑 `~/.config/censorprivacy/managed/policy.yaml`，补充需要保护的业务词典、正则和秘密，再执行：
-
-```bash
-./cpctl start
-./cpctl check --model
-```
-
-网关默认地址为 `http://127.0.0.1:8775`。`check --model` 会调用实际上游，可能计费。私有凭据、策略示例、多实例与 systemd 使用见 [使用手册](docs/usage.md)。
+`check` 检查本机版本、权限、认证和 run 状态。需要验证实际模型连通性时执行 `./censorprivacy check --model`，该命令会调用上游并可能计费。
 
 ## Agent 接入
 
 保持网关运行，选择已有客户端或项目适配入口。
+
+### DeepSeek Harness
+
+兼容性验证基线为 **DSH `0.2.2-rc.1`**（源码标签 `dsh-v0.2.2-rc.1`）。按 [该版本官方说明](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/README.zh.md#run-from-source) 安装或构建，再启动聊天页面；`censorprivacy` 不限制 DSH 版本。该版需要 Node >=24.9.0，支持官方 npm 包和源码构建。准备步骤见 [使用手册](docs/usage.md#32-deepseek-harness浏览器聊天)。
+
+```bash
+./censorprivacy dsh web --dsh-path /path/to/deepseek-harness
+```
+
+打开终端打印的**带 token 的完整网址**，默认端口为 `3080`，选择工作目录后即可聊天。DSH 默认只开放私密工具；需要同时开启 Harness 自带工具时添加 `--enable-tools`。
+
+### openEuler xiaoO
+
+准备已构建的 xiaoO 后，启动终端交互：
+
+```bash
+./censorprivacy xiaoo tui --xiaoO-path /path/to/xiaoO
+```
+
+xiaoO 默认关闭自身工具。需要文件、Shell 等工具时加 `--enable-tools`；启动器会先加载工具目录并预热本地检测，准备请求不调用云模型，也不保存为会话。
+
+两者自动复用当前网关的模型与凭据，使用独立配置，不覆盖原客户端配置。PATH 已有可用命令时可省略源码目录。可粘贴 [虚构费用工单](examples/demo.txt) 试用；完整准备和工具调用说明见 [Agent 接入指南](docs/usage.md#3-接入-agent)。
+
+会话会自动同步到网关页面，点击消息可查看原文、检测结果和实际遮蔽文本。记录保存在本机私有配置目录的 `xiaoo/records/` 中，刷新和重启后可回看；记录管理见 [使用手册](docs/usage.md#35-通用-agent-会话检测台)。
 
 ### 通用客户端
 
@@ -112,41 +93,51 @@ cd censorprivacy-0.3.2-linux-x86_64-standalone
 | API Key | `~/.config/censorprivacy/managed/gateway.token` 的内容 |
 | 模型 ID | 与 `init --model-id` 一致 |
 
-Agent 使用本机 gateway token，provider Key 由网关持有。Responses/Messages 等接口的路径配置见 [使用手册](docs/usage.md#31-通用客户端)。
+Agent 使用本机 gateway token，provider Key 由网关持有。Responses/Messages 路径及其他 Agent 的会话同步方式见 [使用手册](docs/usage.md#31-通用客户端)。
 
-### DeepSeek Harness 与 openEuler xiaoO
-
-先按各自官方说明安装或构建客户端，再执行对应入口：
-
-```bash
-# DeepSeek Harness：浏览器聊天
-./cpctl dsh web --dsh-path /path/to/deepseek-harness
-```
-
-```bash
-# openEuler xiaoO：终端交互
-./cpctl xiaoo tui --xiaoO-path /path/to/xiaoO
-# 查看会话检测台地址（默认 http://127.0.0.1:8775/）
-./cpctl xiaoo web
-```
-
-两者自动复用当前网关的模型与凭据，使用独立配置，不覆盖原客户端配置。PATH 已有可用命令时可省略源码目录。完整准备、聊天示例和工具调用验收见 [Agent 接入指南](docs/usage.md#3-接入-agent)。
-
-xiaoO 默认关闭自身工具。需要文件、Shell 等工具时加 `--enable-tools`，启动器会在进入对话前加载真实工具目录并预热本地隐私检测，显示准备状态；准备请求不调用云模型，也不保存为会话。NER 线程数可通过 `init --ner-threads N` 持久保存，或 `start --ner-threads N` 临时覆盖，默认 1。 NER 支持 `start --ner-device cpu --ner-threads 4` 和 `start --ner-device cuda --ner-batch-size 4`，多卡使用 `--ner-device cuda:0,1,2,3`；昇腾使用 `--ner-device cann` 或 `cann:0,1`。CUDA/CANN 须另配对应原生运行库及设备依赖，配置见 [检测器说明](docs/rust-detector.md#2-配置路径)。
-
-DeepSeek Harness CLI/Web 和 xiaoO 会话自动同步到隐私检测台，运行 `./cpctl web` 查看地址；页面标明 Agent 来源，点击消息可查看原文、检测结果和实际遮蔽文本。对话与工具结果保存在本机私有目录 `xiaoo/records/`，刷新和重启后可回看；网页与网关共用模型。更新后重启网关与 Agent 客户端。其他 OpenAI Chat Completions Agent 可通过 Base URL 或请求头指定来源与会话，见 [通用接入说明](plugins/detector-web/README.md)。
-
-## 日常管理与本机演示
+## 日常管理
 
 | 命令 | 用途 |
 | --- | --- |
-| `./cpctl check` | 检查当前网关认证、权限与 run 状态，无上游调用 |
-| `./cpctl stop` | 停止当前用户实例 |
-| `./cpctl start` | 启动新 run；Agent 需新建会话 |
-| `./cpctl demo gateway` | 真实检测器 + 模拟上游，演示遮蔽、恢复与引用计算，无需云 Key |
-| `./cpctl help` | 查看命令与选项 |
+| `./censorprivacy check` | 检查当前网关认证、权限与 run 状态，无上游调用 |
+| `./censorprivacy dashboard` | 查看当前网关的页面地址 |
+| `./censorprivacy stop` | 停止当前用户实例 |
+| `./censorprivacy start` | 启动新 run；Agent 需新建会话 |
+| `./censorprivacy demo gateway` | 真实检测器 + 模拟上游，演示遮蔽、恢复与引用计算，无需云 Key |
+| `./censorprivacy help` | 查看命令与选项 |
 
-演示另需 Node 22.19+（22.x）或 ≥24。映射只保存在服务内存中，重启后旧引用失效；默认 run 有效期为一小时，调整与排查见 [日常管理](docs/usage.md#4-日常管理)。
+映射只保存在服务内存中，重启后旧引用失效，Agent 需重新启动并新建会话。随附配置的有效期为 24 小时，由 `server.ttl_seconds` 设置。多实例、systemd 与更新流程见 [日常管理](docs/usage.md#4-日常管理)。
+
+## 从源码构建
+
+源码构建需要 Linux、[Rust ≥1.85](https://www.rust-lang.org/tools/install) 和 C 链接器。先安装 Rust 工具链，再下载并编译：
+
+```bash
+git clone https://gitcode.com/coco12373/AgentCensor.git
+cd AgentCensor/CensorPrivate
+./censorprivacy deps
+cargo build --locked --release --bins
+```
+
+`deps` 按系统选择 apt/dnf 安装依赖，可能使用 sudo；`--dry-run` 只预览。源码运行本机演示另需 Node 22.19+（22.x）或 ≥24；DSH 0.2.2-rc.1 需要 Node ≥24.9。
+
+**编译完成后还需准备模型与 ONNX Runtime。** 按 [模型下载与 ONNX 导出步骤](docs/build-and-deploy.md#4-准备检测资源) 准备资源，在根目录 `config.yaml` 的 `ner.model_dir`、`ner.ort_library` 中填写实际路径，然后校验：
+
+```bash
+./target/release/censorprivacy config-check --config ./config.yaml
+```
+
+`config-check` 检查配置字段，模型和运行库在启动时验证。已有可信 ONNX 包可直接使用；只有从原始权重导出 ONNX 时需要 Python。
+
+### 安装到当前用户目录
+
+```bash
+./censorprivacy install
+```
+
+`install` 会构建并安装 Rust 命令，复用已有编译缓存，默认安装到 `~/.local`。安装后可在任意目录使用 `~/.local/bin/censorprivacy`，配置文件为 `~/.local/share/censorprivacy/config.yaml`。首次安装不会沿用源码配置中的模型和运行库路径，需在安装后的配置中填写 `ner.model_dir`、`ner.ort_library`，模型与运行库本身需另行准备。
+
+随后按 [开始使用](#开始使用) 初始化并启动网关，将命令中的 `./censorprivacy` 换为 `~/.local/bin/censorprivacy`。只在源码目录运行时，可省略安装，直接使用 `./censorprivacy` 调用 `target/release/` 中的构建产物。公共安装、systemd 与完整依赖见 [构建与部署](docs/build-and-deploy.md)。
 
 ## 工作方式与可选能力
 
@@ -157,8 +148,8 @@ DeepSeek Harness CLI/Web 和 xiaoO 会话自动同步到隐私检测台，运行
 按场景启用额外能力：
 
 - [私密计算与 MCP](docs/usage.md#私密计算与-mcp)：用授权引用完成本地数值/日期运算，返回派生引用。
-- [Linux 受管运行域](docs/usage.md#linux-受管运行域)：通过 `privacy-run` 约束受管进程及后代的网络出口，需要 root 与相应内核能力。
-- [TLS direct](docs/usage.md#tls-direct)：通过 `tls-run` 与可选 native hook 保留受支持客户端的原 TLS 连接。普通网关和检测台无需构建 native。
+- [Linux 受管运行域](docs/usage.md#linux-受管运行域)：通过 `censorprivacy run` 约束受管进程及后代的网络出口，需要 root 与相应内核能力。
+- [TLS direct](docs/usage.md#tls-direct)：通过 `censorprivacy tls-run` 与可选 native hook 保留受支持客户端的原 TLS 连接。普通网关和检测台无需构建 native。
 
 ## 开发与交付
 
@@ -174,8 +165,9 @@ bash scripts/test/run-all.sh
 | 文档 | 内容 |
 | --- | --- |
 | [文档首页](docs/README.md) | 阅读路线与统一约定 |
+| [统一配置](docs/configuration.md) | 部署参数、类别、自定义规则、TTL 与 Kubernetes 挂载 |
 | [构建与部署](docs/build-and-deploy.md) | 源码下载、依赖、模型导出、安装与 systemd |
-| [使用手册](docs/usage.md) | 检测台、网关、Agent 接入及可选模式 |
+| [使用手册](docs/usage.md) | 网关启动、Agent 接入、会话查看及可选模式 |
 | [二进制包](docs/binary-distribution.md) | 获取、校验、解压、自检与打包 |
 | [脚本速查](docs/scripts.md) | 运维、模型工具及测试参数 |
 | [故障排查](docs/troubleshooting.md) | 资源、内存、认证、上游与客户端问题 |

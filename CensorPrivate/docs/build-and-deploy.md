@@ -2,7 +2,7 @@
 
 [文档首页](README.md) · [使用手册](usage.md) · [脚本速查](scripts.md) · [故障排查](troubleshooting.md)
 
-从源码完成 **下载 → 构建 → 准备检测资源 → 验证 → 安装**。日常启动与 Agent 接入统一使用 `cpctl`，不再另外创建一套配置目录。
+从源码完成 **下载 → 构建 → 准备检测资源 → 验证 → 安装**。日常启动与 Agent 接入统一使用 `censorprivacy`，不再另外创建一套配置目录。
 
 已有完整二进制包时，直接按 [二进制包说明](binary-distribution.md) 操作，无需执行本页的编译与模型导出。
 
@@ -47,13 +47,13 @@ sudo apt-get install build-essential pkg-config ca-certificates curl jq openssl 
 也可以让仓库脚本选择包管理器，先预览再执行：
 
 ```bash
-./cpctl deps --dry-run
-./cpctl deps
+./censorprivacy deps --dry-run
+./censorprivacy deps
 rustc --version
 cargo --version
 ```
 
-`deps` 安装系统包，不安装 Rust 工具链或模型。普通网关使用 Rustls，无需 OpenSSL 开发库；`openssl` 命令用于生成本机令牌。运行 `demo` 或 DSH 另需 Node **22.19+（22.x）或 ≥24**；见后文 [依赖表](#用途与依赖)。
+`deps` 安装系统包，不安装 Rust 工具链或模型。普通网关使用 Rustls，无需 OpenSSL 开发库；`openssl` 命令用于生成本机令牌。运行本机 `demo` 另需 Node **22.19+（22.x）或 ≥24**；DSH 0.2.2-rc.1 需要 **Node ≥24.9**；见后文 [依赖表](#用途与依赖)。
 
 内存较小时，在当前终端限制构建和测试并发，模型导出、编译、推理及浏览器验收依次执行：
 
@@ -69,7 +69,7 @@ cargo build --locked --release --bins
 ./target/release/censorprivacy --version
 ```
 
-产物位于 `target/release/`：`censorprivacy`、`privacy-run`、`privcalc`、`censorprivacy-mcp`、`tls-run`。首次构建会获取 Cargo 依赖，`--locked` 使用仓库锁文件。
+唯一产品可执行文件为 `target/release/censorprivacy`，通过 `serve`、`compute`、`mcp`、`run`、`tls-run` 及运维子命令提供功能。首次构建会获取 Cargo 依赖，`--locked` 使用仓库锁文件。
 
 **编译成功后仍需准备模型与 ONNX Runtime，才能启动检测页面或网关。** Cargo 不下载这两项资源。默认 Rust 回归不需要模型：
 
@@ -129,14 +129,14 @@ export CP_DETECTOR_MODEL_DIR="$PWD/models/bert4ner-base-chinese"
 export CP_DETECTOR_ORT_LIBRARY="$(find "$PWD/.venv-model/lib" \
   -path '*/onnxruntime/capi/libonnxruntime.so*' -type f -print -quit)"
 test -f "$CP_DETECTOR_ORT_LIBRARY"
-./cpctl doctor
+./censorprivacy doctor
 ```
 
 已有官方 CPU 运行库时，把 `CP_DETECTOR_ORT_LIBRARY` 改为实际的 `.so` 路径；版本文件名如 `libonnxruntime.so.1.31.1` 也可使用。本机已验收版本为 **ONNX Runtime 1.31.1 CPU / Linux x86_64**，其他版本或平台需单独验收。
 
 开发机可以直接引用准备环境内的原生库。正式服务应将模型和运行库放入稳定目录，例如 `/opt/censorprivacy-models/` 与 `/opt/onnxruntime/lib/`，不要依赖会被删除的虚拟环境。迁移运行库时保留发行包要求的相邻库文件及许可证。
 
-这两个变量需要在**每个启动终端**中设置；`cpctl init` 不保存它们。也可以采用 [默认安装布局](rust-detector.md#2-配置路径)。系统服务的持久配置见 [第 6 节](#6-部署为系统服务)。
+将这两个路径填入 `config.yaml` 的 `ner.model_dir`、`ner.ort_library`，供网关和检测台持久使用；YAML 优先于环境变量。`censorprivacy doctor` 单独检查环境变量和默认布局，不读取 YAML；使用自定义 YAML 时运行 `censorprivacy config-check --config 文件` 校验配置，启动时再验证模型资源。完整优先级见 [检测器配置](rust-detector.md#2-配置路径)。
 
 ## 5. 验证并安装
 
@@ -159,9 +159,9 @@ bash scripts/test/detector.sh --integration
 ### 5.2 安装到当前用户目录
 
 ```bash
-./cpctl install
+./censorprivacy install
 "$HOME/.local/bin/censorprivacy" --version
-"$HOME/.local/bin/cpctl" doctor
+"$HOME/.local/bin/censorprivacy" doctor
 ```
 
 默认前缀为 `~/.local`。`install` 会按锁文件构建 release，复制命令、运维脚本、插件和文档；**不复制模型或 ONNX Runtime**。安装后的命令仍使用前文资源变量。
@@ -169,30 +169,28 @@ bash scripts/test/detector.sh --integration
 需要公共安装或系统服务时改用：
 
 ```bash
-./cpctl install --prefix /usr/local
+./censorprivacy install --prefix /usr/local
 ```
 
 构建由当前账户执行，复制到受保护目录时使用 sudo。接下来转到 [使用手册：启动实际模型网关](usage.md#2-启动实际模型网关)，完成 `init → start → check --model`。需要分发归档时，参阅 [打包说明](binary-distribution.md#4-从源码打包)。
 
 ## 6. 部署为系统服务
 
-先完成 `/usr/local` 安装、`cpctl init` 及实际模型连通性检查。将检测资源放在服务账户可读的公共目录，并在执行 `systemd install` 的终端中设置实际路径：
+先完成 `/usr/local` 安装、`censorprivacy init` 及实际模型连通性检查。将检测资源放在服务账户可读的公共目录，在统一配置的 `ner.model_dir`、`ner.ort_library` 中填写实际路径后执行：
 
 ```bash
-export CP_DETECTOR_MODEL_DIR=/opt/censorprivacy-models/bert4ner-base-chinese
-export CP_DETECTOR_ORT_LIBRARY=/opt/onnxruntime/lib/libonnxruntime.so
-./cpctl systemd install --dry-run
-./cpctl systemd install
-./cpctl systemd start
-./cpctl systemd check
+./censorprivacy systemd install --dry-run
+./censorprivacy systemd install
+./censorprivacy systemd start
+./censorprivacy systemd check
 ```
 
-`systemd install` 创建专用 `censorprivacy` 账户，将配置、策略与凭据复制到 `/etc/censorprivacy/`，并把检测资源变量写入实例环境文件。模板启用 `ProtectHome=yes`，模型、运行库和可执行文件不要放在 `/root` 或用户 home 下。
+`systemd install` 创建专用 `censorprivacy` 账户，将统一配置快照与凭据复制到 `/etc/censorprivacy/`；YAML 路径为空时可回退到安装时保存的资源环境变量。模板启用 `ProtectHome=yes`，模型、运行库和可执行文件应放在公共目录。字段和快照更新方式见 [统一配置](configuration.md)。
 
 `systemd start` 会停止同配置的用户实例，启动后自动检查；`systemd check` 同步当前 run 文件，供 Agent 接入使用。生成的服务名包含用户 ID 与配置目录散列，命令会打印实际名称；不会自动启用开机启动。
 
 ```bash
-./cpctl systemd stop
+./censorprivacy systemd stop
 ```
 
 修改策略、连接配置、凭据或资源路径后，依次执行 `systemd stop → systemd install → systemd start`。重启会清空原值映射，客户端须新建会话。手工模板与目录权限见 [deploy/README.md](../deploy/README.md)。
@@ -206,8 +204,8 @@ export CP_DETECTOR_ORT_LIBRARY=/opt/onnxruntime/lib/libonnxruntime.so
 | 编译 Rust 产品 | Rust ≥1.85、C 链接器、锁文件中的 Cargo 依赖 |
 | 网关与检测页面 | 本地 FP32 ONNX 包、匹配平台的 ONNX Runtime 原生库 |
 | ONNX 首次导出 | Python ≥3.11、CPU PyTorch 及 `scripts/model/requirements.txt` |
-| `cpctl` 运维 | Linux、Bash、curl、jq、openssl、GNU coreutils、flock |
-| 本机演示与 DSH | Node 22.19+（22.x）或 ≥24；DSH 另需可用的 Harness |
+| `censorprivacy` 运维 | Linux、Bash、curl、jq、openssl、GNU coreutils、flock |
+| 本机演示与 DSH | 本机演示需 Node 22.19+（22.x）或 ≥24；DSH 0.2.2-rc.1 需 Node ≥24.9 和可用的 Harness |
 | TLS direct | C11、make、OpenSSL 开发包、动态 OpenSSL 客户端、native hook |
 | Linux 受管运行 | root、iproute2、nftables、unshare、libseccomp、相应内核能力 |
 
@@ -216,13 +214,13 @@ export CP_DETECTOR_ORT_LIBRARY=/opt/onnxruntime/lib/libonnxruntime.so
 普通网关与检测页面无需 `native/`。保留客户端原 TLS 连接的 TLS direct 模式需要：
 
 ```bash
-./cpctl deps --tls --dry-run
-./cpctl deps --tls
+./censorprivacy deps --tls --dry-run
+./censorprivacy deps --tls
 make -C native
-./cpctl install --tls
+./censorprivacy install --tls
 ```
 
-产物为 `native/libcp_tls_guard.so`。`cpctl install --tls` 等价于在安装时启用 `scripts/install.sh --with-native`，见 [native 说明](../native/README.md)。
+产物为 `native/libcensorprivacy_tls_guard.so`。`censorprivacy install --tls` 等价于在安装时启用 `scripts/install.sh --with-native`，见 [native 说明](../native/README.md)。
 
 ### 更新与回退
 
