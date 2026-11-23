@@ -356,6 +356,9 @@ impl Detector for RuleDetector {
             Ok(())
         };
         for rule in &self.rules {
+            if !self.policy.allows_category(&rule.kind) {
+                continue;
+            }
             for captures in rule.expression.captures_iter(text) {
                 let captures = captures.map_err(|_| Error::DetectionFailed)?;
                 let matched = captures.get(rule.group).ok_or(Error::DetectionFailed)?;
@@ -363,6 +366,9 @@ impl Detector for RuleDetector {
             }
         }
         for (kind, literals) in self.policy.dictionaries() {
+            if !self.policy.allows_category(kind) {
+                continue;
+            }
             for literal in literals {
                 let mut offset = 0;
                 while let Some(relative) = text[offset..].find(literal) {
@@ -439,7 +445,11 @@ impl DetectionEngine {
                 Ok::<_, Error>(detected)
             })();
             match detected {
-                Ok(detected) => spans.extend(detected),
+                Ok(detected) => spans.extend(
+                    detected
+                        .into_iter()
+                        .filter(|span| self.policy.allows_category(&span.entity_type)),
+                ),
                 _ if spec.required => return Err(Error::DetectionFailed),
                 _ => (),
             }
