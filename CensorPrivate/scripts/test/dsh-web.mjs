@@ -113,6 +113,13 @@ try {
   page = await browser.newPage({ locale: 'zh-CN', viewport: { width: 1440, height: 1000 } });
   page.setDefaultTimeout(30000);
   const pageErrors = []; page.on('pageerror', error => pageErrors.push(String(error)));
+  page.on('response', async response => {
+    if (!response.url().endsWith('/api/censorprivacy/session')) return;
+    const result = await response.json().catch(() => null);
+    if (response.status() !== 200 || result?.result?.ok === false) {
+      console.log('Privacy bridge diagnostic:', new URL(response.url()).pathname, response.status(), result?.result?.error?.message ?? 'invalid response');
+    }
+  });
   const privacy = await browser.newPage({ locale: 'zh-CN', viewport: { width: 1440, height: 1000 } });
   privacy.on('pageerror', error => pageErrors.push(String(error)));
   const privacyURL = `http://127.0.0.1:${port}`;
@@ -157,6 +164,60 @@ try {
   assert.ok(!displayed.includes('DEMO_SECRET_DO_NOT_SEND'));
   assert.ok(requests.every(payload => payload.stream === true && payload.thinking?.type === 'disabled'));
   assert.ok(requests.every(payload => payload.tools?.every(tool => tool.function.name === 'private_compute')), 'private-only profile must not advertise subagent tools');
+  const privacyTab = page.getByRole('tab', { name: '隐私', exact: true });
+  const trajectoryTab = page.getByRole('tab', { name: '轨迹', exact: true });
+  await privacyTab.waitFor();
+  assert.ok((await privacyTab.boundingBox()).x > (await trajectoryTab.boundingBox()).x, 'privacy must follow trajectory in the top bar');
+  await privacyTab.click();
+  const originalInput = page.locator('[data-privacy-original]');
+  const maskedInput = page.locator('[data-privacy-masked]');
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '用户输入' }).first().click();
+  await originalInput.filter({ hasText: '13800138000' }).waitFor();
+  assert.equal(await originalInput.textContent(), sample, 'embedded privacy must preserve the exact original input');
+  assert.equal(await maskedInput.textContent(), requests[1].messages.find(m => m.role === 'user').content,
+    'embedded comparison must show the exact request sent upstream, without rerunning detection');
+  assert.ok(await originalInput.locator('mark').count(), 'original sensitive ranges must be highlighted');
+  assert.ok(await maskedInput.locator('mark').count(), 'replacement references must be highlighted');
+  const embeddedSession = await page.locator('.cp-privacy').getAttribute('data-privacy-session');
+  const rpcURL = new URL('/api/censorprivacy/session', startupURL).href;
+  const rpcBody = sessionId => ({ type: 'client-request', rpcId: 'privacy-acceptance', method: 'censorprivacy/session', payload: { sessionId } });
+  assert.equal((await fetch(rpcURL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(rpcBody(embeddedSession)) })).status, 401);
+  assert.equal((await page.request.post(rpcURL, { data: rpcBody(embeddedSession), headers: { origin: 'https://untrusted.example' } })).status(), 403);
+  const otherSession = await (await page.request.post(rpcURL, { data: rpcBody('unrelated-acceptance-session') })).json();
+  assert.deepEqual(otherSession.result.value.exchanges, [], 'another session must never inherit the active session data');
+  const embeddedRecord = (await (await page.request.post(rpcURL, { data: rpcBody(embeddedSession) })).json()).result.value.exchanges[0];
+  const systemSnapshot = embeddedRecord.snapshots.find(item => item.role === 'system');
+  assert.ok(systemSnapshot, 'full system input must be available in the embedded comparison');
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '系统提示' }).first().click();
+  assert.equal(await originalInput.textContent(), systemSnapshot.text);
+  assert.equal(await maskedInput.textContent(), systemSnapshot.analysis.masked_text);
+  assert.equal(await maskedInput.textContent(), requests[1].messages.find(m => m.role === 'system').content);
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '用户输入' }).first().click();
+  if (process.env.CP_TEST_DSH_ARTIFACTS) {
+    await mkdir(process.env.CP_TEST_DSH_ARTIFACTS, { recursive: true });
+    await page.screenshot({ path: join(process.env.CP_TEST_DSH_ARTIFACTS, 'privacy-desktop.png'), fullPage: true });
+  }
+  await page.reload();
+  await privacyTab.click();
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '用户输入' }).first().click();
+  await originalInput.filter({ hasText: '13800138000' }).waitFor();
+  assert.equal(await originalInput.textContent(), sample, 'refresh must retain the current session comparison');
+  await page.setViewportSize({ width: 390, height: 844 });
+  const collapseSidebar = page.getByRole('button', { name: '收起侧边栏', exact: true });
+  if (await collapseSidebar.isVisible()) await collapseSidebar.click();
+  await page.waitForFunction(() => document.querySelector('.cp-privacy')?.clientWidth >= 350);
+  // The native drawer animates independently of the full-width view. Wait
+  // until it stops covering the view before checking/capturing mobile UI.
+  await page.waitForFunction(() => {
+    const view = document.querySelector('.cp-privacy');
+    const rect = view?.getBoundingClientRect();
+    return rect && view.contains(document.elementFromPoint(rect.left + 2, rect.top + 2));
+  });
+  assert.equal(await page.locator('.cp-privacy').evaluate(element => element.scrollWidth <= element.clientWidth), true, 'privacy view must fit narrow screens');
+  assert.ok((await maskedInput.boundingBox()).y > (await originalInput.boundingBox()).y, 'narrow comparison must stack vertically');
+  if (process.env.CP_TEST_DSH_ARTIFACTS) await page.screenshot({ path: join(process.env.CP_TEST_DSH_ARTIFACTS, 'privacy-mobile.png'), fullPage: true, animations: 'disabled' });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.getByRole('tab', { name: '对话', exact: true }).click();
   await input.fill('工具回归：计算工单中两笔费用之和。日期差缺少第二个日期，不要猜测当前日期。'); await input.press('Enter');
   const recovered = page.locator('[data-chat-flow-kind="assistant-step"]').filter({ hasText: '工具回归完成' }).last();
   await recovered.waitFor({ timeout: 240000 });
@@ -164,6 +225,16 @@ try {
   assert.ok(requests.some(payload => payload.messages.some(message => message.role === 'tool' && message.content.includes('DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES'))), 'invalid date call must reach the model as a recoverable tool error');
   const finalWire = JSON.stringify(requests);
   for (const value of [...values, 'DEMO_SECRET_DO_NOT_SEND', '2100.00']) assert.ok(!finalWire.includes(value), 'raw privacy reached upstream during tool recovery: ' + value);
+  await privacyTab.click();
+  await page.getByLabel('请求轮次', { exact: true }).locator('option').nth(4).waitFor({ state: 'attached' });
+  await page.getByLabel('请求轮次', { exact: true }).selectOption(embeddedRecord.id);
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '用户输入' }).first().click();
+  await originalInput.filter({ hasText: '13800138000' }).waitFor();
+  assert.equal(await maskedInput.textContent(), requests[1].messages.find(m => m.role === 'user').content, 'previous round must remain an exact recorded comparison');
+  await page.getByLabel('请求轮次', { exact: true }).selectOption('');
+  await page.getByRole('navigation', { name: '请求输入' }).getByRole('button').filter({ hasText: '工具结果' }).first().click();
+  assert.ok((await originalInput.textContent()).includes('DATE_DIFF_REQUIRES_TWO_DATE_REFERENCES'), 'tool context must also be available');
+  await page.getByRole('tab', { name: '对话', exact: true }).click();
   assert.deepEqual(pageErrors, []);
   await page.screenshot({ path: join(directory, 'chat.png'), fullPage: true });
   await privacy.bringToFront();
@@ -211,8 +282,9 @@ try {
   await assert.rejects(fetch(new URL('/', startupURL)), 'closing Web must close its listener');
   succeeded = true;
   if (process.env.CP_DSH_WEB_REPORT) await writeFile(process.env.CP_DSH_WEB_REPORT, JSON.stringify({ passed: true, dsh_root: dshRoot, dsh_version: dshVersion, node_version: process.versions.node, browser_picker_overlay: existsSync(pickerPatch) ? pickerPatch : null, cli: cliTiming, web_first_text_ms: webFirst, upstream_requests: requests.length, real_ner_threads: 4, split_reference_and_secret: true, protected_tool_recovery: true,
+    embedded_privacy: ['tab_after_trajectory', 'exact_original_and_wire_text', 'system_prompt', 'sensitive_range_highlights', 'owner_authentication', 'origin_fence', 'session_isolation', 'refresh_persistence', 'request_history', 'tool_context', 'mobile_layout'],
     privacy_workspace: ['automatic_cli_session', 'automatic_web_session', 'tool_round_grouping', 'actual_masking_details', 'generic_base_url', 'mixed_agent_labels', 'legacy_xiaoo', 'refresh_persistence', 'mobile_layout'] }, null, 2) + '\n');
-  console.log('PASS Harness CLI/Web and privacy workspace: automatic sessions, exact masking details, tools, generic Base URL, mixed Agent sources, legacy xiaoO, refresh and mobile.');
+  console.log('PASS Harness CLI/Web with embedded privacy tab: exact system/user input comparison, authentication, request history, tools, refresh and mobile; standalone privacy workspace regression also passed.');
 } finally {
   if (!succeeded && page) {
     await writeFile(join(directory, 'page.txt'), await page.locator('body').ariaSnapshot().catch(() => 'Page unavailable'));

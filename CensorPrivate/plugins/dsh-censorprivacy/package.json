@@ -5,13 +5,17 @@
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
-    "./openai-chat": "./openai-chat.mjs"
+    "./openai-chat": "./openai-chat.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
     "transport.mjs",
     "openai-chat.mjs",
     "cli-output.mjs",
+    "privacy-host.mjs",
+    "lib/client.js",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -19,9 +23,20 @@
     "node": ">=24.9.0"
   },
   "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "scripts": {
+    "build": "node scripts/build-client.mjs"
   },
   "license": "MulanPSL-2.0"
 }

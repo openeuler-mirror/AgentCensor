@@ -10,15 +10,16 @@ elif [[ $# != 0 ]]; then
 fi
 for file in censorprivacy scripts/ops/*.sh scripts/release/*.sh scripts/install.sh scripts/package.sh; do bash -n "$file"; done
 for file in scripts/ops/*.mjs scripts/release/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/detector-web/app.js scripts/test/detector-web.mjs scripts/test/standalone.mjs scripts/test/relocation.mjs scripts/test/dsh-web.mjs scripts/test/dsh-streaming.mjs scripts/test/xiaoo-gateway.mjs scripts/test/xiaoo-web.mjs; do node --check "$file"; done
+node plugins/dsh-censorprivacy/scripts/build-client.mjs --check
 if $static_only; then
   # Fresh-clone CI can validate adapters without provisioning 400 MB weights.
-  node --test --test-concurrency=1 tests/dsh-launch.test.mjs tests/dsh-plugin.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs
+  node --test --test-concurrency=1 tests/dsh-launch.test.mjs tests/dsh-plugin.test.mjs tests/dsh-privacy.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs
   exit 0
 fi
 # Build before timed lifecycle assertions; a cold LTO link can exceed their
 # timeout while installation and daemon startup themselves remain responsive.
 cargo build --locked --release --bins
-CP_TEST_DSH_ROOT="$dsh_test_root" node --test --test-concurrency=1 tests/dsh-launch.test.mjs tests/dsh-plugin.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs tests/operations.test.mjs
+CP_TEST_DSH_ROOT="$dsh_test_root" node --test --test-concurrency=1 tests/dsh-launch.test.mjs tests/dsh-plugin.test.mjs tests/dsh-privacy.test.mjs tests/dsh-streaming.test.mjs tests/ctl-lifecycle.test.mjs tests/operations.test.mjs
 if [[ -n $dsh_test_root ]]; then
   dsh_demo_config=$(mktemp -d)
   trap 'rm -rf -- "$dsh_demo_config"' EXIT
