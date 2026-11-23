@@ -1,6 +1,6 @@
 {
   "name": "@agentcensor/censorpivot-headless",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Internal headless companion for the CensorPivot DSH composite",
   "private": true,
   "type": "module",

@@ -1,9 +1,10 @@
 {
   "name": "@censorfs/deepseek-harness",
-  "version": "0.2.1",
-  "description": "CensorFS Parallel Worlds runtime and UI bundle for dsh 0.2.1-rc.2",
+  "version": "0.2.2",
+  "description": "CensorFS Parallel Worlds runtime and UI bundle for dsh 0.2.1-rc.2 with workspace materialization",
   "type": "module",
   "main": "src/index.js",
+  "bin": { "dsh-jsonrpc-agent": "./bin/dsh-jsonrpc-agent" },
   "files": ["src/", "client/", "cordis.patch.yml", "bin/"],
   "repository": {
     "type": "git",

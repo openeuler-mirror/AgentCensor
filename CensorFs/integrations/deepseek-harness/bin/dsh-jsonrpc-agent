@@ -12,7 +12,7 @@
 #      `dsh` or `node`. argv survives sudo; env does not — so model/provider/
 #      event-socket are passed as argv below.
 #   2. Pass through model + provider: parse --model/--provider from argv and
-#      generate a --patch YAML that overrides the headless profile's
+#      load a bundled patch that overrides the headless profile's
 #      agent-default-model (the child otherwise inherits the global default,
 #      not the plugin's config.model).
 #   3. Bridge the event socket: --event-socket becomes DSH_EVENT_SOCKET so the
@@ -93,6 +93,8 @@ done
 if [ -n "$EVENT_SOCKET" ]; then
   export DSH_EVENT_SOCKET="$EVENT_SOCKET"
 fi
+# This World belongs to its parent's trace and only emits its own call spans.
+export CENSORSCOPE_HOST_ROLE=worker
 
 # 凭据不经 argv：重建 DSH_HOME 后，dsh 读同一个 $DSH_HOME/.credentials.yaml
 # （官方凭据层，文件穿得过 sudo env_reset）。这里不重建任何 API key env。
@@ -114,23 +116,10 @@ if [ -z "$TASK" ]; then
   exit 2
 fi
 
-if [ -n "$MODEL" ] || [ -n "$PROVIDER" ]; then
-  PATCH="/tmp/dsh-child-model.$$.yml"
-  {
-    echo '- id: agent-default-model'
-    echo '  config:'
-    echo "    provider: ${PROVIDER:-deepseek-official}"
-    echo "    model: ${MODEL:-deepseek-v4-flash}"
-  } > "$PATCH"
-  if [ -n "$RESULT_FILE" ]; then
-    exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK" >"$RESULT_FILE" 2>&1
-  else
-    exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK"
-  fi
-else
-  if [ -n "$RESULT_FILE" ]; then
-    exec "$DSH_BIN" --profile headless "$TASK" >"$RESULT_FILE" 2>&1
-  else
-    exec "$DSH_BIN" --profile headless "$TASK"
-  fi
+export DSH_CENSORFS_MODEL="${MODEL:-deepseek-flash}"
+export DSH_CENSORFS_PROVIDER="${PROVIDER:-deepseek-official}"
+PATCH="$(dirname "$(readlink -f "$0")")/../src/fuse-child.patch.yml"
+if [ -n "$RESULT_FILE" ]; then
+  exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK" >"$RESULT_FILE" 2>&1
 fi
+exec "$DSH_BIN" --profile headless --patch "$PATCH" "$TASK"

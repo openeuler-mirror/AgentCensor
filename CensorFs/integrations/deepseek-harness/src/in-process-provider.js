@@ -22,20 +22,8 @@ function stopReason(reason) {
   return 'error'
 }
 
-function attachDescriptor(childCtx, descriptor) {
-  let appended = false
-  childCtx.on('agent/pre-step', async ({ agent }, next) => {
-    const decision = await next()
-    if (!appended && decision.kind === 'enter') {
-      appended = true
-      agent.session.append('subagent/descriptor', descriptor)
-    }
-    return decision
-  })
-}
-
 export class InProcessCensorFsProvider {
-  capabilities = { outputSchema: false, depthLimit: true, toolFilter: true, persona: true }
+  capabilities = { outputSchema: false, depthLimit: true, agentOptions: true, agentPreset: false }
   inheritsParentContext = false
 
   constructor(name, runnerManager) {
@@ -86,6 +74,7 @@ export class InProcessCensorFsProvider {
 
     const handle = await parent.ctx.agents.create({
       sessionId: childId,
+      parentAgent: parent,
       // rc.2 的第三参是 isSeeded: boolean（fork 前缀继承标记）；worker 是全新
       // session，无继承前缀，必须传 false——旧版调用传的 0 会被 header 校验拒绝。
       meta: childSessionMeta(parent, childDepth, false),
@@ -103,7 +92,6 @@ export class InProcessCensorFsProvider {
         manager.bind(childAgent, binding.runner)
         boundAgent = childAgent
         childCtx.effect(() => () => manager.disposeAgent(childAgent), 'censorfs-runner.agent-dispose')
-        attachDescriptor(childCtx, request.descriptor)
         return { commit: () => manager.commitBinding(childAgent, binding.runner) }
       },
     })

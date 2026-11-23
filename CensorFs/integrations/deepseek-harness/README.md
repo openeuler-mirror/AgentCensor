@@ -6,6 +6,8 @@
 
 当前目标 DeepSeek Harness `0.2.1-rc.2`（git tag `dsh-v0.2.1-rc.2`）。部署前需重跑 unit test、Session event snapshot 和 openEuler 真机 smoke。
 
+发布 Candidate 后，插件会把新 Generation 的文件覆盖/复制到当前会话工作目录，并清理该 Run/World 专属的验证临时目录。工作目录优先取最近一次工具调用记录的绝对 `cwd`；若该信息不可用，可设置 `CENSORFS_PUBLISH_WORKSPACE` 指定绝对路径。复制失败时 Generation 仍已发布，卡片和命令结果会显示失败原因。目标目录中与 Generation 同名的文件会被覆盖，目标目录中的其他文件会保留。
+
 ## 架构：三个协同件
 
 这个 integration 由三个协同件组成，运行时通过 Unix socket 协议耦合（不是打包成一个 bundle）：

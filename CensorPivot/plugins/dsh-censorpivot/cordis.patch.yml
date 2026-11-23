@@ -13,7 +13,7 @@
         childArgs: !!js 'process.env.DSH_CENSORFS_CHILD_CONFIG ? [process.env.DSH_CENSORFS_CHILD_CONFIG] : []'
         controlPlaneCwd: !!js 'process.env.DSH_HOME ?? process.cwd()'
         provider: !!js 'process.env.DSH_CENSORFS_PROVIDER ?? "deepseek-official"'
-        model: !!js 'process.env.DSH_CENSORFS_MODEL ?? "deepseek-v4-flash"'
+        model: !!js 'process.env.DSH_CENSORFS_MODEL ?? "deepseek-flash"'
         maxTokens: 49152
         childEnv: !!js '({ ...(process.env.DSH_HOME ? { DSH_HOME: process.env.DSH_HOME } : {}) })'
         branch: main
@@ -28,6 +28,8 @@
         runnerAuditDir: !!js 'process.env.CENSORFS_RUNNER_AUDIT_DIR'
         runnerIsolation: !!js '(() => { const v = {}; if (process.env.CENSORFS_RUNNER_ISOLATION) v.mode = process.env.CENSORFS_RUNNER_ISOLATION; if (process.env.CENSORFS_RUNNER_MINIMUM_LEVEL) v.minimumLevel = process.env.CENSORFS_RUNNER_MINIMUM_LEVEL; if (process.env.CENSORFS_RUNNER_CGROUP_ROOT) v.root = process.env.CENSORFS_RUNNER_CGROUP_ROOT; if (process.env.CENSORFS_RUNNER_CGROUP_STATE_DIR) v.stateDir = process.env.CENSORFS_RUNNER_CGROUP_STATE_DIR; return v })()'
         tmpRoot: !!js 'process.env.CENSORFS_TMP_ROOT ?? "/tmp/dsh-branch-explore"'
+        publishWorkspacePath: !!js 'process.env.CENSORFS_PUBLISH_WORKSPACE ?? undefined'
+        materializeTimeoutMs: 120000
         validationProfiles:
           code:
             - name: tests

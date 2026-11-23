@@ -1,6 +1,6 @@
 {
   "name": "@agentcensor/censorpivot",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "CensorPivot DSH composite bundle for CensorFS, CensorGuard, and CensorScope",
   "private": true,
   "type": "module",

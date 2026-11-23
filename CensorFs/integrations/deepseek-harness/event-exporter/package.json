@@ -1,6 +1,6 @@
 {
   "name": "@censorfs/event-exporter",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Child-side DSH 0.2.1-rc.2 plugin for CensorFS Parallel Worlds events",
   "type": "module",
   "main": "src/index.js",

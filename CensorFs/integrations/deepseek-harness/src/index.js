@@ -87,6 +87,14 @@ export function normalizeConfig(config) {
     && (!Number.isSafeInteger(config.inProcessMaxDepth) || config.inProcessMaxDepth < 0 || config.inProcessMaxDepth > 1)) {
     throw new TypeError('dsh-branch-explore inProcessMaxDepth must be 0 or 1; nested Runner depth > 1 is not supported')
   }
+  if (config.publishWorkspacePath !== undefined
+    && (typeof config.publishWorkspacePath !== 'string' || config.publishWorkspacePath.length === 0)) {
+    throw new TypeError('dsh-branch-explore publishWorkspacePath must be an absolute path')
+  }
+  if (config.materializeTimeoutMs !== undefined
+    && (!Number.isSafeInteger(config.materializeTimeoutMs) || config.materializeTimeoutMs <= 0)) {
+    throw new TypeError('dsh-branch-explore materializeTimeoutMs must be a positive safe integer')
+  }
   if (typeof config.validationProfiles !== 'object' || config.validationProfiles === null) {
     throw new TypeError('dsh-branch-explore validationProfiles is required')
   }
@@ -128,6 +136,8 @@ export function normalizeConfig(config) {
     previewProfiles: config.previewProfiles ?? {},
     defaultPreviewProfile,
     tmpRoot: config.tmpRoot ?? '/tmp/dsh-branch-explore',
+    publishWorkspacePath: config.publishWorkspacePath,
+    materializeTimeoutMs: config.materializeTimeoutMs ?? 120000,
     providerName: config.providerName ?? 'branch-explore',
     inProcessProviderName: config.inProcessProviderName ?? 'censorfs-inprocess',
     inProcessOnly,
@@ -364,7 +374,7 @@ function registerCommands(ctx, runtime, config) {
               'After the tool returns, do not reproduce detailed World summaries, diffs, validation logs, or ranking in chat. Reply briefly that the exploration is complete and can be reviewed in Worlds. Do not publish automatically.',
             ].join('\n\n'),
           }],
-          source: { kind: 'plugin', plugin: name },
+          source: { kind: `plugin:${name}` },
         }))
         return { kind: 'success', text: `Starting ${count} branch exploration worlds (${mode}) for: ${task}` }
       } catch (error) {
@@ -384,9 +394,14 @@ function registerCommands(ctx, runtime, config) {
       if (values.length !== 2) return { kind: 'error', text: 'Usage: /censorfs-publish <run-id> <variant-id> [--force]' }
       try {
         const result = await runtime.publish(invocation.agent, values[0], values[1], force)
+        const materialized = result.materialization?.workspace
+          ? ` Materialized into ${result.materialization.workspace}.`
+          : result.materialization?.error
+            ? ` Published, but workspace materialization failed: ${result.materialization.error}`
+            : ''
         return {
           kind: 'success',
-          text: `Published ${values[1]} as Generation ${result.receipt.new_generation}; Head sequence is ${result.receipt.head_seq}.`,
+          text: `Published ${values[1]} as Generation ${result.receipt.new_generation}; Head sequence is ${result.receipt.head_seq}.${materialized}`,
         }
       } catch (error) {
         return { kind: 'error', text: error instanceof Error ? error.message : String(error) }

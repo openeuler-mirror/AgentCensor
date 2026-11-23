@@ -165,7 +165,7 @@ export class FuseProvider {
       // provider/model 走 argv 而非 env：mounter 经 sudo 启动，env_reset 会清空环境变量。
       // 子进程据此生成 --patch 覆盖 headless agent-default-model。API key 不经 argv，
       // 子进程重建 DSH_HOME 后读 .credentials.yaml（官方凭据层，穿得过 sudo env_reset）。
-      '--model', this.config.model ?? 'deepseek-v4-flash',
+      '--model', this.config.model ?? 'deepseek-flash',
       '--provider', this.config.provider ?? 'deepseek-official',
       '--event-socket', eventSocketPath,
       '--task-file', taskFilePath,
@@ -263,9 +263,9 @@ export class FuseProvider {
         if (cancelled) {
           return { output: [], stopReason: 'aborted' }
         }
-        if (exitCode !== 0 && outputText.length === 0) {
+        if (exitCode !== 0) {
           return {
-            output: [{ type: 'text', text: stderr || `process exited with code ${exitCode}` }],
+            output: [{ type: 'text', text: [outputText, stderr].filter(Boolean).join('\n') || `process exited with code ${exitCode}` }],
             stopReason: 'error',
           }
         }
@@ -302,9 +302,5 @@ export class FuseProvider {
         return Promise.resolve()
       },
     })
-  }
-
-  prepareContinuable() {
-    return Promise.resolve({})
   }
 }
