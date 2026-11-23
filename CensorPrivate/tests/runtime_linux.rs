@@ -63,7 +63,7 @@ async fn actual_domain_drops_privileges_enforces_mount_and_network_and_cleans_af
         read_only_paths: vec![probe],
     };
     let runtime = LinuxRuntime::default();
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_privacy-run"));
+    let executable = PathBuf::from(env!("CARGO_BIN_EXE_censorprivacy"));
     assert_eq!(
         runtime
             .run(
