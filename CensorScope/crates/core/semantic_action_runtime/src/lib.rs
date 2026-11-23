@@ -294,6 +294,7 @@ mod tests {
                 kind: model_core::event::EventKind::Unknown,
                 flags,
                 session_id: None,
+                attribution: Default::default(),
                 call_id: None,
             },
             EventPayload::File(FilePayload {
@@ -350,6 +351,7 @@ mod tests {
                 kind: model_core::event::EventKind::Unknown,
                 flags: EventFlags::PARTIAL.union(EventFlags::TRUNCATED),
                 session_id: None,
+                attribution: Default::default(),
                 call_id: None,
             },
             EventPayload::Process(ProcessPayload {
@@ -390,6 +392,7 @@ mod tests {
                 kind: model_core::event::EventKind::Unknown,
                 flags: EventFlags::empty(),
                 session_id: None,
+                attribution: Default::default(),
                 call_id: None,
             },
             EventPayload::Net(model_core::event::NetPayload {

@@ -401,7 +401,15 @@ static __always_inline int emit_exec_proc_event(
         return BPF_STATUS_ERROR;
     }
 
-    init_event(&event->event, PROC_EXEC, pid, trace_id);
+    init_event_from_cache(&event->event, PROC_EXEC, pid, trace_id);
+    /* Exec installs a new environment; inherited cache entries cannot override it. */
+    find_session(&event->event, bpf_get_current_task());
+    cache_session(current_kernel_tgid(), event->event.session);
+    __builtin_memset(event->event.call_id, 0, sizeof(event->event.call_id));
+    __u32 context_pid = current_kernel_tgid();
+    bpf_map_delete_elem(&call_ids, &context_pid);
+    find_call_id(&event->event, bpf_get_current_task());
+    cache_call_id(current_kernel_tgid(), event->event.call_id);
     event->event.aux = (__u32)ctx->old_pid;
     event->filename_size = 0;
     event->filename_flags = 0;

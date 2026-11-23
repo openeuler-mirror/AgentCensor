@@ -405,7 +405,6 @@ impl WriterHandle {
         self.counters.backfill_gave_up.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code)]
     pub fn call_start(&self, write: CallStartWrite) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control
@@ -414,27 +413,12 @@ impl WriterHandle {
         wait_reply(reply_rx).map(|_| ())
     }
 
-    pub fn call_start_async(&self, write: CallStartWrite) -> Result<(), String> {
-        let (reply_tx, _reply_rx) = mpsc::channel();
-        self.control
-            .try_send(ControlItem::CallStart(write, reply_tx))
-            .map_err(|error| control_queue_error(error.to_string()))
-    }
-
-    #[allow(dead_code)]
     pub fn call_close(&self, write: CallCloseWrite) -> Result<(), String> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control
             .send(ControlItem::CallClose(write, reply_tx))
             .map_err(|_| "writer channel closed".to_string())?;
         wait_reply(reply_rx).map(|_| ())
-    }
-
-    pub fn call_close_async(&self, write: CallCloseWrite) -> Result<(), String> {
-        let (reply_tx, _reply_rx) = mpsc::channel();
-        self.control
-            .try_send(ControlItem::CallClose(write, reply_tx))
-            .map_err(|error| control_queue_error(error.to_string()))
     }
 
     pub fn persist(&self, writes: Vec<PersistWrite>) -> Result<(), String> {
@@ -1174,12 +1158,12 @@ fn execute_backfill_job(
         return Ok(());
     }
     let candidate_count = candidates.len();
-    let session = job.session_id.clone().map(SessionIdentity::new);
     let spans = storage
         .list_call_spans(job.trace_id)
         .map_err(storage_stage("list_call_spans"))?;
     let mut assignments: Vec<(i64, String)> = Vec::new();
-    for (event_id, host_pid, observed_ns) in candidates {
+    for (event_id, host_pid, observed_ns, session_id) in candidates {
+        let session = session_id.map(SessionIdentity::new);
         let observed_at =
             UNIX_EPOCH + Duration::from_nanos(u64::try_from(observed_ns).unwrap_or_default());
         if let Some(call_id) =
@@ -1233,6 +1217,7 @@ mod tests {
                 collector: CollectorName::new("test"),
                 kind: EventKind::Unknown,
                 session_id: Some(SessionIdentity::new("s1")),
+                attribution: Default::default(),
                 call_id: None,
                 flags: EventFlags::empty(),
             },
@@ -1295,6 +1280,7 @@ mod tests {
             trace_id: TraceId::new(1),
             process: ProcessIdentity::new(77),
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             observed_at: at(1),
             source: model_core::payload::PayloadSourceBoundary::Uprobe,
@@ -1404,6 +1390,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn backfill_does_not_use_job_session_as_event_evidence() {
+        let path = temp_db();
+        let config = StorageConfig::sqlite(&path, 5_000);
+        let mut storage = open_storage_backend(&config).unwrap();
+        let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
+        let trace = TraceId::new(5);
+        storage
+            .call_start(trace, Some("s1"), "c1", 11, at(5))
+            .unwrap();
+        storage
+            .call_start(trace, Some("s2"), "c2", 22, at(5))
+            .unwrap();
+        let mut unknown = event(5, 1, at(10));
+        unknown.envelope.session_id = None;
+        let mut known = event(5, 2, at(10));
+        known.envelope.session_id = Some(SessionIdentity::new("s1"));
+        storage.append_events_batch(&[unknown, known]).unwrap();
+        execute_backfill_job(&mut storage, &job(5, at(5), at(20))).unwrap();
+        let ns = |secs| i64::try_from(Duration::from_secs(secs).as_nanos()).unwrap();
+        let remaining = storage
+            .unassigned_events_in_window(trace, None, ns(5), ns(20), 100)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].0, 1);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

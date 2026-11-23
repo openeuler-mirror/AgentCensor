@@ -37,7 +37,6 @@ use trace_runtime::TraceRuntime;
 use trace_runtime::commands::{RootRemovalRequest, TrackTraceRequest};
 use uds_control_server::{ControlService, PeerCredentials};
 
-use crate::attribution::unique_call_window_match;
 use crate::collector_actor::{CollectorActorHandle, CollectorBatchEnvelope, SpoolBatchSink};
 use crate::peer_identity::PeerIdentity;
 use crate::writer::{
@@ -97,6 +96,7 @@ struct SessionResolution {
     kernel: Option<SessionIdentity>,
     procfs: Option<SessionIdentity>,
     from_call: Option<SessionIdentity>,
+    evidence: model_core::attribution::AttributionEvidence,
 }
 
 impl SessionResolution {
@@ -320,27 +320,6 @@ impl DaemonServiceHost {
         }
     }
 
-    fn assign_call_id(
-        &self,
-        trace_id: TraceId,
-        host_pid: Option<u32>,
-        session_id: &Option<SessionIdentity>,
-        observed_at: SystemTime,
-    ) -> Option<String> {
-        // Fallback for events the caller left without a call id: match the
-        // span's explicit parameters and interval. A child shell has a
-        // different PID from the span-opening host, so PID is only a
-        // disambiguator; the shared matcher keeps live ingest and queued
-        // backfill from drifting apart.
-        unique_call_window_match(
-            &self.call_spans,
-            trace_id,
-            host_pid,
-            session_id,
-            observed_at,
-        )
-    }
-
     fn session_for_call(&self, trace_id: TraceId, call_id: &str) -> Option<SessionIdentity> {
         self.call_spans
             .iter()
@@ -480,6 +459,7 @@ impl DaemonServiceHost {
                 kind: model_core::event::EventKind::Guard,
                 flags: model_core::event::EventFlags::empty(),
                 session_id,
+                attribution: Default::default(),
                 call_id: correlation.call_id.clone(),
             },
             model_core::event::EventPayload::Guard(Box::new(payload)),
@@ -925,6 +905,7 @@ impl DaemonServiceHost {
                             .union(model_core::event::EventFlags::PARTIAL)
                             .union(model_core::event::EventFlags::CAPTURE_GAP),
                         session_id: None,
+                        attribution: Default::default(),
                         call_id: None,
                     },
                     model_core::event::EventPayload::Loss(model_core::event::LossPayload {
@@ -961,7 +942,7 @@ impl DaemonServiceHost {
         record.session_id = session.clone();
         let mut writes = vec![PersistWrite::ProcessRecord(record.clone())];
         self.ingested.count = self.ingested.count.saturating_add(1);
-        let segment = self
+        let mut segment = self
             .payload_retention
             .accept(ingest_runtime::normalize_payload(
                 raw,
@@ -972,6 +953,7 @@ impl DaemonServiceHost {
                     session: session.clone(),
                 },
             ));
+        segment.attribution = session_resolution.evidence;
         if let Some(session) = &session {
             writes.push(PersistWrite::Session {
                 session_id: session.clone(),
@@ -1794,6 +1776,7 @@ impl DaemonServiceHost {
         host_pid: Option<u32>,
         envelope: &mut collector_event::RawEventEnvelope,
     ) -> SessionResolution {
+        use model_core::attribution::{AttributionBasis as Basis, AttributionEvidence};
         let kernel = envelope.session_id.clone();
         let procfs = match (&kernel, host_pid) {
             (None, Some(pid)) => {
@@ -1801,28 +1784,65 @@ impl DaemonServiceHost {
             }
             _ => None,
         };
-        if envelope.session_id.is_none() {
-            envelope.session_id = procfs.clone();
-        }
+        let mut evidence = AttributionEvidence {
+            captured_session_id: kernel.as_ref().map(|s| s.as_str().to_owned()),
+            captured_call_id: envelope.call_id.clone(),
+            procfs_session_id: procfs.as_ref().map(|s| s.as_str().to_owned()),
+            session_basis: if kernel.is_some() {
+                Basis::CollectorContext
+            } else if procfs.is_some() {
+                Basis::Procfs
+            } else {
+                Basis::Unknown
+            },
+            call_basis: if envelope.call_id.is_some() {
+                Basis::CollectorContext
+            } else {
+                Basis::Unknown
+            },
+            candidate_call_ids: Vec::new(),
+        };
+        envelope.session_id = kernel.clone().or_else(|| procfs.clone());
         if envelope.call_id.is_none() {
-            envelope.call_id = self.assign_call_id(
+            let decision = crate::attribution::call_window_decision(
+                &self.call_spans,
                 trace_id,
                 host_pid,
                 &envelope.session_id,
                 envelope.observed_at,
             );
+            evidence.call_basis = if decision.call_id.is_some() {
+                Basis::TimeWindow
+            } else if decision.candidates.is_empty() {
+                Basis::Unknown
+            } else {
+                Basis::Ambiguous
+            };
+            evidence.candidate_call_ids = decision.candidates;
+            envelope.call_id = decision.call_id;
         }
-        let from_call = match (envelope.session_id.as_ref(), envelope.call_id.as_deref()) {
-            (None, Some(call_id)) => self.session_for_call(trace_id, call_id),
-            _ => None,
-        };
-        if envelope.session_id.is_none() {
-            envelope.session_id = from_call.clone();
+        let call_session = envelope
+            .call_id
+            .as_deref()
+            .and_then(|call| self.session_for_call(trace_id, call));
+        let mut from_call = None;
+        match (&envelope.session_id, call_session) {
+            (Some(session), Some(call_session)) if *session != call_session => {
+                evidence.call_basis = Basis::Conflict;
+                envelope.call_id = None;
+            }
+            (None, Some(session)) => {
+                from_call = Some(session.clone());
+                envelope.session_id = Some(session);
+                evidence.session_basis = Basis::CallContext;
+            }
+            _ => {}
         }
         let resolution = SessionResolution {
             kernel,
             procfs,
             from_call,
+            evidence,
         };
         // Runs once per collected item: keep at `trace!` so DEBUG has no
         // per-item log-write cost (a DEBUG line here stalled the control plane
@@ -1945,6 +1965,13 @@ impl DaemonServiceHost {
             return Ok(());
         }
         let host_pid = raw.envelope.process.host.as_ref().map(|host| host.pid);
+        if matches!(&raw.payload, collector_event::RawObservationPayload::Process { operation, .. } if operation == "exec")
+        {
+            if let Some(pid) = host_pid {
+                self.session_lookups
+                    .retain(|(cached_pid, _), _| *cached_pid != pid);
+            }
+        }
         let session_resolution = self.resolve_item_session(trace_id, host_pid, &mut raw.envelope);
         let operation = match &raw.payload {
             collector_event::RawObservationPayload::Process { operation, .. } => {
@@ -2005,7 +2032,7 @@ impl DaemonServiceHost {
                 .inherit_process(trace_id, &parent, identity, raw.envelope.observed_at)
                 .map_err(|error| control_error("inherit_process", error))?;
         }
-        let event = ingest_runtime::normalize(
+        let mut event = ingest_runtime::normalize(
             raw.clone(),
             ingest_runtime::IngestMatch {
                 trace_id,
@@ -2015,6 +2042,7 @@ impl DaemonServiceHost {
             },
             self.take_event_id()?,
         );
+        event.envelope.attribution = session_resolution.evidence;
         let semantic_batch = semantic_action_runtime::project_event(&event);
         self.queue_event(event);
         let actions = semantic_batch.actions;
@@ -2748,19 +2776,30 @@ impl DaemonServiceHost {
             ControlCommand::CallStart(command) => {
                 let started_at =
                     std::time::UNIX_EPOCH + std::time::Duration::from_nanos(command.started_at);
-                // SQLite keys spans by (trace_id, call_id): dedupe the
-                // in-memory matcher on the same identity so a retried
-                // call-start cannot create ambiguous duplicate time-window
-                // candidates. Only span metadata is deduped; every eBPF
-                // observation remains independently stored.
-                if let Some(span) = self.call_spans.iter_mut().find(|span| {
+                let existing = self.call_spans.iter().find(|span| {
                     span.trace_id == command.trace_id && span.call_id == command.call_id
-                }) {
-                    span.session_id = command.session_id.clone();
-                    span.host_pid = command.host_pid;
-                    span.started_at = started_at;
-                    span.ended_at = None;
-                } else {
+                });
+                if let Some(span) = existing {
+                    if span.session_id != command.session_id
+                        || span.host_pid != command.host_pid
+                        || span.started_at != started_at
+                    {
+                        return Err(ControlError::new(
+                            "call_conflict",
+                            "call identity or start does not match",
+                        ));
+                    }
+                }
+                self.writer
+                    .call_start(CallStartWrite {
+                        trace_id: command.trace_id,
+                        session_id: command.session_id.clone(),
+                        call_id: command.call_id.clone(),
+                        host_pid: command.host_pid,
+                        started_at,
+                    })
+                    .map_err(|error| control_error("call_start_persist", error))?;
+                if existing.is_none() {
                     self.call_spans.push(CallSpanRecord {
                         trace_id: command.trace_id,
                         session_id: command.session_id.clone(),
@@ -2771,15 +2810,6 @@ impl DaemonServiceHost {
                         status: None,
                     });
                 }
-                self.writer
-                    .call_start_async(CallStartWrite {
-                        trace_id: command.trace_id,
-                        session_id: command.session_id.clone(),
-                        call_id: command.call_id.clone(),
-                        host_pid: command.host_pid,
-                        started_at,
-                    })
-                    .map_err(|error| control_error("call_start_queue", error))?;
                 Ok(ControlReply::CallStarted)
             }
             ControlCommand::CallEnd(command) => {
@@ -2794,18 +2824,41 @@ impl DaemonServiceHost {
                 }
                 let ended_at =
                     std::time::UNIX_EPOCH + std::time::Duration::from_nanos(command.ended_at);
-                // Close the in-memory span first so ingest attribution is
-                // settled for events drained after this point; jobs scope by
-                // the registered span session, not this command's value.
-                let (span_started, span_session) = match self.call_spans.iter_mut().find(|span| {
-                    span.trace_id == command.trace_id && span.call_id == command.call_id
-                }) {
-                    Some(span) => {
-                        span.ended_at = Some(ended_at);
-                        (Some(span.started_at), span.session_id.clone())
-                    }
-                    None => (None, None),
-                };
+                let span = self
+                    .call_spans
+                    .iter()
+                    .find(|span| {
+                        span.trace_id == command.trace_id && span.call_id == command.call_id
+                    })
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "call_missing",
+                            "call-start must be acknowledged before call-end",
+                        )
+                    })?;
+                if span.session_id != command.session_id
+                    || span.host_pid != command.host_pid
+                    || ended_at < span.started_at
+                {
+                    return Err(ControlError::new(
+                        "call_conflict",
+                        "call-end does not match the registered call",
+                    ));
+                }
+                if let Some(previous) = span.ended_at {
+                    return if previous == ended_at
+                        && span.status.as_deref() == Some(command.status.as_str())
+                    {
+                        Ok(ControlReply::CallEnded)
+                    } else {
+                        Err(ControlError::new(
+                            "call_conflict",
+                            "terminal call cannot be changed",
+                        ))
+                    };
+                }
+                let span_started = Some(span.started_at);
+                let span_session = span.session_id.clone();
                 let job_session = span_session.or_else(|| command.session_id.clone());
                 let gate = self.writer.bulk_pushed_count();
                 let now = SystemTime::now();
@@ -2852,10 +2905,8 @@ impl DaemonServiceHost {
                         }
                     }
                 }
-                // Close the stored span and enqueue its backfill jobs together;
-                // the writer commits the transaction asynchronously.
                 self.writer
-                    .call_close_async(CallCloseWrite {
+                    .call_close(CallCloseWrite {
                         trace_id: command.trace_id,
                         session_id: command.session_id.clone(),
                         call_id: command.call_id.clone(),
@@ -2864,7 +2915,13 @@ impl DaemonServiceHost {
                         status: command.status.clone(),
                         jobs,
                     })
-                    .map_err(|error| control_error("call_end_queue", error))?;
+                    .map_err(|error| control_error("call_end_persist", error))?;
+                if let Some(span) = self.call_spans.iter_mut().find(|span| {
+                    span.trace_id == command.trace_id && span.call_id == command.call_id
+                }) {
+                    span.ended_at = Some(ended_at);
+                    span.status = Some(command.status.clone());
+                }
                 Ok(ControlReply::CallEnded)
             }
         }
@@ -3241,7 +3298,29 @@ mod writer_pipeline_tests {
             )
             .expect("call end");
         assert!(matches!(reply, ControlReply::CallEnded));
-        // Give the writer an idle tick to commit the close and execute its job.
+        host.handle_command(
+            None,
+            ControlCommand::CallStart(CallStartCommand {
+                request_id: RequestId::new(3),
+                trace_id: trace,
+                session_id: Some("s1".to_string()),
+                call_id: "c1".to_string(),
+                host_pid: 9,
+                started_at: 5_000_000_000,
+            }),
+        )
+        .expect("duplicate start");
+        assert_eq!(
+            host.call_spans[0].ended_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(20))
+        );
+        let storage = open_storage_backend(&StorageConfig::sqlite(&db, 5_000)).unwrap();
+        assert_eq!(
+            storage.list_call_spans(trace).unwrap()[0].ended_at,
+            host.call_spans[0].ended_at
+        );
+        drop(storage);
+        // Give the writer an idle tick to execute the queued backfill job.
         std::thread::sleep(std::time::Duration::from_millis(60));
         host.shutdown().expect("host shutdown");
         drop(host);
@@ -3922,6 +4001,51 @@ mod ingest_cache_tests {
             Some(SessionIdentity::new("from-kernel"))
         );
         assert_eq!(resolution.source(), "ebpf");
+        drop(host);
+        remove_db(&db);
+    }
+
+    #[test]
+    fn resolution_preserves_capture_and_exposes_ambiguity_and_conflict() {
+        use model_core::attribution::AttributionBasis as Basis;
+        let (mut host, db) = test_host();
+        let trace = TraceId::new(1);
+        let at = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        host.call_spans.push(CallSpanRecord {
+            trace_id: trace,
+            session_id: Some("s".into()),
+            call_id: "a".into(),
+            host_pid: 1,
+            started_at: at(1),
+            ended_at: Some(at(20)),
+            status: None,
+        });
+        let mut envelope = collector_event::RawEventEnvelope {
+            trace_id: Some(trace),
+            observed_at: at(10),
+            process: observation(u32::MAX, 11),
+            collector: model_core::ids::CollectorName::new("test"),
+            session_id: Some(SessionIdentity::new("s")),
+            call_id: None,
+        };
+        let first = host.resolve_item_session(trace, Some(u32::MAX), &mut envelope);
+        assert_eq!(envelope.call_id.as_deref(), Some("a"));
+        assert_eq!(first.evidence.captured_call_id, None);
+        assert_eq!(first.evidence.call_basis, Basis::TimeWindow);
+        let mut other = host.call_spans[0].clone();
+        other.call_id = "b".into();
+        host.call_spans.push(other);
+        envelope.call_id = None;
+        let ambiguous = host.resolve_item_session(trace, Some(u32::MAX), &mut envelope);
+        assert_eq!(ambiguous.evidence.call_basis, Basis::Ambiguous);
+        assert_eq!(ambiguous.evidence.candidate_call_ids, vec!["a", "b"]);
+        assert_eq!(envelope.call_id, None);
+        envelope.call_id = Some("a".into());
+        envelope.session_id = Some(SessionIdentity::new("different"));
+        let conflict = host.resolve_item_session(trace, Some(u32::MAX), &mut envelope);
+        assert_eq!(conflict.evidence.call_basis, Basis::Conflict);
+        assert_eq!(conflict.evidence.captured_call_id.as_deref(), Some("a"));
+        assert_eq!(envelope.call_id, None);
         drop(host);
         remove_db(&db);
     }

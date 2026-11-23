@@ -673,7 +673,9 @@ static __noinline void find_session(struct censorscope_event *event,
                 if (!c)
                     break;
             }
-            break;
+            event->session[SESSION_LEN - 1] = '\0';
+            if (value_offset == 23)
+                break;
         }
         cursor += n;
     }
@@ -706,7 +708,28 @@ static __noinline void find_call_id(struct censorscope_event *event,
         if (n <= 1)
             break;
         int value_offset = 0;
-        if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
+        if (scratch->value[0] == 'C' &&
+            scratch->value[1] == 'E' &&
+            scratch->value[2] == 'N' &&
+            scratch->value[3] == 'S' &&
+            scratch->value[4] == 'O' &&
+            scratch->value[5] == 'R' &&
+            scratch->value[6] == 'S' &&
+            scratch->value[7] == 'C' &&
+            scratch->value[8] == 'O' &&
+            scratch->value[9] == 'P' &&
+            scratch->value[10] == 'E' &&
+            scratch->value[11] == '_' &&
+            scratch->value[12] == 'C' &&
+            scratch->value[13] == 'A' &&
+            scratch->value[14] == 'L' &&
+            scratch->value[15] == 'L' &&
+            scratch->value[16] == '_' &&
+            scratch->value[17] == 'I' &&
+            scratch->value[18] == 'D' &&
+            scratch->value[19] == '=') {
+            value_offset = 20;
+        } else if (scratch->value[0] == 'D' && scratch->value[1] == 'S' &&
             scratch->value[2] == 'H' && scratch->value[3] == '_' &&
             scratch->value[4] == 'C' && scratch->value[5] == 'E' &&
             scratch->value[6] == 'N' && scratch->value[7] == 'S' &&
@@ -728,7 +751,9 @@ static __noinline void find_call_id(struct censorscope_event *event,
                 if (!c)
                     break;
             }
-            break;
+            event->call_id[CALL_ID_LEN - 1] = '\0';
+            if (value_offset == 19)
+                break;
         }
         cursor += n;
     }

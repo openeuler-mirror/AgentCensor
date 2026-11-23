@@ -176,6 +176,100 @@ fn stage3_real_file_tcp_ipc_stdio_signal_workload() {
     );
 }
 
+#[test]
+#[ignore = "requires root/CAP_BPF, writable tracefs, kernel BTF, and eBPF attach support"]
+fn exec_replaces_inherited_call_and_prefers_canonical_context() {
+    let capabilities = vec![
+        CapabilityRequest::required(Capability::ProcLifecycle),
+        CapabilityRequest::required(Capability::ProcExecContext),
+        CapabilityRequest::required(Capability::FsAccessBasic),
+        CapabilityRequest::required(Capability::FsMmap),
+        CapabilityRequest::required(Capability::NetTransport),
+        CapabilityRequest::required(Capability::IpcPipeFifo),
+        CapabilityRequest::required(Capability::IpcUnixSocket),
+        CapabilityRequest::required(Capability::StdioChunk),
+        CapabilityRequest::required(Capability::TlsPlaintextPayload),
+    ];
+    let profile = CaptureProfile::new(
+        ProfileName::new("all-program-verifier-smoke"),
+        capabilities.clone(),
+    );
+    let pid = std::process::id();
+    let observation = ProcfsIdentityReader
+        .read_identity(pid)
+        .expect("read current process identity");
+    let mut collector = EbpfCollector::new(EbpfCollectorConfig {
+        enabled_mode: EbpfEnabledMode::True,
+        enabled: true,
+        memlock_rlimit: MemlockRlimit::Unlimited,
+        tracked_process_max_entries: 4096,
+        pending_operation_max_entries: 4096,
+        event_ring_buffer_max_bytes: 1024 * 1024,
+        tls_dynamic_loading: false,
+        tls_scan_debounce: config_core::daemon::TlsScanDebounce::Image,
+        tls_scan_interval_ms: 250,
+    });
+
+    collector
+        .bind_trace(&TraceBindingRequest {
+            trace_id: TraceId::new(1),
+            root_identity: ProcessIdentity::new(1),
+            root_observation: observation,
+            root_namespace_pid: pid,
+            profile_snapshot: CaptureProfileSnapshot::from_profile(&profile, SystemTime::now()),
+            requested_capabilities: capabilities,
+        })
+        .unwrap_or_else(|error| panic!("load and attach every compiled BPF program: {error:?}"));
+
+    let script = r#"
+import os, sys
+if sys.argv[1] == 'context-a':
+    env = dict(os.environ)
+    env['DSH_SESSION_ID'] = 'legacy-session'
+    env['DSH_CENSORSCOPE_CALL_ID'] = 'legacy-call'
+    env['CENSORSCOPE_SESSION_ID'] = 'session-b'
+    env['CENSORSCOPE_CALL_ID'] = 'call-b'
+    os.execve(sys.executable, [sys.executable, '-c', sys.argv[2], 'context-b'], env)
+"#;
+    let next = r#"
+import os
+env = dict(os.environ)
+env.pop('CENSORSCOPE_CALL_ID', None)
+env.pop('DSH_CENSORSCOPE_CALL_ID', None)
+os.execve('/bin/true', ['/bin/true', 'context-cleared'], env)
+"#;
+    assert!(
+        std::process::Command::new("python3")
+            .args(["-c", script, "context-a", next])
+            .env("CENSORSCOPE_SESSION_ID", "session-a")
+            .env("CENSORSCOPE_CALL_ID", "call-a")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut observations = Vec::new();
+    for _ in 0..20 {
+        observations.extend(collector.poll_batch().unwrap().observations);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for (marker, session, call) in [
+        ("context-b", "session-b", Some("call-b")),
+        ("context-cleared", "session-b", None),
+    ] {
+        let event = observations.iter().find(|event| matches!(
+            &event.payload,
+            RawObservationPayload::Process { operation, argv: Some(argv), .. }
+                if operation == "exec" && argv.args.iter().any(|arg| arg == marker.as_bytes())
+        )).unwrap_or_else(|| panic!("missing exec {marker}"));
+        assert_eq!(
+            event.envelope.session_id.as_ref().map(|s| s.as_str()),
+            Some(session)
+        );
+        assert_eq!(event.envelope.call_id.as_deref(), call);
+    }
+    collector.unbind_trace(TraceId::new(1)).unwrap();
+}
+
 fn run_file_workload() {
     let path = format!("/tmp/censorscope-stage3-{}", std::process::id());
     let renamed = format!("{path}-renamed");

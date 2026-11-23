@@ -199,6 +199,7 @@ mod tests {
             trace_id: TraceId::new(2),
             process: ProcessIdentity::new(4),
             session_id: None,
+            attribution: Default::default(),
             call_id: None,
             observed_at: SystemTime::UNIX_EPOCH,
             source: PayloadSourceBoundary::Uprobe,
