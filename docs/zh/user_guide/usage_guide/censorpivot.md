@@ -159,11 +159,9 @@ Commit/Abort 决策但第二阶段仍待重试，`1` 表示协议或接入错误
 - `request_id` 是调用方幂等键。相同 ID、相同内容返回原事务；相同 ID、不同内容拒绝。
 
 完整协议、状态机、崩溃矩阵与部署信任边界见 [设计文档](../../../../CensorPivot/docs/DESIGN.zh-CN.md)。
-三个底层组件的现有功能、真实接口和 Pivot 责任划分见
-[组件功能与接口说明](../../../../CensorPivot/docs/COMPONENTS.zh-CN.md)。
 从 Guard 策略生效、CensorFS 私有挂载到 Scope 进程树跟踪的逐步说明见
 [完整运行流程](../../../../CensorPivot/docs/flow.md)。
-接口核对、修复及验证范围见 [代码审查记录](../../../../CensorPivot/docs/REVIEW.zh-CN.md)。
+
 
 ## 单场景 Demo
 

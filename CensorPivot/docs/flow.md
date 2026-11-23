@@ -24,9 +24,7 @@ Pivot 自己不重新实现文件系统、安全内核钩子或观测探针。�
 当前 DSH 聚合插件只是三个组件插件的安装和配置入口。普通对话仍走
 `Web Guard attach_self -> Scope 常驻 worker -> 原生 DSH 工具`；CensorFS 的 View 由
 分支探索等组件工具另行创建。普通 `read/bash` 尚未经过 Pivot ingress，不能认为自动
-执行了图中的 `VariantOpen -> Prepare -> Commit/Abort`。真实核对记录见
-[安装与编排验收](ACCEPTANCE.zh-CN.md)。
-
+执行了图中的 `VariantOpen -> Prepare -> Commit/Abort`。
 ## 2. 一张完整可见的流程图
 
 ```text
@@ -499,5 +497,4 @@ Guard 拒绝的是具体 syscall。工具吞掉 EPERM 后仍返回 0 时，Pivot
 - 实测两个请求基于同一 Head 时最多一个 CAS Publish 成功；
 - 重启 Pivot 后，`CommitDecided`/`AbortDecided` 只继续原决定，不重新执行 Tool。
 
-相关的接口字段、系统分层与状态机定义见 [设计文档](DESIGN.zh-CN.md)；三个组件的功能边界
-与仓库实现位置见 [组件功能与接口说明](COMPONENTS.zh-CN.md)。
+相关的接口字段、系统分层与状态机定义见 [设计文档](DESIGN.zh-CN.md)。

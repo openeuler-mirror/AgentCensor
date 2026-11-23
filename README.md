@@ -63,7 +63,7 @@ AgentCensor 是面向 Agent 工作负载的主机级隔离、强制与观测系�
 
 **一次批次，三种身份：** CensorPivot 将文件 View、安全 domain 和观测 Trace 关联到同一个 runner，顺序执行工具，再协调文件结果的发布或放弃。
 
-[查看完整运行流程 →](CensorPivot/docs/flow.md) · [组件功能与接口说明](CensorPivot/docs/COMPONENTS.zh-CN.md)
+[查看完整运行流程 →](CensorPivot/docs/flow.md)
 
 <details>
 <summary><strong>展开：CensorPivot 如何编排一次批次</strong></summary>
@@ -190,8 +190,7 @@ pnpm dsh --profile web
 
 当前组合插件提供 Guard 进程树保护、Scope 会话观测和 CensorFS 分支工具。DSH 普通对话
 中的 `read/bash` 仍由原生工具执行，尚未自动提交 Pivot `BatchRequest`，因此这些调用
-不具备 Pivot 批次的统一 Prepare/Commit/Abort。完整事务流程通过下面的原生 CLI 或
-Demo 验证。实际安装、浏览器和系统接口验收见 [验收记录](CensorPivot/docs/ACCEPTANCE.zh-CN.md)。
+不具备 Pivot 批次的统一 Prepare/Commit/Abort。
 
 <details>
 <summary><strong>原生 CLI 与批次 Demo</strong></summary>
@@ -230,7 +229,7 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 - CensorFS 当前明确不支持 symlink、hardlink、xattr、ACL、设备节点、FIFO、socket、chown、共享可写 mmap、在线 GC 和跨分支原子提交。
 - 组件 daemon 和控制面依赖 Unix socket、合适的 UID/GID、`/dev/fuse`、cgroup v2、BTF 与 BPF LSM；缺少这些条件时应先看 `doctor` 输出和 [部署文档](CensorPivot/docs/INSTALL.zh-CN.md)。
 
-更完整的崩溃矩阵、信任边界和接口约束见 [CensorPivot 设计文档](CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](CensorPivot/docs/flow.md) 和 [代码审查记录](CensorPivot/docs/REVIEW.zh-CN.md)。
+更完整的崩溃矩阵、信任边界和接口约束见 [CensorPivot 设计文档](CensorPivot/docs/DESIGN.zh-CN.md)、[运行流程](CensorPivot/docs/flow.md)。
 
 <a id="documentation"></a>
 
@@ -264,6 +263,6 @@ CENSORPIVOT_DEMO_GUARD_GROUP=censorguard-dsh-default \
 
 ## 致谢
 
-感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](CensorPivot/docs/flow.md) 与 [组件接口说明](CensorPivot/docs/COMPONENTS.zh-CN.md)。
+感谢 **AcTrail** 项目及其作者提供的设计启发。AgentCensor 在进程树追踪集合维护、运行时观测与事件生命周期管理等方面参考了 AcTrail 的思路，并结合 CensorFS 的可恢复文件状态、CensorGuard 的内核强制和 CensorPivot 的批次事务模型形成当前实现。相关借鉴会继续在代码注释和设计文档中保持可追溯；如需了解具体边界，请参阅 [完整运行流程](CensorPivot/docs/flow.md)。
 
 同时感谢 Rust、Linux、eBPF、FUSE、systemd、SQLite 以及 DeepSeek Harness 社区提供的基础设施和工具。

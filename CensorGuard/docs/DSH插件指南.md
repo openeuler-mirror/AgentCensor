@@ -218,7 +218,6 @@ Web 验收需要上游 Web 已构建、Playwright Chromium 和浏览器运行库
 真实对话工具 `read` / `bash cat` / `bash rm` 的 BPF 拒绝及 Web 审计、
 开启全部放行审计后的空闲事件循环检查，以及 reload 后自动重新接入。
 测试只在临时会话中切换 DSH 权限模式，让命令到达 BPF 检查，不改变用户 profile。
-结果见 [策略管理验收](策略管理验收.md)。
 
 在 DSH 根目录卸载：
 
