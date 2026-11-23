@@ -130,6 +130,22 @@ cargo test --workspace --lib --bins
 node --check plugins/*/lib/*.mjs plugins/censorscope-ui/lib/client.js   # 插件语法
 ```
 
+真实 eBPF 内核测试（普通用户执行，脚本会通过 sudo 运行特权测试）：
+
+```bash
+./scripts/test-ebpf.sh                   # 全部特权测试，串行运行
+./scripts/test-ebpf.sh --case verifier   # 内核 verifier 与探针挂载
+./scripts/test-ebpf.sh --case workload   # 真实文件、网络、IPC 等事件
+./scripts/test-ebpf.sh --case exec       # exec 后 session/call 标签更新
+./scripts/test-ebpf.sh --build-only      # 只编译，不提权
+```
+
+需要 Linux、内核 BTF 和可写 tracefs；未挂载时先执行
+`sudo mount -t tracefs tracefs /sys/kernel/tracing`。请在 CensorGuard 受管进程树外运行。
+脚本自动定位 Cargo 产物、检查所选测试存在，并保留编译、环境检查和测试日志。
+`--case exec` 需要包含 Harness exec 上下文测试的分支，例如 `master-merged`。
+内核测试通过不代表 daemon/SQLite 端到端归因或 HTTPS 明文采集已验证。
+
 ## 致谢
 
 本项目 fork 自 [openEuler/AcTrail](https://gitcode.com/openeuler/AcTrail)。感谢 AcTrail 团队和原始贡献者所做的出色工作。

@@ -10,6 +10,7 @@ pub mod procfs;
 pub mod tls_coverage;
 pub mod tls_resolver;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -69,13 +70,38 @@ const TLS_EVENT_SIZE: usize = PROCESS_EVENT_SIZE + 48 + TLS_PAYLOAD_MAX;
 /// Bound one userspace drain so decoding and spooling cannot monopolize the
 /// collector thread while the kernel ring buffer is receiving new events.
 const MAX_EVENTS_PER_POLL: usize = 1024;
-const CONTEXT_ENV_RULE_SIZE: usize = 80;
-const CONTEXT_ENV_CONFIG_SIZE: usize = 4 + MAX_CONTEXT_ENV_RULES * CONTEXT_ENV_RULE_SIZE;
+const MAX_LIBBPF_WARNING_BYTES: usize = 64 * 1024;
+
+thread_local! {
+    // libbpf invokes its print callback on the loading thread. Keep verifier
+    // diagnostics available even when the caller has no tracing subscriber.
+    static LIBBPF_WARNINGS: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn record_libbpf_warning(message: &str) {
+    LIBBPF_WARNINGS.with(|warnings| {
+        let mut warnings = warnings.borrow_mut();
+        warnings.push_str(message);
+        warnings.push('\n');
+        let mut start = warnings.len().saturating_sub(MAX_LIBBPF_WARNING_BYTES);
+        while !warnings.is_char_boundary(start) {
+            start += 1;
+        }
+        warnings.drain(..start);
+    });
+}
+
+fn take_libbpf_warnings() -> String {
+    LIBBPF_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
+}
 
 fn libbpf_log(level: PrintLevel, message: String) {
     let message = message.trim_end();
     match level {
-        PrintLevel::Warn => tracing::warn!(target: "ebpf", "libbpf: {message}"),
+        PrintLevel::Warn => {
+            record_libbpf_warning(message);
+            tracing::warn!(target: "ebpf", "libbpf: {message}");
+        }
         PrintLevel::Info => tracing::info!(target: "ebpf", "libbpf: {message}"),
         PrintLevel::Debug => tracing::debug!(target: "ebpf", "libbpf: {message}"),
     }
@@ -119,6 +145,7 @@ impl EbpfRuntime {
         requested: &BTreeSet<Capability>,
     ) -> Result<Self, LoaderError> {
         set_print(Some((PrintLevel::Warn, libbpf_log)));
+        take_libbpf_warnings();
         apply_memlock_rlimit(config.memlock_rlimit)?;
         let mut open = ObjectBuilder::default()
             .open_memory(include_bytes!(env!("EBPF_OBJECT")))
@@ -211,11 +238,13 @@ impl EbpfRuntime {
             autoloaded_programs = ?instruction_counts,
             "loading eBPF object"
         );
-        let object = open.load().map_err(|error| {
+        let loaded = open.load();
+        let diagnostics = take_libbpf_warnings();
+        let object = loaded.map_err(|error| {
             LoaderError::new(
                 "load_bpf",
                 format!(
-                    "{error}; maps: tracked_process_max_entries={}, pending_operation_max_entries={}, event_ring_buffer_max_bytes={}; requested_capabilities={requested:?}; autoloaded_programs={autoloaded:?}",
+                    "{error}; maps: tracked_process_max_entries={}, pending_operation_max_entries={}, event_ring_buffer_max_bytes={}; requested_capabilities={requested:?}; autoloaded_programs={autoloaded:?}; libbpf diagnostics (last {MAX_LIBBPF_WARNING_BYTES} bytes):\n{diagnostics}",
                     config.tracked_process_max_entries,
                     config.pending_operation_max_entries,
                     config.event_ring_buffer_max_bytes,
@@ -708,6 +737,24 @@ mod capability_tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    #[test]
+    fn libbpf_warnings_remain_available_without_log_output() {
+        take_libbpf_warnings();
+        libbpf_log(PrintLevel::Warn, "verifier rejected program\n".to_string());
+        assert_eq!(take_libbpf_warnings(), "verifier rejected program\n");
+        assert!(take_libbpf_warnings().is_empty());
+    }
+
+    #[test]
+    fn libbpf_warning_history_retains_a_bounded_utf8_tail() {
+        take_libbpf_warnings();
+        record_libbpf_warning(&"诊断".repeat(MAX_LIBBPF_WARNING_BYTES));
+        record_libbpf_warning("processed instruction limit exceeded");
+        let warnings = take_libbpf_warnings();
+        assert!(warnings.len() <= MAX_LIBBPF_WARNING_BYTES);
+        assert!(warnings.ends_with("processed instruction limit exceeded\n"));
+    }
 
     #[test]
     fn process_programs_have_explicit_capability_mapping() {
