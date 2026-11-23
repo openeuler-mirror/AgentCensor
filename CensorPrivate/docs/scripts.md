@@ -60,8 +60,8 @@ DSH 对接基线为 `0.2.2-rc.1`，需要 Node ≥24.9。`--dsh-path` 可指向�
 | --- | --- | --- |
 | `demo gateway` / `demo tls` | TLS 可用 `--native-library FILE` | 自动启动本机模拟上游，无需云 Key |
 | `demo dsh-gateway` / `demo dsh-tls` | `--dsh-path DIR` | 真实 Agent + 本机模拟上游 |
-| `dsh web` | `--dsh-path DIR --port 3080 --enable-tools` | 默认仅私密工具；`--enable-tools` 同时开放 DSH 原生工具 |
-| `dsh run` | `--dsh-path DIR --enable-tools`，接任务文本 | 同 Web 的工具策略；使用实际上游，可能计费 |
+| `dsh web` | `--dsh-path DIR --port 3080 --disable_tool` | 默认开放 DSH 原生与私密工具；`--disable_tool` 仅保留私密工具 |
+| `dsh run` | `--dsh-path DIR --disable_tool`，接任务文本 | 同 Web 的工具策略；使用实际上游，可能计费 |
 | `dsh setup` / `cloud` | `--dsh-path DIR` | `cloud` 继承当前网关实际 NER 设置；使用实际上游，可能计费 |
 | `dashboard` | `--config-dir DIR` | 显示通用隐私检测台地址；自动同步 Harness/xiaoO 会话 |
 | `xiaoo setup` / `tui` / `run` / `demo` / `web` | `--xiaoO-path DIR`，`--enable-tools` | `tui/run/demo` 使用实际上游，可能计费；`web` 显示会话检测台地址 |
@@ -141,7 +141,7 @@ bash scripts/package.sh --with-native
 | `bash scripts/test/rust.sh` | 同上 | 上一命令的默认 Rust 检查入口 |
 | `bash scripts/test/detector.sh` | Rust；无需模型或 Python | 原生规则、验证与资源拒绝 |
 | `bash scripts/test/detector.sh --integration` | 真实 ONNX/ORT 路径 | 固定参考样本、网关/SSE、共享 TLS 转换、HTTPS CLI |
-| `bash scripts/test/operations.sh --static` | Node ≥24.9；无需模型 | Shell/JS 语法及插件边界测试 |
+| `bash scripts/test/operations.sh --static` | Node ≥24.9；无需模型 | Shell/JS 语法、插件边界、隐私读取桥及前端构建一致性 |
 
 ### 环境相关验收
 
@@ -152,6 +152,9 @@ bash scripts/package.sh --with-native
 | `bash scripts/test/runtime.sh` | root 与 Linux 隔离能力 | namespace、挂载、网络、清理 |
 | `bash scripts/test/operations.sh` | Node、release 构建环境、ONNX/ORT、OpenSSL | 安装、生命周期、网关/TLS 演示 |
 | `bash scripts/test/operations.sh --dsh-path /path/to/deepseek-harness` | 上述条件加 Node ≥24.9、DSH 0.2.2-rc.1（npm 或源码构建） | 另加 DSH 两种模拟演示 |
+| `node scripts/test/dsh-web.mjs /path/to/CensorPrivate /path/to/deepseek-harness` | 已构建可执行文件、ONNX/ORT、DSH、Playwright 与 Chromium | 真实 CLI/Web、顶栏“隐私”、系统/用户/工具输入前后对比、请求切换、认证、刷新及窄屏 |
+
+独立 DSH 插件使用 `bash scripts/build-dsh-plugin.sh` 构建为 `dist/dsh-censorprivacy-0.3.2.tgz`，无需 npm 依赖安装。`node plugins/dsh-censorprivacy/scripts/build-client.mjs --check` 检查已分发的浏览器 bundle 与源码一致。
 
 `run-all.sh` 可追加 `--native`、`--runtime`、`--operations`、`--detector`、`--detector-integration`，分别运行对应层级；这些选项会引入上表条件，不会自动准备环境。
 

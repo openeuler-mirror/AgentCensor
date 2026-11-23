@@ -44,14 +44,14 @@ detection:
 | 类别 | 内容 |
 | --- | --- |
 | PERSON、ORG、LOCATION | 姓名、组织、地点 |
-| ADDRESS | 地址 |
+| ADDRESS | 通讯地址 |
 | EMAIL、PHONE | 邮箱、电话 |
 | ID、ACCOUNT | 证件号、银行卡/账号 |
 | SECRET | 密码、密钥、令牌 |
 | MONEY、DATE、NUMBER | 金额、日期时间、普通数字 |
 | IP_ADDRESS、MAC_ADDRESS | IP、MAC 地址 |
 | LICENSE_PLATE | 车牌 |
-| MEDICAL_INFO、CONFIDENTIAL | 医疗信息及其他机密 |
+| CONFIDENTIAL | 自定义机密规则及部分保守保护结果 |
 
 接受别名：PER→PERSON、ORGANIZATION→ORG、LOC→LOCATION、EMAIL_ADDRESS→EMAIL、PHONE_NUMBER→PHONE、CHINA_ID/ID_NUMBER/US_SSN→ID、CREDIT_CARD→ACCOUNT、PASSWORD→SECRET、DATE_TIME/TIME→DATE。
 
@@ -73,11 +73,13 @@ detection:
 
 迁移旧配置时，将 `policy` 改名为 `custom`，仅保留 `epoch`、`dictionaries`、`patterns`、`default_labels`；把 `ttl_seconds` 移到 `server` 下，删除 `mask_money`、`mask_dates`、`mask_all_numbers`，使用 `detection.categories` 选择类别。旧 `policy` 键、`custom.ttl_seconds`、三个 `mask_*` 开关以及 `file` 路径均不再是统一配置的合法字段。旧独立策略文件也按此拆分迁移，检查通过并重启后可归档或删除旧文件。
 
-类别开关统一由 `detection.categories` 控制；`custom` 只补充规则，不负责启用类别。启用 PERSON 后，为 PERSON 添加词条会增强姓名检测。新增 CUSTOMER 类别时，`all` 会包含它；使用列表则需要显式加入 CUSTOMER。启用 NUMBER 时，文本数字会被保护，业务 JSON 中的私密数值仍按既有协议要求拒绝直接发送；合法协议控制参数继续使用原有校验，例如 `max_tokens`。只选择无需 BERT 的类别时不加载模型；PERSON、ORG、LOCATION、DATE 需要本地 NER 资源。类别选择不保证某类别的任意写法都能识别，检测范围仍受已有模型与规则限制。
+类别开关统一由 `detection.categories` 控制；`custom` 只补充规则，不负责启用类别。启用 PERSON 后，为 PERSON 添加词条会增强姓名检测。新增 CUSTOMER 类别时，`all` 会包含它；使用列表则需要显式加入 CUSTOMER。启用 NUMBER 时，文本数字会被保护，业务 JSON 中的私密数值仍按既有协议要求拒绝直接发送；合法协议控制参数继续使用原有校验，例如 `max_tokens`。类别选择不保证某类别的任意写法都能识别，检测范围仍受已有模型与规则限制。
 
 关闭按类别检测后，未标记、未注册的普通文本直接转发；认证、TTL、协议校验、请求限制、显式敏感路径、已注册敏感值和引用授权仍然生效。
 
-`sensitive_paths` 显式标记的整字段保护、已经注册到本次 run 的引用/原文保护独立于列表。金额的某些表达（例如带“万”的数值）会作为 CONFIDENTIAL 不透明值保护，避免将不支持的金额格式误用于私密计算；其检测开关仍是 MONEY。
+`sensitive_paths` 显式标记的整字段保护、已经注册到本次 run 的引用授权独立于列表。普通敏感原文只在所属会话内传播，金额、日期和普通数值需要当前文本的检测依据，不因历史出现相同数字而自动遮蔽。SECRET 和带 secret 标签的凭据继续在本次 run 内保护，网关自身凭据也不受会话切换影响。金额的某些表达（例如带“万”的数值）会作为 CONFIDENTIAL 不透明值保护，避免将不支持的金额格式误用于私密计算；其检测开关仍是 MONEY。
+
+HTTP 网关按本机 Agent/会话标识区分普通敏感值，此行为不依赖是否启用会话记录；无会话标识的请求仅在当前请求内传播。DSH 插件自动携带标识，标识不发送给上游。会话用于控制传播范围，不构成独立用户认证或新的引用访问权限边界。更新后需重启网关与 Agent 并新建会话，旧引用不能跨网关重启使用。
 
 ## 可配置参数
 

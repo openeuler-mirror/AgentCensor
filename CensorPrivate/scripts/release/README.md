@@ -6,7 +6,7 @@
 
 部署参数集中在 `share/censorprivacy/config.yaml`，包括类别、自定义规则、TTL、NER 线程/设备/batch 和超时，详见 [统一配置](share/censorprivacy/docs/configuration.md)。默认全部类别开启；省略 `categories`、`null` 或空列表关闭按类别检测。每个 512 token 窗口默认有 16 秒执行预算，CP 引用后缀为 8 位小写字母和数字。
 
-DSH 默认只提供私密工具，`--enable-tools` 可开启 Harness 工具；也可[注册 Python/Shell 私密工具](share/censorprivacy/docs/usage.md#注册自定义私密工具)。`dsh cloud` 继承当前网关的 NER 设置。xiaoO 默认关闭自身工具，显式开启时先在本机准备工具目录。
+DSH 默认同时提供 Harness 原生工具与私密工具，`--disable_tool` 可关闭原生工具；也可[注册 Python/Shell 私密工具](share/censorprivacy/docs/usage.md#注册自定义私密工具)。`dsh cloud` 继承当前网关的 NER 设置。xiaoO 默认关闭自身工具，显式开启时先在本机准备工具目录。
 
 包内运行库使用 CPU。CUDA/CANN 需要另配对应的 ORT、驱动和设备依赖，并修改 `ner.ort_library`、`ner.device`；详见 [检测器配置](share/censorprivacy/docs/rust-detector.md#2-配置路径)。加速硬件须单独验收；ARM 主机需要对应架构的构建。
 
@@ -77,7 +77,7 @@ ssh -N -L 3080:127.0.0.1:3080 root@服务器IP
 
 预期回复恢复姓名、机构、电话、邮箱、地址、日期和两笔金额，`DEMO_SECRET_DO_NOT_SEND` 不出现，通常显示为 `[REDACTED_SECRET]`。模型需要完整保留占位符才能恢复。上游脱敏内容可对照 `./censorprivacy demo gateway` 的输出查看。发送消息会调用实际模型并可能计费。
 
-Web 使用独立 profile，默认提供 `private_compute` 和已注册的私密工具；加 `--enable-tools` 可开放 Harness 工具。按 Ctrl+C 停止 Web，网关继续运行；网关重启后重新启动 Web 并新建会话。端口占用时加 `--port 3081`。PATH 已有可用的 `dsh` 命令时可省略 `--dsh-path`。
+Web 使用独立 profile，默认提供 Harness 原生工具、`private_compute` 和已注册的私密工具；加 `--disable_tool` 可仅保留私密工具。按 Ctrl+C 停止 Web，网关继续运行；网关重启后重新启动 Web 并新建会话。端口占用时加 `--port 3081`。PATH 已有可用的 `dsh` 命令时可省略 `--dsh-path`。
 
 需要自动验证模型工具调用和私密求和时，另一个终端执行 `./censorprivacy dsh cloud --dsh-path /path/to/deepseek-harness`，预期客户 `DemoCustomerOrchid`、合计 `300.00`，记录保存在 `~/.config/censorprivacy/managed/dsh/cloud-report.json`。
 

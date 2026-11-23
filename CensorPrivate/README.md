@@ -4,6 +4,8 @@
 
 CensorPrivacy 是 AgentCensor 的模型数据隐私组件。它在本地检测敏感信息，将原文替换为随机引用后发送给模型，再在授权的回复显示位置恢复；密码、密钥等 SECRET 始终遮盖。核心与服务使用 Rust，NER 使用本地 ONNX，生产运行无需 Python。
 
+当前提供 16 个内置检测类别：`ADDRESS` 只保护通讯地址，`IP_ADDRESS` 独立保护 IP，已移除 `MEDICAL_INFO`。`PERSON / ORG / LOCATION / DATE` 全部关闭时自动跳过 NER 模型加载与推理；只保留 DATE 仍会运行 NER。配置与规则模式示例见 [类别选择](docs/configuration.md#类别选择)。
+
 产品名统一为 **CensorPrivacy**，命令与发行包使用 **`censorprivacy`**。网关、运维、私密计算、MCP 和客户端隔离功能均通过同一个命令的子命令使用；源码目录仍为 `AgentCensor/CensorPrivate/`。
 
 [使用完整包](#使用完整包) · [开始使用](#开始使用) · [Agent 接入](#agent-接入) · [日常管理](#日常管理) · [从源码构建](#从源码构建) · [完整文档](docs/README.md)
@@ -69,7 +71,9 @@ cd censorprivacy-0.3.2-linux-x86_64-standalone
 ./censorprivacy dsh web --dsh-path /path/to/deepseek-harness
 ```
 
-打开终端打印的**带 token 的完整网址**，默认端口为 `3080`，选择工作目录后即可聊天。DSH 默认只开放私密工具；需要同时开启 Harness 自带工具时添加 `--enable-tools`。
+打开终端打印的**带 token 的完整网址**，默认端口为 `3080`，选择工作目录后即可聊天。默认同时开放 DSH 自带工具和私密工具；添加 `--disable_tool` 可关闭 DSH 自带工具，仅保留私密工具。
+
+顶栏“轨迹”之后的“隐私”可查看当前会话的系统提示、用户输入和工具上下文，逐次对照原文与实际发往模型的遮蔽文本。支持自动同步、历史请求切换和窄屏显示；使用 gateway 模式。独立插件构建与打包见 [插件说明](plugins/dsh-censorprivacy/README.md)。
 
 ### openEuler xiaoO
 
