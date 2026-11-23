@@ -12,8 +12,8 @@
 
 | 包 | 版本 | 作用 | 装入 profile |
 |---|---|---|---|
-| `censorscope-host` | 0.1.2 | main 角色：单 trace track-add(trace-id 复用；显式传递自身 PID namespace，兼容 Guard 的 ptrace 限制) + per-call cache writer + `/censorscope/call` 路由；worker 角色：注入 `DSH_CENSORSCOPE_CALL_ID` + call-start/end span（真实起止时刻） | web + headless |
-| `agentcensor-session-proxy` | 0.1.4 | 每会话 headless worker + `CENSORSCOPE_SESSION_ID`；根会话与子代理会话镜像；协议级取消；审批与 `ask_user_question` 交互桥 | web |
+| `censorscope-host` | 0.1.3 | main 角色：单 trace track-add(trace-id 复用；显式传递自身 PID namespace，兼容 Guard 的 ptrace 限制) + per-call cache writer + `/censorscope/call` 路由；worker 角色：注入 `DSH_CENSORSCOPE_CALL_ID` + call-start/end span（真实起止时刻） | web + headless |
+| `agentcensor-session-proxy` | 0.1.8 | 每会话 headless worker + `CENSORSCOPE_SESSION_ID`；根会话与子代理会话镜像；协议级取消；审批与 `ask_user_question` 交互桥；dsh 0.2.2 Agent 自有模型选择的投影与转发 | web |
 | `censorscope-ui` | 0.1.1 | 浏览器会话「CensorScope」Tab，展示调用轨迹、工具失败原因及事件详情 | web |
 
 ## 一键安装（推荐）

@@ -91,13 +91,28 @@ const { createScope } = await import(
     ? '@deepseek-ai/dsh-scope/src/index.ts'
     : '@deepseek-ai/dsh-scope'
 )
-import { agentEvents } from '@deepseek-ai/dsh-agent'
+// Namespace import, not a named one: dsh 0.2.2 introduced `AgentModel` and
+// `modelSelectionProjectionDefinition`, and a static named import of an export
+// the installed runtime does not have is a link-time SyntaxError rather than
+// `undefined`. Reading them off the namespace keeps one build working on both
+// 0.2.1 (proxy-owned selection) and 0.2.2+ (Agent-owned selection).
+import * as dshAgent from '@deepseek-ai/dsh-agent'
 import * as agentLoopModule from '@deepseek-ai/dsh-agent-loop'
 import { createAssistantMessage, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { createInteractionBridge } from './interaction-bridge.mjs'
 import { AssistantStreamBridge } from './assistant-stream-bridge.mjs'
 import { inboxProjectionDefinition, ProxyInbox } from './inbox.mjs'
+
+const { agentEvents } = dshAgent
+
+/**
+ * Session projection handle for the Agent-owned model selection that dsh 0.2.2
+ * introduced, or `undefined` on 0.2.1, where `session-controller` registers the
+ * same key itself and the driver keeps a mutable `ModelSelectionRef` instead.
+ * A handle is reused by every Agent this plugin publishes.
+ */
+let modelSelectionProjection
 
 // 0.2.1 marks plugin records and unknown extension events `ignorable: true`.
 // Session.append cannot express that flag (its surface options are the only
@@ -334,6 +349,10 @@ export class WebDriverAgent {
     this.scope = createScope(rootCtx, this)
     this.ctx = this.scope.ctx
     this.rootCtx = rootCtx
+    // Filled in by publish() when the runtime gives the Agent its own model
+    // selection (dsh 0.2.2+). Left undefined on 0.2.1, where selection travels
+    // through the mutable ref handed to installModelSelection instead.
+    this.model = undefined
     this.turn = 0
     // Resident worker lifecycle: workerState is undefined until the session's
     // first message lazily spawns the per-session worker process.
@@ -1088,6 +1107,20 @@ async function writeSeed(child, events) {
 /** Publish one agent around a session, replicating the agent-loop order. */
 async function publish(rootCtx, ownerCtx, session, options, source, parentAgent, storageHandle, setup) {
   const agent = new WebDriverAgent(rootCtx, session, options)
+  // dsh 0.2.2 moved model choice onto the Agent: `session-controller` calls
+  // `agent.model.select()` / `agent.model.current()` and has no fallback (the
+  // old `agents.selectForNextRequest()` is gone), so a driver without `model`
+  // turns every model switch and every image prompt into a TypeError. Recording
+  // through the same `model/selection` event the old path appended keeps the
+  // existing `session/event` -> `host-session-event` forwarding to the worker
+  // working unchanged.
+  if (modelSelectionProjection !== undefined && dshAgent.AgentModel !== undefined) {
+    agent.model = new dshAgent.AgentModel(
+      modelSelectionProjection.readerFor(session),
+      session,
+      agent.options,
+    )
+  }
   const detachSession = agent.ctx.sessions.enter(session)
   // dsh 0.1.5 removes the implicit ctx.agent accessor.
   let initiator
@@ -1143,6 +1176,21 @@ async function publish(rootCtx, ownerCtx, session, options, source, parentAgent,
 
 export async function apply(ctx) {
   const persistence = ctx.get('sessionPersistence')
+  // dsh 0.2.2 registers this projection inside agent-loop, and 0.2.1 registered
+  // it inside session-controller. This overlay disables the built-in loop row,
+  // so on 0.2.2 neither registration runs: without it the Agent has no durable
+  // selection to read and clients see an empty `modelSelection`. Registering it
+  // here is also what makes AgentModel resolve, so failure is reported rather
+  // than fatal -- the proxy still mirrors a session, only model switching stops.
+  if (dshAgent.modelSelectionProjectionDefinition !== undefined) {
+    try {
+      modelSelectionProjection = await ctx.sessionProjections.register(
+        dshAgent.modelSelectionProjectionDefinition,
+      )
+    } catch (error) {
+      process.stdout.write(`[agentcensor] modelSelection projection register: ${String(error)}\n`)
+    }
+  }
   ctx.sessionProjections.register(inboxProjectionDefinition)
   interactionBridge = createInteractionBridge(ctx)
   // Re-register what the built-in agent-loop row used to provide for the UI
