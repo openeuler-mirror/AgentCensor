@@ -260,9 +260,8 @@ export function workerOverlay(privHome) {
     '- id: plugin-package-inventory-deepseek',
     '  disabled: true',
     '',
-    '- id: headless-startup',
-    '  disabled: true',
-    '',
+    // Keep headlessStartup for the sandbox and tool services. Only the
+    // one-shot runner competes with our resident runner for stdin.
     '- id: headless-runner',
     '  disabled: true',
     '',

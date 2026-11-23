@@ -149,7 +149,9 @@ export class InProcessCensorFsProvider {
     })
 
     return {
-      id: childId,
+      // The external activation and its privately hosted Agent occupy separate
+      // DSH identities. The session id remains the key for Runner events.
+      id: SessionId('censorfs-worker-' + childId),
       localAgent: child,
       result,
       dispose,

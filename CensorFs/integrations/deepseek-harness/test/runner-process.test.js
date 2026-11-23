@@ -76,6 +76,7 @@ test('runner executes foreground bash in the requested workspace directory', { s
   }, 'bash-1')
   assert.equal(result.exitCode, 0)
   assert.equal(result.stdout.text, '/workspace/sub')
+  assert.equal(result.cwd, '/workspace/sub')
   assert.equal(result.stderr.text, 'warn')
 })
 
@@ -85,6 +86,7 @@ test('runner executes and controls background jobs', { skip: process.platform ==
     command: 'printf first; sleep 0.2; printf second', run_in_background: true,
   }, 'bash-bg')
   assert.equal(started.kind, 'background')
+  assert.equal(started.cwd.replace(/\/$/, ''), '/workspace')
   assert.equal((await runner.dispatch('job.list', {}, 'jobs-list')).length, 1)
   const finished = await runner.dispatch('job.output', {
     job_id: started.jobId, wait: true, timeout_ms: 5000,

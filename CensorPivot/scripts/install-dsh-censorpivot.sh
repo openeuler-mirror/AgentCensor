@@ -74,8 +74,7 @@ if [[ -n ${DSH_PNPM_STORE_DIR:-} ]]; then
   mkdir -p "$DSH_PNPM_STORE_DIR"
   pnpm_store_args=(--store-dir "$DSH_PNPM_STORE_DIR")
 fi
-node_major=$(node -p 'process.versions.node.split(".")[0]')
-(( node_major >= 22 )) || fail "Node 22+ is required (found $node_major)"
+node -e 'const [a,b]=process.versions.node.split(".").map(Number); if(a<24||(a===24&&b<9)) process.exit(1)' || fail "Node 24.9+ is required"
 
 if [[ $(id -u) -ne 0 ]]; then
   getent group censorpivot >/dev/null 2>&1 || fail \

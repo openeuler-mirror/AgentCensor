@@ -66,6 +66,17 @@ worker 重建时从该日志恢复会话。worker 的附件字节保存在各自
 宿主支持的记录类型处理，并输出跳过和失败计数。worker 启动连续失败时触发熔断，
 日志保留失败信息供排查。
 
+## 测试
+
+`DSH_ROOT` 可指向 DSH 源码目录，或包含 `node_modules` 的 DSH 安装目录。
+使用已安装的 DSH 0.2.2-rc.1 运行完整测试套件：
+
+```sh
+DSH_ROOT="$HOME/.dsh-versions/dsh-0.2.2-rc.1" npm test
+```
+
+测试通过临时目录加载已安装的 DSH 依赖，结束后自动清理。
+
 ## 卸载
 
 ```sh

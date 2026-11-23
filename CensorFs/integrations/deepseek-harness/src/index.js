@@ -721,12 +721,17 @@ export async function apply(ctx, rawConfig) {
   // 全局子代理活动追踪：捕捉所有子代理的启动、结束和活动，
   // 不限于 branch_explore 工具启动的子代理。
   // 使用 { global: true } 绕过 scope 过滤，接收所有事件。
+  function sessionInfo(info) {
+    return info.provider === inProcessProvider?.name && info.id.startsWith('censorfs-worker-')
+      ? { ...info, id: info.id.slice('censorfs-worker-'.length), local: true }
+      : info
+  }
   ctx.on('subagent/start', (info) => {
-    runtime.trackSubagentStart(info)
+    runtime.trackSubagentStart(sessionInfo(info))
   }, { global: true })
 
   ctx.on('subagent/end', (info) => {
-    runtime.trackSubagentEnd(info)
+    runtime.trackSubagentEnd(sessionInfo(info))
   }, { global: true })
 
   // 监听所有 session 事件，为追踪中的子代理记录活动摘要

@@ -298,7 +298,7 @@ export class NamespaceRunner {
       }
     }
     sandboxArgs.push('--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--bind', this.workspace, '/workspace', '--chdir', sandboxCwd, '--setenv', 'HOME', '/tmp', '--info-fd', '3', '--', 'bash', '-lc', params.command)
-    return { sandboxArgs, workdir }
+    return { sandboxArgs, cwd: sandboxCwd }
   }
 
   spawnSandbox(sandboxArgs) {
@@ -344,8 +344,8 @@ export class NamespaceRunner {
   }
 
   async runProcess(params, requestId) {
-    const { sandboxArgs } = await this.sandboxCommand(params)
-    if (params.run_in_background === true) return this.startJob(params, sandboxArgs)
+    const { sandboxArgs, cwd } = await this.sandboxCommand(params)
+    if (params.run_in_background === true) return this.startJob(params, sandboxArgs, cwd)
     const requestedTimeout = params.timeoutMs ?? 120000
     if (!Number.isSafeInteger(requestedTimeout) || requestedTimeout <= 0) throw new RpcError('INVALID_REQUEST', 'timeoutMs must be a positive integer')
     const timeoutMs = Math.min(requestedTimeout, 600000)
@@ -367,7 +367,7 @@ export class NamespaceRunner {
       this.active.delete(requestId)
     })
     const [out, err] = await Promise.all([stdout, stderr])
-    return { kind: 'foreground', exitCode: exit.code, signal: exit.signal, timedOut, aborted: false, timeoutMs, stdout: out, stderr: err }
+    return { kind: 'foreground', cwd, exitCode: exit.code, signal: exit.signal, timedOut, aborted: false, timeoutMs, stdout: out, stderr: err }
   }
 
   publicJob(job) {
@@ -393,7 +393,7 @@ export class NamespaceRunner {
     job.truncated = true
   }
 
-  startJob(params, sandboxArgs) {
+  startJob(params, sandboxArgs, cwd) {
     const id = `${this.runnerId}:job:${++this.jobSequence}`
     const child = this.spawnSandbox(sandboxArgs)
     const job = {
@@ -428,7 +428,7 @@ export class NamespaceRunner {
       })
     })
     this.jobs.set(id, job)
-    return { kind: 'background', jobId: id }
+    return { kind: 'background', cwd, jobId: id }
   }
 
   requireJob(id) {

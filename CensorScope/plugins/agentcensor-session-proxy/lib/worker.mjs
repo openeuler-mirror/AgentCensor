@@ -255,8 +255,7 @@ async function run(ctx) {
   // rebuilt from the host seed: the newest `model/selection` or `request/header`
   // config in the conversation wins.
   const selection = durableSelection(agent.session) ?? fallback
-  const selectionRef = { current: selection, assembled: undefined }
-  installModelSelection(agent.ctx, selectionRef)
+  installModelSelection(agent.ctx)
 
   // Register the human-interaction answerers BEFORE any turn can run: a tool
   // call in the first message must already be able to reach the browser.
@@ -275,14 +274,14 @@ async function run(ctx) {
   })}\n`)
 
   try {
-    return await controlLoop(agent, sessions, asks, frames, rl, selectionRef)
+    return await controlLoop(agent, sessions, asks, frames, rl)
   } finally {
     await handle.dispose()
   }
 }
 
 /** Serve messages, cancellations, and interaction answers until shutdown or EOF. */
-export async function controlLoop(agent, sessions, asks, frames, rl, selectionRef) {
+export async function controlLoop(agent, sessions, asks, frames, rl) {
   const pending = new Set()
   const reportIdle = () => {
     const activity = (async () => {
@@ -322,13 +321,6 @@ export async function controlLoop(agent, sessions, asks, frames, rl, selectionRe
           ...(event.surfaceOp === undefined ? {} : { surfaceOp: event.surfaceOp }),
           ...(event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs }),
         })
-        if (event.type === 'model/selection') {
-          selectionRef.current = {
-            provider: event.data.provider,
-            model: event.data.model,
-            ...(event.data.reasoningEffort === undefined ? {} : { reasoningEffort: event.data.reasoningEffort }),
-          }
-        }
         continue
       }
       if (frame?.type === 'message') {
