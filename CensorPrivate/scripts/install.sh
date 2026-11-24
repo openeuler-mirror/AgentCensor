@@ -30,10 +30,10 @@ if [[ ! -e $destdir$prefix/share/censorprivacy/config.yaml && ! -L $destdir$pref
         .private_tools_file = null | .conversation_records_dir = null' > "$destdir$prefix/share/censorprivacy/config.yaml"
   chmod 0644 "$destdir$prefix/share/censorprivacy/config.yaml"
 fi
-for directory in scripts/ops plugins/dsh-censorprivacy plugins/detector-web docs deploy examples/private-tools native; do
+for directory in scripts/ops plugins/dsh-censorprivacy plugins/dsh-censorprivacy/lib plugins/detector-web docs deploy examples/private-tools native; do
   install -d -m 0755 "$destdir$prefix/share/censorprivacy/$directory"
 done
-for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/README.md plugins/detector-web/README.md docs/*.md deploy/censorprivacy@.service examples/*.txt examples/private-tools/* native/README.md README.md; do
+for file in scripts/ops/*.sh scripts/ops/*.mjs plugins/dsh-censorprivacy/*.mjs plugins/dsh-censorprivacy/*.json plugins/dsh-censorprivacy/*.yml plugins/dsh-censorprivacy/lib/client.js plugins/dsh-censorprivacy/README.md plugins/detector-web/README.md docs/*.md deploy/censorprivacy@.service examples/*.txt examples/private-tools/* native/README.md README.md; do
   install -m 0644 "$file" "$destdir$prefix/share/censorprivacy/$file"
 done
 # Core inference has no Python worker. Optional private-tool examples are scripts.

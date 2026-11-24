@@ -1,0 +1,131 @@
+// DSH browser plugin. React is supplied by the platform; no copy is bundled.
+const { createElement: h, useEffect, useState } = require('react');
+
+const roles = { system: '系统提示', user: '用户输入', assistant: '助手上下文', tool: '工具结果', context: '请求上下文' };
+const categories = { PERSON: '姓名', PHONE: '电话', EMAIL: '邮箱', LOCATION: '地址', ADDRESS: '地址', ORG: '机构', ORGANIZATION: '机构',
+  MONEY: '金额', DATE: '日期', NUMBER: '数值', SECRET: '密钥', ID_CARD: '身份证' };
+
+// Gateway offsets count Unicode code points, not JS UTF-16 code units.
+function originalParts(snapshot) {
+  const chars = Array.from(snapshot.text);
+  const spans = [...snapshot.analysis.results].sort((a, b) => a.start - b.start || b.end - a.end);
+  const parts = []; let cursor = 0;
+  for (const span of spans) {
+    if (!Number.isInteger(span.start) || !Number.isInteger(span.end) || span.start < cursor ||
+      span.end <= span.start || span.end > chars.length) continue;
+    parts.push(chars.slice(cursor, span.start).join(''));
+    parts.push(h('mark', { key: `${span.start}:${span.end}`, title: categories[span.entity_type] || span.entity_type },
+      chars.slice(span.start, span.end).join('')));
+    cursor = span.end;
+  }
+  parts.push(chars.slice(cursor).join(''));
+  return parts;
+}
+
+function maskedParts(text) {
+  return text.split(/(<CP_[A-Z][A-Z0-9_]*_[a-z0-9]{8}>|\[REDACTED_[A-Z_]+\])/g)
+    .map((part, index) => /^(?:<CP_|\[REDACTED_)/.test(part) ? h('mark', { key: index }, part) : part);
+}
+
+const css = `
+.cp-privacy{height:100%;min-height:0;overflow:auto;box-sizing:border-box;padding:24px;padding-bottom:calc(var(--dsh-composer-height,152px) + 24px);color:var(--dsw-alias-label-primary,CanvasText);background:var(--dsw-alias-bg-layer-1,Canvas);font:14px/1.6 system-ui,sans-serif}
+.cp-privacy *{box-sizing:border-box}.cp-privacy header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.cp-privacy h2{font-size:20px;margin:0;font-weight:650}.cp-privacy p{margin:6px 0 16px}.cp-privacy .cp-muted{opacity:.66;font-size:12px}
+.cp-privacy button,.cp-privacy select{font:inherit;color:inherit;background:var(--dsw-alias-bg-layer-1,Canvas);border:1px solid var(--dsw-alias-border-l2,#d7dce2);border-radius:7px;padding:6px 10px;cursor:pointer}
+.cp-privacy button:focus-visible,.cp-privacy select:focus-visible{outline:2px solid #527cf0;outline-offset:2px}.cp-privacy button:disabled{opacity:.5;cursor:default}
+.cp-privacy .cp-status{font-size:12px;opacity:.72}.cp-privacy .cp-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:18px 0}
+.cp-privacy select{max-width:100%;min-width:180px}.cp-privacy .cp-layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:20px}
+.cp-privacy nav{display:flex;flex-direction:column;gap:6px;max-height:620px;overflow:auto}.cp-privacy nav button{text-align:left;display:flex;flex-direction:column;gap:2px;background:transparent;flex-shrink:0}
+.cp-privacy nav button[aria-pressed=true]{border-color:#527cf0;background:rgba(82,124,240,.08)}.cp-privacy nav small{opacity:.65;font-size:11px}.cp-privacy .cp-preview{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cp-privacy .cp-detail{min-width:0}.cp-privacy .cp-summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;font-size:12px}
+.cp-privacy .cp-badge{background:rgba(82,124,240,.08);border-radius:20px;padding:3px 10px}.cp-privacy .cp-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.cp-privacy .cp-panel{min-width:0;border:1px solid var(--dsw-alias-border-l2,#d7dce2);border-radius:10px;overflow:hidden}.cp-privacy .cp-panel h3{font-size:13px;font-weight:600;margin:0;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l2,#d7dce2)}
+.cp-privacy pre{font:12px/1.85 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:2;margin:0;padding:16px;max-height:560px;overflow:auto}
+.cp-privacy mark{color:inherit;background:rgba(225,161,30,.19);border-radius:3px;padding:1px 0}.cp-privacy .cp-masked mark{background:rgba(50,153,109,.16)}
+.cp-privacy .cp-empty{margin:40px auto;max-width:560px;padding:28px;border:1px dashed var(--dsw-alias-border-l2,#d7dce2);border-radius:10px}.cp-privacy .cp-error{color:#bd5436}
+@media(max-width:850px){.cp-privacy{padding:16px;padding-bottom:calc(var(--dsh-composer-height,152px) + 16px)}.cp-privacy .cp-layout{grid-template-columns:minmax(0,1fr)}.cp-privacy nav{flex-direction:row;max-height:150px}.cp-privacy nav button{min-width:140px;max-width:210px}.cp-privacy .cp-panels{grid-template-columns:minmax(0,1fr)}.cp-privacy pre{max-height:420px}}
+`;
+
+function PrivacyView({ connection, privacySessionId }) {
+  const [record, setRecord] = useState(null);
+  const [error, setError] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [revision, setRevision] = useState(0);
+  // null follows the latest request; an explicit selection stays put while polling.
+  const [selectedRequest, selectRequest] = useState(null);
+  const [selectedPath, selectPath] = useState(null);
+  useEffect(() => {
+    const abort = new AbortController(); let timer;
+    setRecord(null); setError(false); setLoading(true); selectRequest(null); selectPath(null);
+    async function poll() {
+      try {
+        const result = await connection.rpc.call('/api', 'censorprivacy/session', { sessionId: privacySessionId }, abort.signal);
+        if (abort.signal.aborted) return;
+        if (!result.ok) throw new Error('unavailable');
+        setRecord({ session: privacySessionId, ...result.value }); setError(false);
+      } catch {
+        if (abort.signal.aborted) return;
+        setRecord(null); setError(true);
+      } finally {
+        if (!abort.signal.aborted) { setLoading(false); timer = setTimeout(poll, 1500); }
+      }
+    }
+    void poll();
+    return () => { abort.abort(); clearTimeout(timer); };
+  }, [connection, privacySessionId, revision]);
+
+  // Even before effect cleanup, a session switch must never paint old text.
+  const current = record?.session === privacySessionId ? record : null;
+  const exchanges = current?.exchanges || [];
+  const exchange = exchanges.find(item => item.id === selectedRequest) || exchanges.at(-1);
+  const snapshots = exchange?.snapshots.filter(item => typeof item.text === 'string' &&
+    typeof item.analysis?.masked_text === 'string' && Array.isArray(item.analysis?.results)) || [];
+  const snapshot = snapshots.find(item => item.path === selectedPath) || snapshots[0];
+  const counts = {};
+  for (const span of snapshot?.analysis.results || []) counts[span.entity_type] = (counts[span.entity_type] || 0) + 1;
+  const state = error ? '连接中断' : loading ? '正在同步…' : current?.state === 'tls' ? 'TLS direct' : '自动同步 · 当前会话';
+  const empty = error ? '暂时无法读取隐私记录，请确认 CensorPrivacy 网关正在运行。连接恢复后将自动重试。'
+    : current?.state === 'tls' ? 'TLS direct 暂不记录输入对比。使用 gateway 模式启动新会话后可在这里查看。'
+    : loading ? '正在读取当前会话的隐私记录…'
+    : exchange?.status === 'error' ? '本次请求未完成，没有可展示的遮蔽文本。可切换到之前的请求查看。'
+    : exchange && ['pending', 'streaming'].includes(exchange.status) ? '网关正在处理本次请求，输入记录将自动更新…'
+    : '当前会话暂无输入记录。发送一条消息后，网关实际处理的输入会自动出现在这里。网关需启用 conversation-records-dir；接入前的历史消息不会补录。';
+  return h('section', { className: 'cp-privacy', 'aria-label': '隐私输入对比', 'data-privacy-session': privacySessionId },
+    h('style', null, css),
+    h('header', null, h('h2', null, '隐私'),
+      h('div', { className: 'cp-toolbar' }, h('span', { className: `cp-status${error ? ' cp-error' : ''}`, role: 'status' }, state),
+        h('button', { type: 'button', disabled: loading, onClick: () => setRevision(value => value + 1) }, '刷新'))),
+    h('p', { className: 'cp-muted' }, '查看本次模型请求的完整输入，以及网关遮蔽后发往模型的文本。黄色标出原文敏感范围，绿色标出替换内容。'),
+    exchanges.length ? h('div', { className: 'cp-toolbar' },
+      h('label', { htmlFor: `cp-request-${privacySessionId}` }, '请求轮次'),
+      h('select', { id: `cp-request-${privacySessionId}`, value: selectedRequest || '', onChange: event => {
+        selectRequest(event.target.value || null); selectPath(null);
+      } }, h('option', { value: '' }, `最新请求 · 共 ${exchanges.length} 次`),
+      ...exchanges.map((item, index) => h('option', { key: item.id, value: item.id },
+        `第 ${index + 1} 次 · ${new Date(item.created_at).toLocaleTimeString()} · ${item.status === 'completed' ? '已完成' : ['pending', 'streaming'].includes(item.status) ? '进行中' : '未完成'}`))),
+      h('span', { className: 'cp-muted' }, exchange?.model)) : null,
+    snapshot ? h('div', { className: 'cp-layout' },
+      h('nav', { 'aria-label': '请求输入' }, ...snapshots.map((item, index) => h('button', {
+        key: item.path, type: 'button', 'aria-pressed': item.path === snapshot.path, onClick: () => selectPath(item.path),
+      }, h('span', null, `${index + 1}. ${roles[item.role] || roles.context}`),
+      h('small', { className: 'cp-preview' }, item.text.replace(/\s+/g, ' ').slice(0, 38)),
+      h('small', null, `${item.analysis.masked_count} 处遮蔽 · ${Array.from(item.text).length} 字符`)))),
+      h('div', { className: 'cp-detail' },
+        h('div', { className: 'cp-summary' }, h('span', { className: 'cp-badge' }, `${roles[snapshot.role] || roles.context} · ${snapshot.analysis.masked_count} 处遮蔽`),
+          ...Object.entries(counts).map(([type, count]) => h('span', { key: type, className: 'cp-badge' }, `${categories[type] || type} ${count}`))),
+        h('div', { className: 'cp-panels' },
+          h('section', { className: 'cp-panel', 'aria-label': '遮蔽前' }, h('h3', null, '遮蔽前 · 本机原始输入'),
+            h('pre', { tabIndex: 0, 'data-privacy-original': '' }, ...originalParts(snapshot))),
+          h('section', { className: 'cp-panel cp-masked', 'aria-label': '遮蔽后' }, h('h3', null, '遮蔽后 · 发往模型'),
+            h('pre', { tabIndex: 0, 'data-privacy-masked': '' }, ...maskedParts(snapshot.analysis.masked_text))))))
+      : h('p', { className: 'cp-empty', role: 'status' }, empty));
+}
+
+exports.name = 'censorprivacy-ui';
+exports.inject = ['slots', 'connection'];
+exports.apply = ctx => {
+  ctx.slots.inject('conversation.view', () => ctx.slots.register({
+    name: 'conversation.view', id: 'privacy', order: 15, label: '隐私',
+    inject: sessionId => ({ connection: ctx.connection, privacySessionId: sessionId }),
+  }, PrivacyView));
+};

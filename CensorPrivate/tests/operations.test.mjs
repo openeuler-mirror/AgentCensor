@@ -67,6 +67,8 @@ test('installed censorprivacy: initialization, lifecycle, credential routing and
     }
     assert.equal((await stat(join(prefix, 'share/censorprivacy'))).mode & 0o777, 0o755);
     await stat(join(prefix, 'share/censorprivacy/plugins/dsh-censorprivacy/index.mjs'));
+    await stat(join(prefix, 'share/censorprivacy/plugins/dsh-censorprivacy/privacy-host.mjs'));
+    await stat(join(prefix, 'share/censorprivacy/plugins/dsh-censorprivacy/lib/client.js'));
     const key = join(directory, 'provider.key'); await writeFile(key, providerKey, { mode: 0o600 });
     await call('init', '--upstream', `http://127.0.0.1:${upstream.address().port}`, '--model-id', 'deepseek-flash', '--key-file', key, '--port', String(port),'--ner-threads','4');
     const before = await readFile(join(config, 'config.json'), 'utf8');

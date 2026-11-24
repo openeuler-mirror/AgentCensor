@@ -1,6 +1,7 @@
 import { requestJSON, requestChat, tlsJSON } from './transport.mjs';
 import { chatJSON } from './openai-chat.mjs';
 import { cliOutput } from './cli-output.mjs';
+import { registerPrivacyBridge } from './privacy-host.mjs';
 import { open } from 'node:fs/promises';
 import { constants } from 'node:fs';
 
@@ -229,4 +230,5 @@ export function apply(ctx, supplied) {
     ctx.on('agent/created', ({ agent }) => agent.ctx.tools.restrict({ allow: [...config.privateToolNames] }));
     ctx.tools.guard(exec => config.privateToolNames.has(exec.name) ? undefined : 'CensorPrivacy: PRIVATE_TOOLS_ONLY');
   }
+  if (ctx.inject) registerPrivacyBridge(ctx, config);
 }
