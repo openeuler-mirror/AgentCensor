@@ -25,9 +25,10 @@ while [[ $# -gt 0 ]]; do
     --ner-threads) ner_threads=${2:?需要 NER 线程数}; shift 2 ;;
     --ner-device) ner_device=${2:?需要 cpu、cuda[:ids] 或 cann[:ids]}; shift 2 ;;
     --ner-batch-size) ner_batch_size=${2:?需要 NER batch 大小}; shift 2 ;;
-    --enable-tools|--no-tools)
-      [[ -z $tools_option || $tools_option == "$1" ]] || fail '--enable-tools 与 --no-tools 不能同时使用'
-      tools_option=$1; [[ $1 != --enable-tools ]] || xiaoo_tools=true; shift ;;
+    --enable-tools|--no-tools|--disable_tool)
+      requested_tools=$1; [[ $1 != --disable_tool ]] || requested_tools=--no-tools
+      [[ -z $tools_option || $tools_option == "$requested_tools" ]] || fail '启用与关闭工具的参数不能同时使用'
+      tools_option=$requested_tools; [[ $requested_tools != --enable-tools ]] || xiaoo_tools=true; shift ;;
     --mode) mode=${2:?需要 gateway 或 tls}; shift 2 ;;
     --upstream) upstream=${2:?需要 origin}; shift 2 ;;
     --model-id) model=${2:?需要模型 ID}; shift 2 ;;
@@ -56,7 +57,7 @@ for option in "${options_seen[@]}"; do
     doctor:--dsh-path|doctor:--dsh-root|demo:--dsh-path|demo:--dsh-root|dsh:--dsh-path|dsh:--dsh-root) ;;
     *:--config-dir|*:--prefix|doctor:--tls|doctor:--demo|doctor:--dsh|doctor:--runtime|deps:--tls|deps:--demo|deps:--dsh|deps:--runtime|deps:--dry-run|install:--tls|install:--dry-run|init:--mode|init:--upstream|init:--model-id|init:--key-file|init:--no-key|init:--port|init:--native-library|init:--ca-file|check:--model|systemd:--dry-run|demo:--native-library) ;;
     dsh:--port) [[ ${rest[0]:-} == web ]] || fail '--port 仅用于 dsh web' ;;
-    dsh:--enable-tools|dsh:--no-tools)
+    dsh:--enable-tools|dsh:--no-tools|dsh:--disable_tool)
       [[ ${rest[0]:-} =~ ^(run|web)$ ]] || fail '工具开关仅用于 dsh run|web' ;;
     xiaoo:--xiaoO-path|xiaoo:--xiaoo-root|xiaoo:--xiaoo-bin) ;;
     init:--ner-threads|start:--ner-threads|init:--ner-device|start:--ner-device|init:--ner-batch-size|start:--ner-batch-size) ;;
@@ -99,7 +100,7 @@ Rust 运维与演示：./censorprivacy <命令> [选项]
                          当前配置的 DSH 接入与真实模型验收
                          --dsh-root 为 --dsh-path 的兼容别名
                          路径支持 npm 安装前缀、包目录、CLI 或已构建源码；Node >=24.9
-                         run/web 默认仅私密工具；--enable-tools 同时开放 DSH 自带工具
+                         run/web 默认同时开放 DSH 自带工具；--disable_tool 仅保留私密工具
   xiaoo setup | tui | run | demo | web [--xiaoO-path 源码目录]
                          xiaoO 终端交互、任务、会话检测台与文件读取演示
                          默认关闭工具；--enable-tools 开启并在启动时预热

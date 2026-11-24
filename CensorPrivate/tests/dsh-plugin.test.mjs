@@ -55,14 +55,14 @@ test('Harness automatically attaches real session metadata locally, with an expl
     }
   } finally { server.closeAllConnections(); await new Promise(ok => server.close(ok)); }
 });
-test('private-only requests hide agent-scoped tools and preserve supported compute schemas', () => {
+test('native tools are included by default; explicit private-only requests hide agent-scoped tools', () => {
   const options = { model: 'model', messages: [], tools: [
     { name: 'private_compute', parameters: { type: 'object' } },
     { name: 'subagent', parameters: { type: 'object' } },
     { name: 'bash', parameters: { type: 'object' } },
   ] };
   assert.deepEqual(serialize(options, { privateToolsOnly: true }).tools.map(tool => tool.function.name), ['private_compute']);
-  assert.deepEqual(serialize(options, {}).tools.map(tool => tool.function.name), ['private_compute']);
+  assert.deepEqual(serialize(options, {}).tools.map(tool => tool.function.name), ['private_compute', 'subagent', 'bash']);
   assert.equal(serialize(options, { privateToolsOnly: false }).tools.length, 3);
   assert.equal(serialize({ ...options, tools: [options.tools[1]] }, { privateToolsOnly: true }).tools, undefined);
 });
@@ -114,7 +114,7 @@ test('private tool catalog drives advertisement and execution independently of t
         llm: { registerAdapter(_ids, value) { adapter = value; } },
         tools: { register(tool) { registered.set(tool.name, tool); }, guard(fn) { guard = fn; } },
         on(_event, fn) { fn({ agent: { ctx: { tools: { restrict(spec) { allowed = spec.allow; } } } } }); },
-      }, { mode: 'gateway', baseURL, broker: baseURL, model: 'test', privateToolsOnly: !enabled, privateTools: catalog });
+      }, { mode: 'gateway', baseURL, broker: baseURL, model: 'test', ...(!enabled ? { privateToolsOnly: true } : {}), privateTools: catalog });
       const options = { model: 'test', messages: [], tools: [...registered.values(), { name: 'bash' }] };
       assert.deepEqual(serialize(options, adapter.config).tools.map(tool => tool.function.name),
         enabled ? ['private_compute', 'private_sort', 'bash'] : ['private_compute', 'private_sort']);

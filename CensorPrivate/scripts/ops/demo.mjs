@@ -258,11 +258,11 @@ async function directDemo(mode) {
 async function overlay(directory, config) {
   const content = [
     '- insert:', '    - id: censorprivacy', `      name: ${JSON.stringify(join(root, 'plugins/dsh-censorprivacy/index.mjs'))}`, '      config:',
-    ...Object.entries({ privateToolsOnly: true, ...config }).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`),
+    ...Object.entries({ privateToolsOnly: false, ...config }).map(([key, value]) => `        ${key}: ${JSON.stringify(value)}`),
     '- id: agent-default-model', '  config:', '    provider: censorprivacy', `    model: ${JSON.stringify(config.model)}`,
     ...['llm-deepseek', 'llm-deepseek-account', 'llm-pi-ai', 'session-title-llm', 'session-log-deepseek', 'session-telemetry-otel'].flatMap(id => [`- id: ${id}`, '  disabled: true']),
   ].join('\n') + '\n';
-  const path = join(directory, config.privateToolsOnly === false ? 'censorprivacy-tools-enabled.patch.yml' : 'censorprivacy.patch.yml');
+  const path = join(directory, config.privateToolsOnly ? 'censorprivacy.patch.yml' : 'censorprivacy-tools-enabled.patch.yml');
   await writeFile(path, content, { mode: 0o600 }); return path;
 }
 function dshEnvironment(home, token, runID) {
@@ -367,7 +367,7 @@ async function managedDsh() {
     : [];
   assertion(Array.isArray(privateTools), 'private_tools_catalog_invalid');
   const transport = { mode: config.mode, baseURL: config.mode === 'tls' ? config.upstream : base, model: config.model,
-    privateToolsOnly: flags.tools !== '--enable-tools', privateTools,
+    privateToolsOnly: flags.tools === '--no-tools', privateTools,
     broker: base, executable: join(bin, 'censorprivacy'), nativeLibrary: config.native_library, tokenFile: join(configDir, 'gateway.token'),
     runStateFile, upstreamKeyFile: config.has_key ? join(configDir, 'upstream.key') : '', caFile: config.ca_file ?? '', workspace,
     timeoutMs: 90000, contextWindow: 32768, maxTokens: action === 'web' ? 4096 : 512, cliStream: action === 'run' };
