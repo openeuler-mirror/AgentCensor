@@ -73,6 +73,8 @@ custom:
 
 部署参数和类别选择统一放在源码目录的 `config.yaml`。随附配置设置 `detection.categories: all`，开启全部类别；填写列表则只检测所列类别，省略该项、填写 `null` 或 `[]` 则关闭按类别检测。业务规则放在 `custom` 下，TTL 在 `server.ttl_seconds` 中设置，NER 参数在 `ner` 下管理。详细字段、优先级与容器挂载见 [统一配置](configuration.md)。
 
+当前有 16 个内置类别：`ADDRESS` 专指通讯/邮寄地址，`IP_ADDRESS` 独立检测 IP；`MEDICAL_INFO` 已移除，旧类别列表需删去该项。NER 同时服务 `PERSON / ORG / LOCATION / DATE`，四类全部关闭后自动跳过模型加载与推理，仅关闭前三类而保留 DATE 仍会运行模型。规则模式示例及性能边界见 [类别选择与 NER 开销](configuration.md#类别选择与-ner-开销)。
+
 ### 2.3 启动并检查
 
 ```bash
@@ -137,6 +139,8 @@ node apps/cli/lib/bin.js --version  # 基线环境输出 0.2.2-rc.1
 
 首次直接访问 `http://127.0.0.1:3080/` 会返回 401，必须先使用日志中的 token 网址。Web 重启后使用新的网址；网址中的 token 由 Harness 生成，与网关的 `gateway.token` 不同。
 
+顶栏“轨迹”后的“隐私”显示当前会话的输入遮蔽对比。发送消息后，可切换请求轮次与系统提示、用户输入、助手上下文或工具结果，查看原文敏感范围和当次真正发给模型的遮蔽文本。页面自动同步、刷新后可回看；窄屏上下排列。数据复用网关记录，无需另开检测台或再加载模型。需使用 gateway 模式并启用 `conversation-records-dir`（`censorprivacy start` 默认启用）；TLS direct 与接入前的历史没有对比记录。升级插件后重启 Harness Web 即可显示入口。独立插件构建与打包见 [插件说明](../plugins/dsh-censorprivacy/README.md)。
+
 在聊天框发送下列任务，并粘贴 [虚构费用工单](../examples/demo.txt)：
 
 ```text
@@ -163,7 +167,13 @@ PATH 已有可用 `dsh` 时可省略 `--dsh-path`；旧参数 `--dsh-root` 仍�
 
 `setup` 准备独立 profile 并记住 DSH 路径；`run` 执行实际任务。任务含命令行选项时用 `--` 分隔，例如 `./censorprivacy dsh run -- '--help 是任务文本，请解释。'`。
 
-`run` 和 `web` 默认只提供 CensorPrivacy 的私密工具。需要 DSH 自带工具时，在本次启动加 `--enable-tools`，例如 `./censorprivacy dsh web --dsh-path /path/to/deepseek-harness --enable-tools`。这些原生工具按 DSH 自身权限运行，不会获得替换隐私引用所需的原值。下一次启动仍默认只提供私密工具。
+`run` 和 `web` 默认同时提供 DSH 自带工具和 CensorPrivacy 私密工具。原生工具按 DSH 自身权限运行，不会获得替换隐私引用所需的原值。仅需私密工具时，在本次启动加 `--disable_tool`：
+
+```bash
+./censorprivacy dsh web --dsh-path /path/to/deepseek-harness --disable_tool
+```
+
+该开关仅对本次运行生效，下一次启动仍默认提供原生工具。旧参数 `--enable-tools`、`--no-tools` 继续兼容。
 
 `cloud` 使用独立临时网关和虚构策略验证真实模型的 `private_compute sum`，预期恢复客户 `DemoCustomerOrchid` 与合计 `300.00`，SECRET 不恢复。它从当前网关的认证 `/ready` 继承实际 NER 线程、设备和 batch 设置（包括 `start` 临时覆盖），并将请求值与实际值写入私有的 `dsh/cloud-report.json`。设置不一致会在请求模型前停止。`run/cloud` 均会调用真实模型；`cloud` 验收期间会额外加载一份检测模型，请确认本机有足够资源。
 
@@ -328,7 +338,7 @@ censorprivacy compute aggregate "$REF_A" "$REF_B"
 
 1. 把 [注册表样例](../examples/private-tools/manifest.example.json) 复制到管理目录下的 `private-tools.json`，权限设为 `0600`。管理目录默认是 `${XDG_CONFIG_HOME:-$HOME/.config}/censorprivacy/managed`，也可用 `--config-dir` 指定。
 2. 修改 `command` 中的绝对路径，指向本机可信的 [Python 排序脚本](../examples/private-tools/sort.py) 或 [Shell 排序脚本](../examples/private-tools/sort.sh)。Python 样例使用 Python 3；Shell 样例使用 `jq`。`command` 是固定的程序和参数列表，工具名称使用 `private_*`，不要把密钥、路径或业务数据写进模型可见的 `description`。
-3. 可在统一配置的 `private_tools_file` 中填写注册表路径，也可使用上述实例默认位置。重启网关和 DSH，DSH 会自动发现工具，无需 `--enable-tools`。直接运行网关时也可用 `--private-tools-file` 覆盖路径。systemd 用户修改后需要重新执行 `censorprivacy systemd install`，并确保服务账号能读取脚本及依赖。
+3. 可在统一配置的 `private_tools_file` 中填写注册表路径，也可使用上述实例默认位置。重启网关和 DSH，DSH 会自动发现私密工具，使用 `--disable_tool` 时仍会保留。直接运行网关时也可用 `--private-tools-file` 覆盖路径。systemd 用户修改后需要重新执行 `censorprivacy systemd install`，并确保服务账号能读取脚本及依赖。
 
 本机认证接口 `GET /v1/private_tools` 列出工具；`POST /v1/private_tools/<name>` 对自定义工具仅接受 `{"refs":[...]}`。网关验证当前 run 的引用、排除 SECRET，再通过标准输入将 `{"inputs":[{"value":"…","entity_type":"…","unit":null}]}` 交给程序。标准输出必须是单个 JSON 对象：
 
@@ -363,6 +373,6 @@ censorprivacy compute aggregate "$REF_A" "$REF_B"
 
 ### Agent 接入范围
 
-DSH 使用独立 profile，默认仅开放私密工具；支持非 reasoning Chat Completions 与工具调用，未知内容块拒绝处理。gateway 模式的 Web 与 `dsh run` 使用真实 SSE，校验后的文字逐段显示；工具调用在完整参数与流结束校验后交给 DSH。TLS direct 保留完整 JSON 校验。插件字段见 [DSH 插件说明](../plugins/dsh-censorprivacy/README.md)。
+DSH 使用独立 profile，默认同时开放原生工具和私密工具，`--disable_tool` 仅保留私密工具；支持非 reasoning Chat Completions 与工具调用，未知内容块拒绝处理。gateway 模式的 Web 与 `dsh run` 使用真实 SSE，校验后的文字逐段显示；工具调用在完整参数与流结束校验后交给 DSH。TLS direct 保留完整 JSON 校验。插件字段见 [DSH 插件说明](../plugins/dsh-censorprivacy/README.md)。
 
 xiaoO 使用网关与原生 SSE，配置的 `api_base` 是带本次启动会话标识的完整 `/xiaoo/<session>/no-tools/v1/chat/completions` 地址（开启工具时省略 `no-tools/`）；会话标识仅用于本机记录，不发送给上游。TUI 中的模型请求归属本次启动，重新启动 xiaoO 会创建另一条会话。网关记录实际模型交互，未发送给模型的 TUI 编辑、界面命令不在记录范围内。普通工具参数不恢复隐私原值，尚未注册 DSH 的 `private_compute`。`demo --enable-tools` 仅开放 `file_read`。`run/TUI` 默认不向上游提供工具定义，并阻止工具调用；显式启用后，其工具权限由实际运行环境管理。准备将工具目录检测移至进入对话前，耗时仍取决于 CPU 和目录大小；TUI 自身的系统提示与新文本仍需在请求时检测。
