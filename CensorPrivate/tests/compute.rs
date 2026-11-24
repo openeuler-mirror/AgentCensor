@@ -213,13 +213,14 @@ impl ManualClock {
 }
 
 #[test]
-fn expiry_and_epoch_remove_authority_without_declassifying_known_values() {
+fn expiry_and_epoch_remove_authority_without_declassifying_credentials() {
     let clock = Arc::new(ManualClock::default());
     let vault = RunVault::with_clock(Duration::from_secs(60), clock.clone()).unwrap();
     let cap = vault.begin_run("owner", 1).unwrap();
     let mut parent = registration("NUMBER");
     parent.ttl = Some(Duration::from_secs(1));
     let reference = vault.register_value(&cap, 1, "531", parent).unwrap();
+    register(&vault, &cap, "hiddencredential", "SECRET");
     let result = compute(
         &vault,
         &cap,
@@ -234,7 +235,7 @@ fn expiry_and_epoch_remove_authority_without_declassifying_known_values() {
     clock.set(1000);
     assert!(vault.restore_text(&cap, 1, reference.as_str()).is_err());
     assert!(vault.restore_text(&cap, 1, result.as_str()).is_err());
-    assert_eq!(vault.known_spans(&cap, 1, "value 531.").unwrap().len(), 1);
+    assert!(vault.known_spans(&cap, 1, "value 531.").unwrap().is_empty());
     assert!(vault
         .known_spans(&cap, 1, "python531 531.5 _531")
         .unwrap()
@@ -243,13 +244,23 @@ fn expiry_and_epoch_remove_authority_without_declassifying_known_values() {
         .advance_epoch(&cap, 1, 2, Duration::from_secs(60))
         .unwrap();
     assert!(vault.restore_text(&cap, 2, reference.as_str()).is_err());
-    assert_eq!(vault.known_spans(&cap, 2, "531").unwrap().len(), 1);
+    assert!(vault.known_spans(&cap, 2, "531").unwrap().is_empty());
+    assert_eq!(
+        vault
+            .known_spans(&cap, 2, "hiddencredential")
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(vault
         .protect_text(&cap, 2, reference.as_str(), vec![])
         .is_err());
-    let fresh = vault.protect_text(&cap, 2, "531", vec![]).unwrap();
-    assert_ne!(fresh, reference.as_str());
-    assert_eq!(vault.restore_text(&cap, 2, &fresh).unwrap(), "531");
+    assert_eq!(vault.protect_text(&cap, 2, "531", vec![]).unwrap(), "531");
+    let fresh = vault
+        .register_value(&cap, 2, "531", registration("NUMBER"))
+        .unwrap();
+    assert_ne!(fresh, reference);
+    assert_eq!(vault.restore_text(&cap, 2, fresh.as_str()).unwrap(), "531");
     clock.set(60_000);
     assert!(vault.validate_run(&cap, 2).is_err());
     assert_eq!(vault.cleanup_expired().unwrap(), 1);

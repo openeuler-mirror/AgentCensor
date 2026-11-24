@@ -2,7 +2,7 @@
 
 复用 `privacy-detector` 提交 `007c7ea7b5e4c58085564cc336ffd75f28b73d74` 的页面、样式和交互。后端使用产品的 Rust `ProfessionalDetector`，固定本地 `shibing624/bert4ner-base-chinese` FP32 ONNX，不需要 Flask、Python、Node 或前端构建。
 
-先按 [检测器说明](../../docs/rust-detector.md) 准备模型与 ONNX Runtime，再从 `CensorPrivate/` 目录启动：
+选择 PERSON、ORG、LOCATION、DATE 任一类时，先按 [检测器说明](../../docs/rust-detector.md) 准备模型与 ONNX Runtime；四类全关时无需这些资源。从 `CensorPrivate/` 目录启动：
 
 ```bash
 ./target/release/censorprivacy web
@@ -15,6 +15,8 @@
 页面提供原文高亮、结果定位、来源/校验状态、遮蔽分数阈值、三种预览和复制功能。检测范围由 `detection.categories` 选择，页面还可关闭本次 NER。中文 BERT 不提供英文专用 NER，英文示例可检查已启用的正则和规则。预览 CP 引用使用 8 位小写字母和数字后缀，同一类别的重复值复用引用。
 
 输入框默认空白，示例只在主动点击示例按钮后载入。
+
+当前内置 16 类。ADDRESS 只保护有通讯/邮寄结构的地址，不因通用 `address` 字段名而覆盖 IP、URL、域名或文件路径；IP_ADDRESS 独立检测 IPv4/IPv6。MEDICAL_INFO 及医疗标签检测已移除，页面改用通讯地址与寄送回访示例，不提供医疗语义检测。
 
 页面显示生产检测结果，并额外展示普通数字的 0.4 分线索；NER 沿用生产输出阈值 0.6。遮蔽阈值默认 0.6，包含等号。界面标注使用 Unicode 字符区间，Rust 检测接口仍使用 UTF-8 字节区间。重叠范围复用产品的合并逻辑。
 

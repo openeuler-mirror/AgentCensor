@@ -12,6 +12,13 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+static NUMERIC_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"^[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$",
+    )
+    .expect("constant numeric grammar")
+});
+
 fn literal_matches<'a>(text: &'a str, value: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
     let mut cursor = 0;
     std::iter::from_fn(move || {
@@ -103,6 +110,7 @@ pub(crate) struct VaultEntry {
     expires_at: Duration,
     pub metadata: ValueMetadata,
     depends_on: Vec<Reference>,
+    session: Option<String>,
 }
 
 impl VaultEntry {
@@ -126,6 +134,7 @@ pub struct RunVault {
     ttl: Duration,
     clock: Arc<dyn Clock>,
     runs: Mutex<HashMap<String, Run>>,
+    session: Option<String>,
 }
 
 impl RunVault {
@@ -141,7 +150,11 @@ impl RunVault {
             ttl,
             clock,
             runs: Mutex::new(HashMap::new()),
+            session: None,
         })
+    }
+    pub(crate) fn select_session(&mut self, session: Option<String>) -> Option<String> {
+        std::mem::replace(&mut self.session, session)
     }
     fn lock(&self) -> Result<MutexGuard<'_, HashMap<String, Run>>> {
         self.runs.lock().map_err(|_| Error::ServiceUnavailable)
@@ -305,8 +318,14 @@ impl RunVault {
             registration.labels.extend(parent.labels.iter().cloned());
             expires_at = expires_at.min(parent.expires_at);
         }
+        let session = if registration.labels.contains("secret") {
+            None
+        } else {
+            self.session.clone()
+        };
         let identity = serde_json::to_vec(&(
             run.epoch,
+            &session,
             &registration.entity_type,
             value,
             &registration.metadata.unit,
@@ -348,6 +367,7 @@ impl RunVault {
             expires_at,
             metadata: registration.metadata,
             depends_on: registration.depends_on,
+            session,
         };
         run.value_bytes += value.len();
         run.entries.insert(reference.clone(), entry);
@@ -413,6 +433,18 @@ impl RunVault {
             // Expiry/revocation removes authority, not sensitivity. Keep values
             // available for detection until the whole run is destroyed.
             if entry.entity_type == "LITERAL" {
+                continue;
+            }
+            // Credentials retain run-wide protection. Ordinary values only
+            // propagate within their session; numeric values need fresh context.
+            if !entry.is_secret()
+                && (entry.session != self.session
+                    || matches!(
+                        entry.entity_type.as_str(),
+                        "MONEY" | "NUMBER" | "DATE" | "DURATION"
+                    )
+                    || NUMERIC_VALUE.is_match(&entry.value))
+            {
                 continue;
             }
             for (start, end) in literal_matches(text, entry.value.as_str()) {

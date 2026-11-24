@@ -15,7 +15,21 @@ server:
   run_state_file: /root/.config/censorprivacy/managed/run.json
 
 detection:
-  categories: all
+  categories: [
+    "PERSON",
+    "ORG",
+    "LOCATION",
+    "ADDRESS",
+    "EMAIL",
+    "PHONE",
+    "ID",
+    "ACCOUNT",
+    "SECRET",
+    "MONEY",
+    "MAC_ADDRESS",
+    "LICENSE_PLATE",
+    "CONFIDENTIAL",
+  ]
   sensitive_paths: []
 
 ner:

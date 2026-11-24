@@ -15,6 +15,53 @@ const TOKEN: &str = "professional-local-test-token-01234567890123456789";
 
 #[test]
 #[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
+fn masked_money_and_mac_keep_original_ner_protection_without_fragment_false_positives() {
+    use censorprivacy::config::AppConfig;
+    let config = AppConfig::from_yaml(
+        "detection: {categories: [PERSON, ORG, LOCATION, MONEY, MAC_ADDRESS, EMAIL, SECRET]}",
+    )
+    .unwrap();
+    let mut gate = PrivacyGate::with_professional_detector(
+        config.privacy_policy().unwrap(),
+        GateOptions::default(),
+        config.detector(None, None, None, None, None).unwrap(),
+    )
+    .unwrap();
+    let target = "/v1/chat/completions";
+    for text in [
+        "金额：125元\nMAC aa:bb:cc:dd:ee:ff\n",
+        "金额：125元\nMAC aa:bb:cc:dd:ee:ff\n姓名：张三\napi_key=sk-synthetic1234567890",
+    ] {
+        let body = json!({"model":"configured-model","messages":[{"role":"user","content":text}]});
+        let (permit, snapshots) = gate.protect_recorded(Api::Chat, &body, target).unwrap();
+        let approved = gate.consume(permit, target, "POST").unwrap();
+        let protected: Value = serde_json::from_slice(approved.body()).unwrap();
+        let masked = protected["messages"][0]["content"].as_str().unwrap();
+        assert!(masked.contains("<CP_MONEY_") && masked.contains("<CP_MAC_ADDRESS_"));
+        for value in ["125", "aa:bb:cc:dd:ee:ff", "张三", "sk-synthetic1234567890"] {
+            assert!(!masked.contains(value), "{masked}");
+        }
+        assert_eq!(snapshots.len(), 1);
+        if text.contains("张三") {
+            assert!(masked.contains("<CP_PERSON_") && masked.contains("<CP_SECRET_"));
+        }
+    }
+    gate.protect_text("金额1.3元，工资1.18元", "").unwrap();
+    for text in [
+        "1.13和1.3哪个大",
+        "1.3和1.18哪个大",
+        "name: read",
+        "单位：ms",
+        "max_tokens: 4096",
+        "api-response-handler",
+        "100元素",
+    ] {
+        assert_eq!(gate.protect_text(text, "").unwrap(), text);
+    }
+}
+
+#[test]
+#[ignore = "requires local ONNX Runtime and bert4ner-base-chinese ONNX bundle"]
 fn deployment_categories_filter_real_ner_without_disabling_selected_rules() {
     use censorprivacy::config::AppConfig;
     let config = AppConfig::from_yaml("detection: {categories: all}").unwrap();

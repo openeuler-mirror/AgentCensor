@@ -139,3 +139,34 @@ fn overlapping_known_literals_do_not_leak_the_unmatched_tail() {
         "[REDACTED_SECRET]"
     );
 }
+
+#[test]
+fn numeric_literals_need_current_detection_but_secret_numbers_remain_protected() {
+    let (vault, cap) = vault();
+    for kind in [
+        "MONEY",
+        "NUMBER",
+        "DATE",
+        "DURATION",
+        "CONFIDENTIAL",
+        "PRIVATE_RESULT",
+    ] {
+        register(&vault, &cap, "1.3", kind);
+    }
+    assert!(vault
+        .known_spans(&cap, 1, "1.13和1.3哪个大")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        vault
+            .protect_text(&cap, 1, "1.13和1.3哪个大", vec![])
+            .unwrap(),
+        "1.13和1.3哪个大"
+    );
+    register(&vault, &cap, "1.3", "SECRET");
+    assert!(!vault.known_spans(&cap, 1, "1.3").unwrap().is_empty());
+    assert_eq!(
+        vault.redact_known_secrets(&cap, 1, "1.3").unwrap(),
+        "[REDACTED_SECRET]"
+    );
+}

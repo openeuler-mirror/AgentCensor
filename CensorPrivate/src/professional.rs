@@ -155,7 +155,7 @@ impl ProfessionalDetector {
             return Err(Error::NerConfigInvalid);
         }
         config.ner_device.validate()?;
-        let rules = rules::Rules::new()?;
+        let rules = rules::Rules::new_selected(&config.categories)?;
         let ner = if crate::categories::uses_ner(&config.categories) {
             let mut model = model::NerModel::load(&config)?;
             model.warmup()?;
