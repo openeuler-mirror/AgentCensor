@@ -4,15 +4,17 @@ use censorguard_common::protocol::{
     Operation, Request, Response, RpcError, RpcErrorCode, RpcMethod, RpcRequest, RpcResponse,
     RpcResult, VERSION, read_json_line, validate_version, write_json_line,
 };
+use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
 use nix::sys::socket::{MsgFlags, getsockopt, recv, sockopt::PeerCredentials};
 use nix::unistd::{Gid, chown, geteuid};
 use std::fs;
 use std::io::{self, BufReader};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
@@ -1170,6 +1172,73 @@ fn failure(message: impl Into<String>) -> Response {
     }
 }
 
+/// A unique private directory that stages a socket until it is published.
+///
+/// The listener socket is bound inside a freshly created 0700 directory and
+/// only renamed onto the configured path after its ownership and permission
+/// bits have been tightened. Connecting to a pathname Unix socket requires
+/// search permission on every parent directory, so while the socket lives
+/// inside the staging directory no other local user can reach it — no matter
+/// how permissive the process umask is.
+struct StagingDir {
+    path: PathBuf,
+}
+
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+impl StagingDir {
+    fn create(parent: &Path) -> io::Result<Self> {
+        for _ in 0..32 {
+            let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".cg-{}-{sequence}", std::process::id()));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "unable to allocate a unique staging directory under {}",
+                parent.display()
+            ),
+        ))
+    }
+
+    fn socket_path(&self) -> PathBuf {
+        self.path.join("socket")
+    }
+
+    /// Best-effort cleanup; the socket may already have been renamed away.
+    fn remove(&self) {
+        let _ = fs::remove_file(self.socket_path());
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
+/// Atomically publishes the staged socket onto its configured path.
+///
+/// RENAME_NOREPLACE guarantees the configured path either does not exist yet
+/// and receives the fully configured socket, or already exists and is left
+/// untouched (the rename fails instead of overwriting a concurrent file).
+fn publish_staged_socket(staged: &Path, target: &Path) -> io::Result<()> {
+    renameat2(
+        AT_FDCWD,
+        staged,
+        AT_FDCWD,
+        target,
+        RenameFlags::RENAME_NOREPLACE,
+    )
+    .map_err(io::Error::from)
+}
+
 fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListener, io::Error> {
     let parent = path
         .parent()
@@ -1190,15 +1259,21 @@ fn listen(path: &Path, socket_group: Option<Gid>, mode: u32) -> Result<UnixListe
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let listener = UnixListener::bind(path)?;
+
+    // Bind inside the 0700 staging directory: unlike the previous bind-then-
+    // chmod sequence, the socket is unreachable by other local users from the
+    // moment it appears, even under a permissive umask such as 0000.
+    let staging = StagingDir::create(parent)?;
+    let staged_socket = staging.socket_path();
+    let listener = UnixListener::bind(&staged_socket)?;
     let configured = socket_group
         .map_or(Ok(()), |gid| {
-            chown(path, None, Some(gid)).map_err(io::Error::from)
+            chown(&staged_socket, None, Some(gid)).map_err(io::Error::from)
         })
-        .and_then(|()| fs::set_permissions(path, fs::Permissions::from_mode(mode)));
+        .and_then(|()| fs::set_permissions(&staged_socket, fs::Permissions::from_mode(mode)))
+        .and_then(|()| publish_staged_socket(&staged_socket, path));
     if let Err(error) = configured {
         drop(listener);
-        let _ = fs::remove_file(path);
         return Err(error);
     }
     Ok(listener)
@@ -1228,8 +1303,10 @@ pub(crate) fn validate_socket_parent(parent: &Path) -> Result<(), io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRole, is_privileged, role_allows};
+    use super::{SocketRole, is_privileged, listen, publish_staged_socket, role_allows};
     use censorguard_common::protocol::RpcMethod;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn only_root_or_the_explicit_gateway_uid_is_privileged() {
@@ -1285,5 +1362,73 @@ mod tests {
         assert!(role_allows(SocketRole::Admin, &RpcMethod::ApplyPolicy));
         assert!(role_allows(SocketRole::Admin, &RpcMethod::EvaluateIntent));
         assert!(!role_allows(SocketRole::Admin, &RpcMethod::RegisterSelf));
+    }
+
+    #[test]
+    fn listen_publishes_socket_with_requested_permissions_and_no_staging_leftovers()
+    -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("ctl.sock");
+        let listener = listen(&path, None, 0o600)?;
+
+        let metadata = std::fs::symlink_metadata(&path)?;
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+        // The published socket must accept connections from local clients.
+        let peer = UnixStream::connect(&path)?;
+        drop(peer);
+        drop(listener);
+
+        // Only the published socket may remain; every staging directory must
+        // have been cleaned up even on the success path.
+        for entry in std::fs::read_dir(directory.path())? {
+            let name = entry?
+                .file_name()
+                .into_string()
+                .map_err(|_| std::io::Error::other("non-UTF8 directory entry"))?;
+            assert_eq!(name, "ctl.sock");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publish_staged_socket_keeps_listener_usable_at_target_path() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let staged = directory.path().join(".cg-staged");
+        std::fs::create_dir(&staged)?;
+        let staged_socket = staged.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&staged_socket)?;
+        let target = directory.path().join("ctl.sock");
+
+        publish_staged_socket(&staged_socket, &target)?;
+
+        // Connecting through the published path must reach the same listener.
+        let peer = UnixStream::connect(&target)?;
+        let _accepted = listener.accept()?;
+        drop(peer);
+        assert!(!staged_socket.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn publish_staged_socket_never_overwrites_a_concurrent_file() -> std::io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let staged = directory.path().join(".cg-staged");
+        std::fs::create_dir(&staged)?;
+        let staged_socket = staged.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&staged_socket)?;
+        let target = directory.path().join("ctl.sock");
+        std::fs::write(&target, b"concurrent file")?;
+
+        let result = publish_staged_socket(&staged_socket, &target);
+
+        assert_eq!(
+            result.err().map(|error| error.kind()),
+            Some(std::io::ErrorKind::AlreadyExists),
+        );
+        assert_eq!(std::fs::read(&target)?, b"concurrent file");
+        drop(listener);
+        Ok(())
     }
 }
